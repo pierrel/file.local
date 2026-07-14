@@ -5,11 +5,22 @@ A local peer to peer, local-first file syncing system.
 I have a local directory that I want to share with my coding agent, which runs on my server which I can connect to over wireguard (I know the IP).
 
 I create a directory with files locally.
+: local $ mkdir mydir
 
-I name the directory as shared specifically with my server. On my server, I specify a location for my files to show up (like a git repo).
+I name the directory as shared specifically with my server.
+: local $ file.local dir mydir
+: some id]
+
+On my server, I specify a location for my files to show up (like a git repo).
+: server $ file.local dir otherdir [some id]
 
 If possible, it should follow git conventions (at least at the start, for convenience) for example for:
 - ignoring files (.gitignore)
-- syncs the git state between the files (so that either can workm off of the same exact branch) - this is probably free since the git state is just a directory with real files in it.
+- syncs the git state between the files (so that either can work off of the same exact branch) - this is probably free since the git state is just a directory with real files in it.
+
+Explicitly *not supported* for this version
+- merge conflict resolution (pick some reasonable rule for handling)
+- explicit (user-controlled) branching - we all work on the same directory with the same version of the same files.
+- Discoverability - Unless it's already easier to do it in another way, all collaborators (sync targets) already know each others' IP addresses and the path to the file/directory they want to sync or some reasonable stable ID.
 ** v0.1.0 - works for my family
 ** v1.0.0 - works for another community
