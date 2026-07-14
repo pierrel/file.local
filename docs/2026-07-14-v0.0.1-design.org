@@ -1,0 +1,389 @@
+#+title: file.local v0.0.1 design
+#+date: 2026-07-14
+#+status: proposed
+
+* Summary
+
+=file.local= synchronizes one ordinary directory between two equal peers. Each
+peer remains usable while disconnected. On reconnection, the peers exchange
+changes and converge on the same synchronized tree.
+
+Version 0.0.1 targets Linux and macOS. It supports regular files, directories,
+and symbolic links, including files larger than memory. It uses Git's ignore
+and portable metadata conventions, but deliberately does not synchronize
+=.git=. This version does not provide collaborative editing, peer discovery,
+more than two peers, or user-controlled branches.
+
+The first transport is SSH. A peer is any SSH destination accepted by the
+user's existing SSH client, including a hostname, IP address, or
+=~/.ssh/config= alias. WireGuard, a LAN, or the public internet can provide the
+underlying route without changing =file.local=. SSH supplies encryption,
+authentication, host verification, and remote process launch, avoiding a new
+network daemon and key-management system in the first release.
+
+* Goals
+
+- Bidirectional synchronization between two equal peers.
+- Full local operation and eventual synchronization after either peer returns.
+- A short setup path for a directory on a workstation and a directory on a
+  server.
+- Predictable behavior for concurrent writes, deletes, and renames.
+- Streaming and atomic application of arbitrary-sized files.
+- Git-compatible ignore matching and Git-like portable file metadata.
+- Useful status and dry-run output before data changes.
+
+* Non-goals
+
+- Synchronizing =.git=, Git branches, the Git index, or Git locks.
+- Character-level collaborative editing or CRDT semantics.
+- Automatic peer discovery, NAT traversal, or relay service.
+- More than two active peers. Stable share and peer identities are retained so
+  this can be added later without changing the on-disk model.
+- Synchronizing ownership, ACLs, extended attributes, creation times, resource
+  forks, or general Unix permission bits.
+- Block-level transfer resumption or delta encoding within a file.
+- Guaranteed preservation of every concurrent user intent. The initial visible
+  conflict policy is last-write-wins with recovery of the losing content.
+
+* User experience
+
+** Installation
+
+The =file.local= executable must be installed on both peers and discoverable in
+the non-interactive SSH =PATH=. Setup errors should print the exact remote
+command that failed and a corrective action.
+
+** Create and connect a share
+
+On the first peer:
+
+#+begin_src sh
+$ file.local init ~/src/example
+Initialized share quiet-river-7f3a at ~/src/example
+#+end_src
+
+The generated share ID is stable and non-secret. Metadata is stored outside the
+synchronized tree in the platform user-data directory.
+
+Connect the second directory from either peer:
+
+#+begin_src sh
+$ file.local peer add ~/src/example --host buildbox --remote-path /srv/work/example
+Checking buildbox... connected
+Created /srv/work/example
+Connected quiet-river-7f3a to buildbox:/srv/work/example
+Run =file.local sync ~/src/example --dry-run= to preview the initial sync.
+#+end_src
+
+=buildbox= is passed to the system SSH client unchanged, so SSH aliases,
+identity files, ports, jump hosts, and host-key policy continue to work. The
+remote path is passed as data to the remote process, never interpolated into a
+shell command.
+
+The peer running =peer add= becomes the connector for this two-peer share. It
+runs =watch= and opens SSH sessions; the other peer starts an on-demand
+responder through SSH. This is a connection-lifecycle role only. Both replicas
+remain equal when changes are reconciled, and the role can be recreated from
+the other side if the deployment changes. Having one connector avoids two
+persistent watchers acquiring their respective local locks and repeatedly
+colliding.
+
+If the remote directory already contains files, setup does not choose a winner.
+The first dry run reports the union, conflicts, ignored paths, and planned
+deletions. The user then runs a real sync.
+
+** Routine operation
+
+#+begin_src sh
+$ file.local watch ~/src/example
+Watching quiet-river-7f3a; peer buildbox is offline
+12:41:08 peer connected
+12:41:09 uploaded 3 files, downloaded 1 file, 18.4 MiB
+#+end_src
+
+=watch= performs an initial reconciliation, observes filesystem events, and
+periodically rescans the tree so missed or coalesced watcher events do not cause
+permanent drift. When SSH is unavailable it reports the offline state once,
+continues recording local changes, and reconnects with bounded backoff.
+
+The foreground process runs on the connector only and is sufficient for
+v0.0.1. Running =watch= on the responder explains that the command belongs on
+the configured connector. Operating-system service installation and background
+lifecycle management are deferred.
+
+** Inspect and control
+
+#+begin_src sh
+$ file.local status ~/src/example
+Share: quiet-river-7f3a
+Peer:  buildbox:/srv/work/example (offline, last sync 2h ago)
+Local: 4 pending changes
+       2 modified, 1 added, 1 deleted
+
+$ file.local sync ~/src/example --dry-run
+UPLOAD   src/main.rs                 8.1 KiB
+DELETE   build/cache.bin             remote
+IGNORE   .env                        local only
+CONFLICT notes.txt                   local wins; remote version retained
+No files changed.
+#+end_src
+
+Human output is concise and stable in meaning, not a parsing API. Every
+read-only command supports =--json= for scripts. Commands that can alter files
+support =--dry-run=. Exit status is nonzero for an unreachable peer, an unsafe
+path, unresolved platform incompatibility, or partial synchronization.
+
+** Recovery
+
+Last-write-wins determines the visible tree, but losing file contents are
+retained in internal recovery storage for 30 days. They are not written beside
+the user's files because conflict-copy filenames would change the working tree
+and may themselves synchronize.
+
+#+begin_src sh
+$ file.local conflicts ~/src/example
+$ file.local restore ~/src/example <conflict-id> --to ./notes.remote.txt
+#+end_src
+
+Recovery retention is time-based and best-effort in v0.0.1. Status warns before
+purging the only retained copy of conflict data.
+
+* CLI interface
+
+#+begin_example
+file.local init PATH [--name NAME]
+file.local peer add PATH --host SSH_DEST --remote-path REMOTE_PATH
+file.local peer list PATH [--json]
+file.local peer remove PATH
+file.local sync PATH [--dry-run] [--json]
+file.local watch PATH [--json]
+file.local status PATH [--json]
+file.local conflicts PATH [--json]
+file.local restore PATH CONFLICT_ID --to DESTINATION
+file.local doctor PATH [--json]
+#+end_example
+
+Paths may be relative at the CLI boundary but are stored as canonical absolute
+paths. Commands accept any path within a share and locate its root, similar to
+Git. Destructive remote effects are always shown in dry-run output.
+
+=doctor= checks local metadata, ignore parsing, SSH reachability, remote binary
+compatibility, share identity, case-sensitivity compatibility, and whether
+another process currently owns the share lock.
+
+No command accepts a password or private key argument. Authentication remains
+the responsibility of SSH and its agent/configuration.
+
+* Synchronization model
+
+** Identities and versions
+
+Each installation has a random stable peer ID. Each synchronized directory has
+a random stable share ID. IDs are independent of hostnames and paths, both of
+which may change.
+
+Each peer records a monotonically increasing sequence number for local
+operations. A path version contains:
+
+- originating peer ID and sequence number;
+- wall-clock timestamp for last-write-wins ordering;
+- the last common version observed before the operation;
+- kind, content hash or link target, executable bit, and deletion state.
+
+The common ancestor identifies concurrent operations even when clocks disagree.
+For concurrent changes, the greater wall-clock timestamp wins. Equal timestamps
+are broken deterministically by peer ID. Clock skew can therefore choose a
+surprising winner, but never makes the peers diverge. The losing regular-file
+content is retained for recovery.
+
+** Filesystem representation
+
+- Regular files are identified by a cryptographic content hash and streamed in
+  bounded buffers.
+- Symbolic links synchronize their target text. Remote links are created as
+  links and are never followed while scanning or applying changes.
+- Only the executable bit is synchronized for regular files. Other permission
+  and ownership metadata stays local.
+- Directories are structural. Empty directories are synchronized explicitly.
+- Modification times are evidence for conflict ordering, not content identity.
+- =.git= is always excluded. User ignore rules cannot re-include it.
+
+** Ignore behavior
+
+The root =.gitignore= and nested =.gitignore= files use Git-compatible matching
+and precedence. The ignore files themselves synchronize. An ignored path is
+outside the replicated data model:
+
+- it is not uploaded;
+- it is not downloaded;
+- its presence is not reported as drift;
+- a new ignore rule does not delete an existing copy on either peer.
+
+When a formerly synchronized path becomes ignored, its last synchronized
+metadata is retained but no deletion is generated. If it becomes included
+again, it is reconciled as a current local path.
+
+** Deletes and tombstones
+
+A deletion is stored as a versioned tombstone rather than absence. This prevents
+an offline peer's old copy from resurrecting the path. Tombstones are removed
+only after both peers have acknowledged the deletion and the recovery window
+has elapsed.
+
+Directory deletion applies only if no included child has a later surviving
+version. Applying a remote deletion never traverses through a symbolic link.
+
+** Rename behavior
+
+Filesystem watcher rename hints are recorded when available. Reconciliation
+may infer a rename from a matching content hash, but correctness does not depend
+on doing so: a rename can be represented as one deletion and one creation.
+Concurrent rename, delete, and modification operations use the same
+last-write-wins ordering as other path changes.
+
+** Applying a transfer
+
+The receiver streams a regular file into a temporary file in the destination
+directory, verifies its declared size and hash, applies the executable bit,
+flushes it, and atomically renames it over the destination. Metadata advances
+only after the rename succeeds.
+
+If the connection breaks, the incomplete temporary file is discarded on the
+next run and that file restarts from byte zero. Completed files remain complete,
+so an interrupted multi-file sync resumes at file granularity.
+
+Operations are ordered to avoid transient data loss: create needed directories,
+install content, apply renames/deletes, then remove empty directories. A crash
+at any point is repaired by the next full reconciliation.
+
+* Local storage and process model
+
+Metadata and recovery objects live outside the synchronized directory:
+
+- Linux: =${XDG_STATE_HOME:-~/.local/state}/file.local/=
+- macOS: =~/Library/Application Support/file.local/=
+
+Each share has a SQLite database for versions, acknowledgements, tombstones,
+peer configuration, and recovery references. Content-addressed recovery objects
+are stored as ordinary files beside the database.
+
+One process holds an exclusive advisory lock for a share while synchronizing.
+Concurrent =status= and =--dry-run= operations may read a consistent database
+snapshot. Two simultaneous mutating sessions fail clearly rather than racing.
+The connector does not hold the mutation lock while waiting offline; it obtains
+both session locks as part of reconciliation and releases them afterward.
+
+* SSH protocol
+
+The initiating process runs a fixed remote command equivalent to:
+
+#+begin_example
+file.local protocol serve --stdio
+#+end_example
+
+The protocol is framed binary data over standard input/output. Standard error
+is reserved for remote diagnostics. The handshake exchanges protocol version,
+peer ID, share ID, capabilities, and current reconciliation state. A mismatched
+share ID or unsupported protocol version fails without touching files.
+
+Both endpoints implement the same reconciliation and transfer code. Initiating
+the SSH connection does not make one peer authoritative.
+
+Protocol messages are length-limited and validated before allocation or path
+use. Relative synchronized paths must be normalized, contain no parent
+traversal, contain no NUL byte, and remain beneath the configured root. Absolute
+paths are never accepted from the peer.
+
+* Platform behavior
+
+The scanner treats filenames as raw platform path values internally rather than
+assuming UTF-8. The initial implementation must define a reversible wire
+encoding for names valid on both supported systems.
+
+Before applying changes, peers detect names that cannot coexist on the target,
+including case-fold collisions such as =README= and =readme=. These are reported
+as blocking compatibility conflicts. The program never selects one silently.
+
+macOS Unicode normalization and case-insensitive volumes require tests against
+a real macOS filesystem. Linux-only unit tests are insufficient for release.
+
+* Security model
+
+SSH authenticates the remote machine and encrypts transport. =file.local= still
+treats a successfully authenticated peer as untrusted input because a remote
+process or directory may be compromised.
+
+Primary threats and constructions:
+
+- Path traversal: accept normalized relative paths only and operate relative
+  to an already-open share root.
+- Symlink escape: inspect paths without following links and replace a link as a
+  link rather than writing through it.
+- Resource exhaustion: bound message lengths, entry counts per frame, in-memory
+  buffers, and concurrent transfers. Stream file contents.
+- Corrupt transfer: verify size and hash before installation.
+- Partial update: use destination-local temporary files and atomic rename.
+- Command injection: invoke SSH with an argument vector and a fixed remote
+  command; transmit the remote path inside the framed protocol.
+- Wrong-directory sync: require the expected share ID before reconciliation.
+- Local secret exposure: store no SSH private material. Metadata uses normal
+  user-only filesystem permissions.
+
+SSH authorization grants the remote user all permissions that account already
+has. Restricted remote commands and least-privilege accounts are useful future
+deployment options but are not configured automatically in v0.0.1.
+
+* Implementation boundaries
+
+Rust is the proposed implementation language. The core should separate:
+
+1. filesystem scanning and safe application;
+2. ignore evaluation;
+3. version/reconciliation logic;
+4. metadata and recovery storage;
+5. framed transport;
+6. CLI presentation.
+
+The reconciliation core consumes snapshots and operations without depending on
+SSH or a watcher. This makes offline and concurrent histories testable without
+network mocks. SSH and filesystem watchers trigger the same reconciliation used
+by an explicit =sync=.
+
+The design does not select crates. Crate selection belongs to the implementation
+plan and should prefer maintained, narrow dependencies with demonstrated Linux
+and macOS behavior.
+
+* Validation and acceptance criteria
+
+Version 0.0.1 is acceptable when automated tests and real-system checks show:
+
+1. A new, changed, executable, deleted, renamed, empty-directory, and symbolic-
+   link path converges in both directions.
+2. Changes made independently while disconnected converge after reconnection.
+3. Concurrent content, rename, and delete cases select the same deterministic
+   winner on both peers and retain losing regular-file content.
+4. Ignored files remain untouched on each peer, including after ignore-rule
+   changes.
+5. =.git= is never scanned, transferred, or deleted.
+6. A file larger than available process memory transfers with bounded memory.
+7. Killing a transfer at arbitrary points leaves either the old complete file
+   or the new complete file, never a partially installed destination.
+8. A later sync repairs an interrupted run without retransferring files already
+   committed.
+9. Malicious paths and symbolic-link escapes cannot modify anything outside the
+   share root.
+10. Case and Unicode incompatibilities fail visibly without data loss.
+11. The end-to-end flow works between a real Linux filesystem and a real macOS
+    filesystem over an SSH alias.
+12. =status --json= and =sync --dry-run --json= are machine-readable and do not
+    mutate synchronized state.
+
+* Deferred decisions
+
+- Three-way text merging using the last common content as a base.
+- More than two peers and tombstone acknowledgement across a group.
+- Chunk-level transfer resume and delta transfer for large changed files.
+- Native long-running services and desktop status integration.
+- Non-SSH transports and invitations.
+- Retention configuration and content quota for recovery storage.
+- Stable JSON schema versioning beyond the first implementation.
