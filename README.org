@@ -3,6 +3,27 @@
 =file.local= is a local-first, peer-to-peer directory synchronizer. The command
 is named =flocal=.
 
+* Build and try the alpha
+
+Rust stable is required on both peers:
+
+#+begin_src sh
+cargo build --release
+mkdir -p ~/.local/bin
+install -m 755 target/release/flocal ~/.local/bin/flocal
+
+flocal init ~/src/example
+flocal peer add ~/src/example --host buildbox --remote-path /srv/work/example
+flocal sync ~/src/example --dry-run
+flocal sync ~/src/example
+flocal watch ~/src/example
+#+end_src
+
+The SSH destination may be a hostname, address, or =~/.ssh/config= alias. The
+remote =flocal= must be available to a non-interactive SSH command. The current
+code is proof-stage alpha software: review the explicit implementation gaps in
+[[file:docs/2026-07-14-alpha-implementation.org][the alpha implementation state]] before using it on irreplaceable data.
+
 It follows the local-first principle that the copy on your device is primary:
 files remain ordinary local files, every peer can read and change them without
 a network connection, and synchronization happens when peers can reach each

@@ -1,0 +1,83 @@
+#+title: v0.0.1-alpha implementation state
+#+date: 2026-07-14
+#+status: implementation review
+
+* Implemented
+
+- Rust =flocal= binary with =init=, peer pairing/listing, =sync=, =status=,
+  conflict inspection/restoration, foreground =watch=, and the private protocol
+  responder.
+- SSH transport using a fixed validated remote executable and framed standard
+  input/output protocol. Share paths travel inside protocol messages.
+- SQLite state in WAL/FULL mode, stable installation/share/peer identities,
+  per-share sequences, records, peer binding, initial-sync state, and conflicts.
+- Git-compatible nested ignore walking with unconditional =.git= exclusion.
+- Streaming capture and transfer through validated, content-addressed BLAKE3
+  objects. Snapshot and apply streams are split into bounded protocol frames.
+- Regular files, executable bits, directories, symlinks, deletions/tombstones,
+  initial union, deterministic whole-file LWW, and retained conflict inputs.
+- Mandatory initial-sync preview/confirmation and versioned JSON for status,
+  plans, peer listing, and conflict inspection.
+- Receiver-side ignore evaluation before requesting objects, plus
+  capability-relative filesystem mutation that cannot follow a swapped parent
+  symlink outside the share.
+- Compact per-peer causal history, with deterministic LWW used only when
+  neither input is known to descend from the other.
+- Protocol-version negotiation, per-share process locking, aggregate session
+  bounds, a configurable state budget (=FLOCAL_MAX_STATE_BYTES=), and a
+  configurable transfer budget (=FLOCAL_MAX_SESSION_BYTES=); both default to
+  10 GiB. Sessions also have a configurable duration
+  (=FLOCAL_MAX_SESSION_SECONDS=, one hour by default). Files remain streaming
+  and have no fixed protocol-level size limit, but receiving installations must
+  provision large enough budgets and duration.
+- Synchronization operations within one installation are serialized by a
+  fail-fast installation lock. This keeps object publication, record commit,
+  and pruning in one local critical section for the two-peer alpha.
+- Successful two-sided application prunes content objects that are no longer
+  referenced by any current record, retained conflict, or pending install.
+- Linux and macOS CI for formatting, Clippy, and tests.
+
+* Alpha limitations found during implementation
+
+- The foreground watcher currently uses native dirty notifications for prompt
+  local saves and a 30-second reconciliation connection to discover remote
+  edits. This performs a scan at that interval rather than the design's final
+  version-vector-only idle heartbeat. A persistent two-sided watcher protocol
+  remains required before calling the full v0.0.1 behavior complete.
+- Filesystem installation uses destination-local temporaries, fsync, atomic
+  exchange/no-replace operations, displaced-entry verification/rollback, and a
+  durable install intent replayed on startup. Directory fsync coverage and
+  fault-injection across every crash boundary remain incomplete; this alpha
+  does not yet claim the detailed design's full crash-consistency guarantee.
+- Filesystem mutation is descriptor-relative through a directory capability.
+  Additional adversarial stress tests for concurrent symlink swapping remain
+  useful acceptance coverage.
+- General ACL and extended-attribute preservation is not implemented. New files
+  use private transfer permissions plus the synchronized executable bit;
+  replacements retain the displaced file's ordinary permission bits.
+- Conflict recovery is intentionally narrower than the final design:
+  =restore --version winner|loser --to DEST= is available, while peer-named
+  inputs and =--base=/=--merged= await three-way merge support. Conflict
+  inspection currently uses =conflicts list PATH= and =conflicts show PATH ID=.
+- Conflict pruning, connector migration, background
+  services, three-way text merge, and ambiguous offline rename inference are
+  deferred.
+- Offline deletions discovered without a running watcher have no trustworthy
+  deletion timestamp; the discovery scan time orders delete-versus-edit in
+  this alpha. A running watcher can remove this ambiguity in a later milestone.
+- Real cross-machine SSH and macOS filesystem acceptance still need to be run.
+
+These limitations are deliberately stated rather than weakening the detailed
+design. Local review decides which are blockers for publishing the alpha and
+which may remain visible proof-stage constraints.
+
+* Validation
+
+- Unit coverage for trusted-type deserialization, path and object-hash
+  rejection, =.gitignore= behavior, protocol frame bounds, causal
+  reconciliation, convergence, and symlink-parent rejection.
+- Integration coverage for scan/apply/delete, nested deletion, file/directory
+  transitions, ignored-file preservation, and bidirectional synchronization
+  across an SSH process boundary using two state stores and directory roots.
+- Required local gates: =cargo fmt --check=, =cargo clippy --all-targets
+  --all-features -- -D warnings=, and =cargo test --all-targets=.

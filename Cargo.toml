@@ -1,0 +1,29 @@
+[package]
+name = "flocal"
+version = "0.0.1-alpha.0"
+edition = "2024"
+license = "MIT"
+description = "Local-first peer-to-peer directory synchronization"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+blake3 = "1.8"
+cap-std = "3.4"
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0"
+fs2 = "0.4"
+ignore = "0.4"
+notify = "8.2"
+rand = "0.9"
+rusqlite = { version = "0.38", features = ["bundled"] }
+rustix = { version = "1.1", features = ["event", "fs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[profile.release]
+lto = "thin"
+strip = true
