@@ -4,11 +4,14 @@
 
 * Summary
 
-=file.local= synchronizes one ordinary directory between two equal peers. Each
+=file.local=, invoked as =flocal=, synchronizes one ordinary directory between
+two equal peers. Each
 peer remains usable while disconnected. On reconnection, the peers exchange
 changes and converge on the same synchronized tree.
 
-Version 0.0.1 targets Linux and macOS. It supports regular files, directories,
+Version 0.0.1 targets Linux and macOS. The first implementation is explicitly
+=v0.0.1-alpha=: it proves foreground synchronization before service management
+and automatic text merge are ready. It supports regular files, directories,
 and symbolic links, including files larger than memory. It uses Git's ignore
 and portable metadata conventions, but deliberately does not synchronize
 =.git=. This version does not provide collaborative editing, peer discovery,
@@ -28,7 +31,8 @@ network daemon and key-management system in the first release.
 - A short setup path for a directory on a workstation and a directory on a
   server.
 - Predictable behavior for concurrent writes, deletes, and renames.
-- Streaming and atomic application of arbitrary-sized files.
+- Streaming and atomic application of files larger than memory, bounded only by
+  filesystem and available-storage limits.
 - Git-compatible ignore matching and Git-like portable file metadata.
 - Useful status and dry-run output before data changes.
 
@@ -42,125 +46,234 @@ network daemon and key-management system in the first release.
 - Synchronizing ownership, ACLs, extended attributes, creation times, resource
   forks, or general Unix permission bits.
 - Block-level transfer resumption or delta encoding within a file.
-- Guaranteed preservation of every concurrent user intent. The initial visible
-  conflict policy is last-write-wins with recovery of the losing content.
+- Semantic preservation of every concurrent user intent. Three-way text merge
+  preserves non-overlapping line edits; overlapping hunks and binary files use
+  last-write-wins with recovery of the losing content.
 
 * User experience
 
 ** Installation
 
-The =file.local= executable must be installed on both peers and discoverable in
-the non-interactive SSH =PATH=. Setup errors should print the exact remote
-command that failed and a corrective action.
+The =flocal= executable must be installed on both peers. =flocal --version=
+prints the build and protocol versions. During pairing, the connector discovers
+and stores the absolute remote executable path; persistent configuration does
+not depend on a later non-interactive SSH =PATH=. Setup errors print the exact
+remote check that failed and a corrective action. Packaging and update
+distribution are selected in the implementation plan.
+
+Discovery uses one fixed remote =command -v flocal= probe. It rejects output
+that is multiline, relative, begins with =-=, or contains anything outside
+ASCII letters, digits, =/=, =.=, =_=, =+=, and =-=. Whitespace, quotes,
+backslashes, shell metacharacters, and control bytes are rejected. =--host=
+likewise rejects option-like values beginning with =-= so it cannot inject local
+OpenSSH options. Every later SSH launch uses the safely constrained absolute
+path in a fixed command. Share paths and all other user data travel only inside
+protocol frames, never in the remote command string.
 
 ** Create and connect a share
 
 On the first peer:
 
 #+begin_src sh
-$ file.local init ~/src/example
+$ flocal init ~/src/example
 Initialized share quiet-river-7f3a at ~/src/example
 #+end_src
 
 The generated share ID is stable and non-secret. Metadata is stored outside the
 synchronized tree in the platform user-data directory.
 
-Connect the second directory from either peer:
+Connect the second directory from the initialized peer:
 
 #+begin_src sh
-$ file.local peer add ~/src/example --host buildbox --remote-path /srv/work/example
+$ flocal peer add ~/src/example --host buildbox --remote-path /srv/work/example
 Checking buildbox... connected
-Created /srv/work/example
+Joined quiet-river-7f3a at /srv/work/example
 Connected quiet-river-7f3a to buildbox:/srv/work/example
-Run =file.local sync ~/src/example --dry-run= to preview the initial sync.
+Run =flocal sync ~/src/example --dry-run= to preview the initial sync.
+$ flocal sync ~/src/example --dry-run
+$ flocal sync ~/src/example
+Apply this initial plan? [y/N] y
+$ flocal watch ~/src/example
 #+end_src
 
 =buildbox= is passed to the system SSH client unchanged, so SSH aliases,
 identity files, ports, jump hosts, and host-key policy continue to work. The
 remote path is passed as data to the remote process, never interpolated into a
-shell command.
+shell command. =--remote-path= must be absolute; =~= and environment variables
+are not expanded.
+
+=peer add= sends the share ID and remote path inside the framed protocol. The
+responder refuses a path already registered to another share. It accepts an
+existing nonempty directory but changes no user file. SSH access to the remote
+account is the v0.0.1 authorization to pair; the handshake binds the share to
+both stable peer IDs and later rejects any different peer.
+Pairing writes the remote registration atomically and idempotently; retrying the
+same share, peer, and path tuple completes it, while a differing tuple fails
+without alteration. After pairing, the responder resolves the share ID through
+its local registry and rejects any transmitted attempt to select another path.
 
 The peer running =peer add= becomes the connector for this two-peer share. It
 runs =watch= and opens SSH sessions; the other peer starts an on-demand
 responder through SSH. This is a connection-lifecycle role only. Both replicas
-remain equal when changes are reconciled, and the role can be recreated from
-the other side if the deployment changes. Having one connector avoids two
+remain equal in data and write authority. Connection lifecycle is deliberately
+asymmetric in v0.0.1. Having one connector avoids two
 persistent watchers acquiring their respective local locks and repeatedly
 colliding.
+Moving the connector role without unpairing is deferred beyond v0.0.1.
 
-If the remote directory already contains files, setup does not choose a winner.
-The first dry run reports the union, conflicts, ignored paths, and planned
-deletions. The user then runs a real sync.
+On the first reconciliation there is no shared history from which to infer a
+deletion. Unique paths form a union and same-path differences are conflicts.
+Nothing is deleted. Until initial reconciliation is complete, =sync= always
+displays the complete plan and asks for confirmation. =--dry-run= exits after
+the preview and =--yes= confirms noninteractively. The service will not perform
+initial reconciliation until a confirmed =sync= records completion.
 
 ** Routine operation
 
 #+begin_src sh
-$ file.local watch ~/src/example
+$ flocal watch ~/src/example
 Watching quiet-river-7f3a; peer buildbox is offline
 12:41:08 peer connected
 12:41:09 uploaded 3 files, downloaded 1 file, 18.4 MiB
 #+end_src
 
-=watch= performs an initial reconciliation, observes filesystem events, and
-periodically rescans the tree so missed or coalesced watcher events do not cause
-permanent drift. When SSH is unavailable it reports the offline state once,
-continues recording local changes, and reconnects with bounded backoff.
+=watch= refuses to start until a confirmed =sync= completes initial
+reconciliation. It then keeps one SSH protocol session open. Both processes
+observe their local filesystem. An event on either peer
+sends a change notification and schedules synchronization 250 milliseconds
+after the last event, with a two-second maximum delay during a continuous burst.
+This catches an Emacs buffer save promptly, including the common safe-save
+sequence that writes a temporary file and renames it over the destination.
 
-The foreground process runs on the connector only and is sufficient for
-v0.0.1. Running =watch= on the responder explains that the command belongs on
-the configured connector. Operating-system service installation and background
-lifecycle management are deferred.
+While idle, peers exchange a small two-peer version vector and acknowledgement
+state every 30 seconds. If neither side reports an unseen operation, no manifest
+or file content is sent and no directory scan occurs. A full scan runs at
+process startup, after a watcher reports an overflow or gap, and when explicitly
+requested by =doctor --repair=. A healthy watcher does not trigger periodic full
+scans.
+
+When SSH is unavailable, =watch= reports the offline state once, continues
+recording filesystem events, and reconnects with bounded exponential backoff up
+to one minute between attempts. On reconnection, the version-vector exchange
+transfers recorded operations before returning to event-driven operation.
+
+When the connector is asleep or =watch= is stopped, no responder process runs
+on the other peer. Remote edits remain safe as ordinary files rather than being
+journaled. The responder's mandatory startup scan discovers them on the next
+connection before reconciliation.
+
+The foreground process runs on the connector only in =v0.0.1-alpha=. Running
+=watch= on the responder explains that the command belongs on the configured
+connector. Before v0.0.1, =flocal service install PATH= preflights the exact
+stored SSH command with =BatchMode=yes=. It refuses installation if host-key
+verification, the key/agent, remote executable, or protocol negotiation needs
+interaction. It then installs and starts a user-level systemd unit on Linux or
+launchd agent on macOS using the absolute local executable and argument-safe
+generated configuration with user-only permissions. It prints the log location
+and commands to inspect, stop, restart, and uninstall the service. Secrets are
+not written to unit files or logs. Unit/plist and log paths use the stable share
+ID, are created atomically without following links, and never overwrite an
+unexpected or non-owned definition. The executable must be a regular file not
+writable by group/other. Filenames and remote diagnostics are escaped before
+logging to prevent control-character or multiline log forging. A launchd user agent runs while the user is
+logged in; the installer explains that limitation. Linux service installation
+requires an available systemd user manager and runs in the user's login session;
+v0.0.1 does not enable lingering. Other Linux systems use foreground =watch=.
+
+The supported unattended SSH setup must be usable from the actual service
+environment, such as a dedicated noninteractive key selected by SSH config or a
+platform agent integration whose socket is present there. An interactive agent
+available only in the current terminal is insufficient. After starting the
+service, installation performs an end-to-end connection from that environment
+and rolls back with corrective guidance if it fails.
 
 ** Inspect and control
 
 #+begin_src sh
-$ file.local status ~/src/example
+$ flocal status ~/src/example
 Share: quiet-river-7f3a
+Role:  connector; service stopped; last scan 2h ago
 Peer:  buildbox:/srv/work/example (offline, last sync 2h ago)
 Local: 4 pending changes
        2 modified, 1 added, 1 deleted
 
-$ file.local sync ~/src/example --dry-run
+$ flocal sync ~/src/example --dry-run
 UPLOAD   src/main.rs                 8.1 KiB
 DELETE   build/cache.bin             remote
 IGNORE   .env                        local only
-CONFLICT notes.txt                   local wins; remote version retained
+CONFLICT notes.txt                   workstation input selected; both retained
 No files changed.
 #+end_src
 
 Human output is concise and stable in meaning, not a parsing API. Every
-read-only command supports =--json= for scripts. Commands that can alter files
-support =--dry-run=. Exit status is nonzero for an unreachable peer, an unsafe
-path, unresolved platform incompatibility, or partial synchronization.
+finite read-only command supports =--json= for scripts. =watch --json= emits one
+versioned NDJSON event per line. =sync= supports =--dry-run=; other mutating
+commands display their own confirmation or refuse unsafe state. Exit status is
+nonzero for an unreachable peer, an unsafe path, unresolved platform
+incompatibility, or partial synchronization.
 
 ** Recovery
 
-Last-write-wins determines the visible tree, but losing file contents are
-retained in internal recovery storage for 30 days. They are not written beside
-the user's files because conflict-copy filenames would change the working tree
-and may themselves synchronize.
+Last-write-wins determines the visible tree, but both peer inputs are retained
+in internal recovery storage until the user explicitly prunes them. The base
+and merged result are retained when they exist; first-sync and no-common-base
+conflicts have neither. These objects are not written beside the user's files because conflict-copy
+filenames would change the working tree and may themselves synchronize.
 
 #+begin_src sh
-$ file.local conflicts ~/src/example
-$ file.local restore ~/src/example <conflict-id> --to ./notes.remote.txt
+$ flocal conflicts ~/src/example
+ID        PATH       WHEN                 INPUTS                 RESULT
+c-7e91    notes.txt  2026-07-14 12:42:03  workstation, buildbox  mixed hunks
+
+$ flocal conflicts show ~/src/example c-7e91
+$ flocal restore ~/src/example c-7e91 --input buildbox --to ./notes.buildbox.txt
 #+end_src
 
-Recovery retention is time-based and best-effort in v0.0.1. Status warns before
-purging the only retained copy of conflict data.
+=conflicts show= displays the base, merged result, named peer inputs, time and
+ordering metadata, and conflicting hunk ranges. A missing object is shown as
+unavailable, and selecting it fails without writing a destination.
+=restore --input PEER= copies
+that peer's complete input to a user-chosen path using the same descriptor-safe
+atomic write as synchronization. =--base= and =--merged= select those complete
+objects. Restore refuses to overwrite an existing path unless =--force= is
+given, and =--force= never recursively replaces a directory. Recovery never
+changes synchronization metadata or automatically propagates the restored copy;
+editing or moving it into the share creates a normal new change.
+
+Before resolving a conflict, both peers fully write, hash, fsync, and commit the
+required base and input objects. The per-peer state-object budget covers
+recovery, unacknowledged versions, and owned temporaries; its default is 10 GiB.
+It can be raised locally with =flocal config PATH state.max-bytes SIZE= or on the
+responder with the same command's =--peer= option. If either peer encounters its budget or =ENOSPC=, synchronization stops
+before changing the visible file and reports the required space; partial objects
+are transactionally removed. =conflicts prune= previews and then explicitly
+deletes selected recovery records and unreferenced objects;
+common bases still needed for future merging are not eligible. Nothing silently
+expires in v0.0.1.
 
 * CLI interface
 
 #+begin_example
-file.local init PATH [--name NAME]
-file.local peer add PATH --host SSH_DEST --remote-path REMOTE_PATH
-file.local peer list PATH [--json]
-file.local peer remove PATH
-file.local sync PATH [--dry-run] [--json]
-file.local watch PATH [--json]
-file.local status PATH [--json]
-file.local conflicts PATH [--json]
-file.local restore PATH CONFLICT_ID --to DESTINATION
-file.local doctor PATH [--json]
+flocal init PATH [--name NAME]
+flocal peer add PATH --host SSH_DEST --remote-path REMOTE_PATH
+flocal peer list PATH [--json]
+flocal peer remove PATH [--local-only] [--yes]
+flocal sync PATH [--dry-run] [--yes] [--json]
+flocal watch PATH [--json]
+flocal service install PATH
+flocal service status PATH [--json]
+flocal service start PATH
+flocal service stop PATH
+flocal service restart PATH
+flocal service logs PATH
+flocal service uninstall PATH
+flocal config PATH state.max-bytes SIZE [--peer PEER]
+flocal status PATH [--json]
+flocal conflicts PATH [--json]
+flocal conflicts show PATH CONFLICT_ID [--json]
+flocal conflicts prune PATH [CONFLICT_ID...] [--yes]
+flocal restore PATH CONFLICT_ID (--input PEER|--base|--merged) --to DEST [--force]
+flocal doctor PATH [--repair] [--json]
 #+end_example
 
 Paths may be relative at the CLI boundary but are stored as canonical absolute
@@ -171,6 +284,28 @@ Git. Destructive remote effects are always shown in dry-run output.
 compatibility, share identity, case-sensitivity compatibility, and whether
 another process currently owns the share lock.
 
+=peer remove= is a connector-only command and requires confirmation that it will
+stop the local service. On a responder it prints the connector on which to run
+the command. It removes the peer registration on both endpoints when reachable,
+and retains synchronized files, share metadata, and recovery objects. If the
+peer is permanently unreachable, =--local-only= warns about asymmetric
+registration and forgets it locally. =service uninstall= removes only the
+generated service definition; it never removes user data or share metadata.
+
+When =watch= or the service owns a share, an explicit =sync= asks that process
+to reconcile over a per-share Unix-domain control socket stored in the user-only
+state directory and waits with a bounded timeout instead of competing for the
+lock. The OS releases the lifetime lock when an owner dies; a lock without a
+reachable socket is diagnosed as a stale or starting owner rather than removed
+blindly. =doctor --repair= uses the same control request for a full scan.
+The state directory must be owned by the user and inaccessible to group/other;
+socket bind and connect do not follow links, the socket is mode 0600 with a
+stable unguessable per-share name, peer credentials are checked where the OS
+supports them, and request frames are length-limited.
+=status= reports connector/service state, last complete scan, last successful
+sync, last connection error, locally pending operations, whether remote state is
+unknown while offline, and disk space consumed by recovery objects.
+
 No command accepts a password or private key argument. Authentication remains
 the responsibility of SSH and its agent/configuration.
 
@@ -180,7 +315,8 @@ the responsibility of SSH and its agent/configuration.
 
 Each installation has a random stable peer ID. Each synchronized directory has
 a random stable share ID. IDs are independent of hostnames and paths, both of
-which may change.
+which may change. The share ID is the durable group identity; binding exactly
+two peer IDs is a v0.0.1 membership limit, not a replacement for that identity.
 
 Each peer records a monotonically increasing sequence number for local
 operations. A path version contains:
@@ -203,7 +339,11 @@ content is retained for recovery.
 - Symbolic links synchronize their target text. Remote links are created as
   links and are never followed while scanning or applying changes.
 - Only the executable bit is synchronized for regular files. Other permission
-  and ownership metadata stays local.
+  and ownership metadata stays local. When replacing an existing file, its
+  owner, non-executable mode bits, ACLs, and extended attributes are copied to
+  the temporary inode; inability to preserve them blocks replacement. A new
+  file uses the invoking user's ownership and umask, then applies the replicated
+  executable bit.
 - Directories are structural. Empty directories are synchronized explicitly.
 - Modification times are evidence for conflict ordering, not content identity.
 - =.git= is always excluded. User ignore rules cannot re-include it.
@@ -223,30 +363,108 @@ When a formerly synchronized path becomes ignored, its last synchronized
 metadata is retained but no deletion is generated. If it becomes included
 again, it is reconciled as a current local path.
 
+If an included remote path collides with an ignored local path, synchronization
+reports a blocking conflict. Ignored local content is never overwritten,
+renamed, or deleted to make room for synchronized content.
+
+** Git working copies
+
+=.git= never synchronizes, so only working-tree paths converge. Git branches,
+=HEAD=, index entries, commits, and staged state remain local. v0.0.1 supports
+one Git-controlling peer at a time: the other peer may edit files but does not
+stage, commit, or switch branches. Before control moves, file synchronization
+finishes and commits move through the repository's normal Git remote. =flocal=
+does not inspect, infer, or verify Git state and does not execute Git commands.
+The handoff is entirely user-managed.
+
 ** Deletes and tombstones
 
 A deletion is stored as a versioned tombstone rather than absence. This prevents
 an offline peer's old copy from resurrecting the path. Tombstones are removed
-only after both peers have acknowledged the deletion and the recovery window
-has elapsed.
+only after both peers have durably acknowledged the deletion and no retained
+merge base refers to the deleted version.
 
 Directory deletion applies only if no included child has a later surviving
 version. Applying a remote deletion never traverses through a symbolic link.
+An ignored local child prevents physical directory removal: the directory
+remains as a local container while it is logically absent from the replicated
+tree.
 
 ** Rename behavior
 
-Filesystem watcher rename hints are recorded when available. Reconciliation
-may infer a rename from a matching content hash, but correctness does not depend
-on doing so: a rename can be represented as one deletion and one creation.
-Concurrent rename, delete, and modification operations use the same
-last-write-wins ordering as other path changes.
+An observed filesystem rename is a first-class operation correlating its old
+and new paths, so a concurrent observed rename, delete, or modification can use
+operation-level last-write-wins. If no watcher was present, a scan may infer a
+rename only from an unambiguous prior file identity or content match. Otherwise
+the history is observationally indistinguishable from delete plus create and is
+represented that way, with path-wise conflict resolution. This fallback can
+leave both the old and new path after concurrent offline operations; =status=
+reports the ambiguity. Guaranteeing operation-level rename semantics for an
+unobserved rename-and-edit would require identity metadata in user files, which
+v0.0.1 does not add.
+
+** Automatic text merge
+
+When both peers change a regular file from the same retained base, the connector
+classifies all three versions as text only if they are valid UTF-8 and contain
+no NUL byte. It performs the merge once and transfers the exact merged bytes and
+their hash as a new operation, so the peers cannot independently produce
+different results. It uses a pinned Git-compatible, line-oriented diff3
+implementation whose version is part of the protocol capability:
+
+- a change made by only one peer is retained;
+- identical changes made by both peers are retained once;
+- non-overlapping changes from both peers are retained;
+- for an overlapping hunk, the version with the greater last-write-wins order
+  supplies that hunk, without discarding non-conflicting changes elsewhere.
+
+The merged file contains no conflict markers. Every overlapping hunk creates a
+conflict record holding the base, both inputs, the merged result, ordering
+metadata, and hunk ranges. Files that are binary, lack a retained common base,
+or cannot be merged safely use whole-file last-write-wins and the same recovery
+record. Lines retain their original bytes and final-newline state; the chosen
+hunk supplies its own line endings. The executable bit resolves separately by
+last-write-wins. Delete-versus-edit is not a text merge and resolves as a
+whole-path last-write-wins conflict.
+
+Merge classification and diff3 run with bounded memory and CPU, spilling to
+owner-only temporary storage. Inputs above the implementation's documented
+merge limits fall back to whole-file last-write-wins after recovery objects are
+durable; limits never prevent ordinary streaming synchronization.
+
+Automatic text merge is required for v0.0.1. The alpha may initially implement
+whole-file last-write-wins while exercising the version and recovery model that
+the merge requires.
 
 ** Applying a transfer
 
-The receiver streams a regular file into a temporary file in the destination
-directory, verifies its declared size and hash, applies the executable bit,
-flushes it, and atomically renames it over the destination. Metadata advances
-only after the rename succeeds.
+After selecting or merging content, the receiver streams the result into a mode
+0600 temporary file in the destination directory, verifies its declared size
+and hash, applies the destination-local metadata policy and executable bit, and
+fsyncs it (using =F_FULLFSYNC= on supported macOS local filesystems). It then
+records and fsyncs an SQLite install intent containing the expected old version,
+new version/hash, and owned temporary token.
+
+If a destination exists, installation uses a platform atomic exchange
+(Linux =renameat2(RENAME_EXCHANGE)= or macOS =renameatx_np(RENAME_SWAP)=). The
+exact displaced entry remains at the owned temporary name. The receiver verifies
+that entry against the expected old version. On mismatch it atomically swaps it
+back and restarts conflict selection. It never unlinks either exchanged entry
+until immutable snapshots of both post-exchange inodes have been captured with
+the same bounded pre/post stability checks used for source capture. The install
+intent tracks both entries across a crash. Any mutation of either inode during
+exchange, verification, or rollback becomes a recoverable new local input; an
+unstable owned temporary is quarantined and retried rather than cleaned up. On a
+match it likewise durably captures required recovery state before unlinking the
+displaced entry. If no destination exists, an atomic no-replace rename is used;
+a concurrent creation makes selection restart without deleting either input.
+
+After successful installation the containing directory is fsynced and SQLite
+finalizes the intent as the installed version. Startup resolves any durable
+intent idempotently by inspecting the destination and owned temporary token; it
+does not misclassify installed remote bytes as a new local operation. A metadata
+version is never finalized before its file is durable. Filesystems lacking the
+required atomic exchange/no-replace behavior are rejected by =doctor=.
 
 If the connection breaks, the incomplete temporary file is discarded on the
 next run and that file restarts from byte zero. Completed files remain complete,
@@ -254,35 +472,94 @@ so an interrupted multi-file sync resumes at file granularity.
 
 Operations are ordered to avoid transient data loss: create needed directories,
 install content, apply renames/deletes, then remove empty directories. A crash
-at any point is repaired by the next full reconciliation.
+at any point is repaired by the next full reconciliation. Atomicity is per path,
+not for the entire multi-file synchronization. Replacing a different path kind
+(file, directory, or link) follows explicit per-kind rules: a regular file or
+link is durably captured and atomically exchanged; an empty directory may be
+removed and replaced after directory fsync; a nonempty directory replacement is
+a blocking conflict and is never recursively copied as recovery.
+
+Temporary files use unpredictable names opened descriptor-relatively with
+=O_CREAT|O_EXCL= and are recorded in SQLite before use. Cleanup removes only
+recorded owned temporaries, never files selected by a name pattern.
+
+Symbolic links use a separate path: create a temporary link descriptor-relative
+to the destination directory and atomically rename it into place without ever
+opening, hashing, or fsyncing its target. The containing directory is fsynced.
+File-to-link and link-to-file replacement may retain the old link or file as a
+recovery object. Replacement of a nonempty directory by another kind is a
+blocking conflict rather than a recursive recovery copy.
 
 * Local storage and process model
 
 Metadata and recovery objects live outside the synchronized directory:
 
-- Linux: =${XDG_STATE_HOME:-~/.local/state}/file.local/=
+- Linux: =$XDG_STATE_HOME/file.local/= when set, otherwise
+  =$HOME/.local/state/file.local/=
 - macOS: =~/Library/Application Support/file.local/=
 
 Each share has a SQLite database for versions, acknowledgements, tombstones,
 peer configuration, and recovery references. Content-addressed recovery objects
-are stored as ordinary files beside the database.
+are stored as ordinary files beside the database. SQLite uses WAL mode with
+=synchronous=FULL=. Power-loss guarantees apply to supported local filesystems,
+not network or unusual FUSE mounts; =doctor= rejects or warns about mounts whose
+rename, executable-bit, or durability semantics cannot meet the contract.
 
-One process holds an exclusive advisory lock for a share while synchronizing.
-Concurrent =status= and =--dry-run= operations may read a consistent database
-snapshot. Two simultaneous mutating sessions fail clearly rather than racing.
-The connector does not hold the mutation lock while waiting offline; it obtains
-both session locks as part of reconciliation and releases them afterward.
+Every unacknowledged regular-file version also owns an immutable,
+content-addressed object. A watcher or scan streams the current file into a new
+owner-only object. It compares descriptor identity, size, modification time, and
+change time before and after hashing and retries a bounded number of times on
+any change; exhaustion marks the journal incomplete for a later scan. A process
+already able to maliciously rewrite files as the same Unix user is outside the
+security boundary. Later edits cannot change bytes promised by an earlier hash.
+
+Object creation follows a crash-safe lifecycle: create an unreferenced unique
+mode-0600 temporary, stream and hash it, fsync it, atomically install the
+content-addressed object, then commit its database reference. Startup removes
+only unreferenced owned objects. Sequential local versions never advertised to
+the peer may be coalesced into the newest version; once advertised, an object
+remains until both peers acknowledge it and no merge base or recovery record
+references it. All objects count against =state.max-bytes=. On budget or
+=ENOSPC=, the visible working file remains untouched, the journal is marked
+incomplete, and a later scan retries rather than losing the change.
+
+One long-lived =watch= or service process owns the connector share for its
+lifetime. Its SSH responder owns the remote share for that session. Before any
+startup or repair scan, the process establishes recursive watcher coverage,
+buffers events during the scan, then replays them and rescans dirty paths before
+declaring the journal complete or comparing version vectors. Watcher
+events are hints: the owning process stats and hashes the affected path, then
+commits the resulting operation and sequence advance to SQLite before
+advertising it. Remote-applied filesystem events are matched to the operation
+being installed by inode identity and content hash and do not create echo
+operations. A post-install stat/rescan captures a simultaneous user edit rather
+than suppressing it. Ignore-file changes trigger
+targeted reconciliation of their affected subtree. A watcher gap or responder
+restart, registration failure, root identity change, watch-limit error, or
+backend error marks the journal incomplete and requires a scan before
+version-vector comparison.
+
+Concurrent =status= and =--dry-run= operations read a consistent database
+snapshot. Other mutating commands either request work through the owner or fail
+with the command needed to stop it. The lifetime lock prevents a foreground
+watcher, service, or second SSH session from racing the share.
 
 * SSH protocol
 
 The initiating process runs a fixed remote command equivalent to:
 
 #+begin_example
-file.local protocol serve --stdio
+/absolute/path/to/flocal protocol serve --stdio
 #+end_example
 
-The protocol is framed binary data over standard input/output. Standard error
-is reserved for remote diagnostics. The handshake exchanges protocol version,
+OpenSSH sends even an argv-supplied remote command through the login shell, so
+the command contains only the previously validated executable path and fixed
+tokens. The process uses =ssh -T= without a pseudo-terminal. The protocol is
+framed binary data over standard input/output; startup files or banners that
+write to stdout cause a clear handshake failure. Standard error is reserved for
+remote diagnostics, but its bytes and rate are bounded per session, escaped,
+and truncated before logging. launchd log files rotate under a fixed quota;
+systemd journal retention remains the host journal policy. The handshake exchanges protocol version,
 peer ID, share ID, capabilities, and current reconciliation state. A mismatched
 share ID or unsupported protocol version fails without touching files.
 
@@ -297,8 +574,16 @@ paths are never accepted from the peer.
 * Platform behavior
 
 The scanner treats filenames as raw platform path values internally rather than
-assuming UTF-8. The initial implementation must define a reversible wire
-encoding for names valid on both supported systems.
+assuming UTF-8. Unix filename bytes are encoded reversibly as length-prefixed
+byte strings on the wire. A target filesystem that cannot represent the exact
+name, including its Unicode normalization, reports a blocking compatibility
+conflict rather than substituting a name.
+
+Human output escapes non-UTF-8 bytes; JSON represents such names as an explicit
+base64-tagged byte field rather than an invalid string. Representability is
+verified by create/lookup round-trip on the actual target volume. Collision
+checks cover the whole affected directory, including canonically equivalent but
+byte-distinct names.
 
 Before applying changes, peers detect names that cannot coexist on the target,
 including case-fold collisions such as =README= and =readme=. These are reported
@@ -306,6 +591,12 @@ as blocking compatibility conflicts. The program never selects one silently.
 
 macOS Unicode normalization and case-insensitive volumes require tests against
 a real macOS filesystem. Linux-only unit tests are insufficient for release.
+
+Filesystem events are dirty-path or dirty-subtree hints, not an authoritative
+journal. Linux recursively registers inotify watches, handles new-directory
+races, reports watch-limit exhaustion, and scans after queue overflow. macOS
+handles coalesced FSEvents and scans on =MustScanSubDirs=, dropped-event, or root
+change flags. The 250-millisecond save UX is verified on both real backends.
 
 * Security model
 
@@ -315,19 +606,42 @@ process or directory may be compromised.
 
 Primary threats and constructions:
 
-- Path traversal: accept normalized relative paths only and operate relative
-  to an already-open share root.
-- Symlink escape: inspect paths without following links and replace a link as a
-  link rather than writing through it.
+- Path traversal and symlink swap: accept normalized relative paths only and
+  perform every component lookup, create, delete, and rename descriptor-relative
+  to an open share root with no-follow semantics. Revalidate parent components
+  during mutation. Linux uses =openat2= or a safe =openat= walk; macOS uses the
+  equivalent component walk built from =openat=, =fstatat=, =renameat=, and
+  no-follow flags. The implementation plan must select and test the required
+  =rustix= or =libc= bindings. A link is replaced as a link, never written
+  through.
 - Resource exhaustion: bound message lengths, entry counts per frame, in-memory
   buffers, and concurrent transfers. Stream file contents.
 - Corrupt transfer: verify size and hash before installation.
 - Partial update: use destination-local temporary files and atomic rename.
 - Command injection: invoke SSH with an argument vector and a fixed remote
-  command; transmit the remote path inside the framed protocol.
-- Wrong-directory sync: require the expected share ID before reconciliation.
+  command, reject option-like SSH destinations, validate the executable-path
+  alphabet for the remote-shell boundary, and transmit the remote path only
+  inside the framed pairing protocol.
+- Wrong-directory sync: during pairing atomically bind the share, path, and peer
+  IDs. Thereafter resolve paths only from the receiver's registry and require
+  the expected bound peer before reconciliation.
+- Apply-policy bypass: the receiver independently rejects =.git= at the protocol
+  boundary and evaluates its current ignore rules before accepting or mutating
+  any path. An ignored collision blocks before content transfer.
 - Local secret exposure: store no SSH private material. Metadata uses normal
   user-only filesystem permissions.
+
+Peer IDs prevent accidental cross-pairing but are self-asserted inside the SSH
+session. They do not protect against another principal already authorized as
+the same remote Unix account; SSH account and host-key policy remain the
+security identity in v0.0.1.
+
+Recovery and version objects are created descriptor-relative in the verified
+owner-only state directory, atomically installed, and re-hashed before merge or
+restore. Object names are not trusted as proof of content. Pruning never follows
+links and deletes only database-referenced objects. A restore destination is a
+separate local user authorization: its parent is safely opened and revalidated,
+remote data can never select it, and =--force= replaces regular files only.
 
 SSH authorization grants the remote user all permissions that account already
 has. Restricted remote commands and least-privilege accounts are useful future
@@ -360,8 +674,10 @@ Version 0.0.1 is acceptable when automated tests and real-system checks show:
 1. A new, changed, executable, deleted, renamed, empty-directory, and symbolic-
    link path converges in both directions.
 2. Changes made independently while disconnected converge after reconnection.
-3. Concurrent content, rename, and delete cases select the same deterministic
-   winner on both peers and retain losing regular-file content.
+3. Concurrent text edits on different lines merge cleanly; overlapping hunks,
+   binary files, deletes, and observed or unambiguously inferred renames select
+   the same deterministic winner on both peers and retain losing regular-file
+   content. Ambiguous offline renames converge path-wise and are reported.
 4. Ignored files remain untouched on each peer, including after ignore-rule
    changes.
 5. =.git= is never scanned, transferred, or deleted.
@@ -374,16 +690,16 @@ Version 0.0.1 is acceptable when automated tests and real-system checks show:
    share root.
 10. Case and Unicode incompatibilities fail visibly without data loss.
 11. The end-to-end flow works between a real Linux filesystem and a real macOS
-    filesystem over an SSH alias.
+    filesystem over an SSH alias. On macOS and Linux with a systemd user
+    manager, user services reconnect after login and network interruption
+    without foreground process management.
 12. =status --json= and =sync --dry-run --json= are machine-readable and do not
     mutate synchronized state.
 
 * Deferred decisions
 
-- Three-way text merging using the last common content as a base.
 - More than two peers and tombstone acknowledgement across a group.
 - Chunk-level transfer resume and delta transfer for large changed files.
-- Native long-running services and desktop status integration.
+- Desktop status integration beyond systemd and launchd service commands.
 - Non-SSH transports and invitations.
-- Retention configuration and content quota for recovery storage.
 - Stable JSON schema versioning beyond the first implementation.

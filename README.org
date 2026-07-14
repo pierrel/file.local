@@ -1,26 +1,99 @@
-#+title:file.local
-A local peer to peer, local-first file syncing system.
+#+title: file.local
+
+=file.local= is a local-first, peer-to-peer directory synchronizer. The command
+is named =flocal=.
+
+It follows the local-first principle that the copy on your device is primary:
+files remain ordinary local files, every peer can read and change them without
+a network connection, and synchronization happens when peers can reach each
+other. There is no authoritative server. This project is directly inspired by
+Ink & Switch's foundational [[https://www.inkandswitch.com/local-first-software/][Local-first software]] essay and its ideals of offline
+work, multi-device access, longevity, privacy, and user control. Their
+[[https://www.inkandswitch.com/pushpin/][PushPin]] report explores the production peer-to-peer synchronization problems
+that this smaller project will meet in practice. The detailed research behind
+the initial design is in [[file:references/][references/]].
+
+* Design
+
+Version 0.0.1 synchronizes one directory between two equal Linux or macOS
+peers. The connector reaches the other peer using an ordinary SSH hostname,
+address, or =~/.ssh/config= alias. SSH is only the first transport: WireGuard,
+a LAN, or the public internet may provide connectivity underneath it.
+
+While connected, both peer processes watch regular files, directories, and
+symbolic links. Edits made while a watcher is absent remain ordinary safe local
+files and are discovered by the next reconciliation scan. Git-compatible
+=.gitignore= rules leave ignored paths entirely local, and =.git= is always
+excluded. Only Git-portable metadata, file contents, symbolic-link targets, and
+the executable bit synchronize.
+
+Excluding =.git= means the working trees converge, but Git state does not:
+branches, =HEAD=, the index, commits, and staged changes remain independent. The
+supported v0.0.1 workflow assigns Git control to one peer at a time. The other
+peer may edit files, but does not commit, stage, or switch branches until the
+working trees are synchronized and Git control is deliberately handed over.
+Both clones use an ordinary Git remote to transfer commits. This handoff is
+entirely user-managed and =flocal= cannot verify it. Automatic Git-state handoff
+is outside v0.0.1; =flocal= never reads or runs Git commands implicitly.
+
+Concurrent text edits use a three-way merge from the last shared version.
+Non-overlapping line changes merge automatically. When both sides change the
+same hunk, the later change wins that hunk. Both peer inputs, plus the base and
+merged result when they exist, are retained for explicit recovery until the
+user prunes them.
+Binary files and files without a common base use the same last-write-wins rule
+for the whole file. Deletes and observed renames participate in the same
+ordering. An ambiguous rename discovered only by a later scan falls back to
+path-wise delete-plus-create and is reported rather than guessed.
+Ordinary transfers stream files larger than memory; conflicts additionally
+require enough configured recovery space on both peers and stop safely if it is
+unavailable.
+The alpha proves the same flow with recoverable whole-file last-write-wins
+before three-way text merging is implemented.
+
+While connected, a filesystem event on either peer schedules synchronization
+after a short debounce. A small heartbeat exchanges sequence state while idle;
+healthy idle peers do not repeatedly scan their trees. Startup, watcher
+overflow, and explicit repair trigger a full scan. While disconnected, the
+connector retries with bounded backoff and synchronizes recorded changes when
+the connection returns.
+
+See [[file:docs/2026-07-14-v0.0.1-design.org][the proposed detailed design]] for the CLI, wire behavior, recovery commands,
+security model, platform constraints, and acceptance criteria. The README is
+the durable high-level contract. Any implementation or design change that no
+longer matches it must update this file in the same pull request.
+
 * Stories
+
+** v0.0.1-alpha - proves the synchronization model
+
+- Two equal peers synchronize in both directions over SSH.
+- Local work continues offline and synchronizes after reconnection.
+- Initial scan, filesystem watching, dry-run, status, ignore rules, atomic
+  writes, tombstones, and recoverable last-write-wins conflicts work.
+- The connector runs =flocal watch= in the foreground.
+- Whole-file conflict selection is acceptable while the core is being proven.
+
 ** v0.0.1 - works for me
-I have a local directory that I want to share with my coding agent, which runs on my server which I can connect to over wireguard (I know the IP).
 
-I create a directory with files locally.
-: local $ mkdir mydir
+- Linux systems with a systemd user manager and macOS install =flocal watch= as
+  a user-level systemd or launchd service, so normal use does not require
+  managing a foreground process. Other Linux systems retain foreground mode.
+- Saving a buffer in Emacs is noticed promptly, including editors that save by
+  writing a temporary file and renaming it over the original.
+- A local editor and a coding agent working from the remote copy can alternate
+  or work offline without treating either machine as authoritative.
+- Three-way text merge preserves non-overlapping changes and applies
+  last-write-wins only to overlapping hunks.
+- The service reconnects and catches up without intervention when either peer
+  or its network returns.
 
-I name the directory as shared specifically with my server.
-: local $ file.local dir mydir
-: some id]
-
-On my server, I specify a location for my files to show up (like a git repo).
-: server $ file.local dir otherdir [some id]
-
-If possible, it should follow git conventions (at least at the start, for convenience) for example for:
-- ignoring files (.gitignore)
-- syncs the git state between the files (so that either can work off of the same exact branch) - this is probably free since the git state is just a directory with real files in it.
-
-Explicitly *not supported* for this version
-- merge conflict resolution (pick some reasonable rule for handling)
-- explicit (user-controlled) branching - we all work on the same directory with the same version of the same files.
-- Discoverability - Unless it's already easier to do it in another way, all collaborators (sync targets) already know each others' IP addresses and the path to the file/directory they want to sync or some reasonable stable ID.
 ** v0.1.0 - works for my family
+
+The next milestone will define invitations, more than two peers, refined
+service-management UX, and recovery retention suitable for non-technical users.
+
 ** v1.0.0 - works for another community
+
+The stable milestone will be defined from experience running the earlier
+versions across real directories and peers.

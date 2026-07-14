@@ -2,24 +2,40 @@
 
 This repository builds `file.local`, a local-first directory synchronizer for
 Linux and macOS. Keep the implementation small and make filesystem and network
-failure modes explicit. The current product contract lives in
-`docs/2026-07-14-v0.0.1-design.org`.
+failure modes explicit. `README.org` is the durable high-level product and
+architecture contract. Update it in the same pull request whenever a design or
+implementation change no longer aligns with it. Dated files in `docs/` retain
+the detailed decisions and state for individual features.
 
 ## Development cycle
 
 Every non-trivial feature follows three phases:
 
-1. **Design.** Write or update a dated state document in `docs/`. Describe the
-   user flow, interfaces, trade-offs, failure modes, security boundaries, and
-   acceptance criteria. Review the design through the lenses of simplicity,
-   user experience, clean interfaces, and threat model before implementing.
+1. **Design.** An architect subagent writes a numbered plan with concrete
+   references, user flow, interfaces, trade-offs, failure modes, security
+   boundaries, and acceptance criteria in a dated `docs/` state document. The
+   primary agent reads and redirects it. Then run independent design-review
+   subagents in parallel, one per lens: simplicity; platform and dependency
+   fit; user guidance and intention; end-to-end user experience; clean
+   interfaces; filesystem correctness; and threat model/attack surface. Apply
+   the most scrutiny to network and untrusted-filesystem changes. Reconcile
+   findings into the design before implementing.
 2. **Code.** Implement against the accepted design and test the observable
-   behavior. Review for simplicity, readability, design adherence, shared-logic
-   reduction, filesystem correctness, and adversarial security. Network and
-   untrusted-filesystem changes receive the most scrutiny.
-3. **Review.** Reconcile the design document against the actual diff, run the
-   complete local test and lint suite, and review until clean. Then push the
-   feature branch and open a draft pull request. The user merges it.
+   behavior. Then run independent code-review subagents in parallel through the
+   lenses of simplicity; clean code and interfaces; readability; existing
+   patterns; design adherence; shared-logic and line-count reduction;
+   cross-platform filesystem behavior; and adversarial security. Add a
+   dedicated documentation-alignment pass. Fix every blocker and important
+   finding, rerun validation, and repeat the affected reviews until clean.
+3. **Review.** Run the complete local review loop to convergence. Reconcile the
+   design document and `README.org` against the actual diff, run the complete
+   local test and lint suite, and record any changed decision and why. Then push
+   the feature branch and open a draft pull request. Address review feedback by
+   rerunning the affected local-review lenses before pushing. After the fix is
+   pushed, resolve each GitHub thread that it fully addresses. If a thread needs
+   a user decision or clarification, reply in that thread instead of resolving
+   it and sign the reply `— Codex` so automated comments are distinguishable
+   from the user's own comments. The user merges.
 
 Branch from `main`, never from another feature branch. Use one feature per
 branch. Commit and push freely on feature branches, but never merge or commit
