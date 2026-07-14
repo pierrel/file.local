@@ -1,0 +1,15 @@
+#+title:file.local
+A local peer to peer, local-first file syncing system.
+* Stories
+** v0.0.1 - works for me
+I have a local directory that I want to share with my coding agent, which runs on my server which I can connect to over wireguard (I know the IP).
+
+I create a directory with files locally.
+
+I name the directory as shared specifically with my server. On my server, I specify a location for my files to show up (like a git repo).
+
+If possible, it should follow git conventions (at least at the start, for convenience) for example for:
+- ignoring files (.gitignore)
+- syncs the git state between the files (so that either can workm off of the same exact branch) - this is probably free since the git state is just a directory with real files in it.
+** v0.1.0 - works for my family
+** v1.0.0 - works for another community
