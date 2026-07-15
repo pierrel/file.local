@@ -237,6 +237,17 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
         .iter()
         .map(|record| (record.path.as_bytes().to_vec(), record))
         .collect();
+    let matcher = IgnoreMatcher::new(&root)?;
+    let root_dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority())?;
+    for record in records {
+        if matcher.is_record_ignored(record) && !prior.contains_key(record.path.as_bytes()) {
+            match root_dir.symlink_metadata(record.path.to_path_buf()) {
+                Ok(_) => bail!("incoming path collides with unsynchronized ignored local content"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     let (intent, _) = state.set_install_intent(share, records)?;
     let install_temps: std::collections::HashMap<&[u8], _> = intent
         .temps
@@ -244,7 +255,6 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
         .map(|temp| (temp.path.as_bytes(), temp))
         .collect();
     let mut accepted = Vec::with_capacity(records.len());
-    let matcher = IgnoreMatcher::new(&root)?;
     let mut ignore_cache = std::collections::HashMap::new();
     for record in records {
         if ignored_cached(&matcher, record, &mut ignore_cache) {

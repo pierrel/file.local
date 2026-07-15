@@ -66,6 +66,33 @@ fn ignored_existing_file_is_not_tombstoned() -> Result<()> {
 }
 
 #[test]
+fn ignored_unsynchronized_collision_blocks_apply() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root)?;
+    fs::write(root.join(".gitignore"), "local.env\n")?;
+    fs::write(root.join("local.env"), "local secret")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let remote = flocal::model::Record {
+        path: flocal::model::RelativePath::from_bytes(b"local.env".to_vec())?,
+        version: flocal::model::Version {
+            peer: flocal::model::PeerId("remote".into()),
+            sequence: 1,
+            timestamp_ns: 1,
+            seen: Vec::new(),
+            entry: Entry::Tombstone,
+        },
+    };
+
+    let error = apply_plan(&mut state, &share, &[remote]).expect_err("collision must block");
+    assert!(error.to_string().contains("ignored local content"));
+    assert_eq!(fs::read_to_string(root.join("local.env"))?, "local secret");
+    assert!(state.install_intent(&share)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn directory_only_ignore_protects_against_tombstones() -> Result<()> {
     let temp = tempdir()?;
     let root = temp.path().join("root");
