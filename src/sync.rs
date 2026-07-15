@@ -374,7 +374,7 @@ fn apply_record(
         };
         if !staged_matches {
             state.rotate_unowned_install_temp(share, &record.path)?;
-            bail!("creating install temporary collided with an unrelated entry");
+            bail!("creating install temporary does not match its intended entry");
         }
         state.mark_install_temp_owned(share, &record.path)?;
     }

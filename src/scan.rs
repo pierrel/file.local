@@ -63,13 +63,16 @@ fn scan_mode(
             continue;
         }
         let relative = dent.path().strip_prefix(root)?;
-        if relative.components().any(|c| c.as_os_str() == ".git") {
+        if state.is_owned_temp(share, relative)? {
+            continue;
+        }
+        if relative.components().any(|component| {
+            let name = component.as_os_str().as_encoded_bytes();
+            name == b".git" || name.starts_with(b".flocal-tmp-")
+        }) {
             continue;
         }
         let path = RelativePath::from_path(relative)?;
-        if state.is_owned_temp(share, &path)? {
-            continue;
-        }
         seen.insert(path.as_bytes().to_vec());
         let metadata = root_dir.symlink_metadata(relative)?;
         let entry = if metadata.file_type().is_symlink() {

@@ -44,8 +44,12 @@ impl RelativePath {
         let mut normalized = PathBuf::new();
         for component in path.components() {
             match component {
-                Component::Normal(name) if name != ".git" => normalized.push(name),
-                Component::Normal(_) => bail!(".git is never synchronized"),
+                Component::Normal(name)
+                    if name != ".git" && !name.as_encoded_bytes().starts_with(b".flocal-tmp-") =>
+                {
+                    normalized.push(name)
+                }
+                Component::Normal(_) => bail!("reserved path is never synchronized"),
                 _ => bail!("path must be normalized and relative"),
             }
         }
@@ -221,6 +225,8 @@ mod tests {
     fn path_rejects_traversal_and_git() {
         assert!(RelativePath::from_bytes(b"../secret".to_vec()).is_err());
         assert!(RelativePath::from_bytes(b"a/.git/config".to_vec()).is_err());
+        assert!(RelativePath::from_bytes(b".flocal-tmp-peer".to_vec()).is_err());
+        assert!(RelativePath::from_bytes(b"a/.flocal-tmp-peer/file".to_vec()).is_err());
         assert!(RelativePath::from_bytes(b"src/main.rs".to_vec()).is_ok());
         assert!(RelativePath::from_bytes(b"src//main.rs".to_vec()).is_err());
         assert!(RelativePath::from_bytes(b"src/./main.rs".to_vec()).is_err());
@@ -231,6 +237,8 @@ mod tests {
     fn wire_types_reject_untrusted_paths_and_hashes() {
         assert!(serde_json::from_str::<RelativePath>(r#"[46,46,47,120]"#).is_err());
         assert!(serde_json::from_str::<RelativePath>(r#"[46,103,105,116,47,120]"#).is_err());
+        let reserved = serde_json::to_string(&b"a/.flocal-tmp-peer".to_vec()).unwrap();
+        assert!(serde_json::from_str::<RelativePath>(&reserved).is_err());
         assert!(serde_json::from_str::<ObjectHash>(r#""../../secret""#).is_err());
         assert!(serde_json::from_str::<ObjectHash>(r#""ABCDEF""#).is_err());
     }

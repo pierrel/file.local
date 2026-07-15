@@ -59,8 +59,9 @@ While connected, both peer processes watch regular files, directories, and
 symbolic links. Edits made while a watcher is absent remain ordinary safe local
 files and are discovered by the next reconciliation scan. Git-compatible
 =.gitignore= rules leave ignored paths entirely local, and =.git= is always
-excluded. Only Git-portable metadata, file contents, symbolic-link targets, and
-the executable bit synchronize.
+excluded. Names beginning =.flocal-tmp-= are reserved for crash-recovery
+temporaries and are never synchronized. Only Git-portable metadata, file
+contents, symbolic-link targets, and the executable bit synchronize.
 
 Excluding =.git= means the working trees converge, but Git state does not:
 branches, =HEAD=, the index, commits, and staged changes remain independent. The

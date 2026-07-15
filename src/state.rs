@@ -255,7 +255,7 @@ impl State {
             .collect()
     }
 
-    pub fn is_owned_temp(&self, share: &ShareId, path: &RelativePath) -> Result<bool> {
+    pub fn is_owned_temp(&self, share: &ShareId, path: &Path) -> Result<bool> {
         let Some(intent) = self.install_intent(share)? else {
             return Ok(false);
         };
@@ -266,7 +266,7 @@ impl State {
             .any(|temp| {
                 let mut owned = temp.path.to_path_buf();
                 owned.set_file_name(&temp.token);
-                RelativePath::from_path(&owned).is_ok_and(|owned| owned == *path)
+                owned == path
             }))
     }
 

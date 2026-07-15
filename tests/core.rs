@@ -287,3 +287,44 @@ fn recovers_file_created_during_creating_phase() -> Result<()> {
     assert!(!target.join(&install_temp.token).exists());
     Ok(())
 }
+
+#[test]
+fn mismatched_creating_temp_remains_internal_and_retryable() -> Result<()> {
+    let temp = tempdir()?;
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    fs::create_dir_all(&source)?;
+    fs::create_dir_all(&target)?;
+    fs::write(source.join("file"), "content")?;
+    let source_state = State::open(temp.path().join("source-state"))?;
+    let share = source_state.init_share(&source)?;
+    let records = scan(&source_state, &share, &source, &[])?;
+    let mut target_state = State::open(temp.path().join("target-state"))?;
+    target_state.register_share(&share, &target)?;
+    copy_objects(&source_state, &target_state, &records)?;
+    let (intent, _) = target_state.set_install_intent(&share, &records)?;
+    let install_temp = &intent.temps[0];
+    target_state.mark_install_temp_creating(&share, &install_temp.path)?;
+    fs::write(target.join(&install_temp.token), "partial")?;
+
+    assert!(apply_plan(&mut target_state, &share, &records).is_err());
+    let scanned = scan(&target_state, &share, &target, &[])?;
+    assert!(
+        scanned
+            .iter()
+            .all(|record| { record.path.as_bytes() != install_temp.token.as_bytes() })
+    );
+    apply_plan(&mut target_state, &share, &records)?;
+    assert_eq!(fs::read_to_string(target.join("file"))?, "content");
+    assert_eq!(
+        fs::read_to_string(target.join(&install_temp.token))?,
+        "partial"
+    );
+    let scanned = scan(&target_state, &share, &target, &[])?;
+    assert!(
+        scanned
+            .iter()
+            .all(|record| record.path.as_bytes() != install_temp.token.as_bytes())
+    );
+    Ok(())
+}

@@ -75,6 +75,10 @@ These limitations are deliberately stated rather than weakening the detailed
 design. Local review decides which are blockers for publishing the alpha and
 which may remain visible proof-stage constraints.
 
+The =.flocal-tmp-= filename prefix is reserved at every directory level. Scan
+always excludes that namespace so an interrupted staging file cannot enter the
+replicated model while recovery rotates to a fresh temporary and retries.
+
 * Validation
 
 - Unit coverage for trusted-type deserialization, path and object-hash
