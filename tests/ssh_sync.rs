@@ -209,6 +209,19 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
         directory_destination.to_str().unwrap(),
         "--force",
     ])?;
+    let symlink_destination = temp.path().join("restore-symlink");
+    std::os::unix::fs::symlink(&restored, &symlink_destination)?;
+    run_fails(&[
+        "restore",
+        local_root.to_str().unwrap(),
+        &conflict.id,
+        "--version",
+        "winner",
+        "--to",
+        symlink_destination.to_str().unwrap(),
+        "--force",
+    ])?;
+    assert!(symlink_destination.is_symlink());
     run(&[
         "restore",
         local_root.to_str().unwrap(),

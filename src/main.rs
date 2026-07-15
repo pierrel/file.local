@@ -776,11 +776,14 @@ fn restore(
         &conflict.loser
     };
     let hash = record_hash(record).context("selected conflict input is not a regular file")?;
-    if destination.exists() && !force {
-        bail!("destination exists; use --force to replace it");
-    }
-    if destination.is_dir() {
-        bail!("refusing to replace a directory");
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) if !force => bail!("destination exists; use --force to replace it"),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!("--force replaces regular files only")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let parent = destination.parent().context("destination has no parent")?;
     std::fs::create_dir_all(parent)?;
