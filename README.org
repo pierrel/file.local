@@ -13,9 +13,10 @@ make install
 
 Run that command from a checkout of this repository on *both* peers. Ensure
 =~/.local/bin= is in =PATH= and that non-interactive SSH can run =flocal= on
-the remote peer. The remote directory must already exist, but it does not need
-to be initialized separately: pairing registers it under the initiating
-peer's share identity.
+the remote peer. Pairing also checks =~/.local/bin/flocal= directly, since
+non-interactive SSH sessions often use a smaller =PATH=. The remote directory
+must already exist, but it does not need to be initialized separately: pairing
+registers it under the initiating peer's share identity.
 
 Then, on one peer only, initialize the local directory and pair the remote:
 

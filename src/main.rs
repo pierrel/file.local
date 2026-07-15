@@ -1018,6 +1018,7 @@ impl<R: Read + AsFd> Read for TimedReader<R> {
 
 fn discover_executable(host: &str) -> Result<String> {
     validate_host(host)?;
+    const DISCOVER_COMMAND: &str = r#"command -v flocal || { test -x "$HOME/.local/bin/flocal" && printf '%s\n' "$HOME/.local/bin/flocal"; }"#;
     let output = Command::new("ssh")
         .args([
             "-T",
@@ -1028,7 +1029,7 @@ fn discover_executable(host: &str) -> Result<String> {
             "-o",
             "ServerAliveCountMax=2",
             host,
-            "command -v flocal",
+            DISCOVER_COMMAND,
         ])
         .output()?;
     if !output.status.success() {

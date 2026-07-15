@@ -22,10 +22,12 @@ fn bidirectional_sync_over_ssh_process_boundary() -> Result<()> {
         &fake_ssh,
         r#"#!/bin/sh
 for arg do last=$arg; done
-if [ "$last" = "command -v flocal" ]; then
+case "$last" in
+"command -v flocal"*)
   printf '%s\n' "$FLOCAL_BIN"
   exit 0
-fi
+  ;;
+esac
 exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_REMOTE_MAX_SESSION_BYTES" "$FLOCAL_BIN" protocol serve
 "#,
     )?;
