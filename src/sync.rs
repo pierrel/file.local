@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Entry, ObjectHash, PeerId, Record, RelativePath, ShareId};
+use crate::model::{Entry, ObjectHash, PeerId, Record, ShareId};
 use crate::reconcile::{Plan, reconcile};
 use crate::scan::{IgnoreMatcher, preview, scan};
 use crate::state::{InstallTempPhase, State};
@@ -223,7 +223,7 @@ fn advertised_records(root: &Path, records: &[Record]) -> Result<Vec<Record>> {
     let matcher = IgnoreMatcher::new(root)?;
     Ok(records
         .iter()
-        .filter(|record| !matcher.is_ignored(&record.path))
+        .filter(|record| !matcher.is_record_ignored(record))
         .cloned()
         .collect())
 }
@@ -247,7 +247,7 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
     let matcher = IgnoreMatcher::new(&root)?;
     let mut ignore_cache = std::collections::HashMap::new();
     for record in records {
-        if ignored_cached(&matcher, &record.path, &mut ignore_cache) {
+        if ignored_cached(&matcher, record, &mut ignore_cache) {
             if let Some(old) = prior.get(record.path.as_bytes()) {
                 accepted.push((*old).clone());
             }
@@ -261,14 +261,14 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
         .collect();
     for old in prior.values() {
         if accepted_paths.insert(old.path.as_bytes().to_vec())
-            && ignored_cached(&matcher, &old.path, &mut ignore_cache)
+            && ignored_cached(&matcher, old, &mut ignore_cache)
         {
             accepted.push((*old).clone());
         }
     }
     let mut ordered = Vec::new();
     for record in &accepted {
-        if !ignored_cached(&matcher, &record.path, &mut ignore_cache) {
+        if !ignored_cached(&matcher, record, &mut ignore_cache) {
             ordered.push(record.clone());
         }
     }
@@ -717,7 +717,7 @@ pub fn required_hashes_for_share(
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for record in records {
-        if matcher.is_ignored(&record.path) {
+        if matcher.is_record_ignored(record) {
             continue;
         }
         if let Entry::File { hash, size, .. } = &record.version.entry
@@ -768,14 +768,20 @@ fn validate_unique_paths(records: &[Record]) -> Result<()> {
 
 fn ignored_cached(
     matcher: &IgnoreMatcher,
-    path: &RelativePath,
-    cache: &mut std::collections::HashMap<Vec<u8>, bool>,
+    record: &Record,
+    cache: &mut std::collections::HashMap<(Vec<u8>, u8), bool>,
 ) -> bool {
-    if let Some(ignored) = cache.get(path.as_bytes()) {
+    let kind = match record.version.entry {
+        Entry::Directory => 1,
+        Entry::Tombstone => 2,
+        _ => 0,
+    };
+    let key = (record.path.as_bytes().to_vec(), kind);
+    if let Some(ignored) = cache.get(&key) {
         return *ignored;
     }
-    let ignored = matcher.is_ignored(path);
-    cache.insert(path.as_bytes().to_vec(), ignored);
+    let ignored = matcher.is_record_ignored(record);
+    cache.insert(key, ignored);
     ignored
 }
 

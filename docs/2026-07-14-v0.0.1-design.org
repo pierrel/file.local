@@ -549,7 +549,7 @@ watcher, service, or second SSH session from racing the share.
 The initiating process runs a fixed remote command equivalent to:
 
 #+begin_example
-/absolute/path/to/flocal protocol serve --stdio
+/absolute/path/to/flocal protocol serve
 #+end_example
 
 OpenSSH sends even an argv-supplied remote command through the login shell, so

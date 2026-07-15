@@ -87,12 +87,12 @@ unavailable.
 The alpha proves the same flow with recoverable whole-file last-write-wins
 before three-way text merging is implemented.
 
-While connected, a filesystem event on either peer schedules synchronization
-after a short debounce. A small heartbeat exchanges sequence state while idle;
-healthy idle peers do not repeatedly scan their trees. Startup, watcher
-overflow, and explicit repair trigger a full scan. While disconnected, the
-connector retries with bounded backoff and synchronizes recorded changes when
-the connection returns.
+The target v0.0.1 behavior is event-driven synchronization after a short
+debounce, with only a small sequence heartbeat while idle. The proof-stage
+alpha currently performs a full reconciliation scan every 30 seconds while
+=watch= is running; avoiding those idle scans remains deferred. While
+disconnected, the connector retries and synchronizes recorded changes when the
+connection returns.
 
 See [[file:docs/2026-07-14-v0.0.1-design.org][the proposed detailed design]] for the CLI, wire behavior, recovery commands,
 security model, platform constraints, and acceptance criteria. The README is

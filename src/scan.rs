@@ -247,7 +247,7 @@ impl IgnoreMatcher {
         })
     }
 
-    pub fn is_ignored(&self, relative: &RelativePath) -> bool {
+    pub fn is_ignored(&self, relative: &RelativePath, is_dir: bool) -> bool {
         if relative
             .to_path_buf()
             .components()
@@ -257,13 +257,23 @@ impl IgnoreMatcher {
         }
         let path = relative.to_path_buf();
         self.matcher
-            .matched_path_or_any_parents(self.root.join(path), false)
+            .matched_path_or_any_parents(self.root.join(path), is_dir)
             .is_ignore()
+    }
+
+    pub fn is_record_ignored(&self, record: &Record) -> bool {
+        match record.version.entry {
+            Entry::Directory => self.is_ignored(&record.path, true),
+            Entry::Tombstone => {
+                self.is_ignored(&record.path, false) || self.is_ignored(&record.path, true)
+            }
+            _ => self.is_ignored(&record.path, false),
+        }
     }
 }
 
-pub fn is_ignored(root: &Path, relative: &RelativePath) -> Result<bool> {
-    Ok(IgnoreMatcher::new(root)?.is_ignored(relative))
+pub fn is_ignored(root: &Path, relative: &RelativePath, is_dir: bool) -> Result<bool> {
+    Ok(IgnoreMatcher::new(root)?.is_ignored(relative, is_dir))
 }
 
 fn add_ignore_file(
@@ -339,18 +349,27 @@ mod tests {
         let temp = tempdir()?;
         let root = temp.path().join("root");
         fs::create_dir_all(root.join("nested"))?;
-        fs::write(root.join(".gitignore"), "nested/*.txt\n")?;
+        fs::write(root.join(".gitignore"), "nested/*.txt\nonly-dir/\n")?;
         fs::write(root.join("nested/.gitignore"), "!keep.txt\n")?;
         let matcher = IgnoreMatcher::new(&root)?;
-        assert!(!matcher.is_ignored(&RelativePath::from_bytes(b"nested/keep.txt".to_vec())?));
-        assert!(matcher.is_ignored(&RelativePath::from_bytes(b"nested/drop.txt".to_vec())?));
+        assert!(!matcher.is_ignored(
+            &RelativePath::from_bytes(b"nested/keep.txt".to_vec())?,
+            false
+        ));
+        assert!(matcher.is_ignored(
+            &RelativePath::from_bytes(b"nested/drop.txt".to_vec())?,
+            false
+        ));
+        let directory_rule = RelativePath::from_bytes(b"only-dir".to_vec())?;
+        assert!(matcher.is_ignored(&directory_rule, true));
+        assert!(!matcher.is_ignored(&directory_rule, false));
 
         fs::remove_file(root.join(".gitignore"))?;
         let outside = temp.path().join("outside-ignore");
         fs::write(&outside, "victim.txt\n")?;
         std::os::unix::fs::symlink(outside, root.join(".gitignore"))?;
         let matcher = IgnoreMatcher::new(&root)?;
-        assert!(!matcher.is_ignored(&RelativePath::from_bytes(b"victim.txt".to_vec())?));
+        assert!(!matcher.is_ignored(&RelativePath::from_bytes(b"victim.txt".to_vec())?, false));
         Ok(())
     }
 }

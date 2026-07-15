@@ -66,6 +66,31 @@ fn ignored_existing_file_is_not_tombstoned() -> Result<()> {
 }
 
 #[test]
+fn directory_only_ignore_protects_against_tombstones() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("only-dir"))?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let first = refresh(&mut state, &share)?;
+    let mut tombstone = first
+        .iter()
+        .find(|record| record.path.display() == "only-dir")
+        .unwrap()
+        .clone();
+    tombstone.version.entry = Entry::Tombstone;
+    tombstone.version.sequence += 1;
+    fs::write(root.join(".gitignore"), "only-dir/\n")?;
+
+    apply_plan(&mut state, &share, &[tombstone])?;
+    assert!(root.join("only-dir").is_dir());
+    assert!(state.records(&share)?.iter().any(|record| {
+        record.path.display() == "only-dir" && matches!(record.version.entry, Entry::Directory)
+    }));
+    Ok(())
+}
+
+#[test]
 fn synchronizes_symlinks_and_executable_mode_changes() -> Result<()> {
     use std::os::unix::fs::{PermissionsExt, symlink};
 

@@ -284,9 +284,10 @@ fn run_sync(state: &mut State, path: &Path, dry_run: bool, yes: bool, json: bool
     }
 
     let root = state.root_for(&share)?;
+    let matcher = flocal::scan::IgnoreMatcher::new(&root)?;
     let mut required_records = plan.records.clone();
     for conflict in &plan.conflicts {
-        if flocal::scan::is_ignored(&root, &conflict.path)? {
+        if matcher.is_record_ignored(&conflict.winner) {
             continue;
         }
         required_records.push(conflict.winner.clone());
