@@ -44,6 +44,76 @@ Branch from `main`, never from another feature branch. Use one feature per
 branch. Commit and push freely on feature branches, but never merge or commit
 directly to `main` without explicit approval.
 
+## Review subagents and lenses
+
+Use independent subagents so each review has a narrow mandate and findings can
+be traced to a specific lens. A reviewer reports blockers, important findings,
+and minor findings with file or design references; it does not edit the work it
+is reviewing. Combine closely related lenses only when agent capacity requires
+it, and explicitly name every lens in the assignment.
+
+- **Architect (authoring role, not a review lens):** receives the accepted user
+  story, repository constraints, research, and prior decisions. It produces the
+  numbered dated design plan required by the Design phase, including concrete
+  interfaces, data/state flow, alternatives, failure and security boundaries,
+  acceptance tests, and unresolved decisions. It must not approve its own
+  design; the primary agent redirects the draft and independent reviewers test
+  it through the lenses below.
+- **Simplicity:** looks for unnecessary concepts, duplicated paths, excess
+  dependencies, quadratic behavior, and opportunities to make correctness
+  follow from a smaller representation or interface.
+- **Platform and dependency fit:** verifies Linux and macOS behavior, Rust and
+  system dependency choices, filesystem/API availability, packaging, and CI
+  coverage on every supported platform.
+- **User guidance and intention:** checks that the work answers the stated user
+  stories, terminology and examples are understandable, prerequisites are
+  explicit, and deferred behavior is clearly distinguished from implemented
+  behavior.
+- **End-to-end user experience:** walks installation, pairing, initial sync,
+  everyday editing, offline recovery, conflicts, status, and failure recovery
+  as a user would, looking for ambiguity or surprising state transitions.
+- **Interfaces and clean code:** reviews CLI, protocol, module, state-schema,
+  and filesystem boundaries for narrow contracts, validated types, clear
+  ownership, and useful errors. Findings identify the leaking or over-broad
+  interface and propose the smallest clearer contract.
+- **Readability:** reads the change as a future maintainer, checking names,
+  control flow, error context, comments, locality, and whether invariants are
+  apparent without reconstructing them across files. Findings cite the passage
+  that requires avoidable inference and explain the intended reading.
+- **Existing patterns:** compares the change with established repository
+  conventions and analogous implementations. It flags unjustified new idioms,
+  inconsistent error/state handling, and missed reuse, while rejecting a local
+  pattern when it is itself unsafe or unsuitable.
+- **Design adherence:** maps every accepted design decision and acceptance
+  criterion to implementation and tests. It reports missing behavior, silent
+  scope changes, and implementation discoveries that require README or design
+  updates; it does not treat the design as correct when evidence disproves it.
+- **Shared logic and line-count reduction:** looks for duplicated validation,
+  framing, traversal, state transitions, and platform branches. It proposes
+  deletion or one well-named shared primitive when that reduces both code and
+  divergent behavior, but does not create abstractions solely to reduce lines.
+- **Filesystem correctness:** examines scans, ignores, symlinks, permissions,
+  atomic replacement, interruption recovery, durability, races, and Linux/macOS
+  differences using real filesystem behavior rather than mocks.
+- **Threat model and adversarial security:** treats peers, protocol frames,
+  paths, ignore rules, object contents, SSH configuration, and concurrent local
+  filesystem changes as hostile; checks containment, resource limits, identity
+  binding, verification, and safe failure.
+- **Documentation alignment:** compares README.org, dated design/implementation
+  documents, examples, CLI help, and the actual diff; any mismatch is reported
+  as a defect rather than left as follow-up prose.
+
+The exact **design-review** mapping is: simplicity; platform and dependency fit;
+user guidance and intention; end-to-end user experience; interfaces and clean
+code; filesystem correctness; and threat model and adversarial security. The architect authors
+the input but is not one of its reviewers. The exact **code-review** mapping is:
+simplicity; interfaces and clean code; readability; existing patterns; design
+adherence; shared-logic and line-count reduction; cross-platform filesystem
+correctness; adversarial security; and documentation alignment. Each reviewer
+must cite evidence and return categorized findings or an explicit clear result.
+Rerun every affected lens after a fix until it reports no blocker or important
+finding.
+
 ## Engineering principles
 
 - Simplicity is the default. Prefer deleting code, narrow interfaces, and
