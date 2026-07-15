@@ -1197,6 +1197,24 @@ mod tests {
             },
             true,
         )?;
+        let mut merge_local = record(b"merge", Entry::Directory);
+        merge_local.version.sequence = 2;
+        let merge_remote = record(b"merge", Entry::Directory);
+        let download = record(b"download", Entry::Directory);
+        let neither = record(b"neither", Entry::Directory);
+        print_plan(
+            std::slice::from_ref(&merge_local),
+            &[merge_remote.clone(), download.clone()],
+            &flocal::reconcile::Plan {
+                records: vec![merge_local.clone(), download, neither],
+                conflicts: vec![flocal::reconcile::Conflict {
+                    path: merge_local.path.clone(),
+                    winner: merge_local.clone(),
+                    loser: merge_remote,
+                }],
+            },
+            false,
+        )?;
         Ok(())
     }
 
