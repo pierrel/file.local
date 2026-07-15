@@ -113,7 +113,13 @@ impl State {
         }
         let dirs = ProjectDirs::from("local", "file.local", "file.local")
             .context("could not determine user state directory")?;
-        Self::open(dirs.data_local_dir())
+        #[cfg(target_os = "linux")]
+        let path = dirs
+            .state_dir()
+            .context("could not determine user state directory")?;
+        #[cfg(not(target_os = "linux"))]
+        let path = dirs.data_local_dir();
+        Self::open(path)
     }
 
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
@@ -577,7 +583,7 @@ impl State {
     pub fn conflicts(&self, share: &ShareId) -> Result<Vec<StoredConflict>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,path,winner_json,loser_json,created_ns FROM conflicts
-             WHERE share_id=?1 ORDER BY created_ns DESC",
+             WHERE share_id=?1 ORDER BY CAST(created_ns AS INTEGER) DESC",
         )?;
         let rows = stmt.query_map([&share.0], |r| {
             Ok((
