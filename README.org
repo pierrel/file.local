@@ -8,20 +8,33 @@ is named =flocal=.
 Rust stable is required on both peers:
 
 #+begin_src sh
-cargo build --release
-mkdir -p ~/.local/bin
-install -m 755 target/release/flocal ~/.local/bin/flocal
+make install
+#+end_src
 
+Run that command from a checkout of this repository on *both* peers. Ensure
+=~/.local/bin= is in =PATH= and that non-interactive SSH can run =flocal= on
+the remote peer. The remote directory must already exist, but it does not need
+to be initialized separately: pairing registers it under the initiating
+peer's share identity.
+
+Then, on one peer only, initialize the local directory and pair the remote:
+
+#+begin_src sh
 flocal init ~/src/example
 flocal peer add ~/src/example --host buildbox --remote-path /srv/work/example
+#+end_src
+
+The =--host= value can be a hostname, address, or =~/.ssh/config= alias. After
+pairing, run synchronization commands from either peer's directory. For the
+first sync, inspect the preview before approving it:
+
+#+begin_src sh
 flocal sync ~/src/example --dry-run
 flocal sync ~/src/example
 flocal watch ~/src/example
 #+end_src
 
-The SSH destination may be a hostname, address, or =~/.ssh/config= alias. The
-remote =flocal= must be available to a non-interactive SSH command. The current
-code is proof-stage alpha software: review the explicit implementation gaps in
+The current code is proof-stage alpha software: review the explicit implementation gaps in
 [[file:docs/2026-07-14-alpha-implementation.org][the alpha implementation state]] before using it on irreplaceable data.
 
 It follows the local-first principle that the copy on your device is primary:

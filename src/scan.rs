@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ignore::{WalkBuilder, gitignore::GitignoreBuilder};
+use ignore::{
+    WalkBuilder,
+    gitignore::{Gitignore, GitignoreBuilder},
+};
 
 use crate::model::{Entry, Record, RelativePath, ShareId};
 use crate::state::{State, file_record};
@@ -185,45 +188,79 @@ fn open_regular_nofollow(root: &cap_std::fs::Dir, relative: &Path) -> Result<std
     Ok(fd.into())
 }
 
-pub fn is_ignored(root: &Path, relative: &RelativePath) -> Result<bool> {
-    if relative
-        .to_path_buf()
-        .components()
-        .any(|component| component.as_os_str() == ".git")
-    {
-        return Ok(true);
-    }
-    let mut builder = GitignoreBuilder::new(root);
-    let root_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-    let mut relative_dir = std::path::PathBuf::new();
-    add_ignore_file(&mut builder, &root_dir, root.join(".gitignore"))?;
-    let path = relative.to_path_buf();
-    if let Some(parent) = path.parent() {
-        for component in parent.components() {
-            relative_dir.push(component);
-            let directory = match root_dir.open_dir(&relative_dir) {
-                Ok(directory) => directory,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            add_ignore_file(
-                &mut builder,
-                &directory,
-                root.join(&relative_dir).join(".gitignore"),
-            )?;
+pub struct IgnoreMatcher {
+    root: PathBuf,
+    matcher: Gitignore,
+}
+
+impl IgnoreMatcher {
+    pub fn new(root: &Path) -> Result<Self> {
+        let mut builder = GitignoreBuilder::new(root);
+        let root_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+        let mut walker = WalkBuilder::new(root);
+        walker
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .follow_links(false);
+        let mut ignore_files = Vec::new();
+        for result in walker.build() {
+            let dent = result?;
+            let relative = dent.path().strip_prefix(root)?;
+            if relative
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+            {
+                continue;
+            }
+            if relative
+                .file_name()
+                .is_some_and(|name| name == ".gitignore")
+                && dent.file_type().is_some_and(|kind| kind.is_file())
+            {
+                ignore_files.push(relative.to_path_buf());
+            }
         }
+        ignore_files.sort_by(|left, right| {
+            left.components()
+                .count()
+                .cmp(&right.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        for relative in ignore_files {
+            let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+            let directory = if parent.as_os_str().is_empty() {
+                root_dir.try_clone()?
+            } else {
+                root_dir.open_dir(parent)?
+            };
+            add_ignore_file(&mut builder, &directory, root.join(relative))?;
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            matcher: builder.build()?,
+        })
     }
-    let matcher = builder.build()?;
-    Ok(matcher
-        .matched_path_or_any_parents(root.join(path), false)
-        .is_ignore())
+
+    pub fn is_ignored(&self, relative: &RelativePath) -> bool {
+        if relative
+            .to_path_buf()
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+        {
+            return true;
+        }
+        let path = relative.to_path_buf();
+        self.matcher
+            .matched_path_or_any_parents(self.root.join(path), false)
+            .is_ignore()
+    }
+}
+
+pub fn is_ignored(root: &Path, relative: &RelativePath) -> Result<bool> {
+    Ok(IgnoreMatcher::new(root)?.is_ignored(relative))
 }
 
 fn add_ignore_file(
@@ -231,13 +268,26 @@ fn add_ignore_file(
     directory: &cap_std::fs::Dir,
     source: std::path::PathBuf,
 ) -> Result<()> {
-    match directory.read(".gitignore") {
-        Ok(bytes) => {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    match rustix::fs::openat(
+        directory.as_fd(),
+        ".gitignore",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let mut file = std::fs::File::from(fd);
+            if !file.metadata()?.is_file() {
+                return Ok(());
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
             for line in String::from_utf8_lossy(&bytes).lines() {
                 builder.add_line(Some(source.clone()), line)?;
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => {}
         Err(error) => return Err(error.into()),
     }
     Ok(())
@@ -278,6 +328,26 @@ mod tests {
         assert!(names.contains(&".gitignore".into()));
         assert!(!names.iter().any(|name| name.contains("ignored.txt")));
         assert!(!names.iter().any(|name| name.contains(".git/")));
+        Ok(())
+    }
+
+    #[test]
+    fn matcher_preserves_nested_precedence_and_ignores_symlinked_rules() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("nested"))?;
+        fs::write(root.join(".gitignore"), "nested/*.txt\n")?;
+        fs::write(root.join("nested/.gitignore"), "!keep.txt\n")?;
+        let matcher = IgnoreMatcher::new(&root)?;
+        assert!(!matcher.is_ignored(&RelativePath::from_bytes(b"nested/keep.txt".to_vec())?));
+        assert!(matcher.is_ignored(&RelativePath::from_bytes(b"nested/drop.txt".to_vec())?));
+
+        fs::remove_file(root.join(".gitignore"))?;
+        let outside = temp.path().join("outside-ignore");
+        fs::write(&outside, "victim.txt\n")?;
+        std::os::unix::fs::symlink(outside, root.join(".gitignore"))?;
+        let matcher = IgnoreMatcher::new(&root)?;
+        assert!(!matcher.is_ignored(&RelativePath::from_bytes(b"victim.txt".to_vec())?));
         Ok(())
     }
 }

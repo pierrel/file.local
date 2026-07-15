@@ -34,8 +34,11 @@ Every non-trivial feature follows three phases:
    rerunning the affected local-review lenses before pushing. After the fix is
    pushed, resolve each GitHub thread that it fully addresses. If a thread needs
    a user decision or clarification, reply in that thread instead of resolving
-   it and sign the reply `— Codex` so automated comments are distinguishable
-   from the user's own comments. The user merges.
+  it and sign the reply `— Codex` so automated comments are distinguishable
+  from the user's own comments. Once local review is clean and current feedback
+  is addressed, mark the pull request ready for review before requesting a
+  Copilot review. Never request Copilot while the pull request is still a draft.
+  The user merges.
 
 Branch from `main`, never from another feature branch. Use one feature per
 branch. Commit and push freely on feature branches, but never merge or commit

@@ -4,9 +4,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Entry, ObjectHash, PeerId, Record, ShareId};
+use crate::model::{Entry, ObjectHash, PeerId, Record, RelativePath, ShareId};
 use crate::reconcile::{Plan, reconcile};
-use crate::scan::{is_ignored, preview, scan};
+use crate::scan::{IgnoreMatcher, preview, scan};
 use crate::state::{InstallTempPhase, State};
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
@@ -92,23 +92,17 @@ pub fn read_message(reader: &mut impl Read) -> Result<Message> {
 }
 
 pub fn write_snapshot(writer: &mut impl Write, records: &[Record]) -> Result<()> {
-    let mut chunk = Vec::new();
-    for record in records {
-        chunk.push(record.clone());
-        let message = Message::SnapshotChunk {
-            records: chunk.clone(),
-        };
-        if serde_json::to_vec(&message)?.len() > MAX_FRAME {
-            let last = chunk.pop().expect("snapshot chunk has a record");
-            if chunk.is_empty() {
-                bail!("single snapshot record exceeds protocol limit");
-            }
-            write_message(writer, &Message::SnapshotChunk { records: chunk })?;
-            chunk = vec![last];
-        }
-    }
-    if !chunk.is_empty() {
-        write_message(writer, &Message::SnapshotChunk { records: chunk })?;
+    let envelope = serde_json::to_vec(&Message::SnapshotChunk {
+        records: Vec::new(),
+    })?
+    .len();
+    for chunk in bounded_chunks(records, envelope, "snapshot record")? {
+        write_message(
+            writer,
+            &Message::SnapshotChunk {
+                records: chunk.to_vec(),
+            },
+        )?;
     }
     write_message(writer, &Message::SnapshotEnd)
 }
@@ -135,25 +129,78 @@ pub fn read_snapshot(reader: &mut impl Read) -> Result<Vec<Record>> {
 }
 
 pub fn write_plan(writer: &mut impl Write, plan: &Plan) -> Result<()> {
-    for records in plan.records.chunks(1) {
+    write_record_chunks(writer, &plan.records)?;
+    write_conflict_chunks(writer, &plan.conflicts)?;
+    write_message(writer, &Message::ApplyEnd)
+}
+
+fn write_record_chunks(writer: &mut impl Write, records: &[Record]) -> Result<()> {
+    let envelope = serde_json::to_vec(&Message::ApplyChunk {
+        records: Vec::new(),
+        conflicts: Vec::new(),
+    })?
+    .len();
+    for chunk in bounded_chunks(records, envelope, "plan record")? {
         write_message(
             writer,
             &Message::ApplyChunk {
-                records: records.to_vec(),
+                records: chunk.to_vec(),
                 conflicts: Vec::new(),
             },
         )?;
     }
-    for conflicts in plan.conflicts.chunks(1) {
+    Ok(())
+}
+
+fn write_conflict_chunks(
+    writer: &mut impl Write,
+    conflicts: &[crate::reconcile::Conflict],
+) -> Result<()> {
+    let envelope = serde_json::to_vec(&Message::ApplyChunk {
+        records: Vec::new(),
+        conflicts: Vec::new(),
+    })?
+    .len();
+    for chunk in bounded_chunks(conflicts, envelope, "plan conflict")? {
         write_message(
             writer,
             &Message::ApplyChunk {
                 records: Vec::new(),
-                conflicts: conflicts.to_vec(),
+                conflicts: chunk.to_vec(),
             },
         )?;
     }
-    write_message(writer, &Message::ApplyEnd)
+    Ok(())
+}
+
+fn bounded_chunks<'a, T: serde::Serialize>(
+    items: &'a [T],
+    empty_envelope_size: usize,
+    item_name: &str,
+) -> Result<Vec<&'a [T]>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < items.len() {
+        let mut end = start;
+        let mut frame_size = empty_envelope_size;
+        while end < items.len() {
+            let separator = usize::from(end > start);
+            let next_size = frame_size
+                .saturating_add(separator)
+                .saturating_add(serde_json::to_vec(&items[end])?.len());
+            if next_size > MAX_FRAME {
+                break;
+            }
+            frame_size = next_size;
+            end += 1;
+        }
+        if end == start {
+            bail!("single {item_name} exceeds protocol limit");
+        }
+        chunks.push(&items[start..end]);
+        start = end;
+    }
+    Ok(chunks)
 }
 
 pub fn refresh(state: &mut State, share: &ShareId) -> Result<Vec<Record>> {
@@ -161,16 +208,28 @@ pub fn refresh(state: &mut State, share: &ShareId) -> Result<Vec<Record>> {
     let previous = state.records(share)?;
     let records = scan(state, share, &root, &previous)?;
     state.replace_records(share, &records)?;
-    Ok(records)
+    advertised_records(&root, &records)
 }
 
 pub fn preview_refresh(state: &State, share: &ShareId) -> Result<Vec<Record>> {
     let root = state.root_for(share)?;
-    preview(state, share, &root, &state.records(share)?)
+    advertised_records(
+        &root,
+        &preview(state, share, &root, &state.records(share)?)?,
+    )
+}
+
+fn advertised_records(root: &Path, records: &[Record]) -> Result<Vec<Record>> {
+    let matcher = IgnoreMatcher::new(root)?;
+    Ok(records
+        .iter()
+        .filter(|record| !matcher.is_ignored(&record.path))
+        .cloned()
+        .collect())
 }
 
 pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Result<()> {
-    validate_declared_sizes(state, records)?;
+    validate_declared_sizes(records)?;
     let root = state.root_for(share)?;
     let prior = state.records(share)?;
     let prior: std::collections::HashMap<_, _> = prior
@@ -179,8 +238,10 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
         .collect();
     let (intent, _) = state.set_install_intent(share, records)?;
     let mut accepted = Vec::with_capacity(records.len());
+    let matcher = IgnoreMatcher::new(&root)?;
+    let mut ignore_cache = std::collections::HashMap::new();
     for record in records {
-        if is_ignored(&root, &record.path)? {
+        if ignored_cached(&matcher, &record.path, &mut ignore_cache) {
             if let Some(old) = prior.get(record.path.as_bytes()) {
                 accepted.push((*old).clone());
             }
@@ -188,7 +249,23 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
             accepted.push(record.clone());
         }
     }
-    let mut ordered = accepted.clone();
+    let mut accepted_paths: std::collections::HashSet<_> = accepted
+        .iter()
+        .map(|record| record.path.as_bytes().to_vec())
+        .collect();
+    for old in prior.values() {
+        if accepted_paths.insert(old.path.as_bytes().to_vec())
+            && ignored_cached(&matcher, &old.path, &mut ignore_cache)
+        {
+            accepted.push((*old).clone());
+        }
+    }
+    let mut ordered = Vec::new();
+    for record in &accepted {
+        if !ignored_cached(&matcher, &record.path, &mut ignore_cache) {
+            ordered.push(record.clone());
+        }
+    }
     ordered.sort_by_key(|record| {
         let depth = record.path.to_path_buf().components().count();
         match record.version.entry {
@@ -311,10 +388,15 @@ fn apply_record(
             atomic_install(&parent_dir, temp, name, expected)?;
         }
         Entry::File {
-            hash, executable, ..
+            hash,
+            size,
+            executable,
         } => {
             if !temp_exists {
                 let mut source = state.open_verified_object(hash)?;
+                if source.metadata()?.len() != *size {
+                    bail!("stored verified object size differs from the validated record");
+                }
                 let mut options = OpenOptions::new();
                 options.create_new(true).write(true);
                 let mut output = parent_dir.open_with(temp, &options)?;
@@ -605,10 +687,15 @@ pub fn receive_object(
 }
 
 pub fn required_hashes(state: &State, records: &[Record]) -> Vec<ObjectHash> {
+    let mut seen = std::collections::HashSet::new();
     records
         .iter()
         .filter_map(|r| match &r.version.entry {
-            Entry::File { hash, .. } if !state.object_path(hash).exists() => Some(hash.clone()),
+            Entry::File { hash, .. }
+                if seen.insert(hash.clone()) && !has_verified_object(state, hash) =>
+            {
+                Some(hash.clone())
+            }
             _ => None,
         })
         .collect()
@@ -619,17 +706,25 @@ pub fn required_hashes_for_share(
     share: &ShareId,
     records: &[Record],
 ) -> Result<Vec<ObjectHash>> {
-    validate_declared_sizes(state, records)?;
+    validate_declared_sizes(records)?;
     let root = state.root_for(share)?;
+    let matcher = IgnoreMatcher::new(&root)?;
     let mut hashes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for record in records {
-        if is_ignored(&root, &record.path)? {
+        if matcher.is_ignored(&record.path) {
             continue;
         }
-        if let Entry::File { hash, .. } = &record.version.entry
-            && !state.object_path(hash).exists()
+        if let Entry::File { hash, size, .. } = &record.version.entry
+            && seen.insert(hash.clone())
         {
-            hashes.push(hash.clone());
+            match state.open_verified_object(hash) {
+                Ok(file) if file.metadata()?.len() != *size => {
+                    bail!("stored verified object size differs from the validated record")
+                }
+                Ok(_) => {}
+                Err(_) => hashes.push(hash.clone()),
+            }
         }
     }
     hashes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -637,29 +732,46 @@ pub fn required_hashes_for_share(
     Ok(hashes)
 }
 
-fn validate_declared_sizes(state: &State, records: &[Record]) -> Result<()> {
+fn validate_declared_sizes(records: &[Record]) -> Result<()> {
     let mut sizes = std::collections::HashMap::new();
     for record in records {
         if let Entry::File { hash, size, .. } = &record.version.entry {
-            if let Some(prior) = sizes.insert(hash.clone(), *size)
-                && prior != *size
-            {
-                bail!("the same object hash has conflicting declared sizes");
-            }
-            if state.object_path(hash).exists()
-                && state.open_verified_object(hash)?.metadata()?.len() != *size
-            {
-                bail!("stored object size differs from the validated record");
+            match sizes.entry(hash.clone()) {
+                std::collections::hash_map::Entry::Occupied(prior) => {
+                    if *prior.get() != *size {
+                        bail!("the same object hash has conflicting declared sizes");
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(*size);
+                }
             }
         }
     }
     Ok(())
 }
 
+fn ignored_cached(
+    matcher: &IgnoreMatcher,
+    path: &RelativePath,
+    cache: &mut std::collections::HashMap<Vec<u8>, bool>,
+) -> bool {
+    if let Some(ignored) = cache.get(path.as_bytes()) {
+        return *ignored;
+    }
+    let ignored = matcher.is_ignored(path);
+    cache.insert(path.as_bytes().to_vec(), ignored);
+    ignored
+}
+
+pub fn has_verified_object(state: &State, hash: &ObjectHash) -> bool {
+    state.open_verified_object(hash).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::RelativePath;
+    use crate::model::{PeerId, RelativePath, Version};
     use std::fs;
     use tempfile::tempdir;
 
@@ -667,6 +779,76 @@ mod tests {
     fn rejects_oversized_frame_before_allocation() {
         let bytes = ((MAX_FRAME as u32) + 1).to_be_bytes().to_vec();
         assert!(read_message(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn plan_records_share_protocol_frames() -> Result<()> {
+        let records = (0..100)
+            .map(|sequence| {
+                Ok(Record {
+                    path: RelativePath::from_bytes(format!("file-{sequence}").into_bytes())?,
+                    version: Version {
+                        peer: PeerId("peer-test".into()),
+                        sequence,
+                        timestamp_ns: sequence as i64,
+                        seen: Vec::new(),
+                        entry: Entry::Tombstone,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut wire = Vec::new();
+        write_plan(
+            &mut wire,
+            &Plan {
+                records,
+                conflicts: Vec::new(),
+            },
+        )?;
+        let mut input = wire.as_slice();
+        let mut chunks = 0;
+        loop {
+            match read_message(&mut input)? {
+                Message::ApplyChunk { records, .. } => {
+                    chunks += 1;
+                    assert!(records.len() > 1);
+                }
+                Message::ApplyEnd => break,
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        assert_eq!(chunks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_cached_object_is_requested_and_replaced() -> Result<()> {
+        let temp = tempdir()?;
+        let state = State::open(temp.path().join("state"))?;
+        let bytes = b"expected";
+        let hash = ObjectHash::from_blake3(blake3::hash(bytes));
+        state.import_object(&hash, bytes)?;
+        fs::write(state.object_path(&hash), b"corrupt")?;
+        let record = Record {
+            path: RelativePath::from_bytes(b"file".to_vec())?,
+            version: Version {
+                peer: PeerId("peer-test".into()),
+                sequence: 1,
+                timestamp_ns: 1,
+                seen: Vec::new(),
+                entry: Entry::File {
+                    hash: hash.clone(),
+                    size: bytes.len() as u64,
+                    executable: false,
+                },
+            },
+        };
+        assert_eq!(required_hashes(&state, &[record]), vec![hash.clone()]);
+        let mut sink = state.begin_object(hash.clone(), bytes.len() as u64)?;
+        sink.write_chunk(bytes)?;
+        sink.finish()?;
+        assert_eq!(state.read_object(&hash)?, bytes);
+        Ok(())
     }
 
     #[test]

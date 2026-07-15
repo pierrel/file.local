@@ -293,7 +293,7 @@ fn run_sync(state: &mut State, path: &Path, dry_run: bool, yes: bool, json: bool
             .into_iter()
             .flatten()
         {
-            if !state.object_path(&hash).exists() && !needs.contains(&hash) {
+            if !sync::has_verified_object(state, &hash) && !needs.contains(&hash) {
                 needs.push(hash);
             }
         }
@@ -580,7 +580,7 @@ fn serve_sync(
                 if !peer_snapshot_done || plan_ready {
                     bail!("apply end received out of order");
                 }
-                let expected = sync::plan(&state.records(share)?, &peer_records);
+                let expected = sync::plan(advertised, &peer_records);
                 if pending != expected {
                     bail!("peer apply plan does not match deterministic reconciliation");
                 }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use flocal::model::Entry;
 use flocal::scan::scan;
 use flocal::state::State;
-use flocal::sync::apply_plan;
+use flocal::sync::{apply_plan, refresh};
 use tempfile::tempdir;
 
 #[test]
@@ -49,12 +49,15 @@ fn ignored_existing_file_is_not_tombstoned() -> Result<()> {
     let root = temp.path().join("root");
     fs::create_dir_all(&root)?;
     fs::write(root.join("local.env"), "secret")?;
-    let state = State::open(temp.path().join("state"))?;
+    let mut state = State::open(temp.path().join("state"))?;
     let share = state.init_share(&root)?;
-    let first = scan(&state, &share, &root, &[])?;
+    let first = refresh(&mut state, &share)?;
+    assert!(first.iter().any(|r| r.path.display() == "local.env"));
     fs::write(root.join(".gitignore"), "local.env\n")?;
-    let second = scan(&state, &share, &root, &first)?;
-    let record = second
+    let advertised = refresh(&mut state, &share)?;
+    assert!(!advertised.iter().any(|r| r.path.display() == "local.env"));
+    let persisted = state.records(&share)?;
+    let record = persisted
         .iter()
         .find(|r| r.path.display() == "local.env")
         .unwrap();

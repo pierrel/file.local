@@ -77,11 +77,24 @@ impl ObjectSink {
             bail!("received object hash mismatch");
         }
         self.file.sync_all()?;
-        if self.final_path.exists() && object_path_matches(&self.final_path, &self.expected_hash)? {
-            fs::remove_file(&self.temp_path)?;
-        } else {
-            fs::rename(&self.temp_path, &self.final_path)?;
-            sync_dir(self.final_path.parent().expect("object parent"))?;
+        match fs::symlink_metadata(&self.final_path) {
+            Ok(_) if object_path_matches(&self.final_path, &self.expected_hash)? => {
+                fs::remove_file(&self.temp_path)?;
+            }
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    fs::remove_dir(&self.final_path)?;
+                } else {
+                    fs::remove_file(&self.final_path)?;
+                }
+                fs::rename(&self.temp_path, &self.final_path)?;
+                sync_dir(self.final_path.parent().expect("object parent"))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::rename(&self.temp_path, &self.final_path)?;
+                sync_dir(self.final_path.parent().expect("object parent"))?;
+            }
+            Err(error) => return Err(error.into()),
         }
         Ok(())
     }
@@ -738,10 +751,24 @@ impl State {
         expected_size: u64,
     ) -> Result<ObjectSink> {
         let budget_lock = self.lock_objects()?;
-        if expected_size > self.available_object_bytes()? {
+        let final_path = self.object_path(&expected_hash);
+        let reclaimable = match fs::symlink_metadata(&final_path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && !object_path_matches(&final_path, &expected_hash)? =>
+            {
+                metadata.len()
+            }
+            Ok(_) | Err(_) => 0,
+        };
+        if expected_size > self.available_object_bytes()?.saturating_add(reclaimable) {
             bail!("object exceeds remaining state storage budget");
         }
-        let final_path = self.object_path(&expected_hash);
+        if reclaimable > 0 {
+            fs::remove_file(&final_path)?;
+            sync_dir(final_path.parent().expect("object parent"))?;
+        }
         let temp_path = self
             .dir
             .join("objects")

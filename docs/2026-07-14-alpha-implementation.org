@@ -12,8 +12,12 @@
 - SQLite state in WAL/FULL mode, stable installation/share/peer identities,
   per-share sequences, records, peer binding, initial-sync state, and conflicts.
 - Git-compatible nested ignore walking with unconditional =.git= exclusion.
+  Newly ignored synchronized paths retain local history but are excluded from
+  advertised snapshots, so each peer can keep its own ignored content.
 - Streaming capture and transfer through validated, content-addressed BLAKE3
   objects. Snapshot and apply streams are split into bounded protocol frames.
+  Missing or corrupt cached objects are requested again and eventually repaired
+  by a validated replacement transfer.
 - Regular files, executable bits, directories, symlinks, deletions/tombstones,
   initial union, deterministic whole-file LWW, and retained conflict inputs.
 - Mandatory initial-sync preview/confirmation and versioned JSON for status,
@@ -77,7 +81,9 @@ which may remain visible proof-stage constraints.
   rejection, =.gitignore= behavior, protocol frame bounds, causal
   reconciliation, convergence, and symlink-parent rejection.
 - Integration coverage for scan/apply/delete, nested deletion, file/directory
-  transitions, ignored-file preservation, and bidirectional synchronization
+  transitions, ignored-file preservation and advertisement exclusion, and
+  bidirectional synchronization
   across an SSH process boundary using two state stores and directory roots.
+- Unit coverage for corrupt-object detection and eventual repair.
 - Required local gates: =cargo fmt --check=, =cargo clippy --all-targets
   --all-features -- -D warnings=, and =cargo test --all-targets=.
