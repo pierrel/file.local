@@ -101,7 +101,7 @@ mod tests {
                 seen: Vec::new(),
                 entry: Entry::File {
                     hash: ObjectHash::from_blake3(blake3::hash(text.as_bytes())),
-                    size: 1,
+                    size: text.len() as u64,
                     executable: false,
                 },
             },

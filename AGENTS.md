@@ -19,7 +19,11 @@ Every non-trivial feature follows three phases:
    fit; user guidance and intention; end-to-end user experience; clean
    interfaces; filesystem correctness; and threat model/attack surface. Apply
    the most scrutiny to network and untrusted-filesystem changes. Reconcile
-   findings into the design before implementing.
+   findings into the design. Present the reviewed design to the user and, by
+   default, require explicit user sign-off before implementing it. Prior
+   approval is required unless the user explicitly delegates design approval
+   for that feature; silence, a request to draft a design, or approval of an
+   earlier design is not implementation authorization.
 2. **Code.** Implement against the accepted design and test the observable
    behavior. Then run independent code-review subagents in parallel through the
    lenses of simplicity; clean code and interfaces; readability; existing
@@ -34,11 +38,10 @@ Every non-trivial feature follows three phases:
    rerunning the affected local-review lenses before pushing. After the fix is
    pushed, resolve each GitHub thread that it fully addresses. If a thread needs
    a user decision or clarification, reply in that thread instead of resolving
-  it and sign the reply `— Codex` so automated comments are distinguishable
-  from the user's own comments. Once local review is clean and current feedback
-  is addressed, mark the pull request ready for review before requesting a
-  Copilot review. Never request Copilot while the pull request is still a draft.
-  The user merges.
+   it and sign the reply `— Codex` so automated comments are distinguishable
+   from the user's own comments. Once local review is clean and current feedback
+   is addressed, mark the pull request ready for review and enter the Copilot
+   review stage below. The user merges.
 
 Branch from `main`, never from another feature branch. Use one feature per
 branch. Commit and push freely on feature branches, but never merge or commit
@@ -112,7 +115,67 @@ adherence; shared-logic and line-count reduction; cross-platform filesystem
 correctness; adversarial security; and documentation alignment. Each reviewer
 must cite evidence and return categorized findings or an explicit clear result.
 Rerun every affected lens after a fix until it reports no blocker or important
-finding.
+finding. The complete local gate includes both whole-project and changed-line
+coverage of at least 90% through `make check`; dependencies are excluded, and
+coverage below either threshold is a blocker.
+
+## Copilot review stage
+
+Copilot review begins only after the complete local review team is clear, all
+local gates pass, the reviewed changes are pushed, current human review threads
+are addressed, and the pull request is marked ready for review. Never request
+Copilot while the pull request is a draft or while known local blocker or
+important findings remain.
+
+Request Copilot to review the current head commit, then inspect its complete
+review and thread state. Treat correctness, security, performance, tests,
+documentation, examples, CLI help, and code/design/README alignment as
+meaningful feedback. Do not dismiss a finding merely because it changes only
+documentation or exposes pre-existing drift in code touched by the pull
+request.
+
+Record a disposition for every Copilot thread or review finding, with evidence:
+`fixed`, `already satisfied/not applicable`, `duplicate`, or `user decision`.
+Only the first category normally produces a change; the others require a signed
+in-thread explanation. Convergence requires that no unresolved item is
+classified as actionable, not merely that no new code was suggested.
+
+For each round:
+
+1. Cluster every actionable Copilot thread and implement all meaningful fixes.
+2. Rerun the affected local-review lenses to convergence and rerun the complete
+   local validation gates.
+3. Push the reviewed fix, reply in each addressed thread with a signed
+   `— Codex` response, and resolve only threads fully addressed. Leave decision
+   threads open with a signed explanation or question.
+4. If meaningful fixes produced a new head, fewer than seven Copilot reviews
+   have been submitted, and the preceding review was not converged, confirm the
+   pull request is ready and request Copilot again. On convergence, do not
+   request another round. At seven submitted reviews, stop and report the
+   remaining feedback instead of requesting an eighth.
+
+Immediately after each Copilot request, start a **recurring monitor** for the
+pull request with its first scheduled check about seven minutes later. This is
+the workflow's wake-up mechanism: it must inspect submitted reviews, unresolved
+threads, and checks, then resume the round without waiting for a user message.
+If the environment cannot schedule a seven-minute continuation directly, keep
+the turn active and poll with the available wait/monitor mechanism at intervals
+of at most 60 seconds until the review arrives or seven minutes elapse, then
+continue monitoring rather than ending the task.
+
+A round is one submitted Copilot review of one head commit. Continue until a
+round produces no meaningful actionable findings: that is Copilot convergence.
+Stop after at most seven submitted Copilot review rounds for a pull request; at
+that limit, report any remaining feedback and why it was not resolved rather
+than silently continuing. Categorize remaining feedback by severity. If any
+blocker or important-equivalent issue remains, return the pull request to draft
+and request an explicit user risk/priority decision; the round cap limits
+automation, not the quality gate. Do not stop merely because one fix was pushed,
+CI is pending, or another review was requested. Keep working and monitoring
+until Copilot converges, seven rounds are submitted, or progress genuinely
+requires a user decision or external state change. A user-decision stop must
+state the specific decision, available evidence, and consequences of each
+viable choice.
 
 ## Engineering principles
 

@@ -6,4 +6,4 @@ pub mod scan;
 pub mod state;
 pub mod sync;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub use sync::PROTOCOL_VERSION;

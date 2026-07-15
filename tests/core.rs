@@ -66,6 +66,70 @@ fn ignored_existing_file_is_not_tombstoned() -> Result<()> {
 }
 
 #[test]
+fn synchronizes_symlinks_and_executable_mode_changes() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let temp = tempdir()?;
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    fs::create_dir_all(&source)?;
+    fs::create_dir_all(&target)?;
+    fs::write(source.join("script"), "first")?;
+    fs::set_permissions(source.join("script"), fs::Permissions::from_mode(0o755))?;
+    symlink("script", source.join("link"))?;
+    let mut source_state = State::open(temp.path().join("source-state"))?;
+    let share = source_state.init_share(&source)?;
+    let mut target_state = State::open(temp.path().join("target-state"))?;
+    target_state.register_share(&share, &target)?;
+    let first = scan(&source_state, &share, &source, &[])?;
+    copy_objects(&source_state, &target_state, &first)?;
+    apply_plan(&mut target_state, &share, &first)?;
+    assert_eq!(
+        fs::read_link(target.join("link"))?,
+        std::path::Path::new("script")
+    );
+    assert_ne!(
+        fs::metadata(target.join("script"))?.permissions().mode() & 0o111,
+        0
+    );
+
+    source_state.replace_records(&share, &first)?;
+    fs::write(source.join("script"), "second")?;
+    fs::set_permissions(source.join("script"), fs::Permissions::from_mode(0o644))?;
+    fs::remove_file(source.join("link"))?;
+    let second = scan(&source_state, &share, &source, &first)?;
+    copy_objects(&source_state, &target_state, &second)?;
+    apply_plan(&mut target_state, &share, &second)?;
+    assert_eq!(
+        fs::metadata(target.join("script"))?.permissions().mode() & 0o111,
+        0
+    );
+    assert!(!target.join("link").exists());
+    Ok(())
+}
+
+#[test]
+fn preview_reports_deletion_without_advancing_persisted_state() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("file"), "value")?;
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("socket"))?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let first = refresh(&mut state, &share)?;
+    fs::remove_file(root.join("file"))?;
+    let previewed = flocal::scan::preview(&state, &share, &root, &first)?;
+    assert!(
+        previewed
+            .iter()
+            .any(|record| matches!(record.version.entry, Entry::Tombstone))
+    );
+    assert_eq!(state.records(&share)?, first);
+    Ok(())
+}
+
+#[test]
 fn applies_nested_deletions_and_file_directory_transitions() -> Result<()> {
     let temp = tempdir()?;
     let source = temp.path().join("source");

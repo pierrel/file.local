@@ -25,7 +25,8 @@ flocal peer add ~/src/example --host buildbox --remote-path /srv/work/example
 #+end_src
 
 The =--host= value can be a hostname, address, or =~/.ssh/config= alias. After
-pairing, run synchronization commands from either peer's directory. For the
+pairing, run synchronization commands from the initiating peer's directory.
+The alpha responder accepts incoming sessions but cannot initiate them. For the
 first sync, inspect the preview before approving it:
 
 #+begin_src sh

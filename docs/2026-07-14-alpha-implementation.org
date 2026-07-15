@@ -85,5 +85,6 @@ which may remain visible proof-stage constraints.
   bidirectional synchronization
   across an SSH process boundary using two state stores and directory roots.
 - Unit coverage for corrupt-object detection and eventual repair.
-- Required local gates: =cargo fmt --check=, =cargo clippy --all-targets
-  --all-features -- -D warnings=, and =cargo test --all-targets=.
+- Required local gate: =make check=. It runs formatting and lint checks, the
+  complete test suite under coverage, and requires at least 90% line coverage
+  both project-wide and on executable lines changed from =github/main=.

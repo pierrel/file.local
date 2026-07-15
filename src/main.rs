@@ -283,30 +283,40 @@ fn run_sync(state: &mut State, path: &Path, dry_run: bool, yes: bool, json: bool
         return remote.finish();
     }
 
-    let mut needs = sync::required_hashes_for_share(state, &share, &plan.records)?;
     let root = state.root_for(&share)?;
+    let mut required_records = plan.records.clone();
     for conflict in &plan.conflicts {
         if flocal::scan::is_ignored(&root, &conflict.path)? {
             continue;
         }
-        for hash in [record_hash(&conflict.winner), record_hash(&conflict.loser)]
-            .into_iter()
-            .flatten()
-        {
-            if !sync::has_verified_object(state, &hash) && !needs.contains(&hash) {
-                needs.push(hash);
-            }
-        }
+        required_records.push(conflict.winner.clone());
+        required_records.push(conflict.loser.clone());
     }
+    let needs = sync::required_hashes_for_share(state, &share, &required_records)?;
     sync::write_message(
         &mut remote.input,
         &Message::Need {
             hashes: needs.clone(),
         },
     )?;
+    let mut expected_sizes = std::collections::HashMap::new();
+    for record in &required_records {
+        if let Entry::File { hash, size, .. } = &record.version.entry {
+            expected_sizes.insert(hash.clone(), *size);
+        }
+    }
+    let transfer_limit = sync::max_transfer_bytes_per_session();
+    let mut received_bytes = 0u64;
     for expected in needs {
         match sync::read_message(&mut remote.output)? {
             Message::ObjectStart { hash, size } if hash == expected => {
+                if expected_sizes.get(&hash) != Some(&size) {
+                    bail!("peer object size differs from the validated plan");
+                }
+                received_bytes = received_bytes.saturating_add(size);
+                if received_bytes > transfer_limit {
+                    bail!("inbound object transfer exceeds session byte limit");
+                }
                 sync::receive_object(state, hash, size, &mut remote.output)?;
             }
             other => bail!("expected object {expected}, got {other:?}"),
@@ -323,7 +333,29 @@ fn run_sync(state: &mut State, path: &Path, dry_run: bool, yes: bool, json: bool
         Message::Need { hashes } => hashes,
         other => bail!("expected remote object request, got {other:?}"),
     };
+    let unique: std::collections::HashSet<_> = remote_needs.iter().collect();
+    if unique.len() != remote_needs.len() {
+        bail!("peer object request contains duplicate hashes");
+    }
+    let mut allowed_outbound: std::collections::HashSet<_> =
+        local.iter().filter_map(record_hash).collect();
+    for conflict in &plan.conflicts {
+        allowed_outbound.extend(
+            [record_hash(&conflict.winner), record_hash(&conflict.loser)]
+                .into_iter()
+                .flatten(),
+        );
+    }
+    let mut outbound_bytes = 0u64;
     for hash in remote_needs {
+        if !allowed_outbound.contains(&hash) {
+            bail!("peer requested an object outside this share");
+        }
+        outbound_bytes =
+            outbound_bytes.saturating_add(state.open_verified_object(&hash)?.metadata()?.len());
+        if outbound_bytes > transfer_limit {
+            bail!("outbound object transfer exceeds session byte limit");
+        }
         sync::send_object(state, &hash, &mut remote.input)?;
     }
     sync::write_message(&mut remote.input, &Message::Done)?;
@@ -346,6 +378,14 @@ fn serve(state: &mut State) -> Result<()> {
     let stdout = io::stdout();
     let mut input = BufReader::new(TimedReader::new(stdin.lock()));
     let mut output = BufWriter::new(stdout.lock());
+    serve_io(state, &mut input, &mut output)
+}
+
+fn serve_io(
+    state: &mut State,
+    mut input: &mut impl Read,
+    mut output: &mut impl Write,
+) -> Result<()> {
     match sync::read_message(&mut input)? {
         Message::Register {
             protocol,
@@ -1023,4 +1063,289 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 fn bytes_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::OsStr::from_bytes(bytes).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn serve_messages(messages: &[Message]) -> Result<(Result<()>, Vec<u8>)> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let mut input = Vec::new();
+        for message in messages {
+            sync::write_message(&mut input, message)?;
+        }
+        let mut output = Vec::new();
+        let result = serve_sync(&mut state, &share, &[], &mut input.as_slice(), &mut output);
+        Ok((result, output))
+    }
+
+    fn initial_message(message: Message) -> Result<(Result<()>, Vec<u8>)> {
+        let temp = tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let mut input = Vec::new();
+        sync::write_message(&mut input, &message)?;
+        let mut output = Vec::new();
+        let result = serve_io(&mut state, &mut input.as_slice(), &mut output);
+        Ok((result, output))
+    }
+
+    #[test]
+    fn serve_sync_accepts_empty_exchange_and_cancel() -> Result<()> {
+        let (result, output) = serve_messages(&[
+            Message::Need { hashes: Vec::new() },
+            Message::SnapshotEnd,
+            Message::ApplyEnd,
+            Message::Done,
+            Message::Done,
+        ])?;
+        result?;
+        let mut messages = output.as_slice();
+        assert!(matches!(sync::read_message(&mut messages)?, Message::Done));
+        assert!(
+            matches!(sync::read_message(&mut messages)?, Message::Need { hashes } if hashes.is_empty())
+        );
+        assert!(matches!(
+            sync::read_message(&mut messages)?,
+            Message::Applied
+        ));
+        serve_messages(&[Message::Cancel])?.0?;
+        Ok(())
+    }
+
+    #[test]
+    fn serve_sync_rejects_out_of_order_and_untrusted_messages() -> Result<()> {
+        let hash = flocal::model::ObjectHash::from_blake3(blake3::hash(b"x"));
+        let cases = vec![
+            vec![Message::Need {
+                hashes: vec![hash.clone(), hash.clone()],
+            }],
+            vec![Message::Need {
+                hashes: vec![hash.clone()],
+            }],
+            vec![Message::ObjectStart {
+                hash: hash.clone(),
+                size: 1,
+            }],
+            vec![Message::SnapshotEnd, Message::SnapshotEnd],
+            vec![Message::ApplyChunk {
+                records: Vec::new(),
+                conflicts: Vec::new(),
+            }],
+            vec![Message::ApplyEnd],
+            vec![Message::Accepted {
+                protocol: sync::PROTOCOL_VERSION,
+                peer: flocal::model::PeerId("unexpected".into()),
+            }],
+        ];
+        for messages in cases {
+            assert!(serve_messages(&messages)?.0.is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn formatting_and_validation_helpers_cover_all_entry_kinds() -> Result<()> {
+        assert!(validate_host("host").is_ok());
+        assert!(validate_host("").is_err());
+        assert!(validate_host("-option").is_err());
+        assert!(validate_host("bad\nhost").is_err());
+        assert!(validate_executable("/usr/local/bin/flocal").is_ok());
+        assert!(validate_executable("flocal").is_err());
+        assert!(validate_executable("/bad path").is_err());
+        assert_eq!(escaped("a\nb"), "a\\nb");
+
+        let record = |name: &[u8], entry: Entry| flocal::model::Record {
+            path: flocal::model::RelativePath::from_bytes(name.to_vec()).unwrap(),
+            version: flocal::model::Version {
+                peer: flocal::model::PeerId("peer".into()),
+                sequence: 1,
+                timestamp_ns: 1,
+                seen: Vec::new(),
+                entry,
+            },
+        };
+        let directory = record(b"directory", Entry::Directory);
+        let tombstone = record(b"deleted", Entry::Tombstone);
+        let symlink = record(
+            b"link",
+            Entry::Symlink {
+                target: b"target".to_vec(),
+            },
+        );
+        assert!(record_hash(&directory).is_none());
+        print_plan(
+            &[directory.clone(), symlink.clone()],
+            std::slice::from_ref(&directory),
+            &flocal::reconcile::Plan {
+                records: vec![directory.clone(), tombstone, symlink],
+                conflicts: Vec::new(),
+            },
+            false,
+        )?;
+        print_plan(
+            &[],
+            &[],
+            &flocal::reconcile::Plan {
+                records: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            true,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn initial_protocol_registration_and_rejections() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        let share = ShareId("share-protocol".into());
+        let peer = flocal::model::PeerId("peer-protocol".into());
+        let (result, output) = initial_message(Message::Register {
+            protocol: sync::PROTOCOL_VERSION,
+            share: share.clone(),
+            peer: peer.clone(),
+            root: path_bytes(&root),
+        })?;
+        result?;
+        assert!(matches!(
+            sync::read_message(&mut output.as_slice())?,
+            Message::Accepted { .. }
+        ));
+
+        for message in [
+            Message::Register {
+                protocol: sync::PROTOCOL_VERSION + 1,
+                share: share.clone(),
+                peer: peer.clone(),
+                root: path_bytes(&root),
+            },
+            Message::Sync {
+                protocol: sync::PROTOCOL_VERSION + 1,
+                share: share.clone(),
+                peer: peer.clone(),
+                dry_run: true,
+            },
+        ] {
+            let (result, output) = initial_message(message)?;
+            result?;
+            assert!(matches!(
+                sync::read_message(&mut output.as_slice())?,
+                Message::Error { .. }
+            ));
+        }
+        assert!(
+            initial_message(Message::Sync {
+                protocol: sync::PROTOCOL_VERSION,
+                share,
+                peer,
+                dry_run: true,
+            })?
+            .0
+            .is_err()
+        );
+        assert!(initial_message(Message::Done)?.0.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn initial_protocol_runs_bound_dry_sync() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = ShareId("share-bound".into());
+        let peer = flocal::model::PeerId("peer-bound".into());
+        state.register_share_bound(&share, &root, &peer)?;
+        let mut input = Vec::new();
+        sync::write_message(
+            &mut input,
+            &Message::Sync {
+                protocol: sync::PROTOCOL_VERSION,
+                share,
+                peer,
+                dry_run: true,
+            },
+        )?;
+        sync::write_message(&mut input, &Message::Cancel)?;
+        let mut output = Vec::new();
+        serve_io(&mut state, &mut input.as_slice(), &mut output)?;
+        let mut messages = output.as_slice();
+        assert!(matches!(
+            sync::read_message(&mut messages)?,
+            Message::Accepted { .. }
+        ));
+        assert!(matches!(
+            sync::read_message(&mut messages)?,
+            Message::SnapshotEnd
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn registration_reports_lock_and_binding_failures() -> Result<()> {
+        fn register(
+            state: &mut State,
+            share: &ShareId,
+            peer: &flocal::model::PeerId,
+            root: &Path,
+        ) -> Result<Message> {
+            let mut input = Vec::new();
+            sync::write_message(
+                &mut input,
+                &Message::Register {
+                    protocol: sync::PROTOCOL_VERSION,
+                    share: share.clone(),
+                    peer: peer.clone(),
+                    root: path_bytes(root),
+                },
+            )?;
+            let mut output = Vec::new();
+            serve_io(state, &mut input.as_slice(), &mut output)?;
+            sync::read_message(&mut output.as_slice())
+        }
+
+        let temp = tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = ShareId("share-register".into());
+        let peer = flocal::model::PeerId("peer-register".into());
+        assert!(matches!(
+            register(&mut state, &share, &peer, &first)?,
+            Message::Accepted { .. }
+        ));
+        assert!(matches!(
+            register(&mut state, &share, &peer, &second)?,
+            Message::Error { .. }
+        ));
+        assert!(matches!(
+            register(
+                &mut state,
+                &share,
+                &flocal::model::PeerId("different".into()),
+                &first
+            )?,
+            Message::Error { .. }
+        ));
+
+        let global = state.lock_global_sync()?;
+        assert!(matches!(
+            register(&mut state, &ShareId("global-lock".into()), &peer, &first)?,
+            Message::Error { .. }
+        ));
+        drop(global);
+        let share_lock = state.lock_share(&ShareId("share-lock".into()))?;
+        assert!(matches!(
+            register(&mut state, &ShareId("share-lock".into()), &peer, &first)?,
+            Message::Error { .. }
+        ));
+        drop(share_lock);
+        Ok(())
+    }
 }

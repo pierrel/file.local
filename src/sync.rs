@@ -229,6 +229,7 @@ fn advertised_records(root: &Path, records: &[Record]) -> Result<Vec<Record>> {
 }
 
 pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Result<()> {
+    validate_unique_paths(records)?;
     validate_declared_sizes(records)?;
     let root = state.root_for(share)?;
     let prior = state.records(share)?;
@@ -237,6 +238,11 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
         .map(|record| (record.path.as_bytes().to_vec(), record))
         .collect();
     let (intent, _) = state.set_install_intent(share, records)?;
+    let install_temps: std::collections::HashMap<&[u8], _> = intent
+        .temps
+        .iter()
+        .map(|temp| (temp.path.as_bytes(), temp))
+        .collect();
     let mut accepted = Vec::with_capacity(records.len());
     let matcher = IgnoreMatcher::new(&root)?;
     let mut ignore_cache = std::collections::HashMap::new();
@@ -278,10 +284,9 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
         let expected = prior
             .get(record.path.as_bytes())
             .map(|old| &old.version.entry);
-        let install_temp = intent
-            .temps
-            .iter()
-            .find(|temp| temp.path == record.path)
+        let install_temp = install_temps
+            .get(record.path.as_bytes())
+            .copied()
             .context("install intent is missing a temporary token")?;
         let mut token = install_temp.token.clone();
         let mut phase = install_temp.phase;
@@ -746,6 +751,16 @@ fn validate_declared_sizes(records: &[Record]) -> Result<()> {
                     entry.insert(*size);
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_paths(records: &[Record]) -> Result<()> {
+    let mut paths = std::collections::HashSet::new();
+    for record in records {
+        if !paths.insert(record.path.as_bytes()) {
+            bail!("apply plan contains duplicate paths");
         }
     }
     Ok(())
