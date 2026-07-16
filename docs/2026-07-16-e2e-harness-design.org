@@ -442,10 +442,12 @@ of wedging the developer machine or CI runner.
 One image serves both peers, built by a multi-stage Dockerfile at
 =tests/e2e/Dockerfile=:
 
-- *Builder stage:* =rust:1-bookworm=, =cargo build --release --locked= of the
-  repository source, with BuildKit cache mounts for the cargo registry and
-  target directory.
-- *Runtime stage:* =debian:bookworm-slim= plus =openssh-server=; copies the
+- *Builder stage:* =rust:1-bookworm= (the tag names the base here for
+  readability; the Dockerfile itself references it by manifest-list digest,
+  as below), =cargo build --release --locked= of the repository source, with
+  BuildKit cache mounts for the cargo registry and target directory.
+- *Runtime stage:* =debian:bookworm-slim= (likewise digest-pinned in the
+  Dockerfile) plus =openssh-server=; copies the
   binary in, creates the =peer= user, generates host keys, and installs the
   =flocal= entry point as the thin stderr-teeing wrapper described in
   section 8.
