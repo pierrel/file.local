@@ -657,7 +657,9 @@ Two rules:
 Every wait in the harness is a predicate polled at 250 ms under a bounded
 deadline (default 30 s); a deadline expiry produces the full failure dump,
 not a bare timeout. Fixed sleeps are forbidden as correctness mechanisms —
-the only sub-second sleep in the system is the poll interval itself. This is
+the only fixed sleep in the harness is the poll interval itself (the
+product's own 250 ms watch debounce is its own concern, outside this rule's
+scope). This is
 the same "no sleep-loop as correctness" discipline the project already
 applies elsewhere.
 
