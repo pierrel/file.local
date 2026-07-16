@@ -576,7 +576,7 @@ Scenarios are ordinary integration tests under =tests/e2e/= marked
 
 #+begin_example
 e2e:
-        cargo test --test e2e -- --ignored --test-threads=1
+	cargo test --test e2e -- --ignored --test-threads=1
 #+end_example
 
 Host prerequisites, checked up front with one-line diagnoses: a reachable
