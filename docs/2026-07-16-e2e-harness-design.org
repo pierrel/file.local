@@ -420,16 +420,19 @@ User-defined networks provide embedded DNS, so container A reaches B as
 =peer-b= — no IP addresses appear anywhere, satisfying the no-real-hosts rule
 by construction.
 
-Each container runs =sshd= as PID 1 (=/usr/sbin/sshd -D -e=) under a
-non-root user =peer= created at image build. The share root is
+Each container runs =sshd= as PID 1 (=/usr/sbin/sshd -D -e=), root as sshd
+requires for privilege separation; sessions log in as the unprivileged
+=peer= user created at image build (the root/non-root split section 9
+describes). The share root is
 =/home/peer/share=; =flocal= state lands in the real default
 =~/.local/state/file.local= — no =FLOCAL_STATE_DIR= override, because the
 point is exercising defaults.
 
-Each container mounts a per-run named Docker volume (labeled =flocal-e2e=1=
-and removed with the run) at =/home/peer=, so the share root /and/ the state
-directory live on a real host filesystem rather than the container's
-overlay2 layer. This is a correctness decision, not a convenience: =flocal=
+Each container mounts its own named Docker volume — two per run, one per
+peer, so the peers' filesystems stay fully independent (labeled
+=flocal-e2e=1= and removed with the run) — at =/home/peer=, so the share
+root /and/ the state directory live on a real host filesystem rather than
+the container's overlay2 layer. This is a correctness decision, not a convenience: =flocal=
 depends on =RENAME_EXCHANGE= / =RENAME_NOREPLACE= semantics and on inotify
 delivery, and overlayfs — especially fuse-overlayfs under rootless Docker —
 is an environment hazard for exactly those, which would masquerade as
@@ -517,10 +520,10 @@ Fresh containers per scenario (creation is 1–2 seconds against a built
 image); no state leaks between scenarios by construction.
 
 Ownership is explicit. A single run context, shared by =Arc=, owns the
-network, the run's volume, temporary directory and keys, the transcript, and
-a dumped-once flag. Each peer handle's =Drop= force-removes only its own
-container; the context's =Drop= — the last =Arc= clone — removes the network
-and volume. Every =Drop= logs its failures and never panics: a panicking
+network, the two per-peer volumes, the temporary directory and keys, the
+transcript, and a dumped-once flag. Each peer handle's =Drop= force-removes
+only its own container; the context's =Drop= — the last =Arc= clone —
+removes the network and both volumes. Every =Drop= logs its failures and never panics: a panicking
 =Drop= during unwind would abort the process and lose the failure dump. An
 ordinary panic (every failed assertion) therefore still cleans up, in order.
 
@@ -535,8 +538,9 @@ a time — two simultaneous runs would sweep each other's live containers.
 * 4. Connectivity control
 
 =offline()= is =docker network disconnect <net> <container>=; =online()= is
-=docker network connect --alias peer-b <net> <container>=. The failure-mode
-comparison:
+=docker network connect --alias <that peer's alias> <net> <container>= —
+the primitive is peer-generic, so reattaching peer A restores =peer-a= and
+peer B restores =peer-b=. The failure-mode comparison:
 
 - *=docker network disconnect= (chosen):* removes the container's interface
   and its embedded-DNS entry. The next SSH attempt fails immediately with
@@ -560,8 +564,8 @@ disconnect produces it in its cleanest, fastest form. If a future story needs
 hang-versus-refused distinctions, a second primitive can be added without
 disturbing =offline()='s meaning. One subtlety is handled inside =online()=:
 reconnection may assign a different IP, which is invisible to scenarios
-because everything addresses =peer-b= by alias, and the harness re-supplies
-the alias on reconnect.
+because peers address each other only by their configured DNS aliases, and
+the harness re-supplies the reattaching peer's own alias on reconnect.
 
 * 5. Runner integration
 
