@@ -29,10 +29,12 @@ product of this feature; the container plumbing exists to serve it.
 - A scenario vocabulary so small and literal that a new scenario reads as the
   user story it encodes, and a reviewer can verify it against the story
   without reading harness internals.
-- First-class coverage of the offline-deletion tombstone-retention story fixed
-  on =agent/tombstone-retention=: deletion discovered while the peer is
-  unreachable, retained across repeated scan cycles, propagated on reunion,
-  and never resurrected.
+- First-class coverage of the offline-deletion tombstone-retention story:
+  the harness lands first and /pins the bug on =main=/ as a strict expected
+  failure (section 2.4), then proves the fix on =agent/tombstone-retention=
+  by promoting the scenario from expected-fail to passing — a machine-checked
+  fail-to-pass validation, not an assumption that the fixed branch is
+  already present.
 - Deterministic, condition-based waiting. No fixed sleep is ever load-bearing
   for correctness.
 - Debuggability on failure: a failing scenario dumps both trees, both
@@ -122,7 +124,10 @@ peer A, =peer add= toward peer B, confirmed initial sync — and returns
 
 The end-to-end form of the =agent/tombstone-retention= fix
 (=offline_deletion_survives_scan_cycles_until_peer_returns= in
-=tests/core.rs=), now over real SSH and a real disconnected network:
+=tests/core.rs=), now over real SSH and a real disconnected network. The
+body below is its final form; it lands wrapped in =e2e::fails_on_main=
+(section 2.4) until PR #2 merges, and promotion deletes only the wrapper
+line:
 
 #+begin_src rust
 #[test]
@@ -213,7 +218,8 @@ fn files_directories_symlinks_and_exec_bits_sync_both_ways() -> Result<()> {
 *** Watch notices an editor-style atomic-rename save
 
 A later-slice scenario (catalog #13); it requires the
-=FLOCAL_WATCH_RESCAN_SECONDS= prerequisite of section 14.1:
+=FLOCAL_WATCH_RESCAN_SECONDS= hook of section 14.1, which is not needed for
+S1:
 
 #+begin_src rust
 #[test]
@@ -270,10 +276,11 @@ name, then =rename= — which stays within the same directory and mount.
 | =a.sync_expect_offline()=                 | asserts nonzero exit and that neither peer's tree changed |
 | =a.sync_expect_err(needle)=               | asserts nonzero exit and a substring of stderr |
 | =a.watch_start() -> Watch= / =watch.stop()= | foreground =flocal watch= held by a guard |
-| =p.status() -> Status=                    | parsed =status --json= (entries, tombstones, initial_complete, pending_install) |
+| =p.status() -> Status=                    | parsed =status --json= (entries, initial_complete, pending_install, and — from schema 2 — tombstones) |
 | =a.conflicts() -> Conflicts=              | parsed =conflicts list --json=, with =expect_one(path)= |
 | =a.restore_loser(id) -> String=           | =restore --version loser= to a scratch path outside the share; returns the content |
 | =p.reset_state()=                         | delete the peer's flocal state directory (=~/.local/state/file.local=) inside its container, so it no longer holds the share registration or peer binding, while its share files and the other peer's registration of it survive |
+| =e2e::fails_on_main(body)=                | strict expected-failure wrapper for scenarios pinning known-broken behavior on =main= (section 2.4) |
 
 =sync()= returns =Result<()>= — no report type is introduced until a
 scenario consumes one. A sync that records a conflict exits 0 and is a
@@ -306,9 +313,16 @@ Three lifecycle contracts deserve spelling out:
 
 =Status=, =Plan=, and =Conflicts= deserialize the product's own JSON and
 assert that the embedded =schema= field equals a constant pinned in the
-harness, failing with the actual version on mismatch. A schema bump — such
-as the tombstone branch's status change — therefore breaks scenarios
-mechanically and visibly rather than silently misparsing.
+harness, failing with the actual version on mismatch, so a schema bump
+breaks scenarios mechanically and visibly rather than silently misparsing.
+The pinned constant tracks /=main= at harness landing/: status schema 1,
+which has no =tombstones= field. The =Status= struct nevertheless declares
+=tombstones= as a required field — its final form — so scenarios #6 and #11
+cannot even parse a =main= status today. That is fine and expected: both
+land wrapped in =fails_on_main= (section 2.4). The tombstone pull request
+bumps the pinned constant to 2 in the same change that promotes #6, #8, and
+#11. An implementer must /not/ "helpfully" pin schema 2 at harness landing —
+that would break the seven scenarios that pass on =main=.
 
 *Connectivity:*
 
@@ -356,6 +370,38 @@ Exit codes and errors are asserted through the =sync_expect_*= lifecycle
 verbs rather than a general shell primitive, keeping scenarios declarative.
 A scenario that needs a new primitive adds one method to the harness; it
 never shells into a container directly.
+
+** 2.4 Strict expected failure: =fails_on_main=
+
+The accepted delivery order is harness first, off =main=, with zero
+product-code prerequisites — which means some scenarios encode behavior
+that is /known broken/ on =main= today. Those scenarios land wrapped:
+
+#+begin_src rust
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn offline_deletion_propagates_and_nothing_resurrects() -> Result<()> {
+    e2e::fails_on_main(|| {
+        // the pristine scenario body of example 2.2.1, unchanged
+    })
+}
+#+end_src
+
+=fails_on_main(body)= runs the scenario closure and inverts the verdict,
+strictly — the analog of pytest's =xfail(strict=True)=:
+
+- If the closure returns =Err= (any primitive or assertion fails), the test
+  /passes/: the known bug is still pinned. The section 8 failure dump is
+  suppressed, because the failure is the expected outcome.
+- If the closure succeeds, the test /fails/, with the message "scenario now
+  passes — promote it to a plain test in this PR".
+
+This is what keeps =main='s e2e run green while continuously pinning each
+known bug, and what forces the fixing pull request to flip the scenario in
+the same change — a machine-checked fail-to-pass validation. The fix cannot
+merge without deleting the wrapper, and the wrapper cannot outlive the fix.
+Promotion is exactly one edit — remove the wrapper line — because every
+wrapped scenario body is already written in its final, post-fix form.
 
 * 3. Container topology and lifecycle
 
@@ -585,7 +631,8 @@ Two rules:
 2. *=watch= gets a small testability hook and few scenarios.* The watch loop
    hardcodes its 30-second rescan (=rx.recv_timeout(Duration::from_secs(30))=
    in =src/main.rs=), which would make every watch scenario cost tens of
-   seconds. Prerequisite code change, requiring sign-off (section 14.1): read
+   seconds. Product-code change, requiring sign-off and needed only for the
+   later-slice watch scenarios — not for S1 (section 14.1): read
    =FLOCAL_WATCH_RESCAN_SECONDS= with a default of 30 and a clamped floor of
    one second — zero or an unparseable value falls back to the default. The
    clamp is a deliberate, stated deviation from the unclamped
@@ -624,18 +671,22 @@ AGENTS.md forbids.
 | 3 | Initial union with both trees non-empty; same-path difference becomes a conflict, nothing deleted | design §Create and connect | S1 |
 | 4 | Basic bidirectional sync: files, directories, empty directory, symlink, exec bit (example 2.2.3); also asserts a =.flocal-tmp-=-prefixed file is never synchronized (absent on the peer). Covers acceptance criterion 1 /except renames/ | acceptance criterion 1 (partial) | S1 |
 | 5 | Offline edits on both sides plus a rename on one side; reconnect catch-up converges (with the alpha's documented delete-plus-create fallback for the unobserved rename) | acceptance criterion 2 | S1 |
-| 6 | Offline deletion retention: the tombstone story, end to end (example 2.2.1) | =agent/tombstone-retention= | S1 |
+| 6 | Offline deletion retention: the tombstone story, end to end (example 2.2.1); lands expected-fail on =main= (tombstone early-drop, PR #2) and is promoted when that fix merges | =agent/tombstone-retention= | S1 |
 | 7 | Nested deletion of a directory tree propagates | existing =tests/core.rs= coverage, now over SSH | S1 |
-| 8 | Recreation over a retained tombstone supersedes it | tombstone fix, recreation arm | S1 |
+| 8 | Recreation over a retained tombstone supersedes it; lands expected-fail on =main= (PR #2), promoted with #6 | tombstone fix, recreation arm | S1 |
 | 9 | Concurrent-edit conflict: winner on both, loser retained, =restore= works (example 2.2.2) | acceptance criterion 3 | S1 |
-| 10 | Peer identity mismatch: =b.reset_state()= empties B's registration; =a.sync_expect_err("peer identity mismatch")= observes the rejection and no file on either peer changes (depends on the =bound_peer= prerequisite, section 14.2) | design §Security model | S1 |
-| 11 | Status and tombstone counts across the deletion lifecycle | status schema (tombstone branch) | S1 |
+| 10 | Peer identity mismatch: =b.reset_state()= empties B's registration; =a.sync_expect_err("peer identity mismatch")= observes the rejection and no file on either peer changes; lands expected-fail on =main= (=bound_peer= error contract, section 14.2) and is promoted by that fix's own pull request | design §Security model | S1 |
+| 11 | Status and tombstone counts across the deletion lifecycle; lands expected-fail on =main= (PR #2), promoted with #6 | status schema (tombstone branch) | S1 |
 | 12 | Ignore rules: pre-existing ignored path never transfers; newly-ignored path is not deleted on either peer | acceptance criterion 4 | later |
 | 13 | Watch mode: editor-style atomic-rename save propagates (example 2.2.4); requires the section 14.1 hook | v0.0.1 story "Saving a buffer" | later |
 | 14 | Watch mode: peer goes offline and returns; unattended catch-up asserted via =wait_*= on the reconnected tree (the watcher's offline/reconnected stderr text has no observing verb and is not promised) | v0.0.1 reconnect story | later |
 | 15 | Interrupted transfer: kill the SSH session mid-transfer of a large file; destination is old-complete or new-complete; the next sync converges. Requires new vocabulary when implemented: a kill-mid-transfer primitive, since =sync()= is blocking. No user-visible observable exists today for "committed files were not retransferred"; naming one would be a further product change | acceptance criterion 7 | later |
 | 16 | Large file streams within bounded memory and session budgets. Requires per-peer =Config= knobs (=FLOCAL_MAX_SESSION_BYTES=) and byte-oriented content primitives when implemented | acceptance criterion 6 | later |
 | 17 | =.git= is never scanned, transferred, or deleted | acceptance criterion 5 | later |
+
+Rows marked expected-fail land wrapped in =fails_on_main= (section 2.4).
+All four wrapped scenario bodies are written in their final, post-fix form
+from day one; promotion deletes only the wrapper line.
 
 The budget and limit behaviors already covered elsewhere
 (=FLOCAL_MAX_STATE_BYTES=, =FLOCAL_MAX_SESSION_SECONDS=, the recovery-space
@@ -653,7 +704,8 @@ assertions, and =assert_trees_equal()= in #4; =offline()=/=online()= in #5,
 #6, and #9; =rename()= in #5; =sync_expect_offline()=, =remove_dir_all()=,
 =assert_absent()=, =assert_status()= in #6–#7; =conflicts()=, =read()=,
 =restore_loser()= in #9; =sync_expect_err()= and =reset_state()= in #10;
-=remove()= and =status()= in #11 — or is reserved on paper for a named later
+=remove()= and =status()= in #11; =fails_on_main()= in #6, #8, #10, and
+#11 — or is reserved on paper for a named later
 scenario and implemented with it, per the slice policy: =pair_with()=,
 =watch_start()=/=stop()=, and the wait primitives (=wait_for_file=,
 =wait_absent=, =wait_status=) belong to the watch scenarios #13–#14.
@@ -709,7 +761,8 @@ bails early.
 
 Dump emission is exactly-once, guarded by the run context's flag: it fires
 at the first failing primitive, or at unwind (=std::thread::panicking=) for
-a panic that bypassed the harness. With =FLOCAL_E2E_KEEP=1= the harness
+a panic that bypassed the harness — except inside =fails_on_main=, where
+failure is the expected outcome and the dump is suppressed (section 2.4). With =FLOCAL_E2E_KEEP=1= the harness
 additionally preserves the containers and prints their names for manual
 =docker exec= inspection. A failing scenario — including a responder-side
 failure — must be diagnosable from its CI log alone.
@@ -806,9 +859,11 @@ runners are exactly where the BuildKit cache mounts deliver warm builds.
 
 The harness's first implementation is acceptable when:
 
-1. =make e2e= on a Linux machine with Docker builds the image and passes all
-   eleven S1 scenarios (catalog #1–#11), including the offline-deletion
-   retention scenario, over real SSH between two containers.
+1. =make e2e= on a Linux machine with Docker, running against =main=, builds
+   the image and runs all eleven S1 scenarios (catalog #1–#11) over real SSH
+   between two containers, with every scenario matching its declared
+   expectation: seven pass, and four (#6, #8, #10, #11) fail-as-expected
+   under =fails_on_main=.
 2. =make check= passes unchanged on a machine with no Docker daemon, with
    both coverage thresholds computed exactly as before — the =tests/e2e/=
    exclusion applied in both the Makefile =coverage= target and the CI
@@ -840,6 +895,10 @@ The harness's first implementation is acceptable when:
 10. =docker inspect= on a scenario's containers shows no published ports,
     and the single =docker run= call site contains no =-p=, =--publish=, or
     =--network host=.
+11. Promoting an expected-fail scenario requires only removing its
+    =fails_on_main= wrapper — no scenario-body edits — and the wrapper
+    fails loudly, naming the required promotion, when its scenario starts
+    passing.
 
 * 13. Alternatives considered
 
@@ -868,43 +927,55 @@ The harness's first implementation is acceptable when:
 
 * 14. Unresolved decisions
 
-For explicit user sign-off. This is a design-only deliverable: nothing
-described here is implemented, and this document must not be read as
-implying otherwise. Two of the decisions below are product-code
-prerequisites; the rest are policy.
+For explicit user sign-off, plus one direction already accepted and
+recorded. This is a design-only deliverable: nothing described here is
+implemented, and this document must not be read as implying otherwise. The
+harness itself has /zero/ product-code prerequisites; the two product
+changes below are sequenced after it, and each proves itself by promoting
+expected-fail scenarios (section 2.4).
 
-1. *The =FLOCAL_WATCH_RESCAN_SECONDS= hook* — the first of two product-code
-   changes this design requires (a few lines in =src/main.rs=, following the
-   established =FLOCAL_*= pattern, with the clamped one-second floor of
-   section 6). Approve the hook, or defer it and drop the watch scenarios
-   (#13–#14) from the plan? Recommendation: approve with the clamp — the
-   default is unchanged, environment variables are same-privilege
-   configuration so production posture is not eroded, and the clamp removes
-   the only misuse (a zero-interval hot loop).
-2. *The =bound_peer= error-contract fix* — the second product-code
-   prerequisite, forced by scenario #10. =State::bound_peer=
-   (=src/state.rs:532=) calls =query_row= without =.optional()=, so a
-   responder holding no registration for the share — exactly the state
-   =reset_state()= creates — dies on =QueryReturnedNoRows= /before writing
-   any protocol frame/; the connector observes a bare EOF ("failed to fill
-   whole buffer"), never the designed rejection. Making a missing row return
-   =Ok(None)= lets the existing graceful branch in =serve_io= answer, and
-   the connector observes "remote rejected sync: peer identity mismatch" —
-   the observable scenario #10 asserts. This also fixes a real product
-   error-contract hole that exists today: an internal database error plus an
-   opaque EOF where a clear rejection was designed. Recommendation: approve.
+1. *The =FLOCAL_WATCH_RESCAN_SECONDS= hook* — a product-code change (a few
+   lines in =src/main.rs=, following the established =FLOCAL_*= pattern,
+   with the clamped one-second floor of section 6). It is not needed for S1
+   at all — the watch scenarios are later slice — so it sequences after the
+   harness in any case. Approve the hook for the watch slice, or defer it
+   and drop the watch scenarios (#13–#14) from the plan? Recommendation:
+   approve with the clamp — the default is unchanged, environment variables
+   are same-privilege configuration so production posture is not eroded, and
+   the clamp removes the only misuse (a zero-interval hot loop).
+2. *The =bound_peer= error-contract fix* — a product-code change to sign
+   off, sequenced /after/ the harness: scenario #10 lands expected-fail,
+   pinning today's behavior, and the fix ships as its own small pull request
+   whose proof is #10's promotion. =State::bound_peer= (=src/state.rs:532=)
+   calls =query_row= without =.optional()=, so a responder holding no
+   registration for the share — exactly the state =reset_state()= creates —
+   dies on =QueryReturnedNoRows= /before writing any protocol frame/; the
+   connector observes a bare EOF ("failed to fill whole buffer"), never the
+   designed rejection. Making a missing row return =Ok(None)= lets the
+   existing graceful branch in =serve_io= answer, and the connector observes
+   "remote rejected sync: peer identity mismatch" — the observable #10's
+   final-form body asserts. This also fixes a real product error-contract
+   hole that exists today: an internal database error plus an opaque EOF
+   where a clear rejection was designed. Recommendation: approve, validated
+   by #10's promotion.
 3. *CI gating.* Should the new =e2e= job be required for merge from day one,
    or advisory for a probation period while its flakiness record is
    established? Recommendation: required — every wait is condition-based and
    the isolation is per-scenario, so a red run should be treated as signal.
-4. *Ordering against =agent/tombstone-retention=.* Without that branch, S1
-   does not merely weaken: scenarios #6 (the headline offline-deletion
-   story), #8, and #11 fail outright, because on =main= the deletion
-   resurrects. Landing the tombstone branch first is effectively the only
-   ordering compatible with acceptance criterion 12.1. Recommendation: land
-   it first. Its status-schema bump is then pinned by the harness's schema
-   constant (section 2.3), so running the harness against a pre-tombstone
-   binary fails loudly rather than silently misparsing.
+4. *Ordering — accepted direction, recorded here rather than open.* The
+   harness lands first, off =main=, with zero product-code prerequisites;
+   scenarios for known-broken behavior land as strict expected failures
+   (section 2.4). PR #2 (=agent/tombstone-retention=, open) stays open and
+   is re-validated by promoting #6, #8, and #11 when it lands after the
+   harness — on =main= today those scenarios fail outright because the
+   deletion resurrects, which is exactly what their wrappers pin. The
+   =bound_peer= =.optional()= fix becomes its own small pull request
+   promoting #10. Accepted trade-off: the tombstone data-loss fix merges
+   later than it otherwise would; that is acceptable for the current
+   single-user alpha, and PR #2's own unit-level regression tests already
+   demonstrate fail-on-main at that level. The status-schema pin follows the
+   same order (section 2.3): schema 1 at harness landing, bumped to 2 by the
+   tombstone pull request together with the promotions.
 5. *The slice boundary itself.* Approve S1 = catalog #1–#11 with #12–#17 as
    the enumerated follow-up, or pull items forward? Recommendation: approve
    as sliced; the strongest pull-forward candidates are #12 (ignore rules)
