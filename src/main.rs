@@ -694,7 +694,7 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":1,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install})
+            serde_json::json!({"schema":2,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install})
         );
     } else {
         println!("Share: {}", share.0);
