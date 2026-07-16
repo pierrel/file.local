@@ -1,0 +1,924 @@
+#+title: End-to-end two-container test harness
+#+date: 2026-07-16
+#+status: proposed
+
+* 1. Summary, goals, and non-goals
+
+The alpha implementation state records one standing validation gap: "Real
+cross-machine SSH and macOS filesystem acceptance still need to be run"
+([[file:2026-07-14-alpha-implementation.org][alpha implementation state]]). Today's closest test, =tests/ssh_sync.rs=,
+substitutes a shell script for =ssh= and runs both peers as processes of one
+user on one filesystem. That proves the protocol across a process boundary; it
+does not prove the product: real binaries, real =sshd=, real key
+authentication, two isolated filesystems, and a network that can actually go
+away.
+
+This design adds a true end-to-end harness: two Docker containers acting as
+real =flocal= peers over real SSH, driven from ordinary Rust tests. The
+headline requirement, stated by the user verbatim, is that "the interface for
+making changes to files, bringing the containers on and offline, and the like
+(the primitives of our use-cases) should be very easy to read and modify
+(almost like a very simple dsl)". The scenario-authoring interface is the
+product of this feature; the container plumbing exists to serve it.
+
+** Goals
+
+- True end-to-end coverage: released-profile =flocal= binaries, launched
+  through a real OpenSSH client and server, between two hosts with independent
+  filesystems, state directories, and network presence.
+- A scenario vocabulary so small and literal that a new scenario reads as the
+  user story it encodes, and a reviewer can verify it against the story
+  without reading harness internals.
+- First-class coverage of the offline-deletion tombstone-retention story fixed
+  on =agent/tombstone-retention=: deletion discovered while the peer is
+  unreachable, retained across repeated scan cycles, propagated on reunion,
+  and never resurrected.
+- Deterministic, condition-based waiting. No fixed sleep is ever load-bearing
+  for correctness.
+- Debuggability on failure: a failing scenario dumps both trees, both
+  statuses, and both container logs without being asked.
+
+** Non-goals
+
+- Replacing unit or existing integration tests. =tests/core.rs=,
+  =tests/protocol.rs=, =tests/state_api.rs=, and =tests/ssh_sync.rs= remain
+  the fast, always-on gate; the harness is a slower acceptance layer.
+- Performance or load testing. Scenarios assert behavior, not throughput.
+- macOS containers. Docker cannot run macOS; the macOS half of the acceptance
+  gap remains explicitly open (section 11).
+- Clock-skew fault injection. Containers share the host kernel clock, so LWW
+  skew scenarios are out of scope here (section 10).
+- More than two peers, matching the v0.0.1 share model.
+
+* 2. The scenario DSL
+
+** 2.1 Decision: a small Rust fluent API inside ordinary integration tests
+
+Three alternatives were evaluated:
+
+1. *A Rust fluent API* — scenarios are =#[test]= functions in
+   =tests/e2e/=, written against a =Peer= handle with verbs like =write=,
+   =offline=, =sync=, =assert_absent=.
+2. *An external plain-text scenario format* — a =.scenario= file per story
+   plus an interpreter that parses and executes it.
+3. *Shell-script helpers* — a =tests/e2e.sh= library of functions sourced by
+   per-scenario scripts.
+
+Option 1 is selected. Measured against the engineering principles in
+[[file:../AGENTS.md][AGENTS.md]]:
+
+- /Simplicity, no invented abstractions./ Option 2 invents a language: a
+  grammar, a parser, an interpreter, error reporting for malformed scenarios —
+  a permanent maintenance surface that exists only to avoid writing Rust in a
+  Rust repository. Option 1's "DSL" is nothing but well-named methods; there
+  is no syntax to maintain.
+- /Typo and type safety./ In option 1 a misspelled primitive, a missing
+  argument, or a =sync()= call on the wrong peer fails at compile time —
+  =cargo test --all-targets= (already in =make test= and CI) type-checks every
+  scenario on every run even when Docker is absent. Options 2 and 3 fail at
+  runtime, minutes into a container run, or silently (an unset shell variable
+  expands to nothing).
+- /IDE support./ Scenario authors get completion, jump-to-definition into the
+  harness, and rename refactoring for free. Neither alternative offers any.
+- /Rust-native tooling./ Scenarios run under =cargo test=, report through the
+  standard test harness, and reuse =anyhow= error context. Option 3 would be
+  the repository's only shell codebase and reintroduces the quoting and
+  word-splitting hazards this project deliberately engineers away at the SSH
+  boundary.
+- /Readability, the headline requirement./ The examples below are the
+  evidence: an option-1 scenario is a straight-line sequence of
+  subject-verb-object calls with no ceremony beyond =?=. Option 2 would read
+  marginally more "plain" at the cost of everything above; the gap is not
+  worth a parser.
+
+One deliberate type-level guardrail: pairing returns distinct types for the
+two roles. In v0.0.1-alpha only the connector may initiate =sync= and =watch=
+(the responder is launched over SSH on demand), so pairing yields
+=(Connector, Peer)= where =Connector= dereferences to =Peer= for the shared
+file, connectivity, and assertion vocabulary, and only =Connector= has
+=sync()= / =watch_start()=. Calling =sync= on the responder is a scenario
+bug the compiler rejects instead of a runtime surprise. This mirrors the
+product's real asymmetry rather than inventing one.
+
+Two mechanical rules keep that shape safe. First, every primitive takes
+=&self= — the transcript and other bookkeeping live in the shared run context
+(section 3.4) behind interior mutability — and no type in the harness
+implements =DerefMut=, which is precisely what makes
+=Connector: Deref<Target = Peer>= sound; the non-=mut= bindings in the
+committed examples are the intended style. Second, =peer_add= /consumes/ the
+two raw container handles and returns =(Connector, Peer)=, so a half-paired
+topology cannot linger in scope. =pair()= is implemented by calling the same
+public primitives — =containers()=, =init()=, =peer_add()=, one confirmed
+sync — so the opening logic exists exactly once.
+
+** 2.2 Example scenarios
+
+These are complete scenario bodies as they would be committed. =e2e::pair()=
+performs the standard opening — build image, start both containers, =init= on
+peer A, =peer add= toward peer B, confirmed initial sync — and returns
+=(Connector, Peer)=. All names are synthetic.
+
+*** Offline deletion is retained and never resurrects
+
+The end-to-end form of the =agent/tombstone-retention= fix
+(=offline_deletion_survives_scan_cycles_until_peer_returns= in
+=tests/core.rs=), now over real SSH and a real disconnected network:
+
+#+begin_src rust
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn offline_deletion_propagates_and_nothing_resurrects() -> Result<()> {
+    let (a, b) = e2e::pair()?;
+    a.write("dir/child", "v1")?;
+    a.sync()?;
+    b.assert_file("dir/child", "v1")?;
+
+    b.offline()?;
+    a.remove_dir_all("dir")?;
+    for _ in 0..3 {
+        a.sync_expect_offline()?; // a watch cycle: refresh, then fail to reach b
+    }
+    a.assert_status(|s| s.tombstones == 2)?; // exactly dir and dir/child
+
+    b.online()?;
+    a.sync()?;
+    a.assert_absent("dir")?;
+    b.assert_absent("dir")?;
+
+    a.sync()?; // steady-state round: retained tombstones must not reapply
+    a.assert_absent("dir")?;
+    b.assert_absent("dir")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+#+end_src
+
+*** Concurrent offline edits: one winner, loser recoverable
+
+#+begin_src rust
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn concurrent_edit_keeps_one_winner_and_a_recoverable_loser() -> Result<()> {
+    let (a, b) = e2e::pair()?;
+    a.write("notes.txt", "base")?;
+    a.sync()?;
+
+    b.offline()?;
+    a.write("notes.txt", "edit from a")?;
+    b.write("notes.txt", "edit from b")?;
+    b.online()?;
+    a.sync()?;
+
+    e2e::assert_trees_equal(&a, &b)?; // both show the same winner
+    let conflict = a.conflicts()?.expect_one("notes.txt")?;
+    let winner = a.read("notes.txt")?;
+    let loser = a.restore_loser(&conflict.id)?; // restores outside the share
+    let mut both = [winner, loser];
+    both.sort();
+    assert_eq!(both, ["edit from a", "edit from b"]);
+    Ok(())
+}
+#+end_src
+
+The scenario asserts that a deterministic winner exists on both peers and
+that the losing input is fully recoverable; it does not assert /which/ side
+wins, because the alpha stamps an offline edit at discovery-scan time
+(documented in the alpha implementation state), so the winner depends on
+scan ordering, not on which =write= line appears first.
+
+*** Basic bidirectional sync of every supported entry kind
+
+#+begin_src rust
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn files_directories_symlinks_and_exec_bits_sync_both_ways() -> Result<()> {
+    let (a, b) = e2e::pair()?;
+    a.write("src/lib.txt", "from a")?;
+    a.write("run.sh", "#!/bin/sh\n")?;
+    a.set_exec("run.sh")?;
+    a.symlink("current", "src/lib.txt")?;
+    a.mkdir("empty")?;
+    b.write("reply.txt", "from b")?;
+
+    a.sync()?;
+
+    b.assert_file("src/lib.txt", "from a")?;
+    b.assert_exec("run.sh")?;
+    b.assert_symlink("current", "src/lib.txt")?;
+    b.assert_dir("empty")?;
+    a.assert_file("reply.txt", "from b")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+#+end_src
+
+*** Watch notices an editor-style atomic-rename save
+
+A later-slice scenario (catalog #13); it requires the
+=FLOCAL_WATCH_RESCAN_SECONDS= prerequisite of section 14.1:
+
+#+begin_src rust
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn watch_notices_an_atomic_rename_save() -> Result<()> {
+    let (a, b) = e2e::pair_with(e2e::Config { watch_rescan_seconds: 1 })?;
+    a.write("notes.txt", "v1")?;
+    a.sync()?;
+
+    let watch = a.watch_start()?;
+    a.write(".notes.txt.tmp", "v2")?; // editor safe-save: temp file...
+    a.rename(".notes.txt.tmp", "notes.txt")?; // ...renamed over the original
+    b.wait_for_file("notes.txt", "v2")?; // condition-based, bounded timeout
+    watch.stop()
+}
+#+end_src
+
+** 2.3 The primitive vocabulary
+
+Everything a scenario may say. Receiver prefixes are the convention
+throughout: =a.= marks connector-only verbs, =p.= verbs available on either
+peer. Each primitive is one short method; the full set is deliberately
+enumerable on one page.
+
+*Peer file operations* (executed inside the container as the unprivileged
+user; paths are share-relative and validated by the harness — section 9):
+
+| =p.write(path, content)=    | create or replace a file, creating parents    |
+| =p.read(path) -> String=    | read a file                                    |
+| =p.mkdir(path)=             | create a directory (and parents)               |
+| =p.rename(from, to)=        | rename within the share (atomic-save pattern)  |
+| =p.remove(path)=            | delete a file or symlink                       |
+| =p.remove_dir_all(path)=    | delete a directory tree                        |
+| =p.symlink(path, target)=   | create a symlink with the given target text    |
+| =p.set_exec(path)=          | set the executable bit                         |
+
+=write()= streams content over stdin to =tee= and is deliberately /not/
+atomic: a running =watch= may observe a partially written file, exactly as
+it may with a real editor — a representative interleaving, not a harness
+defect. Watch-mode scenarios therefore assert only eventual states through
+the =wait_*= primitives, never intermediates. When a scenario needs an
+atomic mutation it composes it the way editors do — =write= to a temporary
+name, then =rename= — which stays within the same directory and mount.
+
+*Lifecycle* (each maps to exactly one =flocal= invocation or Docker action):
+
+| =e2e::containers() -> (PeerBox, PeerBox)= | started, unpaired containers — for pairing/rejection scenarios |
+| =e2e::pair() -> (Connector, Peer)=        | the standard opening: init, peer add, confirmed initial sync |
+| =e2e::pair_with(Config)=                  | same, with knobs (currently: watch rescan seconds) |
+| =a.init()= / =e2e::peer_add(a, b) -> (Connector, Peer)= | explicit pairing steps; =peer_add= consumes both =PeerBox= handles |
+| =a.sync()=                                | =flocal sync --yes=; fails the scenario on nonzero exit |
+| =a.sync_dry_run() -> Plan=                | =flocal sync --dry-run --json=; asserts nothing changed |
+| =a.sync_decline()=                        | =flocal sync= without =--yes=; answers "n" to the initial confirmation |
+| =a.sync_expect_offline()=                 | asserts nonzero exit and that neither peer's tree changed |
+| =a.sync_expect_err(needle)=               | asserts nonzero exit and a substring of stderr |
+| =a.watch_start() -> Watch= / =watch.stop()= | foreground =flocal watch= held by a guard |
+| =p.status() -> Status=                    | parsed =status --json= (entries, tombstones, initial_complete, pending_install) |
+| =a.conflicts() -> Conflicts=              | parsed =conflicts list --json=, with =expect_one(path)= |
+| =a.restore_loser(id) -> String=           | =restore --version loser= to a scratch path outside the share; returns the content |
+| =p.reset_state()=                         | delete the peer's flocal state directory (=~/.local/state/file.local=) inside its container, so it no longer holds the share registration or peer binding, while its share files and the other peer's registration of it survive |
+
+=sync()= returns =Result<()>= — no report type is introduced until a
+scenario consumes one. A sync that records a conflict exits 0 and is a
+successful =sync()=; "fails on nonzero exit" refers to transport and apply
+errors.
+
+Three lifecycle contracts deserve spelling out:
+
+- =sync_decline()= is meaningful only /before/ the initial confirmed sync:
+  the confirmation prompt is gated on incomplete initial reconciliation in
+  =src/main.rs=. The primitive waits for the =[y/N]= prompt on stdout before
+  feeding "n" over the exec's stdin, then asserts a clean exit and that
+  neither peer's tree changed. Because it requires observing the prompt,
+  misuse after =pair()= fails loudly instead of passing vacuously.
+- =sync_expect_offline()= asserts /no/ error text — only the nonzero exit
+  and unchanged trees. On an unreachable peer the product surfaces only a
+  generic connection/EOF failure (the SSH session's stderr is surfaced by
+  the product only on the clean-exit path), and the design does not promise
+  more than the product prints. It shares one exit-checking implementation
+  with =sync_expect_err()=.
+- =watch.stop()= terminates the watcher /inside/ the container: a second
+  =docker exec= signals the recorded PID and waits for it to exit, because
+  killing the =docker exec= client does not kill the exec'd process, and a
+  surviving watcher would keep holding the share and global locks. Even
+  SIGKILL is lock-safe by the product's own construction: =flock= releases
+  on process exit, SQLite WAL recovers, and =recover_installs= repairs any
+  interrupted install on the next command. =stop(self)= consumes the guard,
+  so double-stop is unrepresentable; the guard's =Drop= is the
+  never-panicking best-effort backstop.
+
+=Status=, =Plan=, and =Conflicts= deserialize the product's own JSON and
+assert that the embedded =schema= field equals a constant pinned in the
+harness, failing with the actual version on mismatch. A schema bump — such
+as the tombstone branch's status change — therefore breaks scenarios
+mechanically and visibly rather than silently misparsing.
+
+*Connectivity:*
+
+| =p.offline()= | detach the container from the shared network (section 4) |
+| =p.online()=  | reattach it, restoring its DNS alias                      |
+
+*Time — always a condition plus a bounded timeout, never a bare sleep:*
+
+| =p.wait_for_file(path, content)=  | poll until present with content, or dump and fail at the deadline |
+| =p.wait_absent(path)=             | poll until absent |
+| =p.wait_status(predicate)=        | poll =status --json= until the predicate holds |
+
+Default deadline 30 seconds, poll interval 250 ms, both overridable per call.
+Because =flocal sync= is synchronous, most scenarios need no waiting at all;
+the wait primitives exist for =watch=-mode scenarios and reconnection races.
+
+*Assertions* (each failure names the peer and, where the primitive knows
+them, the path plus expected and actual values — =assert_status= shows the
+peer and the full parsed status, since a closure predicate cannot print its
+own expectation — and triggers the failure dump of section 8):
+
+| =p.assert_file(path, content)= | exists, is a regular file, content matches |
+| =p.assert_absent(path)=        | no entry of any kind at the path |
+| =p.assert_dir(path)= / =p.assert_exec(path)= / =p.assert_symlink(path, target)= | kind- and metadata-specific |
+| =e2e::assert_trees_equal(&a, &b)= | full-tree comparison of kind, content hash, exec bit, link target |
+| =p.assert_status(predicate)=   | one assertion over the parsed status |
+
+Each =assert_*= shares its comparator with the corresponding =wait_*= — an
+assertion is its wait with a zero deadline — so a predicate cannot drift
+between its immediate and eventual forms.
+
+=assert_trees_equal= and every failure dump are fed by a harness-internal
+tree walk that is deliberately /not/ scenario-facing vocabulary. Its
+comparison mirrors what the product actually synchronizes: it excludes
+=.git= and any =.flocal-tmp-*= component exactly as the scanner does;
+records the executable bit as the boolean the product syncs
+(=mode & 0o111 != 0= — full permission modes legitimately differ across
+peers); hashes regular-file content only; records symlink target text from
+an =lstat=-based walk that never follows links, so a dangling link is
+representable; and treats empty directories as first-class entries. The
+harness never names its own staging files with the product-owned
+=.flocal-tmp-= prefix.
+
+Exit codes and errors are asserted through the =sync_expect_*= lifecycle
+verbs rather than a general shell primitive, keeping scenarios declarative.
+A scenario that needs a new primitive adds one method to the harness; it
+never shells into a container directly.
+
+* 3. Container topology and lifecycle
+
+** 3.1 Topology
+
+One user-defined Docker bridge network and two containers per scenario, with
+synthetic in-network aliases =peer-a= and =peer-b=. Real container and network
+names carry a per-run unique suffix (=flocal-e2e-<run>-a=) plus a
+=flocal-e2e=1= label so cleanup can never touch unrelated containers.
+User-defined networks provide embedded DNS, so container A reaches B as
+=peer-b= — no IP addresses appear anywhere, satisfying the no-real-hosts rule
+by construction.
+
+Each container runs =sshd= as PID 1 (=/usr/sbin/sshd -D -e=) under a
+non-root user =peer= created at image build. The share root is
+=/home/peer/share=; =flocal= state lands in the real default
+=~/.local/state/file.local= — no =FLOCAL_STATE_DIR= override, because the
+point is exercising defaults.
+
+Each container mounts a per-run named Docker volume (labeled =flocal-e2e=1=
+and removed with the run) at =/home/peer=, so the share root /and/ the state
+directory live on a real host filesystem rather than the container's
+overlay2 layer. This is a correctness decision, not a convenience: =flocal=
+depends on =RENAME_EXCHANGE= / =RENAME_NOREPLACE= semantics and on inotify
+delivery, and overlayfs — especially fuse-overlayfs under rootless Docker —
+is an environment hazard for exactly those, which would masquerade as
+product bugs. A tmpfs mount was rejected because =fsync= there is a no-op,
+quietly weakening the durability behavior the product exercises. Named
+volumes behave identically under rootful and rootless Docker.
+
+Containers are started with modest =--memory= and =--pids-limit= caps, so a
+regressed binary that leaks memory or forks unboundedly dies inside its own
+container — producing a scenario failure with the section 8 dump — instead
+of wedging the developer machine or CI runner.
+
+** 3.2 Image
+
+One image serves both peers, built by a multi-stage Dockerfile at
+=tests/e2e/Dockerfile=:
+
+- *Builder stage:* =rust:1-bookworm=, =cargo build --release --locked= of the
+  repository source, with BuildKit cache mounts for the cargo registry and
+  target directory.
+- *Runtime stage:* =debian:bookworm-slim= plus =openssh-server=; copies the
+  binary in, creates the =peer= user, generates host keys, and installs the
+  =flocal= entry point as the thin stderr-teeing wrapper described in
+  section 8.
+
+The build context is minimal and explicit: the Dockerfile =COPY=s only
+=Cargo.toml=, =Cargo.lock=, and =src/= — nothing else is needed to build the
+binary — and a =.dockerignore= (=.git=, =target=, =docs=, =references=,
+=tests=) is added as belt-and-braces. The repository has no =.dockerignore=
+today, so a naive =COPY . .= would ship =.git=, a multi-gigabyte =target/=,
+and any stray developer-local file into cached builder layers; the explicit
+COPY list makes that impossible rather than merely unlikely, and section 12
+makes it an acceptance criterion.
+
+Building on the host and copying the binary in was rejected: the developer
+host and CI runner link against a newer glibc than a stable slim base, so a
+host-built binary can fail to load in the container — an environment bug
+masquerading as a product bug. A musl static build would avoid that but adds
+a host cross-toolchain requirement (=rusqlite= bundles C). Building inside
+the image is hermetic and needs nothing but Docker.
+
+The base images are pinned by digest, matching this repository's convention
+of pinning CI actions by hash — specifically by /manifest-list/ digest, not
+a single-architecture image digest, so Docker Desktop on an Apple-silicon
+macOS development host resolves them and =make e2e= works there too (Linux
+containers on a macOS host; distinct from the macOS /CI/ limitation in
+section 11). Pinned bases are the smaller half of the supply-chain story:
+the real build-time fetch surface is crates.io — pinned by =Cargo.lock= and
+enforced by =--locked= — and Debian's signed apt repositories.
+
+One honesty note on caching: the cache mounts deliver seconds-warm rebuilds
+on local machines and persistent runners (the Forgejo target environment).
+GitHub-hosted CI runners are fresh VMs — no BuildKit cache survives between
+runs, and the =gha= layer-cache backend does not persist
+=RUN --mount=type=cache= contents — so CI runs build cold and are budgeted
+for it explicitly (section 12).
+
+** 3.3 Keys and SSH configuration
+
+Per run, the harness generates a throwaway ed25519 client keypair with
+=ssh-keygen= into the run's temporary directory — never written into the
+repository, never reused across runs. The public key is installed into
+=peer='s =authorized_keys= in both containers after start; the private key
+is copied into container A. Container A's =~/.ssh/config= gets:
+
+#+begin_example
+Host peer-b
+    User peer
+    IdentityFile ~/.ssh/id_ed25519
+    StrictHostKeyChecking accept-new
+#+end_example
+
+so =flocal peer add /home/peer/share --host peer-b --remote-path
+/home/peer/share= exercises the documented alias flow exactly.
+=accept-new= is safe here because the network is isolated and the host key
+is fixed at image build; it also keeps the first connection non-interactive.
+Pairing's =command -v flocal= discovery probe runs for real against the
+container's =sshd=.
+
+** 3.4 Lifecycle, ownership, and cleanup
+
+Fresh containers per scenario (creation is 1–2 seconds against a built
+image); no state leaks between scenarios by construction.
+
+Ownership is explicit. A single run context, shared by =Arc=, owns the
+network, the run's volume, temporary directory and keys, the transcript, and
+a dumped-once flag. Each peer handle's =Drop= force-removes only its own
+container; the context's =Drop= — the last =Arc= clone — removes the network
+and volume. Every =Drop= logs its failures and never panics: a panicking
+=Drop= during unwind would abort the process and lose the failure dump. An
+ordinary panic (every failed assertion) therefore still cleans up, in order.
+
+Two backstops cover what =Drop= cannot. =make e2e= begins by removing
+anything labeled =flocal-e2e=1= left behind by an aborted earlier run; the
+sweep is =rm=-only as an invariant — it never runs =exec= or =logs= against
+swept objects. And =FLOCAL_E2E_KEEP=1= disables cleanup deliberately for
+post-mortem inspection (the failure dump prints the container names when
+set). The sweep implies a stated assumption: one =make e2e= run per host at
+a time — two simultaneous runs would sweep each other's live containers.
+
+* 4. Connectivity control
+
+=offline()= is =docker network disconnect <net> <container>=; =online()= is
+=docker network connect --alias peer-b <net> <container>=. The failure-mode
+comparison:
+
+- *=docker network disconnect= (chosen):* removes the container's interface
+  and its embedded-DNS entry. The next SSH attempt fails immediately with
+  name-resolution or no-route errors; =flocal sync= exits nonzero within a
+  second — with the generic connection/EOF failure the product prints on
+  this path, which is exactly what =sync_expect_offline()= promises
+  (section 2.3). Deterministic, fast, needs no privileges beyond the Docker
+  access the harness already has, and works identically under rootful and
+  rootless Docker.
+- *iptables/nftables rules:* requires =NET_ADMIN= in the containers or root
+  on the host, and can emit either RST (refused) or silent drops (hangs)
+  depending on rule shape — more fidelity knobs than any current scenario
+  needs, at real privilege cost.
+- *=docker pause=:* freezes processes but the kernel still completes TCP
+  handshakes, so the SSH client connects and then stalls in the protocol
+  until =ServerAliveInterval= expires (~30–45 s with the options in
+  =src/main.rs=). Slow, and it models a hung peer rather than an absent one.
+
+All current stories need exactly one semantic — "peer unreachable" — and
+disconnect produces it in its cleanest, fastest form. If a future story needs
+hang-versus-refused distinctions, a second primitive can be added without
+disturbing =offline()='s meaning. One subtlety is handled inside =online()=:
+reconnection may assign a different IP, which is invisible to scenarios
+because everything addresses =peer-b= by alias, and the harness re-supplies
+the alias on reconnect.
+
+* 5. Runner integration
+
+** 5.1 Invocation
+
+Scenarios are ordinary integration tests under =tests/e2e/= marked
+=#[ignore = "requires docker; run via `make e2e`"]=. New Makefile target:
+
+#+begin_example
+e2e:
+        cargo test --test e2e -- --ignored --test-threads=1
+#+end_example
+
+Host prerequisites, checked up front with one-line diagnoses: a reachable
+Docker daemon with BuildKit (the cache-mount syntax requires it), and the
+OpenSSH client tools on the host (=ssh-keygen=, for the throwaway keypair).
+
+=#[ignore]= was chosen over a Cargo feature flag because it keeps the
+harness and every scenario compiling in the ordinary =cargo test
+--all-targets= path (=make test= and the CI test job), so type errors surface
+on machines without Docker, while never executing there. A feature flag
+would exclude the code from compilation exactly where compile checking is
+wanted.
+
+=make check= is unchanged and must remain green with no Docker daemon
+present. Coverage exclusion is explicit and must land in /both/ places the
+coverage command lives — the Makefile =coverage= target and the separate
+=cargo llvm-cov= line in the =.github/workflows/ci.yml= coverage job — each
+gaining =--ignore-filename-regex 'tests/e2e/'= so the
+never-executed-under-coverage harness and scenario lines appear in neither
+=coverage.xml= denominator. Otherwise unexecuted e2e lines would
+mechanically sink the 90% project-wide and changed-line thresholds.
+=tools/check_changed_coverage.py= reads =coverage.xml=, so the exclusion
+covers both gates. This design's recommendation: converge the CI job onto
+=make coverage= so the flag lives in one place.
+
+** 5.2 Docker access
+
+The harness drives the =docker= CLI via =std::process::Command= with argument
+vectors — the same pattern =src/main.rs= uses for =ssh=. Alternatives:
+
+- *testcontainers:* built for the throwaway-container use case, but brings an
+  async runtime and a generic container-management model; the harness needs
+  roughly eight docker verbs (=build=, =network create/rm=, =run=, =exec=,
+  =cp=, =network connect/disconnect=, =rm -f=, =logs=).
+- *bollard:* a full async Docker API client; the largest dependency for the
+  smallest need.
+
+The dependency-fit principle (maintained, /narrow/ dependencies) points at
+the CLI: it is the interface Docker documents for exactly these operations,
+errors arrive as readable stderr the failure dump can show verbatim, and
+the harness stays compatible with any daemon the CLI supports (a
+Docker-CLI-compatible podman likely works, though it is not a supported
+claim — section 14). No new crate is added.
+
+** 5.3 Serial execution
+
+First slice runs scenarios serially (=--test-threads=1=). Unique per-run
+names mean parallelism would not collide, but serial keeps failure dumps
+unentangled, resource usage flat on small CI runners, and the first
+implementation simpler. Parallel execution is a later optimization,
+unlocked by the naming scheme already in place (section 14).
+
+* 6. Timing and flakiness strategy
+
+Two rules:
+
+1. *Scenarios drive =flocal sync= explicitly.* It is synchronous, so a
+   scenario is deterministic end to end: act, sync, assert — no waiting.
+   The "several watch cycles while offline" element of the tombstone story is
+   modeled as repeated =sync_expect_offline()= calls, which is exactly what a
+   watch cycle does (refresh local state, fail to connect) per the loop in
+   =src/main.rs=; this keeps the headline scenario fully deterministic.
+2. *=watch= gets a small testability hook and few scenarios.* The watch loop
+   hardcodes its 30-second rescan (=rx.recv_timeout(Duration::from_secs(30))=
+   in =src/main.rs=), which would make every watch scenario cost tens of
+   seconds. Prerequisite code change, requiring sign-off (section 14.1): read
+   =FLOCAL_WATCH_RESCAN_SECONDS= with a default of 30 and a clamped floor of
+   one second — zero or an unparseable value falls back to the default. The
+   clamp is a deliberate, stated deviation from the unclamped
+   =FLOCAL_MAX_SESSION_SECONDS= / =FLOCAL_MAX_STATE_BYTES= /
+   =FLOCAL_MAX_SESSION_BYTES= siblings, because a zero interval would
+   hot-loop full rescans and connection attempts, and no scenario or story
+   needs it. A handful of scenarios then cover the watch-specific behaviors
+   (event-driven save pickup, offline/reconnect catch-up); everything else
+   uses explicit sync.
+
+Every wait in the harness is a predicate polled at 250 ms under a bounded
+deadline (default 30 s); a deadline expiry produces the full failure dump,
+not a bare timeout. Fixed sleeps are forbidden as correctness mechanisms —
+the only sub-second sleep in the system is the poll interval itself. This is
+the same "no sleep-loop as correctness" discipline the project already
+applies elsewhere.
+
+* 7. Scenario catalog
+
+Tied to README stories and the alpha state's validation gaps. "S1" marks the
+first implementation slice; "later" rows are enumerated so the slice
+boundary is a decision rather than an accident, with their extra vocabulary
+needs called out per row instead of silently pre-built.
+
+*Slice policy:* S1 implements /only/ the primitives S1 scenarios exercise.
+Later-slice verbs are reserved vocabulary on paper: each is implemented
+together with its first scenario, never before. Unexercised harness code
+would trip =cargo clippy -D warnings= (=dead_code=) on the always-on compile
+path, and reserved-but-dead code is exactly the speculative abstraction
+AGENTS.md forbids.
+
+| # | Scenario | Story / gap it validates | Slice |
+|---+----------+--------------------------+-------|
+| 1 | Install and pairing: raw containers, =init=, =peer add= over the alias, discovery probe finds the binary | README "Build and try the alpha" | S1 |
+| 2 | Preview/confirm gate, opened from =containers()= plus explicit =init()=/=peer_add()= (not =pair()=, which would already have consumed the gate): =sync_dry_run()= changes nothing anywhere; =sync_decline()= answers "n" and applies nothing; =sync()= (=--yes=) applies | design §User experience | S1 |
+| 3 | Initial union with both trees non-empty; same-path difference becomes a conflict, nothing deleted | design §Create and connect | S1 |
+| 4 | Basic bidirectional sync: files, directories, empty directory, symlink, exec bit (example 2.2.3); also asserts a =.flocal-tmp-=-prefixed file is never synchronized (absent on the peer). Covers acceptance criterion 1 /except renames/ | acceptance criterion 1 (partial) | S1 |
+| 5 | Offline edits on both sides plus a rename on one side; reconnect catch-up converges (with the alpha's documented delete-plus-create fallback for the unobserved rename) | acceptance criterion 2 | S1 |
+| 6 | Offline deletion retention: the tombstone story, end to end (example 2.2.1) | =agent/tombstone-retention= | S1 |
+| 7 | Nested deletion of a directory tree propagates | existing =tests/core.rs= coverage, now over SSH | S1 |
+| 8 | Recreation over a retained tombstone supersedes it | tombstone fix, recreation arm | S1 |
+| 9 | Concurrent-edit conflict: winner on both, loser retained, =restore= works (example 2.2.2) | acceptance criterion 3 | S1 |
+| 10 | Peer identity mismatch: =b.reset_state()= empties B's registration; =a.sync_expect_err("peer identity mismatch")= observes the rejection and no file on either peer changes (depends on the =bound_peer= prerequisite, section 14.2) | design §Security model | S1 |
+| 11 | Status and tombstone counts across the deletion lifecycle | status schema (tombstone branch) | S1 |
+| 12 | Ignore rules: pre-existing ignored path never transfers; newly-ignored path is not deleted on either peer | acceptance criterion 4 | later |
+| 13 | Watch mode: editor-style atomic-rename save propagates (example 2.2.4); requires the section 14.1 hook | v0.0.1 story "Saving a buffer" | later |
+| 14 | Watch mode: peer goes offline and returns; unattended catch-up asserted via =wait_*= on the reconnected tree (the watcher's offline/reconnected stderr text has no observing verb and is not promised) | v0.0.1 reconnect story | later |
+| 15 | Interrupted transfer: kill the SSH session mid-transfer of a large file; destination is old-complete or new-complete; the next sync converges. Requires new vocabulary when implemented: a kill-mid-transfer primitive, since =sync()= is blocking. No user-visible observable exists today for "committed files were not retransferred"; naming one would be a further product change | acceptance criterion 7 | later |
+| 16 | Large file streams within bounded memory and session budgets. Requires per-peer =Config= knobs (=FLOCAL_MAX_SESSION_BYTES=) and byte-oriented content primitives when implemented | acceptance criterion 6 | later |
+| 17 | =.git= is never scanned, transferred, or deleted | acceptance criterion 5 | later |
+
+The budget and limit behaviors already covered elsewhere
+(=FLOCAL_MAX_STATE_BYTES=, =FLOCAL_MAX_SESSION_SECONDS=, the recovery-space
+stop) are deliberately left to unit and integration coverage; the e2e
+catalog does not duplicate them.
+
+The S1 set and the section 2.3 vocabulary are checked against each other in
+both directions. Every S1 scenario is expressible in section 2.3 vocabulary
+alone — the two verbs this check forced into existence, =sync_decline()= for
+#2 and =reset_state()= for #10, are defined there. In the other direction,
+every verb is either exercised by a named S1 scenario — =containers()=,
+=init()=, =peer_add()= in #1 and #2; =sync_dry_run()=, =sync_decline()=,
+=sync()= in #2; =write()=, =mkdir()=, =symlink()=, =set_exec()=, the kind
+assertions, and =assert_trees_equal()= in #4; =offline()=/=online()= in #5,
+#6, and #9; =rename()= in #5; =sync_expect_offline()=, =remove_dir_all()=,
+=assert_absent()=, =assert_status()= in #6–#7; =conflicts()=, =read()=,
+=restore_loser()= in #9; =sync_expect_err()= and =reset_state()= in #10;
+=remove()= and =status()= in #11 — or is reserved on paper for a named later
+scenario and implemented with it, per the slice policy: =pair_with()=,
+=watch_start()=/=stop()=, and the wait primitives (=wait_for_file=,
+=wait_absent=, =wait_status=) belong to the watch scenarios #13–#14.
+
+S1 closes the Linux half of the "real cross-machine SSH" gap.
+
+* 8. Interfaces and code layout
+
+The crate remains single-package; no workspace is introduced. A separate
+harness crate was considered and rejected: nothing outside the e2e tests
+consumes the harness, and Cargo integration-test binaries already provide
+the needed isolation. Layout:
+
+#+begin_example
+tests/e2e/
+  main.rs          declares the scenario and harness modules
+  scenarios/
+    mod.rs         the scenario catalog: one module per story area
+    (pairing.rs, sync.rs, offline.rs, conflicts.rs, ...)
+  harness/
+    mod.rs         public vocabulary: pair, containers, peer_add, Connector, Peer, Config
+    context.rs     the shared run context: network, volume, temp dir, keys, transcript, dumped-once flag
+    docker.rs      docker CLI invocation, run-id, labels, cleanup
+    peer.rs        file ops, assertions, status/conflict parsing
+    dump.rs        failure diagnostics
+  Dockerfile
+#+end_example
+
+Public surface (what a scenario may name): =pair=, =pair_with=,
+=containers=, =peer_add=, =Config=, =Connector=, =Peer=, =PeerBox=,
+=Status=, =Plan=, =Conflicts=, =Watch=, and =assert_trees_equal=. Everything
+in =docker.rs= is private; a scenario physically cannot issue a raw docker
+command through the harness API. Every primitive takes =&self= — mutable
+bookkeeping lives in the run context behind interior mutability — and no
+harness type implements =DerefMut= (the rule that keeps
+=Connector: Deref<Target = Peer>= sound, section 2.1).
+
+*Failure reporting is a first-class requirement.* Every primitive appends to
+the run transcript (the command, the peer, duration, exit status). When a
+scenario fails — by assertion, error return, or wait deadline — the harness
+prints, before cleanup: the transcript tail; both peers' internal tree
+walks; both peers' =status --json=; stdout /and stderr/ of every =flocal=
+invocation — the connector-side SSH session's stderr is always captured into
+the transcript, because the product itself surfaces it only on the
+clean-exit path; the responder's own diagnostics; and =docker logs= (sshd's
+stderr) for both containers. The responder's diagnostics need one image
+provision: the =flocal= entry point installed in the image is a thin wrapper
+that execs the real binary with its stderr both forwarded unchanged to the
+SSH channel and appended to an in-container log file, which the dump
+collects — without it, the responder's stderr vanishes on most failure
+paths, because the connector discards the SSH session's stderr whenever it
+bails early.
+
+Dump emission is exactly-once, guarded by the run context's flag: it fires
+at the first failing primitive, or at unwind (=std::thread::panicking=) for
+a panic that bypassed the harness. With =FLOCAL_E2E_KEEP=1= the harness
+additionally preserves the containers and prints their names for manual
+=docker exec= inspection. A failing scenario — including a responder-side
+failure — must be diagnosable from its CI log alone.
+
+* 9. Security boundaries
+
+- *Throwaway keys only.* The ed25519 keypair is generated per run into the
+  run's temporary directory — created mode 0700, with =ssh-keygen= writing
+  the private key 0600 — and destroyed with it. No key material, host key,
+  or =authorized_keys= content is ever committed; the Dockerfile generates
+  host keys at build time inside the image.
+- *No host exposure.* Neither container publishes any port (=-p= is never
+  used). SSH travels only on the run's internal bridge network. The host's
+  own =sshd=, =~/.ssh=, and SSH agent are untouched — the harness never uses
+  the developer's SSH identity.
+- *Synthetic names only.* =peer-a=, =peer-b=, =/home/peer/share= — no real
+  hostnames, addresses, or personal paths in scenarios, harness, or dumps,
+  per the AGENTS.md rule.
+- *Non-root inside containers.* =flocal= and =sshd= sessions run as the
+  unprivileged =peer= user; only PID-1 =sshd= is root, as in a real
+  deployment.
+- *Input discipline in the harness itself.* Scenario paths are validated
+  (relative, no =..=, no leading =-=, no NUL) and passed as distinct argv
+  elements after =--=; file content and interactive answers (the "n" that
+  =sync_decline()= feeds to the confirmation prompt) travel over the
+  =docker exec -i= stdin as data, never through a shell string. The harness
+  applies the same no-interpolation rule the product applies at its SSH
+  boundary.
+- *Docker assumptions.* The harness requires only ordinary access to a
+  Docker daemon. Rootful and rootless Docker both support every operation
+  used (build, run, exec, volumes, network connect/disconnect). It does not
+  require =--privileged=, added capabilities, or host networking. Membership
+  in the =docker= group is root-equivalent on the host; the harness does not
+  widen that existing exposure — it runs no third-party images beyond the
+  digest-pinned bases, and its build-time fetches are pinned or signed
+  (section 3.2).
+
+* 10. Failure modes
+
+- *Docker absent or daemon down.* =make check= and =cargo test= are
+  unaffected by construction (=#[ignore]=). =make e2e= fails fast: the
+  harness's first act checks the daemon and the host prerequisites of
+  section 5.1, and failure produces a one-line diagnosis ("docker daemon
+  unreachable; the e2e suite requires docker") rather than a cascade.
+  Failing rather than skipping is deliberate: invoking =make e2e= expresses
+  intent, and a silently-skipped suite that reports success is a false
+  green.
+- *Image pull flakiness.* Both base images are pinned by manifest-list
+  digest; a pull failure is a hard, clearly-attributed error. Digest bumps
+  are ordinary reviewed commits (cadence: section 14).
+- *Container clock skew.* Structurally impossible here: containers share the
+  host kernel clock, so LWW timestamps are mutually consistent. This is an
+  anti-flake property and a coverage limit — skewed-clock LWW behavior is
+  explicitly not tested by this harness (a =libfaketime=-style injection
+  could add it later; out of scope).
+- *Leftover state.* Per-scenario containers, per-run unique names, ordered
+  =Drop= cleanup on panic, and the =rm=-only label sweep at =make e2e= start
+  (section 3.4). The only escape is a hard-killed test process, which the
+  next run's sweep repairs — under the stated one-run-per-host assumption.
+- *CI resource limits.* Two slim, resource-capped containers and a serial
+  schedule fit the standard runner comfortably. The dominant cost is the
+  image build: warm in seconds on local and persistent runners, cold on
+  GitHub-hosted runners and budgeted for it in section 12.
+- *Slow machines.* All waits are condition-based with generous deadlines, so
+  slowness costs seconds, not correctness. A deadline expiry produces the
+  full dump, making "slow" and "broken" distinguishable from the log.
+
+* 11. Platform and CI
+
+A new =e2e= job in CI runs =make e2e= on =ubuntu-latest=, where Docker is
+preinstalled. The job is Linux-only: GitHub's macOS runners provide no
+Docker daemon, and macOS cannot be containerized regardless. (A developer on
+a macOS machine with Docker Desktop can still run =make e2e= locally —
+Linux containers — per section 3.2.)
+
+Consequence for the acceptance gap, stated plainly: this harness closes the
+"real cross-machine SSH" gap for Linux–Linux only. The macOS side of
+acceptance criterion 11 — real macOS filesystem semantics (normalization,
+case-insensitivity, FSEvents) over SSH — remains open and is *not* covered
+or approximated by this feature. The existing macOS CI job continues to
+cover unit and non-Docker integration tests; full macOS acceptance remains a
+manual (or future dedicated-hardware) task.
+
+Forgejo migration: the job's substance is =make e2e= — plain Docker CLI plus
+cargo, no GitHub-specific services, containers, or action semantics. The
+only Actions-specific pieces are checkout and toolchain setup, both of which
+have direct Forgejo Actions equivalents. One infrastructure prerequisite to
+plan for: Forgejo runners need Docker-daemon access configured (a socket
+mount, DinD, or a host-labeled runner) — a property of the job's
+environment, not of the harness. The upside is that persistent Forgejo
+runners are exactly where the BuildKit cache mounts deliver warm builds.
+
+* 12. Acceptance criteria for the first slice
+
+The harness's first implementation is acceptable when:
+
+1. =make e2e= on a Linux machine with Docker builds the image and passes all
+   eleven S1 scenarios (catalog #1–#11), including the offline-deletion
+   retention scenario, over real SSH between two containers.
+2. =make check= passes unchanged on a machine with no Docker daemon, with
+   both coverage thresholds computed exactly as before — the =tests/e2e/=
+   exclusion applied in both the Makefile =coverage= target and the CI
+   coverage job.
+3. =cargo test --all-targets= compiles every scenario and the harness
+   without Docker and executes none of them.
+4. Each S1 scenario is a straight-line function using only section 2.3
+   vocabulary — no raw =docker= or shell strings in any scenario body, no
+   fixed sleeps anywhere in harness or scenarios — and the harness contains
+   no primitive that no S1 scenario exercises (the slice policy of
+   section 7).
+5. A deliberately failing scenario's output alone contains both trees, both
+   statuses, the transcript tail, and both containers' logs; a failure
+   raised inside the responder (=protocol serve=) is diagnosable from the
+   same output via the responder's stderr log.
+6. After a full run, and after a run interrupted by a panicking scenario,
+   =docker ps -a=, =docker network ls=, and =docker volume ls= show nothing
+   labeled =flocal-e2e=1=; a stale labeled object from a killed run is
+   removed by the next =make e2e=.
+7. A warm =make e2e= run (image cached) completes in under ten minutes on a
+   developer machine or persistent runner; a cold CI run, including the
+   image build, completes in under twenty-five minutes on a standard
+   GitHub-hosted runner.
+8. The CI =e2e= job runs =make e2e= on the Linux runner and fails the build
+   on any scenario failure.
+9. The image build context contains only =Cargo.toml=, =Cargo.lock=, and
+   =src/=, and =.dockerignore= exists — no =.git=, =target/=, or other
+   repository content reaches any build layer.
+10. =docker inspect= on a scenario's containers shows no published ports,
+    and the single =docker run= call site contains no =-p=, =--publish=, or
+    =--network host=.
+
+* 13. Alternatives considered
+
+- *One VM (or two) instead of containers.* Real kernels and real clocks would
+  additionally cover clock skew and kernel-version variation, but VM images,
+  hypervisor availability on CI, multi-minute boot times, and snapshot
+  management dwarf the harness itself. Containers give the properties the
+  stories actually need — process, filesystem, and network isolation with
+  real SSH — at interactive speed.
+- *Two processes plus network namespaces, no Docker.* Closest to zero new
+  dependencies, but creating veth pairs and namespaces requires root or
+  =CAP_NET_ADMIN=, hand-rolls exactly the lifecycle/cleanup/DNS work Docker
+  provides, and still would not exercise a real =sshd= login environment
+  without further assembly. Worth remembering if Docker ever becomes
+  unavailable in CI; not worth building first.
+- *Mocking the SSH transport.* Already exists (=tests/ssh_sync.rs=) and
+  stays. It cannot validate the discovery probe against a real login shell,
+  key authentication, =sshd= environment/PATH behavior, network loss, or two
+  genuinely separate filesystems — the exact gap this feature closes.
+- *docker compose.* A YAML topology file plus a second tool version to pin,
+  in exchange for less runtime control than the harness needs (per-scenario
+  networks, mid-scenario disconnects, per-run names). The harness issues the
+  handful of docker commands itself.
+- *testcontainers / bollard crates.* Rejected on dependency fit (section
+  5.2).
+
+* 14. Unresolved decisions
+
+For explicit user sign-off. This is a design-only deliverable: nothing
+described here is implemented, and this document must not be read as
+implying otherwise. Two of the decisions below are product-code
+prerequisites; the rest are policy.
+
+1. *The =FLOCAL_WATCH_RESCAN_SECONDS= hook* — the first of two product-code
+   changes this design requires (a few lines in =src/main.rs=, following the
+   established =FLOCAL_*= pattern, with the clamped one-second floor of
+   section 6). Approve the hook, or defer it and drop the watch scenarios
+   (#13–#14) from the plan? Recommendation: approve with the clamp — the
+   default is unchanged, environment variables are same-privilege
+   configuration so production posture is not eroded, and the clamp removes
+   the only misuse (a zero-interval hot loop).
+2. *The =bound_peer= error-contract fix* — the second product-code
+   prerequisite, forced by scenario #10. =State::bound_peer=
+   (=src/state.rs:532=) calls =query_row= without =.optional()=, so a
+   responder holding no registration for the share — exactly the state
+   =reset_state()= creates — dies on =QueryReturnedNoRows= /before writing
+   any protocol frame/; the connector observes a bare EOF ("failed to fill
+   whole buffer"), never the designed rejection. Making a missing row return
+   =Ok(None)= lets the existing graceful branch in =serve_io= answer, and
+   the connector observes "remote rejected sync: peer identity mismatch" —
+   the observable scenario #10 asserts. This also fixes a real product
+   error-contract hole that exists today: an internal database error plus an
+   opaque EOF where a clear rejection was designed. Recommendation: approve.
+3. *CI gating.* Should the new =e2e= job be required for merge from day one,
+   or advisory for a probation period while its flakiness record is
+   established? Recommendation: required — every wait is condition-based and
+   the isolation is per-scenario, so a red run should be treated as signal.
+4. *Ordering against =agent/tombstone-retention=.* Without that branch, S1
+   does not merely weaken: scenarios #6 (the headline offline-deletion
+   story), #8, and #11 fail outright, because on =main= the deletion
+   resurrects. Landing the tombstone branch first is effectively the only
+   ordering compatible with acceptance criterion 12.1. Recommendation: land
+   it first. Its status-schema bump is then pinned by the harness's schema
+   constant (section 2.3), so running the harness against a pre-tombstone
+   binary fails loudly rather than silently misparsing.
+5. *The slice boundary itself.* Approve S1 = catalog #1–#11 with #12–#17 as
+   the enumerated follow-up, or pull items forward? Recommendation: approve
+   as sliced; the strongest pull-forward candidates are #12 (ignore rules)
+   and #17 (=.git= exclusion), since both are README-level acceptance
+   criteria.
+6. *Rootless Docker and podman.* Every operation used works under rootless
+   Docker; podman's CLI compatibility likely suffices. Is either a
+   /supported/ configuration (tested, documented) or best-effort?
+   Recommendation: rootful and rootless Docker supported; podman
+   best-effort, undocumented.
+7. *Base-image digest cadence.* Pinned digests need periodic bumps for
+   security updates. Recommendation: manual bumps whenever the Dockerfile is
+   touched; no automation until the repository adopts dependency-update
+   automation generally.
+8. *Parallel scenarios.* Serial in S1. Adopt parallel execution later only
+   if wall-clock time becomes a real constraint; the per-run naming scheme
+   already permits it.
