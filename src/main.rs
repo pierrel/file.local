@@ -682,6 +682,11 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
     let (share, root) = state.find_share(path)?;
     let peer = state.peer(&share)?;
     let records = state.records(&share)?;
+    let entries = records
+        .iter()
+        .filter(|record| !matches!(record.version.entry, Entry::Tombstone))
+        .count();
+    let tombstones = records.len() - entries;
     let pending_install = state
         .install_intents()?
         .iter()
@@ -689,7 +694,7 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":1,"share":share.0,"root":root,"peer":peer,"entries":records.len(),"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install})
+            serde_json::json!({"schema":1,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install})
         );
     } else {
         println!("Share: {}", share.0);
@@ -700,7 +705,8 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
                 .map(|p| p.host.as_str())
                 .unwrap_or("not configured")
         );
-        println!("Entries: {}", records.len());
+        println!("Entries: {entries}");
+        println!("Tombstones: {tombstones}");
         println!(
             "View:  last persisted scan (run `flocal sync {} --dry-run` to preview changes)",
             root.display()

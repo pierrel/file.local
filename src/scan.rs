@@ -126,7 +126,14 @@ fn scan_mode(
         }
     }
     for (bytes, old) in previous {
-        if seen.contains(&bytes) || matches!(old.version.entry, Entry::Tombstone) {
+        if seen.contains(&bytes) {
+            continue;
+        }
+        // A tombstone is carried forward verbatim: dropping it before the
+        // peer has synchronized the deletion would let the peer's old record
+        // resurrect the path. Acknowledgment-based pruning is deferred.
+        if matches!(old.version.entry, Entry::Tombstone) {
+            records.push(old.clone());
             continue;
         }
         if root_dir.symlink_metadata(old.path.to_path_buf()).is_ok() {

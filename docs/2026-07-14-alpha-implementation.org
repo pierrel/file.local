@@ -20,6 +20,13 @@
   by a validated replacement transfer.
 - Regular files, executable bits, directories, symlinks, deletions/tombstones,
   initial union, deterministic whole-file LWW, and retained conflict inputs.
+  Tombstone records are retained indefinitely across scans, so a peer that was
+  unreachable when a deletion was discovered cannot resurrect the deleted path
+  when it returns. Applying a retained tombstone never touches the filesystem,
+  and a received tombstone for a path this peer never recorded is not
+  persisted, so a peer cannot pollute local state with fabricated deletions.
+  =status= excludes tombstones from its entry count and reports the retained
+  tombstone count separately.
 - Mandatory initial-sync preview/confirmation and versioned JSON for status,
   plans, peer listing, and conflict inspection.
 - Receiver-side ignore evaluation before requesting objects, plus
@@ -69,11 +76,18 @@
 - Offline deletions discovered without a running watcher have no trustworthy
   deletion timestamp; the discovery scan time orders delete-versus-edit in
   this alpha. A running watcher can remove this ambiguity in a later milestone.
+- The design's acknowledgment-based tombstone pruning is deferred: tombstones
+  are never removed in this alpha, so state and advertised snapshots retain
+  one record per deleted path until pruning exists. Deleted path names remain
+  visible in state and snapshots for as long as they are retained. Retained
+  tombstones also count against the session record and metadata limits, so a
+  share whose live entries and retained tombstones together approach the
+  session record limit (one million) stops synchronizing until pruning
+  exists; =status= reports the tombstone count.
 - Real macOS filesystem acceptance still needs to be run. The Linux half of
   cross-machine SSH acceptance is now exercised by the =tests/e2e=
-  two-container Docker harness over real SSH; seven of its scenarios pin
-  known-broken =main= behavior as strict expected failures until the fixes
-  land (see [[file:2026-07-16-e2e-harness-design.org][the e2e harness design]]).
+  two-container Docker harness over real SSH (see
+  [[file:2026-07-16-e2e-harness-design.org][the e2e harness design]]).
 
 These limitations are deliberately stated rather than weakening the detailed
 design. Local review decides which are blockers for publishing the alpha and
@@ -89,9 +103,11 @@ replicated model while recovery rotates to a fresh temporary and retries.
   rejection, =.gitignore= behavior, protocol frame bounds, causal
   reconciliation, convergence, and symlink-parent rejection.
 - Integration coverage for scan/apply/delete, nested deletion, file/directory
-  transitions, ignored-file preservation and advertisement exclusion, and
-  bidirectional synchronization
-  across an SSH process boundary using two state stores and directory roots.
+  transitions, ignored-file preservation and advertisement exclusion, offline
+  deletion retention across disconnected scan cycles with steady-state rounds
+  and recreation over a retained tombstone, rejection of foreign tombstones
+  for never-recorded paths, and bidirectional synchronization across an SSH
+  process boundary using two state stores and directory roots.
 - Unit coverage for corrupt-object detection and eventual repair.
 - An end-to-end acceptance layer (=make e2e=; a Linux-only CI job) runs
   sixteen first-slice scenarios between two Docker containers over real
