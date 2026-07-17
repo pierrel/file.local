@@ -1,0 +1,9 @@
+# The e2e image build must never see repository content beyond what the
+# Dockerfile explicitly COPYs; see docs/2026-07-16-e2e-harness-design.org.
+.git
+target
+docs
+references
+tests
+!tests/e2e/entrypoint.sh
+!tests/e2e/flocal-wrapper.sh

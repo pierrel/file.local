@@ -1,0 +1,877 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, Result, bail};
+
+use super::docker::{RunContext, SHARE, image_tag, unique_token};
+
+const POLL: Duration = Duration::from_millis(250);
+const DEADLINE: Duration = Duration::from_secs(30);
+/// The product's status JSON schema this harness is written against. On
+/// `main` that is 1; the tombstone fix bumps it to 2 together with promoting
+/// the scenarios that read `tombstones`.
+const STATUS_SCHEMA: u64 = 1;
+
+/// One running container. Owns its removal; `--rm` plus the in-container
+/// lifetime timeout are the backstops when this Drop never runs.
+struct Container {
+    context: Arc<RunContext>,
+    name: String,
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        if self.context.keep() {
+            eprintln!("FLOCAL_E2E_KEEP=1: keeping container {}", self.name);
+            return;
+        }
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .output();
+    }
+}
+
+/// A started, unpaired container. `peer_add` consumes both boxes and returns
+/// the typed `(Connector, Peer)` pair.
+pub struct PeerBox {
+    peer: Peer,
+}
+
+/// Either peer's shared vocabulary: file operations, connectivity, waits,
+/// and assertions. Every primitive takes `&self`.
+pub struct Peer {
+    context: Arc<RunContext>,
+    container: Container,
+    pub alias: String,
+}
+
+/// The initiating peer. Dereferences to `Peer` for the shared vocabulary;
+/// only a `Connector` can `sync`.
+pub struct Connector {
+    peer: Peer,
+}
+
+impl std::ops::Deref for Connector {
+    type Target = Peer;
+    fn deref(&self) -> &Peer {
+        &self.peer
+    }
+}
+
+/// The parsed `status --json`, pinned to `STATUS_SCHEMA`. `tombstones` is
+/// `Option` so the one struct parses both before and after the schema bump.
+/// Fields grow with the scenarios that read them.
+#[derive(Debug, serde::Deserialize)]
+pub struct Status {
+    pub schema: u64,
+    pub entries: u64,
+    #[serde(default)]
+    pub tombstones: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConflictEntry {
+    pub id: String,
+    pub path: String,
+}
+
+pub struct Conflicts(Vec<ConflictEntry>);
+
+impl Conflicts {
+    pub fn expect_one(&self, path: &str) -> Result<&ConflictEntry> {
+        let matching: Vec<_> = self.0.iter().filter(|c| c.path == path).collect();
+        match matching.as_slice() {
+            [one] => Ok(one),
+            other => bail!(
+                "expected exactly one conflict for {path}, found {}",
+                other.len()
+            ),
+        }
+    }
+}
+
+/// One tree entry as compared by `assert_trees_equal` and shown by the
+/// failure dump: kind, the executable-bit boolean the product syncs, the
+/// content hash for regular files, and the target text for symlinks.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub kind: char,
+    pub exec: bool,
+    pub hash: Option<String>,
+    pub target: Option<String>,
+}
+
+pub type Tree = BTreeMap<String, TreeEntry>;
+
+/// A probe reports Ok(()) when its check holds, or a description of the
+/// actual state when it does not.
+type Probe<'a> = Box<dyn Fn(&Peer) -> Result<std::result::Result<(), String>> + 'a>;
+
+/// A named check. Each check exists exactly once: `assert_x` is `wait_x`
+/// with a zero deadline, so the immediate and eventual forms cannot drift.
+struct Condition<'a> {
+    describe: String,
+    probe: Probe<'a>,
+}
+
+pub fn containers() -> Result<(PeerBox, PeerBox)> {
+    let context = RunContext::new()?;
+    let a = start_peer(&context, "peer-a", 0)?;
+    let b = start_peer(&context, "peer-b", 1)?;
+    for peer in [&a, &b] {
+        peer.wait_sshd_ready()?;
+        peer.install_ssh_material()?;
+        peer.exec_ok(&["mkdir", "-p", SHARE])?;
+    }
+    Ok((PeerBox { peer: a }, PeerBox { peer: b }))
+}
+
+/// The standard opening: two containers, `init` on A, `peer add` toward B,
+/// one confirmed initial sync. Built from the public primitives so the
+/// opening logic exists exactly once.
+pub fn pair() -> Result<(Connector, Peer)> {
+    let (a, b) = containers()?;
+    a.init()?;
+    let (connector, responder) = a.peer_add(b)?;
+    connector.sync()?;
+    Ok((connector, responder))
+}
+
+/// Strict expected failure: passes while the wrapped scenario fails, and
+/// fails loudly the moment the scenario starts passing, so the fixing pull
+/// request must promote the scenario (delete this wrapper) in the same
+/// change. Failure dumps are suppressed inside: the failure is expected.
+pub fn known_failure(body: impl FnOnce() -> Result<()>) -> Result<()> {
+    struct Unsuppress;
+    impl Drop for Unsuppress {
+        fn drop(&mut self) {
+            super::docker::set_suppress_dumps(false);
+        }
+    }
+    super::docker::set_suppress_dumps(true);
+    let _guard = Unsuppress;
+    let outcome = body();
+    match outcome {
+        // A harness-infrastructure failure is not the expected scenario
+        // failure; re-raise it so it cannot masquerade as a satisfied pin.
+        Err(error) if error.is::<super::docker::InfraError>() => Err(error),
+        Err(error) => {
+            eprintln!("known failure (expected): {error:#}");
+            Ok(())
+        }
+        Ok(()) => bail!("scenario now passes — promote it to a plain test in this PR"),
+    }
+}
+
+pub fn assert_trees_equal(a: &Peer, b: &Peer) -> Result<()> {
+    let tree_a = a.tree()?;
+    let tree_b = b.tree()?;
+    if tree_a != tree_b {
+        return Err(a.fail(format!(
+            "trees differ:\n{}: {tree_a:#?}\n{}: {tree_b:#?}",
+            a.alias, b.alias
+        )));
+    }
+    Ok(())
+}
+
+fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<Peer> {
+    let name = format!("flocal-e2e-{}-{alias}", context.run_id);
+    let volume_arg = format!("{}:/home/peer", context.volumes[volume]);
+    context.docker_ok(&[
+        "run",
+        "--rm",
+        "-d",
+        "--label",
+        "flocal-e2e=1",
+        "--name",
+        &name,
+        "--network",
+        &context.network,
+        "--network-alias",
+        alias,
+        "-v",
+        &volume_arg,
+        "--memory",
+        "512m",
+        "--pids-limit",
+        "256",
+        image_tag(),
+    ])?;
+    context
+        .containers
+        .lock()
+        .expect("containers lock")
+        .push(name.clone());
+    Ok(Peer {
+        context: Arc::clone(context),
+        container: Container {
+            context: Arc::clone(context),
+            name,
+        },
+        alias: alias.to_owned(),
+    })
+}
+
+impl PeerBox {
+    pub fn init(&self) -> Result<()> {
+        self.peer
+            .flocal_ok(&["init", SHARE])
+            .map(|_| ())
+            .context("flocal init")
+    }
+
+    pub fn write(&self, path: &str, content: &str) -> Result<()> {
+        self.peer.write(path, content)
+    }
+
+    /// Pairs self (the initiator) with the other peer, consuming both boxes
+    /// into the typed roles.
+    pub fn peer_add(self, other: PeerBox) -> Result<(Connector, Peer)> {
+        let output = self.peer.flocal_ok(&[
+            "peer",
+            "add",
+            SHARE,
+            "--host",
+            &other.peer.alias,
+            "--remote-path",
+            SHARE,
+        ])?;
+        drop(output);
+        Ok((Connector { peer: self.peer }, other.peer))
+    }
+}
+
+impl std::ops::Deref for PeerBox {
+    type Target = Peer;
+    fn deref(&self) -> &Peer {
+        &self.peer
+    }
+}
+
+impl Connector {
+    /// `flocal sync --yes`. A conflicting sync exits zero and records the
+    /// conflict; a nonzero exit fails the scenario.
+    pub fn sync(&self) -> Result<()> {
+        self.flocal_ok(&["sync", SHARE, "--yes"]).map(|_| ())
+    }
+
+    /// `flocal sync --dry-run`; asserts the connector's tree is unchanged by
+    /// the preview.
+    pub fn sync_dry_run(&self) -> Result<()> {
+        let before = self.tree()?;
+        self.flocal_ok(&["sync", SHARE, "--dry-run"])?;
+        if self.tree()? != before {
+            return Err(self.fail("--dry-run changed the connector's tree".into()));
+        }
+        Ok(())
+    }
+
+    /// Runs `flocal sync` without `--yes`, answers "n" to the initial
+    /// confirmation, and asserts the prompt was actually shown and the
+    /// connector's tree is unchanged. Only meaningful before the initial
+    /// confirmed sync; the prompt assertion makes later misuse fail loudly.
+    pub fn sync_decline(&self) -> Result<()> {
+        let before = self.tree()?;
+        let output = self.exec_with_stdin(&["flocal", "sync", SHARE], b"n\n")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            return Err(self.fail(format!("declined sync exited nonzero: {stdout}")));
+        }
+        if !stdout.contains("Apply this initial plan?") {
+            return Err(self.fail(format!(
+                "no initial confirmation prompt was shown; sync_decline is only \
+                 meaningful before the initial sync. stdout: {stdout}"
+            )));
+        }
+        if self.tree()? != before {
+            return Err(self.fail("declined sync changed the connector's tree".into()));
+        }
+        Ok(())
+    }
+
+    /// Asserts the sync attempt fails (the peer is unreachable) and leaves
+    /// the connector's tree unchanged. No error text is asserted: the
+    /// product reports this path with generic connection errors.
+    pub fn sync_expect_offline(&self) -> Result<()> {
+        let before = self.tree()?;
+        let output = self.flocal_raw(&["sync", SHARE, "--yes"])?;
+        if output.status.success() {
+            return Err(self.fail("sync succeeded although the peer is offline".into()));
+        }
+        if self.tree()? != before {
+            return Err(self.fail("offline sync attempt changed the connector's tree".into()));
+        }
+        Ok(())
+    }
+
+    /// Asserts the sync attempt fails with the given substring on stderr.
+    pub fn sync_expect_err(&self, needle: &str) -> Result<()> {
+        let output = self.flocal_raw(&["sync", SHARE, "--yes"])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            return Err(self.fail(format!("sync succeeded; expected an error: {needle}")));
+        }
+        if !stderr.contains(needle) {
+            return Err(self.fail(format!("expected {needle:?} in stderr, got: {stderr}")));
+        }
+        Ok(())
+    }
+
+    pub fn conflicts(&self) -> Result<Conflicts> {
+        let output = self.flocal_ok(&["conflicts", "list", SHARE, "--json"])?;
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            schema: u64,
+            conflicts: Vec<RawConflict>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawConflict {
+            id: String,
+            path: Vec<u8>,
+        }
+        let listing: Listing =
+            serde_json::from_slice(&output.stdout).context("parsing conflicts list --json")?;
+        if listing.schema != STATUS_SCHEMA {
+            return Err(self.fail(format!(
+                "conflicts schema {} does not match the pinned {STATUS_SCHEMA}",
+                listing.schema
+            )));
+        }
+        Ok(Conflicts(
+            listing
+                .conflicts
+                .into_iter()
+                .map(|conflict| ConflictEntry {
+                    id: conflict.id,
+                    path: String::from_utf8_lossy(&conflict.path).into_owned(),
+                })
+                .collect(),
+        ))
+    }
+
+    /// Restores a conflict's losing input to a scratch path outside the
+    /// share and returns its content.
+    pub fn restore_loser(&self, id: &str) -> Result<String> {
+        validate_component(id)?;
+        let destination = format!("/home/peer/.e2e-restore-{}", unique_token());
+        self.flocal_ok(&[
+            "restore",
+            SHARE,
+            id,
+            "--version",
+            "loser",
+            "--to",
+            &destination,
+        ])?;
+        let output = self.exec_ok(&["cat", "--", &destination])?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+impl Peer {
+    // ----- file operations (inside the container, as the peer user) -----
+
+    pub fn write(&self, path: &str, content: &str) -> Result<()> {
+        self.write_bytes(path, content.as_bytes())
+    }
+
+    pub fn write_bytes(&self, path: &str, content: &[u8]) -> Result<()> {
+        let full = self.share_path(path)?;
+        if let Some((parent, _)) = full.rsplit_once('/') {
+            self.exec_ok(&["mkdir", "-p", "--", parent])?;
+        }
+        self.exec_with_stdin_ok(&["tee", "--", &full], content)
+            .map(|_| ())
+    }
+
+    pub fn read(&self, path: &str) -> Result<String> {
+        let full = self.share_path(path)?;
+        let output = self.exec_ok(&["cat", "--", &full])?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    pub fn mkdir(&self, path: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        self.exec_ok(&["mkdir", "-p", "--", &full]).map(|_| ())
+    }
+
+    pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let from = self.share_path(from)?;
+        let to = self.share_path(to)?;
+        self.exec_ok(&["mv", "-T", "--", &from, &to]).map(|_| ())
+    }
+
+    pub fn remove(&self, path: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        self.exec_ok(&["rm", "--", &full]).map(|_| ())
+    }
+
+    pub fn remove_dir_all(&self, path: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        self.exec_ok(&["rm", "-rf", "--", &full]).map(|_| ())
+    }
+
+    pub fn symlink(&self, path: &str, target: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        self.exec_ok(&["ln", "-s", "--", target, &full]).map(|_| ())
+    }
+
+    pub fn set_exec(&self, path: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        self.exec_ok(&["chmod", "a+x", "--", &full]).map(|_| ())
+    }
+
+    pub fn unset_exec(&self, path: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        self.exec_ok(&["chmod", "a-x", "--", &full]).map(|_| ())
+    }
+
+    // ----- connectivity -----
+
+    pub fn offline(&self) -> Result<()> {
+        self.context
+            .docker_ok(&[
+                "network",
+                "disconnect",
+                &self.context.network,
+                &self.container.name,
+            ])
+            .map(|_| ())
+    }
+
+    pub fn online(&self) -> Result<()> {
+        self.context
+            .docker_ok(&[
+                "network",
+                "connect",
+                "--alias",
+                &self.alias,
+                &self.context.network,
+                &self.container.name,
+            ])
+            .map(|_| ())
+    }
+
+    // ----- lifecycle -----
+
+    /// Deletes this peer's flocal state directory, so it no longer holds the
+    /// share registration or peer binding.
+    pub fn reset_state(&self) -> Result<()> {
+        self.exec_ok(&["rm", "-rf", "/home/peer/.local/state/file.local"])
+            .map(|_| ())
+    }
+
+    pub fn status(&self) -> Result<Status> {
+        let output = self.flocal_ok(&["status", SHARE, "--json"])?;
+        let status: Status =
+            serde_json::from_slice(&output.stdout).context("parsing status --json")?;
+        if status.schema != STATUS_SCHEMA {
+            return Err(self.fail(format!(
+                "status schema {} does not match the pinned {STATUS_SCHEMA}",
+                status.schema
+            )));
+        }
+        Ok(status)
+    }
+
+    // ----- assertions and waits: one Condition per check -----
+
+    pub fn assert_file(&self, path: &str, content: &str) -> Result<()> {
+        self.check(self.file_condition(path, content)?, Duration::ZERO)
+    }
+
+    // The `wait_*` twins of these assertions arrive with the first watch
+    // scenario; each will call `check` with the nonzero deadline over the
+    // same Condition its assertion uses.
+
+    pub fn assert_absent(&self, path: &str) -> Result<()> {
+        self.check(self.absent_condition(path)?, Duration::ZERO)
+    }
+
+    pub fn assert_status(&self, predicate: impl Fn(&Status) -> bool + 'static) -> Result<()> {
+        self.check(Self::status_condition(predicate), Duration::ZERO)
+    }
+
+    pub fn assert_dir(&self, path: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        let describe = format!("{path} is a directory");
+        self.check(
+            Condition {
+                describe,
+                probe: Box::new(move |peer| {
+                    let output = peer.exec_raw(&["test", "-d", &full])?;
+                    Ok(if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err("not a directory or missing".into())
+                    })
+                }),
+            },
+            Duration::ZERO,
+        )
+    }
+
+    pub fn assert_exec(&self, path: &str) -> Result<()> {
+        self.assert_exec_is(path, true)
+    }
+
+    pub fn assert_not_exec(&self, path: &str) -> Result<()> {
+        self.assert_exec_is(path, false)
+    }
+
+    fn assert_exec_is(&self, path: &str, expected: bool) -> Result<()> {
+        let full = self.share_path(path)?;
+        let describe = format!("{path} executable bit is {expected}");
+        self.check(
+            Condition {
+                describe,
+                probe: Box::new(move |peer| {
+                    let output = peer.exec_raw(&["test", "-x", &full])?;
+                    let actual = output.status.success();
+                    Ok(if actual == expected {
+                        Ok(())
+                    } else {
+                        Err(format!("executable bit is {actual}"))
+                    })
+                }),
+            },
+            Duration::ZERO,
+        )
+    }
+
+    pub fn assert_symlink(&self, path: &str, target: &str) -> Result<()> {
+        let full = self.share_path(path)?;
+        let expected = target.to_owned();
+        let describe = format!("{path} is a symlink to {target}");
+        self.check(
+            Condition {
+                describe,
+                probe: Box::new(move |peer| {
+                    let output = peer.exec_raw(&["readlink", "--", &full])?;
+                    if !output.status.success() {
+                        return Ok(Err("not a symlink or missing".into()));
+                    }
+                    let actual = String::from_utf8_lossy(&output.stdout)
+                        .trim_end()
+                        .to_owned();
+                    Ok(if actual == expected {
+                        Ok(())
+                    } else {
+                        Err(format!("links to {actual}"))
+                    })
+                }),
+            },
+            Duration::ZERO,
+        )
+    }
+
+    fn file_condition(&self, path: &str, content: &str) -> Result<Condition<'static>> {
+        let full = self.share_path(path)?;
+        let expected = content.to_owned();
+        Ok(Condition {
+            describe: format!("{path} contains {content:?}"),
+            probe: Box::new(move |peer| {
+                let output = peer.exec_raw(&["cat", "--", &full])?;
+                if !output.status.success() {
+                    return Ok(Err("missing".into()));
+                }
+                let actual = String::from_utf8_lossy(&output.stdout).into_owned();
+                Ok(if actual == expected {
+                    Ok(())
+                } else {
+                    Err(format!("contains {actual:?}"))
+                })
+            }),
+        })
+    }
+
+    fn absent_condition(&self, path: &str) -> Result<Condition<'static>> {
+        let full = self.share_path(path)?;
+        Ok(Condition {
+            describe: format!("{path} is absent"),
+            probe: Box::new(move |peer| {
+                let exists = peer.exec_raw(&["test", "-e", &full])?.status.success()
+                    || peer.exec_raw(&["test", "-L", &full])?.status.success();
+                Ok(if exists {
+                    Err("still present".into())
+                } else {
+                    Ok(())
+                })
+            }),
+        })
+    }
+
+    fn status_condition(predicate: impl Fn(&Status) -> bool + 'static) -> Condition<'static> {
+        Condition {
+            describe: "status predicate".into(),
+            probe: Box::new(move |peer| {
+                let status = peer.status()?;
+                Ok(if predicate(&status) {
+                    Ok(())
+                } else {
+                    Err(format!("{status:?}"))
+                })
+            }),
+        }
+    }
+
+    fn check(&self, condition: Condition, deadline: Duration) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            let last = (condition.probe)(self)?;
+            match last {
+                Ok(()) => return Ok(()),
+                Err(actual) => {
+                    if started.elapsed() >= deadline {
+                        return Err(self.fail(format!(
+                            "{}: expected {}; {}",
+                            self.alias, condition.describe, actual
+                        )));
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
+        }
+    }
+
+    // ----- internals -----
+
+    /// The internal tree walk feeding `assert_trees_equal` and the failure
+    /// dump. Mirrors the product scanner's exclusions (`.git` and
+    /// `.flocal-tmp-*` components), records the executable bit as the
+    /// boolean the product syncs, hashes regular files, records symlink
+    /// target text without following, and lists directories first-class.
+    pub fn tree(&self) -> Result<Tree> {
+        let listing = self.exec_ok(&[
+            "find",
+            SHARE,
+            "-mindepth",
+            "1",
+            "(",
+            "-name",
+            ".git",
+            "-prune",
+            ")",
+            "-o",
+            "(",
+            "-name",
+            ".flocal-tmp-*",
+            "-prune",
+            ")",
+            "-o",
+            "-printf",
+            "%y\\t%m\\t%l\\t%p\\n",
+        ])?;
+        let mut tree = Tree::new();
+        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+            let mut fields = line.splitn(4, '\t');
+            let (Some(kind), Some(mode), Some(target), Some(path)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                bail!("unparseable tree line: {line}");
+            };
+            let kind = kind.chars().next().context("empty kind")?;
+            let mode = u32::from_str_radix(mode, 8).context("tree mode")?;
+            let Some(path) = path
+                .strip_prefix(SHARE)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(str::to_owned)
+            else {
+                bail!("tree path outside the share: {path}");
+            };
+            tree.insert(
+                path,
+                TreeEntry {
+                    kind,
+                    exec: kind == 'f' && mode & 0o111 != 0,
+                    hash: None,
+                    target: (kind == 'l').then(|| target.to_owned()),
+                },
+            );
+        }
+        let hashes = self.exec_ok(&[
+            "find",
+            SHARE,
+            "-mindepth",
+            "1",
+            "(",
+            "-name",
+            ".git",
+            "-prune",
+            ")",
+            "-o",
+            "(",
+            "-name",
+            ".flocal-tmp-*",
+            "-prune",
+            ")",
+            "-o",
+            "-type",
+            "f",
+            "-exec",
+            "sha256sum",
+            "--",
+            "{}",
+            "+",
+        ])?;
+        for line in String::from_utf8_lossy(&hashes.stdout).lines() {
+            let Some((hash, path)) = line.split_once("  ") else {
+                bail!("unparseable hash line: {line}");
+            };
+            let Some(path) = path
+                .strip_prefix(SHARE)
+                .and_then(|rest| rest.strip_prefix('/'))
+            else {
+                bail!("hash path outside the share: {path}");
+            };
+            if let Some(entry) = tree.get_mut(path) {
+                entry.hash = Some(hash.to_owned());
+            }
+        }
+        Ok(tree)
+    }
+
+    fn fail(&self, message: String) -> anyhow::Error {
+        self.context.dump_once();
+        anyhow::anyhow!(message)
+    }
+
+    fn flocal_ok(&self, args: &[&str]) -> Result<std::process::Output> {
+        let output = self.flocal_raw(args)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: flocal {} failed: {}",
+                self.alias,
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(output)
+    }
+
+    fn flocal_raw(&self, args: &[&str]) -> Result<std::process::Output> {
+        let mut full = vec!["flocal"];
+        full.extend_from_slice(args);
+        self.exec_raw(&full)
+    }
+
+    fn exec_ok(&self, command: &[&str]) -> Result<std::process::Output> {
+        let output = self.exec_raw(command)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: {} failed: {}",
+                self.alias,
+                command.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(output)
+    }
+
+    fn exec_raw(&self, command: &[&str]) -> Result<std::process::Output> {
+        let mut args = vec!["exec", "-u", "peer", &self.container.name];
+        args.extend_from_slice(command);
+        self.context.docker_raw(&args)
+    }
+
+    fn exec_with_stdin(&self, command: &[&str], stdin: &[u8]) -> Result<std::process::Output> {
+        let mut args = vec!["exec", "-i", "-u", "peer", &self.container.name];
+        args.extend_from_slice(command);
+        self.context.docker_with_stdin(&args, Some(stdin))
+    }
+
+    fn exec_with_stdin_ok(&self, command: &[&str], stdin: &[u8]) -> Result<std::process::Output> {
+        let output = self.exec_with_stdin(command, stdin)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: {} failed: {}",
+                self.alias,
+                command.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(output)
+    }
+
+    fn wait_sshd_ready(&self) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            let probe = self.context.docker_raw(&[
+                "exec",
+                &self.container.name,
+                "bash",
+                "-c",
+                "exec 3<>/dev/tcp/127.0.0.1/22",
+            ])?;
+            if probe.status.success() {
+                return Ok(());
+            }
+            if started.elapsed() >= DEADLINE {
+                self.context.dump_once();
+                bail!("{}: sshd did not become ready", self.alias);
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn install_ssh_material(&self) -> Result<()> {
+        let public = std::fs::read(self.context.temp.path().join("id_ed25519.pub"))?;
+        let private = self.context.temp.path().join("id_ed25519");
+        self.exec_ok(&["mkdir", "-p", "/home/peer/.ssh"])?;
+        self.exec_with_stdin_ok(&["tee", "/home/peer/.ssh/authorized_keys"], &public)?;
+        let target = format!("{}:/home/peer/.ssh/id_ed25519", self.container.name);
+        self.context.docker_ok(&[
+            "cp",
+            private.to_str().context("temp path is not UTF-8")?,
+            &target,
+        ])?;
+        let config = b"Host peer-a peer-b\n    User peer\n    IdentityFile ~/.ssh/id_ed25519\n    StrictHostKeyChecking accept-new\n";
+        self.exec_with_stdin_ok(&["tee", "/home/peer/.ssh/config"], config)?;
+        self.context.docker_ok(&[
+            "exec",
+            &self.container.name,
+            "chown",
+            "-R",
+            "peer:peer",
+            "/home/peer/.ssh",
+        ])?;
+        self.exec_ok(&["chmod", "700", "/home/peer/.ssh"])?;
+        self.exec_ok(&[
+            "chmod",
+            "600",
+            "/home/peer/.ssh/id_ed25519",
+            "/home/peer/.ssh/authorized_keys",
+            "/home/peer/.ssh/config",
+        ])?;
+        Ok(())
+    }
+
+    /// Validates a scenario-supplied share-relative path and returns its
+    /// absolute form inside the container.
+    fn share_path(&self, path: &str) -> Result<String> {
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.starts_with('-')
+            || path.contains('\0')
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            bail!("invalid scenario path: {path:?}");
+        }
+        Ok(format!("{SHARE}/{path}"))
+    }
+}
+
+fn validate_component(value: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("invalid identifier: {value:?}");
+    }
+    Ok(())
+}

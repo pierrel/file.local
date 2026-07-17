@@ -331,7 +331,7 @@ schema 1, populated from schema 2 — and scenarios assert against
 =None=, fails, and satisfies its =known_failure= wrapper (section 2.4); the
 tombstone pull request bumps the pinned constant to 2 in the same change
 that promotes #6, #8, and #11. An implementer must /not/ "helpfully" pin
-schema 2 at harness landing — that would break the twelve scenarios that
+schema 2 at harness landing — that would break the nine scenarios that
 pass on =main=. Diagnostics never depend on any of this: the section 8
 failure dump prints the /raw/ =status --json= output without parsing it, so
 a schema mismatch — or a status that fails to parse at all — is itself
@@ -490,8 +490,12 @@ One image serves both peers, built by a multi-stage Dockerfile at
 
 - *Builder stage:* =rust:1-bookworm= (the tag names the base here for
   readability; the Dockerfile itself references it by manifest-list digest,
-  as below), =cargo build --release --locked= of the repository source, with
-  BuildKit cache mounts for the cargo registry and target directory.
+  as below), =cargo build --release --locked= of the repository source.
+  Dependencies build first against a dummy source tree in their own layer,
+  so a source-only change rebuilds only the crate itself; this ordinary
+  layer caching replaced the originally proposed BuildKit cache mounts
+  because it works identically on the legacy builder and BuildKit, dropping
+  BuildKit as a host prerequisite.
 - *Runtime stage:* =debian:bookworm-slim= (likewise digest-pinned in the
   Dockerfile) plus =openssh-server=; copies the
   binary in, creates the =peer= user, generates host keys, and installs the
@@ -523,12 +527,11 @@ section 11). Pinned bases are the smaller half of the supply-chain story:
 the real build-time fetch surface is crates.io — pinned by =Cargo.lock= and
 enforced by =--locked= — and Debian's signed apt repositories.
 
-One honesty note on caching: the cache mounts deliver seconds-warm rebuilds
-on local machines and persistent runners (the Forgejo target environment).
-GitHub-hosted CI runners are fresh VMs — no BuildKit cache survives between
-runs, and the =gha= layer-cache backend does not persist
-=RUN --mount=type=cache= contents — so CI runs build cold and are budgeted
-for it explicitly (section 12).
+One honesty note on caching: the dependency layer delivers seconds-warm
+rebuilds on local machines and persistent runners (the Forgejo target
+environment). GitHub-hosted CI runners are fresh VMs — no image layer cache
+survives between runs — so CI runs build cold and are budgeted for it
+explicitly (section 12).
 
 ** 3.3 Keys and SSH configuration
 
@@ -628,8 +631,9 @@ e2e:
 #+end_example
 
 Host prerequisites, checked up front with one-line diagnoses: a reachable
-Docker daemon with BuildKit (the cache-mount syntax requires it), and the
-OpenSSH client tools on the host (=ssh-keygen=, for the throwaway keypair).
+Docker daemon (legacy builder or BuildKit — the Dockerfile requires
+neither specifically), and the OpenSSH client tools on the host
+(=ssh-keygen=, for the throwaway keypair).
 
 =#[ignore]= was chosen over a Cargo feature flag because it keeps the
 harness and every scenario compiling in the ordinary =cargo test
@@ -731,9 +735,9 @@ AGENTS.md forbids.
 | 2 | Preview/confirm gate, opened from =containers()= plus explicit =init()=/=peer_add()= (not =pair()=, which would already have consumed the gate): =sync_dry_run()= changes nothing anywhere; =sync_decline()= answers "n" and applies nothing; =sync()= (=--yes=) applies | design §User experience | S1 |
 | 3 | Initial union with both trees non-empty; same-path difference becomes a conflict, nothing deleted | design §Create and connect | S1 |
 | 4 | Basic bidirectional sync: files, directories, empty directory, symlink, exec bit (example 2.2.3); also asserts a =.flocal-tmp-=-prefixed file is never synchronized (absent on the peer). Covers acceptance criterion 1 /except renames/ | acceptance criterion 1 (partial) | S1 |
-| 5 | Offline edits on both sides plus a rename on one side; reconnect catch-up converges (with the alpha's documented delete-plus-create fallback for the unobserved rename) | acceptance criterion 2 | S1 |
+| 5 | Offline edits on both sides plus a rename on one side; reconnect catch-up converges (with the alpha's documented delete-plus-create fallback for the unobserved rename). Implementation finding: expected-fail on =main= — the rename's delete half is lost after one unreachable-peer cycle (the tombstone early-drop); verified to pass with PR #2 merged, promoted with it | acceptance criterion 2 | S1 |
 | 6 | Offline deletion retention: the tombstone story, end to end (example 2.2.1); lands expected-fail on =main= (tombstone early-drop, PR #2) and is promoted when that fix merges | =agent/tombstone-retention= | S1 |
-| 7 | Nested deletion of a directory tree propagates | existing =tests/core.rs= coverage, now over SSH | S1 |
+| 7 | Nested deletion of a directory tree propagates. Implementation finding: expected-fail on =main= — the deleting peer's own apply recreates the deleted parent directories (the tombstone =create_dir_all= path PR #2 guards), a self-apply path no unit test drives; verified to pass with PR #2 merged, promoted with it | existing =tests/core.rs= coverage, now over SSH | S1 |
 | 8 | Recreation over a retained tombstone supersedes it; lands expected-fail on =main= (PR #2), promoted with #6 | tombstone fix, recreation arm | S1 |
 | 9 | Concurrent-edit conflict: winner on both, loser retained, =restore= works (example 2.2.2) | acceptance criterion 3 | S1 |
 | 10 | Peer identity mismatch: =b.reset_state()= empties B's registration; =a.sync_expect_err("peer identity mismatch")= observes the rejection and no file on either peer changes; lands expected-fail on =main= (=bound_peer= error contract, section 14.2) and is promoted by that fix's own pull request | design §Security model | S1 |
@@ -744,7 +748,7 @@ AGENTS.md forbids.
 | 15 | Interrupted transfer: kill the SSH session mid-transfer of a large file; destination is old-complete or new-complete; the next sync converges. Requires new vocabulary when implemented: a kill-mid-transfer primitive, since =sync()= is blocking. No user-visible observable exists today for "committed files were not retransferred"; naming one would be a further product change | acceptance criterion 7 | later |
 | 16 | Large file streams within bounded memory and session budgets. Requires per-peer =Config= knobs (=FLOCAL_MAX_SESSION_BYTES=) when implemented (=write_bytes= already exists for content) | acceptance criterion 6 | later |
 | 17 | =.git= is never scanned, transferred, or deleted | acceptance criterion 5 | S1 |
-| 18 | File-to-directory and directory-to-file transition at the same path propagates (mirrors the transitions coverage in =tests/core.rs=, now over SSH) | existing =tests/core.rs= coverage, now over SSH | S1 |
+| 18 | File-to-directory and directory-to-file transition at the same path propagates (mirrors the transitions coverage in =tests/core.rs=, now over SSH). Implementation finding: expected-fail on =main= — the connector's self-apply of a kind transition fails the whole sync with "apply stopped ... File exists"; verified to pass with PR #2 merged, promoted with it | existing =tests/core.rs= coverage, now over SSH | S1 |
 | 19 | Concurrent-delete convergence: both peers delete the same path offline, reconnect, converge with no error; and an offline delete versus a remote edit resolves by the documented discovery-scan LWW without wedging — asserts convergence and that a sync round completes, /not/ which side wins | alpha delete-versus-edit note; acceptance criterion 3 (delete arm) | S1 |
 | 20 | Exec-bit round-trip — set, sync, =unset_exec=, sync, assert cleared — and binary non-UTF-8 content via =write_bytes= round-trips intact (asserted through tree equality's content hashes) | acceptance criterion 1 (exec bit and binary content) | S1 |
 
@@ -926,7 +930,7 @@ have direct Forgejo Actions equivalents. One infrastructure prerequisite to
 plan for: Forgejo runners need Docker-daemon access configured (a socket
 mount, DinD, or a host-labeled runner) — a property of the job's
 environment, not of the harness. The upside is that persistent Forgejo
-runners are exactly where the BuildKit cache mounts deliver warm builds.
+runners are exactly where the cached dependency layer delivers warm builds.
 
 * 12. Acceptance criteria for the first slice
 
@@ -935,7 +939,8 @@ The harness's first implementation is acceptable when:
 1. =make e2e= on a Linux machine with Docker, running against =main=, builds
    the image and runs all sixteen S1 scenarios (catalog #1–#12 and #17–#20)
    over real SSH between two containers, with every scenario matching its
-   declared expectation: twelve pass, and four (#6, #8, #10, #11)
+   declared expectation: nine pass, and seven (#5, #6, #7, #8, #10, #11,
+   #18)
    fail-as-expected under =known_failure=.
 2. =make check= passes unchanged on a machine with no Docker daemon, with
    both coverage thresholds computed exactly as before — the =tests/e2e/=
@@ -1046,7 +1051,13 @@ expected-fail scenarios (section 2.4).
    harness — on =main= today those scenarios fail outright because the
    deletion resurrects, which is exactly what their wrappers pin. The
    =bound_peer= =.optional()= fix becomes its own small pull request
-   promoting #10. Accepted trade-off: the tombstone data-loss fix merges
+   promoting #10. Implementation finding: the first real runs pinned three
+   /more/ scenarios to PR #2 than predicted — #5 (an offline rename's
+   delete half is lost after one unreachable cycle), #7 (the deleting
+   peer's own apply recreates deleted parent directories), and #18 (a kind
+   transition fails the connector's sync with "File exists") — all verified
+   broken on =main= and passing on a merged probe tree, so PR #2 promotes
+   seven scenarios in total. Accepted trade-off: the tombstone data-loss fix merges
    later than it otherwise would; that is acceptable for the current
    single-user alpha, and PR #2's own unit-level regression tests already
    demonstrate fail-on-main at that level. The status-schema pin follows the
