@@ -5,7 +5,6 @@
 use anyhow::Result;
 
 use crate::harness as e2e;
-use crate::harness::known_failure;
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
@@ -49,34 +48,28 @@ fn files_directories_symlinks_and_exec_bits_sync_both_ways() -> Result<()> {
     e2e::assert_trees_equal(&a, &b)
 }
 
-// Discovered by this harness: on main, the rename's delete half is lost
-// after a single unreachable-peer cycle (the tombstone early-drop PR #2
-// fixes), so the old name survives on the reconnecting peer. Verified to
-// pass with PR #2 merged; promoted when it lands.
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
 fn offline_edits_and_renames_catch_up_after_reconnection() -> Result<()> {
-    known_failure(|| {
-        let (a, b) = e2e::pair()?;
-        a.write("notes.txt", "v1")?;
-        a.write("old-name.txt", "movable")?;
-        a.sync()?;
+    let (a, b) = e2e::pair()?;
+    a.write("notes.txt", "v1")?;
+    a.write("old-name.txt", "movable")?;
+    a.sync()?;
 
-        b.offline()?;
-        a.write("notes.txt", "v2 from a")?;
-        a.rename("old-name.txt", "new-name.txt")?;
-        b.write("reply.txt", "written while offline")?;
-        a.sync_expect_offline()?;
+    b.offline()?;
+    a.write("notes.txt", "v2 from a")?;
+    a.rename("old-name.txt", "new-name.txt")?;
+    b.write("reply.txt", "written while offline")?;
+    a.sync_expect_offline()?;
 
-        b.online()?;
-        a.sync()?;
+    b.online()?;
+    a.sync()?;
 
-        b.assert_file("notes.txt", "v2 from a")?;
-        b.assert_file("new-name.txt", "movable")?;
-        b.assert_absent("old-name.txt")?;
-        a.assert_file("reply.txt", "written while offline")?;
-        e2e::assert_trees_equal(&a, &b)
-    })
+    b.assert_file("notes.txt", "v2 from a")?;
+    b.assert_file("new-name.txt", "movable")?;
+    b.assert_absent("old-name.txt")?;
+    a.assert_file("reply.txt", "written while offline")?;
+    e2e::assert_trees_equal(&a, &b)
 }
 
 #[test]

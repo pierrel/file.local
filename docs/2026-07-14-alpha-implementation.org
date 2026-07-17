@@ -87,7 +87,9 @@
 - Real macOS filesystem acceptance still needs to be run. The Linux half of
   cross-machine SSH acceptance is now exercised by the =tests/e2e=
   two-container Docker harness over real SSH (see
-  [[file:2026-07-16-e2e-harness-design.org][the e2e harness design]]).
+  [[file:2026-07-16-e2e-harness-design.org][the e2e harness design]]); one
+  scenario still pins the =bound_peer= error-contract fix as a known
+  failure.
 
 These limitations are deliberately stated rather than weakening the detailed
 design. Local review decides which are blockers for publishing the alpha and
