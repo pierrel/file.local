@@ -1,6 +1,6 @@
 #+title: End-to-end two-container test harness
 #+date: 2026-07-16
-#+status: proposed
+#+status: accepted; first slice implemented
 
 * 1. Summary, goals, and non-goals
 
@@ -117,10 +117,12 @@ sync — so the opening logic exists exactly once.
 
 ** 2.2 Example scenarios
 
-These are complete scenario bodies as they would be committed. =e2e::pair()=
-performs the standard opening — build image, start both containers, =init= on
-peer A, =peer add= toward peer B, confirmed initial sync — and returns
-=(Connector, Peer)=. All names are synthetic.
+The first three are the committed scenario bodies (=tests/e2e/scenarios/=);
+the watch example (2.2.4) belongs to the unimplemented watch slice and
+remains illustrative. =e2e::pair()= performs the standard opening — build
+image, start both containers, =init= on peer A, =peer add= toward peer B,
+confirmed initial sync — and returns =(Connector, Peer)=. All names are
+synthetic.
 
 *** Offline deletion is retained and never resurrects
 
@@ -128,8 +130,8 @@ The end-to-end form of the =agent/tombstone-retention= fix
 (=offline_deletion_survives_scan_cycles_until_peer_returns= in
 =tests/core.rs=), now over real SSH and a real disconnected network. The
 body below is its final form; it lands wrapped in =e2e::known_failure=
-(section 2.4) until PR #2 merges, and promotion deletes only the wrapper
-line:
+(section 2.4) until PR #2 merges, and promotion deletes only the wrapper —
+a line plus its closing brace:
 
 #+begin_src rust
 #[test]
@@ -175,13 +177,19 @@ fn concurrent_edit_keeps_one_winner_and_a_recoverable_loser() -> Result<()> {
     b.online()?;
     a.sync()?;
 
-    e2e::assert_trees_equal(&a, &b)?; // both show the same winner
-    let conflict = a.conflicts()?.expect_one("notes.txt")?;
+    // Both peers show the same deterministic winner; which side wins depends
+    // on discovery-scan ordering, so only recoverability is asserted.
+    e2e::assert_trees_equal(&a, &b)?;
+    let conflicts = a.conflicts()?;
+    let conflict = conflicts.expect_one("notes.txt")?;
     let winner = a.read("notes.txt")?;
-    let loser = a.restore_loser(&conflict.id)?; // restores outside the share
+    let loser = a.restore_loser(&conflict.id)?;
     let mut both = [winner, loser];
     both.sort();
-    assert_eq!(both, ["edit from a", "edit from b"]);
+    anyhow::ensure!(
+        both == ["edit from a", "edit from b"],
+        "winner and loser must preserve both inputs, got {both:?}"
+    );
     Ok(())
 }
 #+end_src
@@ -204,6 +212,7 @@ fn files_directories_symlinks_and_exec_bits_sync_both_ways() -> Result<()> {
     a.set_exec("run.sh")?;
     a.symlink("current", "src/lib.txt")?;
     a.mkdir("empty")?;
+    a.write(".flocal-tmp-reserved", "never syncs")?;
     b.write("reply.txt", "from b")?;
 
     a.sync()?;
@@ -212,6 +221,7 @@ fn files_directories_symlinks_and_exec_bits_sync_both_ways() -> Result<()> {
     b.assert_exec("run.sh")?;
     b.assert_symlink("current", "src/lib.txt")?;
     b.assert_dir("empty")?;
+    b.assert_absent(".flocal-tmp-reserved")?;
     a.assert_file("reply.txt", "from b")?;
     e2e::assert_trees_equal(&a, &b)
 }
@@ -277,14 +287,14 @@ name, then =rename= — which stays within the same directory and mount.
 | =e2e::containers() -> (PeerBox, PeerBox)= | started, unpaired containers — for pairing/rejection scenarios |
 | =e2e::pair() -> (Connector, Peer)=        | the standard opening: init, peer add, confirmed initial sync |
 | =e2e::pair_with(Config)=                  | same, with knobs (currently: watch rescan seconds) |
-| =a.init()= / =e2e::peer_add(a, b) -> (Connector, Peer)= | explicit pairing steps; =peer_add= consumes both =PeerBox= handles |
+| =a.init()= / =a.peer_add(b) -> (Connector, Peer)= | explicit pairing steps; =peer_add= is a =PeerBox= method consuming both boxes |
 | =a.sync()=                                | =flocal sync --yes=; fails the scenario on nonzero exit |
-| =a.sync_dry_run() -> Plan=                | =flocal sync --dry-run --json=; asserts nothing changed |
-| =a.sync_decline()=                        | =flocal sync= without =--yes=; answers "n" to the initial confirmation |
-| =a.sync_expect_offline()=                 | asserts nonzero exit and that neither peer's tree changed |
+| =a.sync_dry_run()=                        | =flocal sync --dry-run=; asserts the connector's tree is unchanged by the preview |
+| =a.sync_decline()=                        | =flocal sync= without =--yes=, declining the initial confirmation |
+| =a.sync_expect_offline()=                 | asserts nonzero exit and that the connector's tree is unchanged |
 | =a.sync_expect_err(needle)=               | asserts nonzero exit and a substring of stderr |
 | =a.watch_start() -> Watch= / =watch.stop()= | foreground =flocal watch= held by a guard |
-| =p.status() -> Status=                    | parsed =status --json= (entries, initial_complete, pending_install, and tombstones as =Option=, populated from schema 2) |
+| =p.status() -> Status=                    | parsed =status --json= (=schema=, =entries=, and =tombstones= as =Option=; fields grow with the scenarios that read them) |
 | =a.conflicts() -> Conflicts=              | parsed =conflicts list --json=, with =expect_one(path)= |
 | =a.restore_loser(id) -> String=           | =restore --version loser= to a scratch path outside the share; returns the content |
 | =p.reset_state()=                         | delete the peer's flocal state directory (=~/.local/state/file.local=) inside its container, so it no longer holds the share registration or peer binding, while its share files and the other peer's registration of it survive |
@@ -299,16 +309,23 @@ Three lifecycle contracts deserve spelling out:
 
 - =sync_decline()= is meaningful only /before/ the initial confirmed sync:
   the confirmation prompt is gated on incomplete initial reconciliation in
-  =src/main.rs=. The primitive waits for the =[y/N]= prompt on stdout before
-  feeding "n" over the exec's stdin, then asserts a clean exit and that
-  neither peer's tree changed. Because it requires observing the prompt,
-  misuse after =pair()= fails loudly instead of passing vacuously.
+  =src/main.rs=. The primitive feeds "n" up-front over the exec's stdin,
+  then asserts after exit that the =[y/N]= prompt actually appeared on
+  stdout, that the exit was clean, and that the connector's tree is
+  unchanged — the same fail-loudly guarantee as observing the prompt live,
+  with a simpler mechanism. Because the prompt must have appeared, misuse
+  after =pair()= fails loudly instead of passing vacuously.
 - =sync_expect_offline()= asserts /no/ error text — only the nonzero exit
-  and unchanged trees. On an unreachable peer the product surfaces only a
-  generic connection/EOF failure (the SSH session's stderr is surfaced by
-  the product only on the clean-exit path), and the design does not promise
-  more than the product prints. It shares one exit-checking implementation
-  with =sync_expect_err()=.
+  and the connector's unchanged tree. On an unreachable peer the product
+  surfaces only a generic connection/EOF failure (the SSH session's stderr
+  is surfaced by the product only on the clean-exit path), and the design
+  does not promise more than the product prints. It and =sync_expect_err()=
+  are separate functions layered over the same raw-invocation helper.
+
+Both =sync_decline()= and =sync_expect_offline()= — and =sync_dry_run()= —
+check the /connector's/ tree only, because their signatures cannot reach
+the other peer; scenarios assert the responder side explicitly (as
+catalog #2 does with =b.assert_absent=).
 - =watch.stop()= terminates the watcher /inside/ the container: a second
   =docker exec= signals the recorded PID and waits for it to exit, because
   killing the =docker exec= client does not kill the exec'd process, and a
@@ -319,10 +336,13 @@ Three lifecycle contracts deserve spelling out:
   so double-stop is unrepresentable; the guard's =Drop= is the
   never-panicking best-effort backstop.
 
-=Status=, =Plan=, and =Conflicts= deserialize the product's own JSON and
+=Status= and =Conflicts= deserialize the product's own JSON and
 assert that the embedded =schema= field equals a constant pinned in the
 harness, failing with the actual version on mismatch, so a schema bump
 breaks scenarios mechanically and visibly rather than silently misparsing.
+The conflicts listing has its own pinned constant (=CONFLICTS_SCHEMA=,
+currently 1), independent of the status pin, so the status bump to 2 does
+not disturb conflicts parsing.
 The pinned constant tracks /=main= at harness landing/: status schema 1,
 which has no =tombstones= field. So that one =Status= struct is final form
 across the bump, =tombstones= is declared =Option<u64>= — =None= under
@@ -330,7 +350,7 @@ schema 1, populated from schema 2 — and scenarios assert against
 =Some(count)= (example 2.2.1). On =main=, #6's tombstone assertion finds
 =None=, fails, and satisfies its =known_failure= wrapper (section 2.4); the
 tombstone pull request bumps the pinned constant to 2 in the same change
-that promotes #6, #8, and #11. An implementer must /not/ "helpfully" pin
+that promotes its six scenarios (section 14.4). An implementer must /not/ "helpfully" pin
 schema 2 at harness landing — that would break the nine scenarios that
 pass on =main=. Diagnostics never depend on any of this: the section 8
 failure dump prints the /raw/ =status --json= output without parsing it, so
@@ -362,13 +382,13 @@ own expectation — and triggers the failure dump of section 8):
 
 | =p.assert_file(path, content)= | exists, is a regular file, content matches |
 | =p.assert_absent(path)=        | no entry of any kind at the path |
-| =p.assert_dir(path)= / =p.assert_exec(path)= / =p.assert_symlink(path, target)= | kind- and metadata-specific |
+| =p.assert_dir(path)= / =p.assert_exec(path)= / =p.assert_not_exec(path)= / =p.assert_symlink(path, target)= | kind- and metadata-specific |
 | =e2e::assert_trees_equal(&a, &b)= | full-tree comparison of kind, content hash, exec bit, link target |
 | =p.assert_status(predicate)=   | one assertion over the parsed status |
 
 Drift between an assertion and its wait form is prevented structurally, not
 by convention: each check exists exactly once, as a named =Condition= — a
-probe closure plus a describe closure — and the public =assert_x(...)= and
+probe closure plus a describe string — and the public =assert_x(...)= and
 =wait_x(...)= are two thin entry points over the /same/ =Condition=
 constructor, with =assert_x= literally calling the wait implementation with
 a zero deadline. One comparator per check, so the immediate and eventual
@@ -416,12 +436,19 @@ strictly — the analog of pytest's =xfail(strict=True)=:
 - If the closure succeeds, the test /fails/, with the message "scenario now
   passes — promote it to a plain test in this PR".
 
+One carve-out keeps the pin honest: a failure of the harness /itself/ — the
+daemon check, stale-run sweep, image build, or any container, network, or
+key setup before the first scenario primitive — is typed (=InfraError=) and
+re-raised out of =known_failure= instead of satisfying it, so an
+infrastructure flake cannot turn a pinned scenario vacuously green.
+
 This is what keeps =main='s e2e run green while continuously pinning each
 known bug, and what forces the fixing pull request to flip the scenario in
 the same change — a machine-checked fail-to-pass validation. The fix cannot
 merge without deleting the wrapper, and the wrapper cannot outlive the fix.
-Promotion is exactly one edit — remove the wrapper line — because every
-wrapped scenario body is already written in its final, post-fix form.
+Promotion is exactly one edit — delete the wrapper, a line plus its closing
+brace — because every wrapped scenario body is already written in its
+final, post-fix form.
 
 * 3. Container topology and lifecycle
 
@@ -429,7 +456,8 @@ wrapped scenario body is already written in its final, post-fix form.
 
 One user-defined Docker bridge network and two containers per scenario, with
 synthetic in-network aliases =peer-a= and =peer-b=. Real container and network
-names carry a per-run unique suffix (=flocal-e2e-<run>-a=) plus a
+names carry a per-run unique token (=flocal-e2e-<run>-peer-a=,
+=flocal-e2e-<run>-net=) plus a
 =flocal-e2e=1= label so cleanup can never touch unrelated containers.
 User-defined networks provide embedded DNS, so container A reaches B as
 =peer-b= — no IP addresses appear anywhere, satisfying the no-real-hosts rule
@@ -439,8 +467,9 @@ Each container is started with =--rm= and runs
 =timeout <lifetime> /usr/sbin/sshd -D -e= as PID 1 — root, as sshd requires
 for privilege separation; sessions log in as the unprivileged =peer= user
 created at image build (the root/non-root split section 9 describes). The
-lifetime is env-tunable (=FLOCAL_E2E_CONTAINER_LIFETIME_SECONDS=, default
-3600): when it expires, PID 1 exits and =--rm= removes the container, so
+lifetime is env-tunable — =docker run= forwards a host-set
+=FLOCAL_E2E_CONTAINER_LIFETIME_SECONDS= into the container, defaulting to
+3600: when it expires, PID 1 exits and =--rm= removes the container, so
 every container self-terminates and self-removes within the bound with no
 external actor — even if the harness process is SIGKILL'd or hangs.
 The share root is
@@ -497,16 +526,18 @@ One image serves both peers, built by a multi-stage Dockerfile at
   because it works identically on the legacy builder and BuildKit, dropping
   BuildKit as a host prerequisite.
 - *Runtime stage:* =debian:bookworm-slim= (likewise digest-pinned in the
-  Dockerfile) plus =openssh-server=; copies the
-  binary in, creates the =peer= user, generates host keys, and installs the
-  =flocal= entry point as the thin stderr-teeing wrapper described in
-  section 8.
+  Dockerfile) plus =openssh-server=, =openssh-client=, and =bash=; copies
+  the binary in, creates the =peer= user, generates host keys, and installs
+  the =flocal= entry point as the thin stderr-teeing wrapper described in
+  section 8, with the lifetime-bounded =entrypoint.sh= as PID 1.
 
-The build context is minimal and explicit: the Dockerfile =COPY=s only
-=Cargo.toml=, =Cargo.lock=, and =src/= — nothing else is needed to build the
-binary — and a =.dockerignore= (=.git=, =target=, =docs=, =references=,
-=tests=) is added as belt-and-braces. The repository has no =.dockerignore=
-today, so a naive =COPY . .= would ship =.git=, a multi-gigabyte =target/=,
+The build context is minimal and explicit: the Dockerfile =COPY=s
+=Cargo.toml=, =Cargo.lock=, =src/=, and the two runtime scripts
+=tests/e2e/entrypoint.sh= and =tests/e2e/flocal-wrapper.sh= — nothing else
+is needed — with a =.dockerignore= (=.git=, =target=, =docs=,
+=references=, =tests=, plus negations re-admitting exactly those two
+scripts) enforcing it. The repository previously had no =.dockerignore=,
+so a naive =COPY . .= would ship =.git=, a multi-gigabyte =target/=,
 and any stray developer-local file into cached builder layers; the explicit
 COPY list makes that impossible rather than merely unlikely, and section 12
 makes it an acceptance criterion.
@@ -537,19 +568,25 @@ explicitly (section 12).
 
 Per run, the harness generates a throwaway ed25519 client keypair with
 =ssh-keygen= into the run's temporary directory — never written into the
-repository, never reused across runs. The public key is installed into
-=peer='s =authorized_keys= in both containers after start; the private key
-is copied into container A. Container A's =~/.ssh/config= gets:
+repository, never reused across runs. Provisioning is /symmetric/: the
+public key goes into =peer='s =authorized_keys=, and the private key plus a
+=~/.ssh/config= stanza are installed into /both/ containers, because either
+raw container may become the connector — =a.peer_add(b)= or
+=b.peer_add(a)=:
 
 #+begin_example
-Host peer-b
+Host peer-a peer-b
     User peer
     IdentityFile ~/.ssh/id_ed25519
     StrictHostKeyChecking accept-new
 #+end_example
 
 so =flocal peer add /home/peer/share --host peer-b --remote-path
-/home/peer/share= exercises the documented alias flow exactly.
+/home/peer/share= exercises the documented alias flow exactly. The security
+rationale is unchanged by the symmetry: the key is throwaway and per-run,
+the bridge network is isolated, and the containers self-terminate — the
+extra responder-to-connector trust direction is test-only surface the
+product never exercises.
 =accept-new= is safe here because the network is isolated and the host key
 is fixed at image build; it also keeps the first connection non-interactive.
 Pairing's =command -v flocal= discovery probe runs for real against the
@@ -564,9 +601,13 @@ Ownership is explicit. A single run context, shared by =Arc=, owns the
 network, the two per-peer volumes, the temporary directory and keys, the
 transcript, and a dumped-once flag. Each peer handle's =Drop= force-removes
 only its own container; the context's =Drop= — the last =Arc= clone —
-removes the network and both volumes. Every =Drop= logs its failures and never panics: a panicking
-=Drop= during unwind would abort the process and lose the failure dump. An
-ordinary panic (every failed assertion) therefore still cleans up, in order.
+removes the network and both volumes. Every =Drop= — containers and
+context alike — logs its failures and never panics: a panicking =Drop=
+during unwind would abort the process and lose the failure dump. On
+unwind, the /first/ container dropped triggers the dump while both
+containers are still alive — that is how "dump before cleanup" is
+delivered — and an ordinary panic (every failed assertion) then cleans up
+in order.
 
 Two backstops cover what =Drop= cannot. =make e2e= begins by removing
 anything labeled =flocal-e2e=1= left behind by an aborted earlier run; the
@@ -596,9 +637,9 @@ peer B restores =peer-b=. The failure-mode comparison:
 - *=docker network disconnect= (chosen):* removes the container's interface
   and its embedded-DNS entry. The next SSH attempt fails immediately with
   name-resolution or no-route errors; =flocal sync= exits nonzero within a
-  second — with the generic connection/EOF failure the product prints on
-  this path, which is exactly what =sync_expect_offline()= promises
-  (section 2.3). Deterministic, fast, needs no privileges beyond the Docker
+  second with a generic connection/EOF failure — which is why
+  =sync_expect_offline()= asserts only the nonzero exit and the connector's
+  unchanged tree (section 2.3). Deterministic, fast, needs no privileges beyond the Docker
   access the harness already has, and works identically under rootful and
   rootless Docker.
 - *iptables/nftables rules:* requires =NET_ADMIN= in the containers or root
@@ -630,10 +671,12 @@ e2e:
 	cargo test --test e2e -- --ignored --test-threads=1
 #+end_example
 
-Host prerequisites, checked up front with one-line diagnoses: a reachable
+Host prerequisites, each failing with a one-line diagnosis: a reachable
 Docker daemon (legacy builder or BuildKit — the Dockerfile requires
-neither specifically), and the OpenSSH client tools on the host
-(=ssh-keygen=, for the throwaway keypair).
+neither specifically), checked once per process before the stale-run sweep
+and image build; and the OpenSSH client tools on the host (=ssh-keygen=,
+for the throwaway keypair), discovered at the first scenario's setup,
+after the sweep and build.
 
 =#[ignore]= was chosen over a Cargo feature flag because it keeps the
 harness and every scenario compiling in the ordinary =cargo test
@@ -753,8 +796,11 @@ AGENTS.md forbids.
 | 20 | Exec-bit round-trip — set, sync, =unset_exec=, sync, assert cleared — and binary non-UTF-8 content via =write_bytes= round-trips intact (asserted through tree equality's content hashes) | acceptance criterion 1 (exec bit and binary content) | S1 |
 
 Rows marked expected-fail land wrapped in =known_failure= (section 2.4).
-All four wrapped scenario bodies are written in their final, post-fix form
-from day one; promotion deletes only the wrapper line.
+All seven wrapped scenario bodies (#5, #6, #7, #8, #10, #11, #18) are
+written in their final, post-fix form from day one; promotion deletes only
+the wrapper — a line plus its closing brace. Three of the seven (#5, #7,
+#18) pin bugs this harness /newly discovered/ on =main=, all self-apply
+paths no unit test drives.
 
 The budget and limit behaviors already covered elsewhere
 (=FLOCAL_MAX_STATE_BYTES=, =FLOCAL_MAX_SESSION_SECONDS=, the recovery-space
@@ -774,12 +820,14 @@ every verb is either exercised by a named S1 scenario — =containers()=,
 =init()=, =peer_add()= in #1 and #2; =sync_dry_run()=, =sync_decline()=,
 =sync()= in #2; =write()=, =mkdir()=, =symlink()=, =set_exec()=, the kind
 assertions, and =assert_trees_equal()= in #4; =offline()=/=online()= in #5,
-#6, #9, and #19; =rename()= in #5; =sync_expect_offline()=,
-=remove_dir_all()=, =assert_absent()=, =assert_status()= in #6–#7;
-=conflicts()=, =read()=, =restore_loser()= in #9; =sync_expect_err()= and
-=reset_state()= in #10; =remove()= and =status()= in #11;
-=known_failure()= in #6, #8, #10, and #11; =unset_exec()= and
-=write_bytes()= in #20 — or is reserved on paper for a named later
+#6, #8, #9, and #19; =rename()= in #5; =sync_expect_offline()= in #5, #6,
+and #8; =remove_dir_all()= in #6–#8 and #18; =assert_absent()= throughout
+the deletion and ignore scenarios; =assert_status()= in #6 and #11
+(=status()= is its internal probe); =conflicts()=, =read()=,
+=restore_loser()= in #9; =sync_expect_err()= and =reset_state()= in #10;
+=remove()= in #11, #18, and #19; =known_failure()= in #5, #6, #7, #8, #10,
+#11, and #18; =unset_exec()=, =write_bytes()=, and =assert_not_exec()= in
+#20 — or is reserved on paper for a named later
 scenario and implemented with it, per the slice policy: =pair_with()=,
 =watch_start()=/=stop()=, and the wait primitives (=wait_for_file=,
 =wait_absent=, =wait_status=) belong to the watch scenarios #13–#14.
@@ -795,52 +843,63 @@ the needed isolation. Layout:
 
 #+begin_example
 tests/e2e/
-  main.rs          declares the scenario and harness modules
+  main.rs            declares the scenario and harness modules
   scenarios/
-    mod.rs         the scenario catalog: one module per story area
-    (pairing.rs, sync.rs, offline.rs, conflicts.rs, ...)
+    mod.rs           the scenario catalog: one module per story area
+    pairing.rs, syncing.rs, offline.rs, conflicts.rs, ignores.rs, transitions.rs
   harness/
-    mod.rs         public vocabulary: pair, containers, peer_add, Connector, Peer, Config
-    context.rs     the shared run context: network, volume, temp dir, keys, transcript, dumped-once flag
-    docker.rs      docker CLI invocation, run-id, labels, cleanup
-    peer.rs        file ops, assertions, status/conflict parsing
-    dump.rs        failure diagnostics
+    mod.rs           the public vocabulary re-exports
+    docker.rs        docker CLI invocation and the shared RunContext (run-id,
+                     network, volumes, keys, transcript, dumped-once flag),
+                     InfraError, the stale-run sweep, and the image build
+    peer.rs          PeerBox/Connector/Peer: file ops, lifecycle, connectivity,
+                     Conditions/assertions, status and conflicts parsing
+    dump.rs          failure diagnostics
   Dockerfile
+  entrypoint.sh      container PID 1: lifetime-bounded sshd
+  flocal-wrapper.sh  tees flocal stderr to the log the dump collects
 #+end_example
 
-Public surface (what a scenario may name): =pair=, =pair_with=,
-=containers=, =peer_add=, =Config=, =Connector=, =Peer=, =PeerBox=,
-=Status=, =Plan=, =Conflicts=, =Watch=, and =assert_trees_equal=. Everything
-in =docker.rs= is private; a scenario physically cannot issue a raw docker
-command through the harness API. Every primitive takes =&self= — mutable
-bookkeeping lives in the run context behind interior mutability — and no
-harness type implements =DerefMut= (the rule that keeps
+The implemented public surface came out /tighter/ than designed: =mod.rs=
+re-exports exactly four names — =pair=, =containers=, =known_failure=, and
+=assert_trees_equal=. =init= and =peer_add= are methods on the returned
+=PeerBox= handles, every other verb is a method on =Connector= or =Peer=,
+and the types themselves (=PeerBox=, =Connector=, =Peer=, =Status=,
+=Conflicts=) are reachable only by inference from those entry points.
+=pair_with=, =Config=, and =Watch= arrive with the watch slice. Everything
+in =docker.rs= is private to the harness; a scenario physically cannot
+issue a raw docker command through its API. Every primitive takes =&self= —
+mutable bookkeeping lives in the run context behind interior mutability —
+and no harness type implements =DerefMut= (the rule that keeps
 =Connector: Deref<Target = Peer>= sound, section 2.1).
 
-*Failure reporting is a first-class requirement.* Every primitive appends to
-the run transcript (the command, the peer, duration, exit status). When a
-scenario fails — by assertion, error return, or wait deadline — the harness
-prints, before cleanup: the transcript tail; both peers' internal tree
-walks; both peers' raw =status --json= output (printed unparsed, so the
-dump works whatever schema the binary emits); stdout /and stderr/ of every =flocal=
-invocation — the connector-side SSH session's stderr is always captured into
-the transcript, because the product itself surfaces it only on the
-clean-exit path; the responder's own diagnostics; and =docker logs= (sshd's
-stderr) for both containers. The responder's diagnostics need one image
-provision: the =flocal= entry point installed in the image is a thin wrapper
-that execs the real binary with its stderr both forwarded unchanged to the
-SSH channel and appended to an in-container log file, which the dump
-collects — without it, the responder's stderr vanishes on most failure
-paths, because the connector discards the SSH session's stderr whenever it
-bails early.
+*Failure reporting is a first-class requirement.* Every docker invocation
+appends one command/exit-status/duration line to the run transcript. When a
+scenario fails — a failing primitive, a failed assertion, or a wait
+deadline — the harness prints, while both containers are still alive: the
+transcript tail; each container's raw =find= listing of the share
+(deliberately unfiltered, unlike the comparison tree walk, so reserved and
+ignored names are visible); each container's raw =status --json= output,
+printed unparsed so the dump works whatever schema the binary emits; each
+container's captured flocal stderr log; and =docker logs= (sshd's stderr).
+The stderr log needs one image provision: the =flocal= entry point is a
+thin wrapper (=flocal-wrapper.sh=) that execs the real binary with stderr
+both forwarded unchanged and appended to an in-container log — on the
+responder, whose stderr the connector discards whenever it bails early,
+and equally on the connector, so both sides' product diagnostics survive
+into the dump.
 
 Dump emission is exactly-once, guarded by the run context's flag: it fires
-at the first failing primitive, or at unwind (=std::thread::panicking=) for
-a panic that bypassed the harness — except inside =known_failure=, where
-failure is the expected outcome and the dump is suppressed (section 2.4). With =FLOCAL_E2E_KEEP=1= the harness
-additionally preserves the containers and prints their names for manual
-=docker exec= inspection. A failing scenario — including a responder-side
-failure — must be diagnosable from its CI log alone.
+at the first failing primitive, or at unwind (=std::thread::panicking=,
+checked by the first container's =Drop=) for a panic that bypassed the
+harness — except inside =known_failure=, where failure is the expected
+outcome and the dump is suppressed (section 2.4). One accepted residual: a
+scenario-authored plain =Err= (=ensure!=/=bail!= written directly in a
+scenario body, as #9 does) reports through the test harness without the
+dump, since no failing primitive is involved. With =FLOCAL_E2E_KEEP=1= the
+harness additionally preserves the containers and prints their names for
+manual =docker exec= inspection. A failing scenario — including a
+responder-side failure — must be diagnosable from its CI log alone.
 
 * 9. Security boundaries
 
@@ -861,7 +920,9 @@ failure — must be diagnosable from its CI log alone.
   deployment.
 - *Input discipline in the harness itself.* Scenario paths are validated
   (relative, no =..=, no leading =-=, no NUL) and passed as distinct argv
-  elements after =--=; file content and interactive answers (the "n" that
+  elements — with a =--= separator wherever the tool accepts one; the
+  =test= and =readlink= probes pass the already-validated absolute paths
+  without it. File content and interactive answers (the "n" that
   =sync_decline()= feeds to the confirmation prompt) travel over the
   =docker exec -i= stdin as data, never through a shell string. The harness
   applies the same no-interpolation rule the product applies at its SSH
@@ -879,9 +940,11 @@ failure — must be diagnosable from its CI log alone.
 
 - *Docker absent or daemon down.* =make check= and =cargo test= are
   unaffected by construction (=#[ignore]=). =make e2e= fails fast: the
-  harness's first act checks the daemon and the host prerequisites of
-  section 5.1, and failure produces a one-line diagnosis ("docker daemon
-  unreachable; the e2e suite requires docker") rather than a cascade.
+  harness's first act checks the daemon (then sweeps and builds, once per
+  process — section 5.1), and failure produces a one-line diagnosis
+  ("docker daemon unreachable; the e2e suite requires docker") rather than
+  a cascade — typed as infrastructure so it can never satisfy a
+  =known_failure= pin (section 2.4).
   Failing rather than skipping is deliberate: invoking =make e2e= expresses
   intent, and a silently-skipped suite that reports success is a false
   green.
@@ -967,9 +1030,11 @@ The harness's first implementation is acceptable when:
    GitHub-hosted runner.
 8. The CI =e2e= job runs =make e2e= on the Linux runner and fails the build
    on any scenario failure.
-9. The image build context contains only =Cargo.toml=, =Cargo.lock=, and
-   =src/=, and =.dockerignore= exists — no =.git=, =target/=, or other
-   repository content reaches any build layer.
+9. The image build context contains only =Cargo.toml=, =Cargo.lock=,
+   =src/=, and the two runtime scripts =tests/e2e/entrypoint.sh= and
+   =tests/e2e/flocal-wrapper.sh= (readmitted by =.dockerignore=
+   negations) — no =.git=, =target/=, or other repository content reaches
+   any build layer.
 10. =docker inspect= on a scenario's containers shows no published ports,
     and the single =docker run= call site contains no =-p=, =--publish=, or
     =--network host=.
@@ -1008,11 +1073,13 @@ The harness's first implementation is acceptable when:
 
 * 14. Unresolved decisions
 
-For explicit user sign-off, plus one direction already accepted and
-recorded. This is a design-only deliverable: nothing described here is
-implemented, and this document must not be read as implying otherwise. The
-harness itself has /zero/ product-code prerequisites; the two product
-changes below are sequenced after it, and each proves itself by promoting
+The decisions below remain recorded; where one asked for sign-off it still
+does. The first slice this document describes is now /implemented/ —
+=tests/e2e/=, =make e2e=, and the CI =e2e= job — with its findings recorded
+inline throughout this document (the implemented public surface, the dump
+contract, the three =main= bugs the harness newly discovered). The harness
+landed with /zero/ product-code changes; the two product changes below
+remain sequenced after it, and each proves itself by promoting
 expected-fail scenarios (section 2.4).
 
 1. *The =FLOCAL_WATCH_RESCAN_SECONDS= hook* — a product-code change (a few
@@ -1056,8 +1123,10 @@ expected-fail scenarios (section 2.4).
    delete half is lost after one unreachable cycle), #7 (the deleting
    peer's own apply recreates deleted parent directories), and #18 (a kind
    transition fails the connector's sync with "File exists") — all verified
-   broken on =main= and passing on a merged probe tree, so PR #2 promotes
-   seven scenarios in total. Accepted trade-off: the tombstone data-loss fix merges
+   broken on =main= and passing on a merged probe tree. PR #2 therefore
+   promotes six scenarios (#5, #6, #7, #8, #11, #18); with #10's separate
+   promotion by the =bound_peer= fix, all seven wrapped scenarios are
+   accounted for. Accepted trade-off: the tombstone data-loss fix merges
    later than it otherwise would; that is acceptable for the current
    single-user alpha, and PR #2's own unit-level regression tests already
    demonstrate fail-on-main at that level. The status-schema pin follows the

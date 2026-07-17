@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context as _, Result, bail};
 
 pub const SHARE: &str = "/home/peer/share";
-const LABEL: &str = "flocal-e2e=1";
+pub const LABEL: &str = "flocal-e2e=1";
 const IMAGE_TAG: &str = "flocal-e2e";
 
 /// Everything one scenario run owns besides the two containers: the network,
@@ -99,14 +99,19 @@ impl RunContext {
         });
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn().context("spawning docker")?;
-        if let Some(bytes) = stdin {
-            child
-                .stdin
-                .take()
-                .context("docker stdin unavailable")?
-                .write_all(bytes)?;
-        }
+        let writer = if let Some(bytes) = stdin {
+            let mut pipe = child.stdin.take().context("docker stdin unavailable")?;
+            let bytes = bytes.to_vec();
+            Some(std::thread::spawn(move || pipe.write_all(&bytes)))
+        } else {
+            None
+        };
         let output = child.wait_with_output()?;
+        if let Some(writer) = writer {
+            writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("docker stdin writer panicked"))??;
+        }
         self.record(format!(
             "docker {} -> {} in {}ms",
             args.join(" "),
@@ -172,7 +177,8 @@ fn log_cleanup_failure(what: &str, result: std::io::Result<Output>) {
     }
 }
 
-/// A failure of the harness itself (daemon, sweep, or image build) rather
+/// A failure of the harness itself — the daemon, sweep, image build, or any
+/// container/network/key setup before the first scenario primitive — rather
 /// than of the scenario under test. `known_failure` re-raises these instead
 /// of accepting them as the expected scenario failure.
 #[derive(Debug)]

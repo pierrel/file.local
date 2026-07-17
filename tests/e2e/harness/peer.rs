@@ -12,6 +12,9 @@ const DEADLINE: Duration = Duration::from_secs(30);
 /// `main` that is 1; the tombstone fix bumps it to 2 together with promoting
 /// the scenarios that read `tombstones`.
 const STATUS_SCHEMA: u64 = 1;
+/// The conflicts listing has its own schema, which stays 1 when the status
+/// schema bumps to 2.
+const CONFLICTS_SCHEMA: u64 = 1;
 
 /// One running container. Owns its removal; `--rm` plus the in-container
 /// lifetime timeout are the backstops when this Drop never runs.
@@ -22,13 +25,33 @@ struct Container {
 
 impl Drop for Container {
     fn drop(&mut self) {
+        // The first container dropped during an unwind dumps while both
+        // containers are still alive; RunContext's own Drop runs after
+        // every container is gone.
+        if std::thread::panicking() {
+            self.context.dump_once();
+        }
         if self.context.keep() {
             eprintln!("FLOCAL_E2E_KEEP=1: keeping container {}", self.name);
             return;
         }
-        let _ = std::process::Command::new("docker")
+        match std::process::Command::new("docker")
             .args(["rm", "-f", &self.name])
-            .output();
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "e2e cleanup: removing container {} failed: {}",
+                self.name,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => {
+                eprintln!(
+                    "e2e cleanup: removing container {} failed: {error}",
+                    self.name
+                )
+            }
+        }
     }
 }
 
@@ -43,7 +66,7 @@ pub struct PeerBox {
 pub struct Peer {
     context: Arc<RunContext>,
     container: Container,
-    pub alias: String,
+    alias: String,
 }
 
 /// The initiating peer. Dereferences to `Peer` for the shared vocabulary;
@@ -106,16 +129,22 @@ pub type Tree = BTreeMap<String, TreeEntry>;
 
 /// A probe reports Ok(()) when its check holds, or a description of the
 /// actual state when it does not.
-type Probe<'a> = Box<dyn Fn(&Peer) -> Result<std::result::Result<(), String>> + 'a>;
+type Probe = Box<dyn Fn(&Peer) -> Result<std::result::Result<(), String>>>;
 
 /// A named check. Each check exists exactly once: `assert_x` is `wait_x`
 /// with a zero deadline, so the immediate and eventual forms cannot drift.
-struct Condition<'a> {
+struct Condition {
     describe: String,
-    probe: Probe<'a>,
+    probe: Probe,
 }
 
 pub fn containers() -> Result<(PeerBox, PeerBox)> {
+    // Everything up to the first scenario primitive is harness
+    // infrastructure: its failures must not satisfy a known_failure pin.
+    infra(setup_containers())
+}
+
+fn setup_containers() -> Result<(PeerBox, PeerBox)> {
     let context = RunContext::new()?;
     let a = start_peer(&context, "peer-a", 0)?;
     let b = start_peer(&context, "peer-b", 1)?;
@@ -125,6 +154,16 @@ pub fn containers() -> Result<(PeerBox, PeerBox)> {
         peer.exec_ok(&["mkdir", "-p", SHARE])?;
     }
     Ok((PeerBox { peer: a }, PeerBox { peer: b }))
+}
+
+fn infra<T>(outcome: Result<T>) -> Result<T> {
+    outcome.map_err(|error| {
+        if error.is::<super::docker::InfraError>() {
+            error
+        } else {
+            anyhow::Error::new(super::docker::InfraError(format!("{error:#}")))
+        }
+    })
 }
 
 /// The standard opening: two containers, `init` on A, `peer add` toward B,
@@ -184,7 +223,7 @@ fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<P
         "--rm",
         "-d",
         "--label",
-        "flocal-e2e=1",
+        super::docker::LABEL,
         "--name",
         &name,
         "--network",
@@ -197,6 +236,8 @@ fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<P
         "512m",
         "--pids-limit",
         "256",
+        "-e",
+        "FLOCAL_E2E_CONTAINER_LIFETIME_SECONDS",
         image_tag(),
     ])?;
     context
@@ -220,10 +261,6 @@ impl PeerBox {
             .flocal_ok(&["init", SHARE])
             .map(|_| ())
             .context("flocal init")
-    }
-
-    pub fn write(&self, path: &str, content: &str) -> Result<()> {
-        self.peer.write(path, content)
     }
 
     /// Pairs self (the initiator) with the other peer, consuming both boxes
@@ -333,9 +370,9 @@ impl Connector {
         }
         let listing: Listing =
             serde_json::from_slice(&output.stdout).context("parsing conflicts list --json")?;
-        if listing.schema != STATUS_SCHEMA {
+        if listing.schema != CONFLICTS_SCHEMA {
             return Err(self.fail(format!(
-                "conflicts schema {} does not match the pinned {STATUS_SCHEMA}",
+                "conflicts schema {} does not match the pinned {CONFLICTS_SCHEMA}",
                 listing.schema
             )));
         }
@@ -414,6 +451,9 @@ impl Peer {
     }
 
     pub fn symlink(&self, path: &str, target: &str) -> Result<()> {
+        if target.is_empty() || target.starts_with('-') || target.contains(['\0', '\t', '\n']) {
+            bail!("invalid symlink target: {target:?}");
+        }
         let full = self.share_path(path)?;
         self.exec_ok(&["ln", "-s", "--", target, &full]).map(|_| ())
     }
@@ -567,7 +607,7 @@ impl Peer {
         )
     }
 
-    fn file_condition(&self, path: &str, content: &str) -> Result<Condition<'static>> {
+    fn file_condition(&self, path: &str, content: &str) -> Result<Condition> {
         let full = self.share_path(path)?;
         let expected = content.to_owned();
         Ok(Condition {
@@ -587,7 +627,7 @@ impl Peer {
         })
     }
 
-    fn absent_condition(&self, path: &str) -> Result<Condition<'static>> {
+    fn absent_condition(&self, path: &str) -> Result<Condition> {
         let full = self.share_path(path)?;
         Ok(Condition {
             describe: format!("{path} is absent"),
@@ -603,7 +643,7 @@ impl Peer {
         })
     }
 
-    fn status_condition(predicate: impl Fn(&Status) -> bool + 'static) -> Condition<'static> {
+    fn status_condition(predicate: impl Fn(&Status) -> bool + 'static) -> Condition {
         Condition {
             describe: "status predicate".into(),
             probe: Box::new(move |peer| {
@@ -643,7 +683,7 @@ impl Peer {
     /// `.flocal-tmp-*` components), records the executable bit as the
     /// boolean the product syncs, hashes regular files, records symlink
     /// target text without following, and lists directories first-class.
-    pub fn tree(&self) -> Result<Tree> {
+    pub(super) fn tree(&self) -> Result<Tree> {
         let listing = self.exec_ok(&[
             "find",
             SHARE,
@@ -854,7 +894,7 @@ impl Peer {
         if path.is_empty()
             || path.starts_with('/')
             || path.starts_with('-')
-            || path.contains('\0')
+            || path.contains(['\0', '\t', '\n'])
             || path
                 .split('/')
                 .any(|component| component.is_empty() || component == "." || component == "..")
