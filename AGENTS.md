@@ -47,6 +47,18 @@ Branch from `main`, never from another feature branch. Use one feature per
 branch. Commit and push freely on feature branches, but never merge or commit
 directly to `main` without explicit approval.
 
+## Bug workflow
+
+Whenever the user mentions a bug, first write the failing scenario and
+present it for the user's review before fixing anything. Where possible and
+reasonable that scenario is an end-to-end test in `tests/e2e/` wrapped in
+`e2e::known_failure` (see the harness design in `docs/`), so it pins the bug
+on `main` while CI stays green and the eventual fix must promote it to a
+plain passing test in the same change — a machine-checked fail-to-pass
+validation; otherwise a failing unit or integration test serves the same
+role. When a fix or feature makes new kinds of scenarios possible, add new
+end-to-end tests for them in the same spirit where possible and reasonable.
+
 ## Review subagents and lenses
 
 Use independent subagents so each review has a narrow mandate and findings can
