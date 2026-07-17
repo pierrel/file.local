@@ -541,11 +541,11 @@ impl Peer {
             Condition {
                 describe,
                 probe: Box::new(move |peer| {
-                    let output = peer.exec_raw(&["test", "-d", &full])?;
+                    let output = peer.exec_raw(&["test", "!", "-L", &full, "-a", "-d", &full])?;
                     Ok(if output.status.success() {
                         Ok(())
                     } else {
-                        Err("not a directory or missing".into())
+                        Err("not a directory, a symlink, or missing".into())
                     })
                 }),
             },
@@ -568,8 +568,14 @@ impl Peer {
             Condition {
                 describe,
                 probe: Box::new(move |peer| {
-                    let output = peer.exec_raw(&["test", "-x", &full])?;
-                    let actual = output.status.success();
+                    let regular = peer
+                        .exec_raw(&["test", "!", "-L", &full, "-a", "-f", &full])?
+                        .status
+                        .success();
+                    if !regular {
+                        return Ok(Err("not a regular file".into()));
+                    }
+                    let actual = peer.exec_raw(&["test", "-x", &full])?.status.success();
                     Ok(if actual == expected {
                         Ok(())
                     } else {
@@ -613,9 +619,16 @@ impl Peer {
         Ok(Condition {
             describe: format!("{path} contains {content:?}"),
             probe: Box::new(move |peer| {
+                let regular = peer
+                    .exec_raw(&["test", "!", "-L", &full, "-a", "-f", &full])?
+                    .status
+                    .success();
+                if !regular {
+                    return Ok(Err("missing, a symlink, or not a regular file".into()));
+                }
                 let output = peer.exec_raw(&["cat", "--", &full])?;
                 if !output.status.success() {
-                    return Ok(Err("missing".into()));
+                    return Ok(Err("unreadable".into()));
                 }
                 let actual = String::from_utf8_lossy(&output.stdout).into_owned();
                 Ok(if actual == expected {
