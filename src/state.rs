@@ -530,12 +530,18 @@ impl State {
     }
 
     pub fn bound_peer(&self, id: &ShareId) -> Result<Option<PeerId>> {
-        let value: Option<String> = self.conn.query_row(
-            "SELECT bound_peer FROM shares WHERE share_id=?1",
-            [&id.0],
-            |r| r.get(0),
-        )?;
-        Ok(value.map(PeerId))
+        // A share this installation never registered has no binding; it must
+        // not surface as an internal database error, because the responder
+        // turns a binding mismatch into its graceful rejection.
+        let value: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT bound_peer FROM shares WHERE share_id=?1",
+                [&id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value.flatten().map(PeerId))
     }
 
     pub fn peer(&self, id: &ShareId) -> Result<Option<PeerConfig>> {

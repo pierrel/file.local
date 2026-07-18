@@ -181,3 +181,15 @@ fn state_rejects_conflicting_bindings_and_invalid_objects() -> Result<()> {
     assert!(sink.finish().is_err());
     Ok(())
 }
+
+#[test]
+fn bound_peer_of_an_unregistered_share_is_none() -> Result<()> {
+    let temp = tempdir()?;
+    let state = State::open(temp.path().join("state"))?;
+    assert!(
+        state
+            .bound_peer(&ShareId("never-registered".into()))?
+            .is_none()
+    );
+    Ok(())
+}

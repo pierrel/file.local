@@ -144,3 +144,14 @@ Current behavior after the fix:
   never-recorded paths (unit and integration), while six of the seven
   end-to-end pins were promoted to plain passing scenarios; the one
   remaining pin is the =bound_peer= error-contract fix.
+
+* Update 2026-07-18: unknown-share sync rejection
+
+A responder asked to synchronize a share it never registered died with an
+internal database error before writing any protocol frame, so the connector
+saw only a generic connection failure; the "peer identity mismatch"
+rejection described by the detailed design was unreachable for that case.
+=State::bound_peer= now treats the missing registration as no binding and
+the responder answers with the graceful rejection. The end-to-end
+peer-identity scenario was promoted from a known failure, so all sixteen
+end-to-end scenarios now pass against this tree.
