@@ -8,10 +8,10 @@ use super::docker::{RunContext, SHARE, image_tag, unique_token};
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(30);
-/// The product's status JSON schema this harness is written against. On
-/// `main` that is 1; the tombstone fix bumps it to 2 together with promoting
-/// the scenarios that read `tombstones`.
-const STATUS_SCHEMA: u64 = 1;
+/// The product's status JSON schema this harness is written against:
+/// schema 2, which the tombstone-retention fix introduced together with
+/// promoting the scenarios that read `tombstones`.
+const STATUS_SCHEMA: u64 = 2;
 /// The conflicts listing has its own schema, which stays 1 when the status
 /// schema bumps to 2.
 const CONFLICTS_SCHEMA: u64 = 1;

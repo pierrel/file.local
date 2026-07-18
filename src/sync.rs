@@ -257,8 +257,15 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
     let mut accepted = Vec::with_capacity(records.len());
     let mut ignore_cache = std::collections::HashMap::new();
     for record in records {
+        let prior_record = prior.get(record.path.as_bytes());
+        // A tombstone for a path this peer never recorded has no local
+        // resurrection to prevent; persisting it would let a peer permanently
+        // pollute local state with fabricated deletions.
+        if prior_record.is_none() && matches!(record.version.entry, Entry::Tombstone) {
+            continue;
+        }
         if ignored_cached(&matcher, record, &mut ignore_cache) {
-            if let Some(old) = prior.get(record.path.as_bytes()) {
+            if let Some(old) = prior_record {
                 accepted.push((*old).clone());
             }
         } else {
@@ -294,6 +301,14 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
         let expected = prior
             .get(record.path.as_bytes())
             .map(|old| &old.version.entry);
+        // A tombstone with nothing recorded to delete must not touch the
+        // filesystem: creating its parent directories would resurrect a
+        // deleted directory tree on every synchronization.
+        if matches!(record.version.entry, Entry::Tombstone)
+            && matches!(expected, None | Some(Entry::Tombstone))
+        {
+            continue;
+        }
         let install_temp = install_temps
             .get(record.path.as_bytes())
             .copied()
@@ -444,9 +459,6 @@ fn apply_record(
             atomic_install(&parent_dir, temp, name, expected)?;
         }
         Entry::Tombstone => {
-            if matches!(expected, None | Some(Entry::Tombstone)) {
-                return Ok(());
-            }
             if !temp_exists {
                 let mut options = OpenOptions::new();
                 options.create_new(true).write(true);
@@ -456,7 +468,9 @@ fn apply_record(
                 state.mark_install_temp_owned(share, &record.path)?;
             }
             exchange(&parent_dir, temp, name)?;
-            if !disk_matches_cap(&parent_dir, temp, expected.expect("checked above"))? {
+            let expected =
+                expected.expect("tombstones with nothing to delete are skipped before apply");
+            if !disk_matches_cap(&parent_dir, temp, expected)? {
                 exchange(&parent_dir, temp, name)?;
                 bail!("path changed while applying: {}", record.path.display());
             }

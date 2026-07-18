@@ -1161,3 +1161,27 @@ expected-fail scenarios (section 2.4).
    piece (the =Connector=/=Peer= split) that gets revisited when the
    product's topology grows. No current scenario exercises more than two
    peers.
+
+* Update 2026-07-18: the tombstone-retention promotion
+
+The tombstone-retention fix (=agent/tombstone-retention=) merged after the
+first slice landed and executed the promotion mechanism this document
+designed. The sections above are the historical record of the state at
+harness landing; as of this update:
+
+- Six of the seven expected failures were promoted to plain passing
+  scenarios by deleting their =known_failure= wrappers: #5 (offline rename
+  catch-up), #6 (offline deletion retention), #7 (nested deletion), #8
+  (recreation over a retained tombstone), #11 (status and tombstone
+  counts), and #18 (file/directory transitions). The wrappers tripped on
+  rebase exactly as section 2.4 intended, and all six bodies pass
+  unmodified against the fixed product.
+- Section 12 criterion 1's "nine pass, and seven ... fail-as-expected"
+  described harness landing; the suite now runs fifteen passing scenarios
+  plus #10 (peer identity mismatch), the one remaining =known_failure=,
+  promoted by the =bound_peer= error-contract fix of section 14.2.
+- Section 2.3's pinned status-schema constant, described above as tracking
+  =main='s schema 1, is now 2 — bumped together with the promotions, as
+  the schema-pin paragraph required. The conflicts pin is unchanged at 1.
+- The catalog rows for the six scenarios, and example 2.2.1's wrapper
+  note, likewise describe the pre-promotion state.

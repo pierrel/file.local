@@ -101,3 +101,46 @@ replicated model while recovery rotates to a fresh temporary and retries.
 - Required local gate: =make check=. It runs formatting and lint checks, the
   complete test suite under coverage, and requires at least 90% line coverage
   both project-wide and on executable lines changed from =github/main=.
+
+* Update 2026-07-18: tombstone retention
+
+The tombstone-retention fix (=agent/tombstone-retention=) merged after this
+document was written and corrected several statements above.
+
+What was wrong above:
+
+- The Implemented claim "deletions/tombstones ... work" was inaccurate: a
+  persisted tombstone was dropped one scan after its creation, so a peer
+  unreachable for a single watch cycle after a deletion never received it
+  and its old record resurrected the deleted path on reconnection. The
+  end-to-end harness additionally showed the deleting peer's own apply
+  recreated deleted parent directories, and that a file-to-directory
+  transition failed the connector's whole sync with "apply stopped ...
+  File exists" — both self-apply paths the integration coverage listed
+  above never drove.
+- The Validation list above did not include deletion-retention coverage;
+  the harness limitation note ("seven of its scenarios pin known-broken
+  =main= behavior") described the pre-fix state.
+
+Current behavior after the fix:
+
+- Tombstone records are retained indefinitely across scans, so an
+  unreachable peer cannot resurrect a deleted path. Applying a retained
+  tombstone never touches the filesystem, and a received tombstone for a
+  path this peer never recorded is not persisted, so a peer cannot pollute
+  local state with fabricated deletions. =status= excludes tombstones from
+  its entry count and reports the retained count separately (status JSON
+  schema 2).
+- The design's acknowledgment-based tombstone pruning remains deferred:
+  tombstones are never removed in this alpha, deleted path names remain
+  visible in state and snapshots for as long as they are retained, and
+  retained tombstones count against the session record and metadata
+  limits, so a share whose live entries and retained tombstones together
+  approach the session record limit (one million) stops synchronizing
+  until pruning exists.
+- Validation now also covers offline deletion retention across
+  disconnected scan cycles with steady-state rounds and recreation over a
+  retained tombstone, and rejection of foreign tombstones for
+  never-recorded paths (unit and integration), while six of the seven
+  end-to-end pins were promoted to plain passing scenarios; the one
+  remaining pin is the =bound_peer= error-contract fix.

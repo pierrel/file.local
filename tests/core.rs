@@ -4,7 +4,7 @@ use anyhow::Result;
 use flocal::model::Entry;
 use flocal::scan::scan;
 use flocal::state::State;
-use flocal::sync::{apply_plan, refresh};
+use flocal::sync::{apply_plan, plan, refresh};
 use tempfile::tempdir;
 
 #[test]
@@ -214,6 +214,92 @@ fn applies_nested_deletions_and_file_directory_transitions() -> Result<()> {
     copy_objects(&source_state, &target_state, &third)?;
     apply_plan(&mut target_state, &share, &third)?;
     assert_eq!(fs::read_to_string(target.join("node/child"))?, "again");
+    Ok(())
+}
+
+#[test]
+fn offline_deletion_survives_scan_cycles_until_peer_returns() -> Result<()> {
+    let temp = tempdir()?;
+    let a_root = temp.path().join("a");
+    let b_root = temp.path().join("b");
+    fs::create_dir_all(a_root.join("dir"))?;
+    fs::create_dir_all(&b_root)?;
+    fs::write(a_root.join("dir/child"), "content")?;
+
+    let mut a = State::open(temp.path().join("a-state"))?;
+    let share = a.init_share(&a_root)?;
+    let mut b = State::open(temp.path().join("b-state"))?;
+    b.register_share(&share, &b_root)?;
+
+    // Initial sync with both peers reachable, in run_sync's order.
+    let initial = plan(&refresh(&mut a, &share)?, &refresh(&mut b, &share)?);
+    copy_objects(&a, &b, &initial.records)?;
+    apply_plan(&mut b, &share, &initial.records)?;
+    apply_plan(&mut a, &share, &initial.records)?;
+    assert_eq!(fs::read_to_string(b_root.join("dir/child"))?, "content");
+
+    // A deletes the directory; the peer stays unreachable across several
+    // watch cycles, each of which persists a refresh before failing to
+    // connect.
+    fs::remove_dir_all(a_root.join("dir"))?;
+    for _ in 0..3 {
+        let advertised = refresh(&mut a, &share)?;
+        assert!(
+            advertised
+                .iter()
+                .any(|record| matches!(record.version.entry, Entry::Tombstone)),
+            "the tombstone must stay advertised while the peer is unreachable"
+        );
+    }
+
+    // The peer returns: the deletion must propagate, not resurrect.
+    let reunion = plan(&refresh(&mut a, &share)?, &refresh(&mut b, &share)?);
+    apply_plan(&mut a, &share, &reunion.records)?;
+    apply_plan(&mut b, &share, &reunion.records)?;
+    assert!(!a_root.join("dir").exists());
+    assert!(!b_root.join("dir").exists());
+
+    // A steady-state round replays the retained tombstones through
+    // apply_plan; it must not recreate any part of the deleted tree on
+    // either peer.
+    let steady = plan(&refresh(&mut a, &share)?, &refresh(&mut b, &share)?);
+    apply_plan(&mut a, &share, &steady.records)?;
+    apply_plan(&mut b, &share, &steady.records)?;
+    assert!(!a_root.join("dir").exists());
+    assert!(!b_root.join("dir").exists());
+
+    // A recreated path supersedes the retained tombstones on both peers.
+    fs::create_dir_all(a_root.join("dir"))?;
+    fs::write(a_root.join("dir/child"), "again")?;
+    let recreated = plan(&refresh(&mut a, &share)?, &refresh(&mut b, &share)?);
+    copy_objects(&a, &b, &recreated.records)?;
+    apply_plan(&mut b, &share, &recreated.records)?;
+    apply_plan(&mut a, &share, &recreated.records)?;
+    assert_eq!(fs::read_to_string(b_root.join("dir/child"))?, "again");
+    Ok(())
+}
+
+#[test]
+fn foreign_tombstone_for_unknown_path_is_not_persisted_or_applied() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root)?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let foreign = flocal::model::Record {
+        path: flocal::model::RelativePath::from_bytes(b"ghost/child".to_vec())?,
+        version: flocal::model::Version {
+            peer: flocal::model::PeerId("peer-foreign".into()),
+            sequence: 1,
+            timestamp_ns: 1,
+            seen: Vec::new(),
+            entry: Entry::Tombstone,
+        },
+    };
+
+    apply_plan(&mut state, &share, &[foreign])?;
+    assert!(state.records(&share)?.is_empty());
+    assert!(!root.join("ghost").exists());
     Ok(())
 }
 
