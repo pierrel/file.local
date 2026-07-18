@@ -129,9 +129,9 @@ synthetic.
 The end-to-end form of the =agent/tombstone-retention= fix
 (=offline_deletion_survives_scan_cycles_until_peer_returns= in
 =tests/core.rs=), now over real SSH and a real disconnected network. The
-body below is its final form; it landed wrapped in =e2e::known_failure=
-(section 2.4) until the tombstone-retention fix promoted it by deleting
-only the wrapper — a line plus its closing brace:
+body below is its final form; it lands wrapped in =e2e::known_failure=
+(section 2.4) until PR #2 merges, and promotion deletes only the wrapper —
+a line plus its closing brace:
 
 #+begin_src rust
 #[test]
@@ -343,14 +343,19 @@ breaks scenarios mechanically and visibly rather than silently misparsing.
 The conflicts listing has its own pinned constant (=CONFLICTS_SCHEMA=,
 currently 1), independent of the status pin, so the status bump to 2 does
 not disturb conflicts parsing.
-The pinned status constant is 2, introduced by the tombstone-retention fix
-together with promoting the scenarios that read =tombstones= (before that
-fix the pin tracked =main='s schema 1, whose =Status= parses carried
-=tombstones: None=). The conflicts listing keeps its own independent pin
-(=CONFLICTS_SCHEMA=, still 1). Diagnostics never depend on any of this: the
-section 8 failure dump prints the /raw/ =status --json= output without
-parsing it, so a schema mismatch — or a status that fails to parse at all —
-is itself visible in the dump rather than able to break it.
+The pinned constant tracks /=main= at harness landing/: status schema 1,
+which has no =tombstones= field. So that one =Status= struct is final form
+across the bump, =tombstones= is declared =Option<u64>= — =None= under
+schema 1, populated from schema 2 — and scenarios assert against
+=Some(count)= (example 2.2.1). On =main=, #6's tombstone assertion finds
+=None=, fails, and satisfies its =known_failure= wrapper (section 2.4); the
+tombstone pull request bumps the pinned constant to 2 in the same change
+that promotes its six scenarios (section 14.4). An implementer must /not/ "helpfully" pin
+schema 2 at harness landing — that would break the nine scenarios that
+pass on =main=. Diagnostics never depend on any of this: the section 8
+failure dump prints the /raw/ =status --json= output without parsing it, so
+a schema mismatch — or a status that fails to parse at all — is itself
+visible in the dump rather than able to break it.
 
 *Connectivity:*
 
@@ -773,30 +778,29 @@ AGENTS.md forbids.
 | 2 | Preview/confirm gate, opened from =containers()= plus explicit =init()=/=peer_add()= (not =pair()=, which would already have consumed the gate): =sync_dry_run()= changes nothing anywhere; =sync_decline()= answers "n" and applies nothing; =sync()= (=--yes=) applies | design §User experience | S1 |
 | 3 | Initial union with both trees non-empty; same-path difference becomes a conflict, nothing deleted | design §Create and connect | S1 |
 | 4 | Basic bidirectional sync: files, directories, empty directory, symlink, exec bit (example 2.2.3); also asserts a =.flocal-tmp-=-prefixed file is never synchronized (absent on the peer). Covers acceptance criterion 1 /except renames/ | acceptance criterion 1 (partial) | S1 |
-| 5 | Offline edits on both sides plus a rename on one side; reconnect catch-up converges (with the alpha's documented delete-plus-create fallback for the unobserved rename). Was expected-fail (the rename's delete half was lost after one unreachable-peer cycle, the tombstone early-drop); promoted to plain passing by the tombstone-retention fix | acceptance criterion 2 | S1 |
-| 6 | Offline deletion retention: the tombstone story, end to end (example 2.2.1); was expected-fail (tombstone early-drop); promoted to plain passing by the tombstone-retention fix | =agent/tombstone-retention= | S1 |
-| 7 | Nested deletion of a directory tree propagates. Was expected-fail (the deleting peer's own apply recreated deleted parent directories, a self-apply path no unit test drives); promoted to plain passing by the tombstone-retention fix | existing =tests/core.rs= coverage, now over SSH | S1 |
-| 8 | Recreation over a retained tombstone supersedes it; was expected-fail; promoted to plain passing by the tombstone-retention fix | tombstone fix, recreation arm | S1 |
+| 5 | Offline edits on both sides plus a rename on one side; reconnect catch-up converges (with the alpha's documented delete-plus-create fallback for the unobserved rename). Implementation finding: expected-fail on =main= — the rename's delete half is lost after one unreachable-peer cycle (the tombstone early-drop); verified to pass with PR #2 merged, promoted with it | acceptance criterion 2 | S1 |
+| 6 | Offline deletion retention: the tombstone story, end to end (example 2.2.1); lands expected-fail on =main= (tombstone early-drop, PR #2) and is promoted when that fix merges | =agent/tombstone-retention= | S1 |
+| 7 | Nested deletion of a directory tree propagates. Implementation finding: expected-fail on =main= — the deleting peer's own apply recreates the deleted parent directories (the tombstone =create_dir_all= path PR #2 guards), a self-apply path no unit test drives; verified to pass with PR #2 merged, promoted with it | existing =tests/core.rs= coverage, now over SSH | S1 |
+| 8 | Recreation over a retained tombstone supersedes it; lands expected-fail on =main= (PR #2), promoted with #6 | tombstone fix, recreation arm | S1 |
 | 9 | Concurrent-edit conflict: winner on both, loser retained, =restore= works (example 2.2.2) | acceptance criterion 3 | S1 |
 | 10 | Peer identity mismatch: =b.reset_state()= empties B's registration; =a.sync_expect_err("peer identity mismatch")= observes the rejection and no file on either peer changes; lands expected-fail on =main= (=bound_peer= error contract, section 14.2) and is promoted by that fix's own pull request | design §Security model | S1 |
-| 11 | Status and tombstone counts across the deletion lifecycle; was expected-fail; promoted to plain passing by the tombstone-retention fix | status schema (tombstone branch) | S1 |
+| 11 | Status and tombstone counts across the deletion lifecycle; lands expected-fail on =main= (PR #2), promoted with #6 | status schema (tombstone branch) | S1 |
 | 12 | Ignore rules: pre-existing ignored path never transfers; newly-ignored path is not deleted on either peer | acceptance criterion 4 | S1 |
 | 13 | Watch mode: editor-style atomic-rename save propagates (example 2.2.4); requires the section 14.1 hook | v0.0.1 story "Saving a buffer" | later |
 | 14 | Watch mode: peer goes offline and returns; unattended catch-up asserted via =wait_*= on the reconnected tree (the watcher's offline/reconnected stderr text has no observing verb and is not promised) | v0.0.1 reconnect story | later |
 | 15 | Interrupted transfer: kill the SSH session mid-transfer of a large file; destination is old-complete or new-complete; the next sync converges. Requires new vocabulary when implemented: a kill-mid-transfer primitive, since =sync()= is blocking. No user-visible observable exists today for "committed files were not retransferred"; naming one would be a further product change | acceptance criterion 7 | later |
 | 16 | Large file streams within bounded memory and session budgets. Requires per-peer =Config= knobs (=FLOCAL_MAX_SESSION_BYTES=) when implemented (=write_bytes= already exists for content) | acceptance criterion 6 | later |
 | 17 | =.git= is never scanned, transferred, or deleted | acceptance criterion 5 | S1 |
-| 18 | File-to-directory and directory-to-file transition at the same path propagates (mirrors the transitions coverage in =tests/core.rs=, now over SSH). Was expected-fail (the connector's self-apply of a kind transition failed the sync with "apply stopped ... File exists"); promoted to plain passing by the tombstone-retention fix | existing =tests/core.rs= coverage, now over SSH | S1 |
+| 18 | File-to-directory and directory-to-file transition at the same path propagates (mirrors the transitions coverage in =tests/core.rs=, now over SSH). Implementation finding: expected-fail on =main= — the connector's self-apply of a kind transition fails the whole sync with "apply stopped ... File exists"; verified to pass with PR #2 merged, promoted with it | existing =tests/core.rs= coverage, now over SSH | S1 |
 | 19 | Concurrent-delete convergence: both peers delete the same path offline, reconnect, converge with no error; and an offline delete versus a remote edit resolves by the documented discovery-scan LWW without wedging — asserts convergence and that a sync round completes, /not/ which side wins | alpha delete-versus-edit note; acceptance criterion 3 (delete arm) | S1 |
 | 20 | Exec-bit round-trip — set, sync, =unset_exec=, sync, assert cleared — and binary non-UTF-8 content via =write_bytes= round-trips intact (asserted through tree equality's content hashes) | acceptance criterion 1 (exec bit and binary content) | S1 |
 
 Rows marked expected-fail land wrapped in =known_failure= (section 2.4).
-Every wrapped body is written in its final, post-fix form from day one;
-promotion deletes only the wrapper — a line plus its closing brace. The
-tombstone-retention fix promoted six (#5, #6, #7, #8, #11, #18), three of
-which (#5, #7, #18) pinned bugs this harness /newly discovered/, all
-self-apply paths no unit test drives. One scenario remains pinned: #10,
-promoted by the =bound_peer= error-contract fix (section 14.2).
+All seven wrapped scenario bodies (#5, #6, #7, #8, #10, #11, #18) are
+written in their final, post-fix form from day one; promotion deletes only
+the wrapper — a line plus its closing brace. Three of the seven (#5, #7,
+#18) pin bugs this harness /newly discovered/ on =main=, all self-apply
+paths no unit test drives.
 
 The budget and limit behaviors already covered elsewhere
 (=FLOCAL_MAX_STATE_BYTES=, =FLOCAL_MAX_SESSION_SECONDS=, the recovery-space
@@ -998,10 +1002,9 @@ The harness's first implementation is acceptable when:
 1. =make e2e= on a Linux machine with Docker, running against =main=, builds
    the image and runs all sixteen S1 scenarios (catalog #1–#12 and #17–#20)
    over real SSH between two containers, with every scenario matching its
-   declared expectation. At harness landing that was nine passing and
-   seven expected failures; after the tombstone-retention promotion it is
-   fifteen passing with #10 still fail-as-expected under =known_failure=
-   until the =bound_peer= fix promotes it.
+   declared expectation: nine pass, and seven (#5, #6, #7, #8, #10, #11,
+   #18)
+   fail-as-expected under =known_failure=.
 2. =make check= passes unchanged on a machine with no Docker daemon, with
    both coverage thresholds computed exactly as before — the =tests/e2e/=
    exclusion applied in both the Makefile =coverage= target and the CI
@@ -1158,3 +1161,27 @@ expected-fail scenarios (section 2.4).
    piece (the =Connector=/=Peer= split) that gets revisited when the
    product's topology grows. No current scenario exercises more than two
    peers.
+
+* Update 2026-07-18: the tombstone-retention promotion
+
+The tombstone-retention fix (=agent/tombstone-retention=) merged after the
+first slice landed and executed the promotion mechanism this document
+designed. The sections above are the historical record of the state at
+harness landing; as of this update:
+
+- Six of the seven expected failures were promoted to plain passing
+  scenarios by deleting their =known_failure= wrappers: #5 (offline rename
+  catch-up), #6 (offline deletion retention), #7 (nested deletion), #8
+  (recreation over a retained tombstone), #11 (status and tombstone
+  counts), and #18 (file/directory transitions). The wrappers tripped on
+  rebase exactly as section 2.4 intended, and all six bodies pass
+  unmodified against the fixed product.
+- Section 12 criterion 1's "nine pass, and seven ... fail-as-expected"
+  described harness landing; the suite now runs fifteen passing scenarios
+  plus #10 (peer identity mismatch), the one remaining =known_failure=,
+  promoted by the =bound_peer= error-contract fix of section 14.2.
+- Section 2.3's pinned status-schema constant, described above as tracking
+  =main='s schema 1, is now 2 — bumped together with the promotions, as
+  the schema-pin paragraph required. The conflicts pin is unchanged at 1.
+- The catalog rows for the six scenarios, and example 2.2.1's wrapper
+  note, likewise describe the pre-promotion state.
