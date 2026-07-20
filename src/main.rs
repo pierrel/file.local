@@ -1268,16 +1268,17 @@ mod tests {
                 Message::Error { .. }
             ));
         }
-        assert!(
-            initial_message(Message::Sync {
-                protocol: sync::PROTOCOL_VERSION,
-                share,
-                peer,
-                dry_run: true,
-            })?
-            .0
-            .is_err()
-        );
+        let (result, output) = initial_message(Message::Sync {
+            protocol: sync::PROTOCOL_VERSION,
+            share,
+            peer,
+            dry_run: true,
+        })?;
+        result?;
+        assert!(matches!(
+            sync::read_message(&mut output.as_slice())?,
+            Message::Error { message } if message == "peer identity mismatch"
+        ));
         assert!(initial_message(Message::Done)?.0.is_err());
         Ok(())
     }

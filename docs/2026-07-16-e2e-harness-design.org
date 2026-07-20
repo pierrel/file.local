@@ -1185,3 +1185,15 @@ harness landing; as of this update:
   the schema-pin paragraph required. The conflicts pin is unchanged at 1.
 - The catalog rows for the six scenarios, and example 2.2.1's wrapper
   note, likewise describe the pre-promotion state.
+
+* Update 2026-07-18: the bound_peer promotion
+
+The =bound_peer= error-contract fix of section 14.2 landed as designed
+(=State::bound_peer= treats a missing share row as no binding, so the
+responder's graceful "peer identity mismatch" rejection fires instead of an
+internal database error) and promoted #10, the last expected failure. All
+sixteen first-slice scenarios now pass as plain tests; no =known_failure=
+pin remains in the catalog. The wrapper itself stays as standing
+vocabulary — the AGENTS.md bug workflow pins newly reported bugs with it
+where possible — and its semantics are exercised by a Docker-free self-test in the
+harness.
