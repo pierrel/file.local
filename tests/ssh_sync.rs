@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use flocal::state::State;
@@ -255,5 +256,46 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
     run_limited_fails(&["sync", local_root.to_str().unwrap(), "--yes"], "5")?;
     assert!(!remote_root.join("cumulative-local-a").exists());
     assert!(!remote_root.join("cumulative-local-b").exists());
+
+    // `watch` on the real, already-paired, already-synced binary: its
+    // startup line is the one piece of watch's timestamped-output behavior
+    // this suite can drive through a real subprocess rather than only
+    // in-process. Reading exactly one line and killing the
+    // child keeps this bounded — nothing here waits on the 30-second loop.
+    let mut watcher = Command::new(binary)
+        .args(["watch", local_root.to_str().unwrap()])
+        .env("FLOCAL_STATE_DIR", &local_state)
+        .env("FAKE_REMOTE_STATE", &remote_state)
+        .env("FLOCAL_BIN", binary)
+        .env("FAKE_REMOTE_MAX_SESSION_BYTES", "10737418240")
+        .env("PATH", &path)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdout = std::io::BufReader::new(watcher.stdout.take().context("watch stdout")?);
+    let mut first_line = String::new();
+    stdout.read_line(&mut first_line)?;
+    watcher.kill()?;
+    watcher.wait()?;
+    let (timestamp, rest) = first_line
+        .trim_end_matches('\n')
+        .split_once(' ')
+        .context("expected a timestamped watch startup line")?;
+    assert_eq!(timestamp.len(), 20, "{timestamp:?}");
+    assert!(
+        timestamp.char_indices().all(|(i, c)| match i {
+            4 | 7 => c == '-',
+            10 => c == 'T',
+            13 | 16 => c == ':',
+            19 => c == 'Z',
+            _ => c.is_ascii_digit(),
+        }),
+        "{timestamp:?} is not a YYYY-MM-DDTHH:MM:SSZ timestamp"
+    );
+    // flocal reports the canonicalized share root; on macOS that resolves
+    // /var's symlink to /private/var, which the raw tempdir path does not.
+    assert_eq!(
+        rest,
+        format!("Watching {}", local_root.canonicalize()?.display())
+    );
     Ok(())
 }
