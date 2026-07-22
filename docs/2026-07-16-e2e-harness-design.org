@@ -1250,8 +1250,12 @@ update:
   watcher dies before or during the wait for its pid. =stop()= signals the
   recorded pid inside the container per section 2.3 and additionally fails
   if the watcher had already died, so an unnoticed mid-scenario watcher
-  death cannot pass. Signals go through the shell's =kill= builtin (the
-  slim image ships no standalone =kill=), with the pid as a positional
-  argument, preserving section 9's no-interpolation rule. The watcher's
+  death cannot pass. Every real signal (=stop='s SIGTERM, =Drop='s SIGKILL
+  backstop) is gated on a =/proc/<pid>/cmdline= identity check, not a bare
+  =kill -0=: the recorded pid can outlive the watcher and be recycled (the
+  container caps pids), and the check makes it impossible to signal a
+  process that merely reused the pid. Signals go through the shell's =kill=
+  builtin (the slim image ships no standalone =kill=), with the pid as a
+  positional argument, preserving section 9's no-interpolation rule. The watcher's
   stderr reaches the failure dump through the existing wrapper tee; its
   stdout under =-d= is discarded.

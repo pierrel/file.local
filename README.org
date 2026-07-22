@@ -90,10 +90,11 @@ before three-way text merging is implemented.
 
 The target v0.0.1 behavior is event-driven synchronization after a short
 debounce, with only a small sequence heartbeat while idle. The proof-stage
-alpha currently performs a full reconciliation scan every 30 seconds while
-=watch= is running; avoiding those idle scans remains deferred. While
-disconnected, the connector retries and synchronizes recorded changes when the
-connection returns.
+alpha currently performs a full reconciliation scan on a fixed interval —
+30 seconds by default, overridable with =FLOCAL_WATCH_RESCAN_SECONDS= (a zero
+or unparseable value keeps the default) — while =watch= is running; avoiding
+those idle scans remains deferred. While disconnected, the connector retries
+and synchronizes recorded changes when the connection returns.
 
 See [[file:docs/2026-07-14-v0.0.1-design.org][the proposed detailed design]] for the CLI, wire behavior, recovery commands,
 security model, platform constraints, and acceptance criteria. The README is

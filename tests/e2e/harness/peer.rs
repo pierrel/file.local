@@ -447,7 +447,7 @@ impl Connector {
                 .parse::<u32>()
                 .ok())
         })?;
-        if !self.signal("0", pid)?.status.success() {
+        if !self.is_watcher(pid)? {
             return Err(self.fail(format!(
                 "{}: flocal watch exited during startup; see its captured stderr",
                 self.alias
@@ -498,9 +498,10 @@ impl Watch<'_> {
     /// watcher death would silence everything the scenario claims to test.
     pub fn stop(mut self) -> Result<()> {
         let pid = self.pid;
-        if !self.peer.signal("TERM", pid)?.status.success() {
-            // Already gone: the pid may have been recycled, so don't let
-            // Drop KILL it — but still fail loudly, this is unexpected.
+        if !self.peer.is_watcher(pid)? {
+            // Gone already (or the pid was recycled by another process):
+            // don't signal it, but fail loudly — a watcher that died
+            // mid-scenario would silence everything the scenario tests.
             self.stopped = true;
             return Err(self.peer.fail(format!(
                 "{}: flocal watch (pid {pid}) was no longer running at stop; \
@@ -508,12 +509,14 @@ impl Watch<'_> {
                 self.peer.alias
             )));
         }
+        self.peer.signal("TERM", pid)?;
         // Leave the SIGKILL backstop armed until exit is confirmed: if the
-        // wait below times out, Drop still force-kills the survivor.
+        // wait below times out, Drop still force-kills the survivor. The
+        // identity check means a pid recycled after exit reads as gone.
         self.peer.poll_until(
             &format!("flocal watch (pid {pid}) did not exit after SIGTERM"),
             DEADLINE,
-            move |peer| Ok((!peer.signal("0", pid)?.status.success()).then_some(())),
+            move |peer| Ok((!peer.is_watcher(pid)?).then_some(())),
         )?;
         self.stopped = true;
         Ok(())
@@ -522,7 +525,9 @@ impl Watch<'_> {
 
 impl Drop for Watch<'_> {
     fn drop(&mut self) {
-        if !self.stopped {
+        // Best-effort backstop: only signal while the pid is still our
+        // watcher, never a process that recycled it.
+        if !self.stopped && matches!(self.peer.is_watcher(self.pid), Ok(true)) {
             let _ = self.peer.signal("KILL", self.pid);
         }
     }
@@ -925,6 +930,30 @@ impl Peer {
     fn signal(&self, signal: &str, pid: u32) -> Result<std::process::Output> {
         let script = format!("kill -{signal} \"$1\"");
         self.exec_raw(&["sh", "-c", &script, "kill", &pid.to_string()])
+    }
+
+    /// Reports whether `pid` is (still) the flocal watcher, by reading its
+    /// `/proc/<pid>/cmdline`. The recorded pid can outlive the watcher and
+    /// be recycled (the container caps pids), so `stop`/`Drop` gate every
+    /// real signal on this identity check rather than a bare `kill -0`,
+    /// which cannot tell a reused pid apart from the watcher. The watcher's
+    /// argv holds both tokens for its whole life — `<…/flocal-real> watch
+    /// <share>`, stable across the `sh -c`→wrapper→real `exec` chain (same
+    /// pid throughout). The processes that could recycle its pid carry at
+    /// most one: the `sh -c 'kill …'` signaler and the `cat /proc/…` probe
+    /// hold neither, and other `flocal` subcommands (`status`, `sync`, …)
+    /// hold "flocal" but not "watch". The one both-token process that reads
+    /// the pidfile, `cat /tmp/flocal-watch.pid`, runs only during
+    /// `watch_start`'s poll — before any watcher pid is known — never
+    /// against a live watcher pid. `cmdline` is NUL-separated; match on
+    /// substrings.
+    fn is_watcher(&self, pid: u32) -> Result<bool> {
+        let output = self.exec_raw(&["cat", &format!("/proc/{pid}/cmdline")])?;
+        if !output.status.success() {
+            return Ok(false); // no such process
+        }
+        let cmdline = String::from_utf8_lossy(&output.stdout);
+        Ok(cmdline.contains("flocal") && cmdline.contains("watch"))
     }
 
     /// Polls `probe` every `POLL` until it yields `Some(value)`, or dumps and
