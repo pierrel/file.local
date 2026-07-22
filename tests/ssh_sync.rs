@@ -291,6 +291,11 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
         }),
         "{timestamp:?} is not a YYYY-MM-DDTHH:MM:SSZ timestamp"
     );
-    assert_eq!(rest, format!("Watching {}", local_root.display()));
+    // flocal reports the canonicalized share root; on macOS that resolves
+    // /var's symlink to /private/var, which the raw tempdir path does not.
+    assert_eq!(
+        rest,
+        format!("Watching {}", local_root.canonicalize()?.display())
+    );
     Ok(())
 }
