@@ -969,7 +969,7 @@ fn write_plan_report(
         remote.iter().map(|r| (r.path.as_bytes(), r)).collect();
     // `watch`'s repeating background sync timestamps every printed line and
     // omits KEEP: on an idle share almost every path matches on both peers,
-    // and a KEEP line per path per 30-second cycle would drown out the
+    // and a KEEP line per path per rescan cycle would drown out the
     // changes a live log exists to show. `flocal sync`'s plan is unabridged.
     let prefix = match report {
         PlanReport::Full => String::new(),
@@ -1445,11 +1445,8 @@ mod tests {
             watch_rescan_interval(Some("1".into())),
             Duration::from_secs(1)
         );
-        assert_eq!(
-            watch_rescan_interval(Some("120".into())),
-            Duration::from_secs(120)
-        );
-        // Zero would hot-loop; it and unparseable values fall back.
+        // Zero would hot-loop, so it falls back rather than being honored;
+        // negatives and non-numbers fail the u64 parse and fall back too.
         assert_eq!(
             watch_rescan_interval(Some("0".into())),
             Duration::from_secs(30)

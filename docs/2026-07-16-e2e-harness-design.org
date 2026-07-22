@@ -1201,8 +1201,8 @@ harness.
 * Update 2026-07-22: the watch slice and the section 14.1 hook
 
 The watch slice landed (=agent/watch-rescan-hook=), closing unresolved
-decision 1 in favor of the recommendation: approve the hook with the clamp.
-As of this update:
+decision 1 in favor of the recommendation: approve the hook. As of this
+update:
 
 - *The =FLOCAL_WATCH_RESCAN_SECONDS= hook exists* exactly as section 6
   specified: =watch= reads it with a default of 30, and zero or an
@@ -1212,22 +1212,36 @@ As of this update:
   once at watch startup (=watch_rescan_interval= in =src/main.rs=, unit
   tested) and threaded into =watch_loop= as a parameter, keeping the loop
   deterministic in tests.
+  - *Clarification of the section 6 / 14.1 "clamp" wording.* Those sections
+    describe the sub-one-second guard as "a clamped floor of one second."
+    The implemented — and intended — mechanism is /reject-to-default/, not
+    floor-clamp: zero maps to the 30-second default, not to one second (a
+    literal clamp would honor a one-second rescan for a =0= input). Because
+    the value is whole seconds, the smallest interval an explicit config can
+    select is therefore one second, which is the sense in which section 6's
+    "one-second floor" holds. This supersedes the "clamp"/"floor" phrasing
+    in sections 6 and 14.1 wherever the two readings would differ.
 - *Catalog #13 and #14 are implemented* in
   =tests/e2e/scenarios/watching.rs=, both running the watcher at the
   one-second floor. #13 is example 2.2.4 verbatim. #14 takes the peer
   offline under a running watcher, edits and deletes on the connector,
-  reconnects, and asserts unattended catch-up purely through =wait_*=
-  primitives — no observing verb over the watcher's stderr, as its catalog
-  row promised. The suite is now eighteen scenarios; the remaining "later"
-  rows are #15–#16, still blocked on their named vocabulary extensions.
+  reconnects, and asserts the unattended catch-up through =wait_*=
+  primitives (bracketed by an initial-sync precondition and a final
+  tree-equality check) — no observing verb over the watcher's stderr, as
+  its catalog row promised. The suite is now eighteen scenarios; the
+  remaining "later" rows are #15–#16, still blocked on their named
+  vocabulary extensions.
 - *The reserved watch vocabulary arrived with its scenarios*, per the slice
   policy: =pair_with(Config)= (currently one knob, =watch_rescan_seconds=,
   applied to the connector's =watch= invocations), =watch_start()= /
   =watch.stop()=, and the =wait_for_file= / =wait_absent= twins of the
-  existing assertion Conditions. =wait_status= remains reserved on paper —
-  no implemented scenario reads status eventually. The =mod.rs= re-export
-  surface of section 8 grew from four names to six (=pair_with= and
-  =Config=; =Watch= stays reachable only by inference).
+  existing assertion Conditions. =wait_status= remains reserved on paper
+  with no home scenario — so section 7's bidirectional-vocabulary check,
+  which grouped all three wait primitives under #13–#14, now holds only for
+  =wait_for_file= and =wait_absent=; =wait_status= waits for a scenario that
+  reads status eventually. The =mod.rs= re-export surface of section 8 grew
+  from four names to six (=pair_with= and =Config=; =Watch= stays reachable
+  only by inference).
 - *=watch_start()= mechanics.* =docker exec -d= runs a constant
   =sh -c= start command that records the shell's pid and =exec=s =flocal
   watch=, so the recorded pid is the watcher's own (the =flocal= wrapper

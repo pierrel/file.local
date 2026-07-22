@@ -433,26 +433,21 @@ impl Connector {
         }
         args.extend_from_slice(&[&self.container.name, "sh", "-c", &start]);
         self.context.docker_ok(&args)?;
-        let started = Instant::now();
-        let pid = loop {
-            let output = self.exec_raw(&["cat", WATCH_PIDFILE])?;
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                break text
-                    .trim()
-                    .parse::<u32>()
-                    .context("parsing the recorded watch pid")?
-                    .to_string();
+        // The recorded pid appears once `echo` has written it. `echo >file`
+        // truncates before it writes, so a `cat` landing in that window
+        // reads an empty file successfully: an empty or unparseable read
+        // means "not recorded yet", not a failure — keep polling.
+        let pid = self.poll_until("flocal watch never recorded its pid", DEADLINE, |peer| {
+            let output = peer.exec_raw(&["cat", WATCH_PIDFILE])?;
+            if !output.status.success() {
+                return Ok(None);
             }
-            if started.elapsed() >= DEADLINE {
-                return Err(self.fail(format!(
-                    "{}: flocal watch never recorded its pid",
-                    self.alias
-                )));
-            }
-            std::thread::sleep(POLL);
-        };
-        if !self.signal("0", &pid)?.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok())
+        })?;
+        if !self.signal("0", pid)?.status.success() {
             return Err(self.fail(format!(
                 "{}: flocal watch exited during startup; see its captured stderr",
                 self.alias
@@ -491,7 +486,7 @@ impl Connector {
 /// and `recover_installs` repairs any interrupted install.
 pub struct Watch<'a> {
     peer: &'a Peer,
-    pid: String,
+    pid: u32,
     stopped: bool,
 }
 
@@ -502,34 +497,33 @@ impl Watch<'_> {
     /// the dump, if the watcher had already died: an unnoticed mid-scenario
     /// watcher death would silence everything the scenario claims to test.
     pub fn stop(mut self) -> Result<()> {
-        self.stopped = true;
-        if !self.peer.signal("TERM", &self.pid)?.status.success() {
+        let pid = self.pid;
+        if !self.peer.signal("TERM", pid)?.status.success() {
+            // Already gone: the pid may have been recycled, so don't let
+            // Drop KILL it — but still fail loudly, this is unexpected.
+            self.stopped = true;
             return Err(self.peer.fail(format!(
-                "{}: flocal watch (pid {}) was no longer running at stop; \
+                "{}: flocal watch (pid {pid}) was no longer running at stop; \
                  see its captured stderr",
-                self.peer.alias, self.pid
+                self.peer.alias
             )));
         }
-        let started = Instant::now();
-        loop {
-            if !self.peer.signal("0", &self.pid)?.status.success() {
-                return Ok(());
-            }
-            if started.elapsed() >= DEADLINE {
-                return Err(self.peer.fail(format!(
-                    "{}: flocal watch (pid {}) did not exit after SIGTERM",
-                    self.peer.alias, self.pid
-                )));
-            }
-            std::thread::sleep(POLL);
-        }
+        // Leave the SIGKILL backstop armed until exit is confirmed: if the
+        // wait below times out, Drop still force-kills the survivor.
+        self.peer.poll_until(
+            &format!("flocal watch (pid {pid}) did not exit after SIGTERM"),
+            DEADLINE,
+            move |peer| Ok((!peer.signal("0", pid)?.status.success()).then_some(())),
+        )?;
+        self.stopped = true;
+        Ok(())
     }
 }
 
 impl Drop for Watch<'_> {
     fn drop(&mut self) {
         if !self.stopped {
-            let _ = self.peer.signal("KILL", &self.pid);
+            let _ = self.peer.signal("KILL", self.pid);
         }
     }
 }
@@ -928,9 +922,32 @@ impl Peer {
     /// Sends a signal to a process inside the container. `kill` is a shell
     /// builtin here — the slim image ships no standalone binary — and the
     /// pid travels as a positional argument, never spliced into the script.
-    fn signal(&self, signal: &str, pid: &str) -> Result<std::process::Output> {
+    fn signal(&self, signal: &str, pid: u32) -> Result<std::process::Output> {
         let script = format!("kill -{signal} \"$1\"");
-        self.exec_raw(&["sh", "-c", &script, "kill", pid])
+        self.exec_raw(&["sh", "-c", &script, "kill", &pid.to_string()])
+    }
+
+    /// Polls `probe` every `POLL` until it yields `Some(value)`, or dumps and
+    /// fails with `describe` (alias-prefixed, like every other failure) when
+    /// `deadline` expires. The value-returning twin of `check`, which
+    /// collapses its probe to `()`: here `Ok(None)` means "not yet — keep
+    /// polling" (an absent pidfile, a transient empty read, a still-live pid).
+    fn poll_until<T>(
+        &self,
+        describe: &str,
+        deadline: Duration,
+        mut probe: impl FnMut(&Peer) -> Result<Option<T>>,
+    ) -> Result<T> {
+        let started = Instant::now();
+        loop {
+            if let Some(value) = probe(self)? {
+                return Ok(value);
+            }
+            if started.elapsed() >= deadline {
+                return Err(self.fail(format!("{}: {describe}", self.alias)));
+            }
+            std::thread::sleep(POLL);
+        }
     }
 
     fn flocal_ok(&self, args: &[&str]) -> Result<std::process::Output> {
