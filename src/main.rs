@@ -1510,10 +1510,13 @@ mod tests {
 
         // format_utc_timestamp is independently verified above; here it only
         // needs to bracket the call so the timestamp actually printed can be
-        // checked for equality against a known-correct value. The two
-        // Instant::now() calls a test apart are the same wall-clock second
-        // in practice; a tick over a second boundary is the one flake this
-        // tolerates by accepting either bound.
+        // checked against known-correct bounds. The fixed-width
+        // YYYY-MM-DDTHH:MM:SSZ format sorts lexicographically in
+        // chronological order, so a plain string range check is exact
+        // regardless of how many seconds elapse between the two bounds —
+        // unlike an equality check against just the two endpoints, which
+        // would spuriously fail if the printed timestamp legitimately lands
+        // on a third, in-between second under a slow or loaded scheduler.
         let before = utc_timestamp();
         let mut watch = Vec::new();
         write_plan_report(&mut watch, &local, &remote, &plan, false, PlanReport::Watch)?;
@@ -1526,7 +1529,7 @@ mod tests {
             let (timestamp, rest) = line.split_once(' ').expect("timestamped line");
             assert_eq!(rest, suffix, "{watch:?}");
             assert!(
-                timestamp == before || timestamp == after,
+                (before.as_str()..=after.as_str()).contains(&timestamp),
                 "{timestamp} not in [{before}, {after}]"
             );
         }
