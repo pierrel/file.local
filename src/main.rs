@@ -147,7 +147,7 @@ fn run() -> Result<()> {
             if !dry_run {
                 recover_installs(&mut state)?;
             }
-            run_sync(&mut state, &path, dry_run, yes, json)?;
+            run_sync(&mut state, &path, dry_run, yes, json, PlanReport::Full)?;
         }
         Commands::Status { path, json } => status(&state, &path, json)?,
         Commands::Conflicts { command } => conflicts(&state, command)?,
@@ -240,7 +240,24 @@ fn list_peer(state: &State, path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_sync(state: &mut State, path: &Path, dry_run: bool, yes: bool, json: bool) -> Result<()> {
+/// Distinguishes the explicit `flocal sync` invocation — whose plan is the
+/// full, unabridged action list — from `watch`'s repeating background sync,
+/// whose plan is timestamped per line and silent about paths needing no
+/// action, so a live watch log stays readable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanReport {
+    Full,
+    Watch,
+}
+
+fn run_sync(
+    state: &mut State,
+    path: &Path,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    report: PlanReport,
+) -> Result<()> {
     let _global_lock = state.lock_global_sync()?;
     let (share, _) = state.find_share(path)?;
     let _share_lock = state.lock_share(&share)?;
@@ -273,7 +290,7 @@ fn run_sync(state: &mut State, path: &Path, dry_run: bool, yes: bool, json: bool
     }
     let remote_records = sync::read_snapshot(&mut remote.output)?;
     let plan = sync::plan(&local, &remote_records);
-    print_plan(&local, &remote_records, &plan, json)?;
+    print_plan(&local, &remote_records, &plan, json, report)?;
     if dry_run {
         sync::write_message(&mut remote.input, &Message::Cancel)?;
         return remote.finish();
@@ -817,10 +834,37 @@ fn watch(state: &mut State, path: &Path) -> Result<()> {
         let _ = tx.send(event);
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
-    println!("Watching {}", root.display());
+    watch_loop(
+        state,
+        path,
+        &root,
+        &rx,
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+}
+
+/// The reconciliation loop, taking an already-set-up event receiver and the
+/// destinations for its status lines, so both the control flow and the
+/// exact text it prints can be driven and asserted deterministically in
+/// tests, without a live filesystem watcher or terminal. A disconnected
+/// receiver ends the loop the same way tearing down the real watcher
+/// would, via `rx.recv_timeout`'s own `Disconnected` error.
+fn watch_loop(
+    state: &mut State,
+    path: &Path,
+    root: &Path,
+    rx: &std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<()> {
+    watch_log(out, &format!("Watching {}", root.display()))?;
     let mut offline = false;
-    if let Err(error) = run_sync(state, path, false, true, false) {
-        eprintln!("peer offline; watching locally and retrying: {error:#}");
+    if let Err(error) = run_sync(state, path, false, true, false, PlanReport::Watch) {
+        watch_log(
+            err,
+            &format!("peer offline; watching locally and retrying: {error:#}"),
+        )?;
         offline = true;
     }
     loop {
@@ -829,39 +873,90 @@ fn watch(state: &mut State, path: &Path) -> Result<()> {
                 std::thread::sleep(Duration::from_millis(250));
                 while rx.try_recv().is_ok() {}
             }
-            Ok(Err(error)) => eprintln!("watch error, rescanning: {error}"),
+            Ok(Err(error)) => watch_log(err, &format!("watch error, rescanning: {error}"))?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => return Err(error.into()),
         }
-        match run_sync(state, path, false, true, false) {
-            Ok(()) if offline => {
-                eprintln!("peer reconnected; synchronization resumed");
-                offline = false;
-            }
-            Ok(()) => {}
-            Err(error) if !offline => {
-                eprintln!("peer offline; retrying in background: {error:#}");
-                offline = true;
-            }
-            Err(_) => {}
+        let outcome = run_sync(state, path, false, true, false, PlanReport::Watch);
+        let (message, next_offline) = watch_sync_edge(&outcome, offline);
+        if let Some(message) = message {
+            watch_log(err, &message)?;
         }
+        offline = next_offline;
     }
 }
+
+/// The status line (if any) a watch cycle's sync outcome should print,
+/// given the previous `offline` state, and the resulting `offline` state
+/// to carry into the next cycle. This is the single source of truth
+/// `watch_loop` reads from for both the transition and its exact wording,
+/// so a swapped or misattributed message cannot pass unnoticed; all four
+/// online/offline transitions and their messages are pinned directly by
+/// `watch_sync_edge_covers_all_four_online_offline_transitions` below,
+/// independent of a live sync.
+fn watch_sync_edge(outcome: &Result<()>, was_offline: bool) -> (Option<String>, bool) {
+    match (outcome, was_offline) {
+        (Ok(()), true) => (
+            Some("peer reconnected; synchronization resumed".to_string()),
+            false,
+        ),
+        (Ok(()), false) => (None, false),
+        (Err(_), true) => (None, true),
+        (Err(error), false) => (
+            Some(format!("peer offline; retrying in background: {error:#}")),
+            true,
+        ),
+    }
+}
+
+/// Writes one of watch's own status lines with a UTC timestamp prefix,
+/// matching the per-line timestamps `write_plan_report` gives its
+/// `PlanReport::Watch` output — every line a long-running `watch` prints is
+/// timestamped, not just the synchronized-paths lines.
+fn watch_log(destination: &mut impl Write, message: &str) -> Result<()> {
+    writeln!(destination, "{} {message}", utc_timestamp())?;
+    Ok(())
+}
+
+/// The padded action label for a path that matches on both peers. Named
+/// here and reused below rather than repeated as a literal, so the KEEP
+/// filter can never drift from the match arms that produce it.
+const KEEP: &str = "KEEP  ";
 
 fn print_plan(
     local: &[flocal::model::Record],
     remote: &[flocal::model::Record],
     plan: &flocal::reconcile::Plan,
     json: bool,
+    report: PlanReport,
+) -> Result<()> {
+    write_plan_report(&mut io::stdout(), local, remote, plan, json, report)
+}
+
+fn write_plan_report(
+    output: &mut impl Write,
+    local: &[flocal::model::Record],
+    remote: &[flocal::model::Record],
+    plan: &flocal::reconcile::Plan,
+    json: bool,
+    report: PlanReport,
 ) -> Result<()> {
     if json {
-        println!("{}", serde_json::json!({"schema": 1, "plan": plan}));
+        writeln!(output, "{}", serde_json::json!({"schema": 1, "plan": plan}))?;
         return Ok(());
     }
     let local_by_path: std::collections::HashMap<_, _> =
         local.iter().map(|r| (r.path.as_bytes(), r)).collect();
     let remote_by_path: std::collections::HashMap<_, _> =
         remote.iter().map(|r| (r.path.as_bytes(), r)).collect();
+    // `watch`'s repeating background sync timestamps every printed line and
+    // omits KEEP: on an idle share almost every path matches on both peers,
+    // and a KEEP line per path per 30-second cycle would drown out the
+    // changes a live log exists to show. `flocal sync`'s plan is unabridged.
+    let prefix = match report {
+        PlanReport::Full => String::new(),
+        PlanReport::Watch => format!("{} ", utc_timestamp()),
+    };
     for record in &plan.records {
         let local_record = local_by_path.get(record.path.as_bytes());
         let remote_record = remote_by_path.get(record.path.as_bytes());
@@ -870,18 +965,21 @@ fn print_plan(
                 if local.version.id() == remote.version.id()
                     && local.version.entry == remote.version.entry =>
             {
-                "KEEP  "
+                KEEP
             }
             (Entry::Tombstone, _, _) => "DELETE",
             (_, Some(_), Some(_)) => "MERGE ",
             (_, Some(_), None) => "UPLOAD",
             (_, None, Some(_)) => "DOWNLOAD",
-            _ => "KEEP  ",
+            _ => KEEP,
         };
-        println!("{action} {}", record.path.display());
+        if report == PlanReport::Watch && action == KEEP {
+            continue;
+        }
+        writeln!(output, "{prefix}{action} {}", record.path.display())?;
     }
     for conflict in &plan.conflicts {
-        println!("CONFLICT {}", conflict.path.display());
+        writeln!(output, "{prefix}CONFLICT {}", conflict.path.display())?;
     }
     Ok(())
 }
@@ -899,6 +997,55 @@ fn confirm(prompt: &str) -> Result<bool> {
 
 fn escaped(value: &str) -> String {
     value.escape_default().take(4096).collect()
+}
+
+/// A `YYYY-MM-DDTHH:MM:SSZ` timestamp for watch's log lines. Hand-rolled
+/// over `std::time` rather than a calendar dependency: watch only ever
+/// needs second-precision UTC (every container in this project's own
+/// end-to-end harness already runs UTC), so there is no timezone database
+/// to get right, only the well-known civil-time conversion below.
+fn utc_timestamp() -> String {
+    format_utc_timestamp(std::time::SystemTime::now())
+}
+
+fn format_utc_timestamp(instant: std::time::SystemTime) -> String {
+    let elapsed = instant
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_seconds = elapsed.as_secs();
+    let days_since_epoch = (total_seconds / 86_400) as i64;
+    let seconds_of_day = total_seconds % 86_400;
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    let (hour, minute, second) = (
+        seconds_of_day / 3600,
+        (seconds_of_day / 60) % 60,
+        seconds_of_day % 60,
+    );
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days since the Unix epoch to a proleptic-Gregorian (year, month, day).
+/// Howard Hinnant's constant-time civil-time algorithm (public domain);
+/// see <https://howardhinnant.github.io/date_algorithms.html>. Verified
+/// against independently computed reference instants in
+/// `utc_timestamp_matches_known_instants` below.
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 fn record_hash(record: &flocal::model::Record) -> Option<flocal::model::ObjectHash> {
@@ -1198,6 +1345,7 @@ mod tests {
                 conflicts: Vec::new(),
             },
             false,
+            PlanReport::Full,
         )?;
         print_plan(
             &[],
@@ -1207,6 +1355,7 @@ mod tests {
                 conflicts: Vec::new(),
             },
             true,
+            PlanReport::Full,
         )?;
         let mut merge_local = record(b"merge", Entry::Directory);
         merge_local.version.sequence = 2;
@@ -1225,7 +1374,162 @@ mod tests {
                 }],
             },
             false,
+            PlanReport::Full,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn utc_timestamp_matches_known_instants() {
+        let format = |epoch_seconds: u64| {
+            format_utc_timestamp(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch_seconds),
+            )
+        };
+        // Reference epoch seconds independently computed with
+        // `date -u -d '<instant>' +%s`, not derived from the code under test.
+        assert_eq!(format(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format(946_684_800), "2000-01-01T00:00:00Z");
+        assert_eq!(format(2_147_483_647), "2038-01-19T03:14:07Z");
+        assert_eq!(format(1_709_210_096), "2024-02-29T12:34:56Z"); // leap day
+        assert_eq!(format(1_784_715_330), "2026-07-22T10:15:30Z");
+    }
+
+    #[test]
+    fn watch_sync_edge_covers_all_four_online_offline_transitions() {
+        let (message, next_offline) = watch_sync_edge(&Ok(()), true);
+        assert_eq!(
+            message.as_deref(),
+            Some("peer reconnected; synchronization resumed")
+        );
+        assert!(!next_offline);
+
+        let (message, next_offline) = watch_sync_edge(&Ok(()), false);
+        assert_eq!(message, None);
+        assert!(!next_offline);
+
+        let (message, next_offline) = watch_sync_edge(&Err(anyhow::anyhow!("boom")), true);
+        assert_eq!(message, None);
+        assert!(next_offline);
+
+        let (message, next_offline) = watch_sync_edge(&Err(anyhow::anyhow!("boom")), false);
+        assert_eq!(
+            message.as_deref(),
+            Some("peer offline; retrying in background: boom")
+        );
+        assert!(next_offline);
+    }
+
+    #[test]
+    fn watch_loop_retries_offline_and_exits_once_the_watcher_disconnects() -> Result<()> {
+        // No dependency on a live filesystem watcher or network: the share
+        // has no peer configured, so every run_sync attempt inside the loop
+        // fails fast, in-process; one queued event drives the loop through
+        // both its match arms before the sender is dropped, which ends the
+        // loop deterministically via Disconnected exactly as tearing down a
+        // real watcher would. Capturing both writers pins the exact printed
+        // text, not just that the loop ran — a message swapped between the
+        // pre-loop and in-loop offline cases would fail this test.
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        state.init_share(&root)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(notify::Event::default()))?;
+        drop(tx);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let error = watch_loop(&mut state, &root, &root, &rx, &mut out, &mut err)
+            .expect_err("disconnect ends the loop");
+        assert!(
+            error
+                .downcast_ref::<std::sync::mpsc::RecvTimeoutError>()
+                .is_some()
+        );
+
+        let out = String::from_utf8(out)?;
+        let (timestamp, rest) = out
+            .trim_end()
+            .split_once(' ')
+            .context("expected a timestamped watch startup line")?;
+        assert_eq!(timestamp.len(), 20, "{timestamp:?}");
+        assert_eq!(rest, format!("Watching {}", root.display()));
+
+        let err = String::from_utf8(err)?;
+        let err_lines: Vec<&str> = err.lines().collect();
+        // The pre-loop attempt fails (no peer configured) and reports it;
+        // the in-loop attempt fails too, but silently, matching
+        // watch_sync_edge's (Err(_), true) => no message case — offline was
+        // already true, so this is a steady-state retry, not a fresh
+        // transition, and must not repeat the line every cycle.
+        assert_eq!(err_lines.len(), 1, "{err:?}");
+        let (_, rest) = err_lines[0].split_once(' ').context("timestamped line")?;
+        assert_eq!(
+            rest,
+            "peer offline; watching locally and retrying: no peer configured; \
+             run `flocal peer add`"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn watch_report_omits_keep_and_timestamps_every_line_full_report_does_not() -> Result<()> {
+        let record = |name: &[u8], entry: Entry| flocal::model::Record {
+            path: flocal::model::RelativePath::from_bytes(name.to_vec()).unwrap(),
+            version: flocal::model::Version {
+                peer: flocal::model::PeerId("peer".into()),
+                sequence: 1,
+                timestamp_ns: 1,
+                seen: Vec::new(),
+                entry,
+            },
+        };
+        // kept matches on both peers (KEEP); uploaded exists locally only.
+        let kept = record(b"kept", Entry::Directory);
+        let uploaded = record(b"uploaded", Entry::Directory);
+        let plan = flocal::reconcile::Plan {
+            records: vec![kept.clone(), uploaded.clone()],
+            conflicts: vec![flocal::reconcile::Conflict {
+                path: kept.path.clone(),
+                winner: kept.clone(),
+                loser: uploaded.clone(),
+            }],
+        };
+        let local = [kept.clone(), uploaded.clone()];
+        let remote = [kept.clone()];
+
+        let mut full = Vec::new();
+        write_plan_report(&mut full, &local, &remote, &plan, false, PlanReport::Full)?;
+        let full = String::from_utf8(full)?;
+        assert!(full.contains("KEEP   kept"), "{full:?}");
+        assert!(full.contains("UPLOAD uploaded"), "{full:?}");
+        assert!(full.contains("CONFLICT kept"), "{full:?}");
+        // The explicit `flocal sync` report is unchanged: no timestamp.
+        assert!(!full.lines().next().unwrap().starts_with(char::is_numeric));
+
+        // format_utc_timestamp is independently verified above; here it only
+        // needs to bracket the call so the timestamp actually printed can be
+        // checked for equality against a known-correct value. The two
+        // Instant::now() calls a test apart are the same wall-clock second
+        // in practice; a tick over a second boundary is the one flake this
+        // tolerates by accepting either bound.
+        let before = utc_timestamp();
+        let mut watch = Vec::new();
+        write_plan_report(&mut watch, &local, &remote, &plan, false, PlanReport::Watch)?;
+        let after = utc_timestamp();
+        let watch = String::from_utf8(watch)?;
+        assert!(!watch.contains("KEEP"), "{watch:?}");
+        let lines: Vec<&str> = watch.lines().collect();
+        assert_eq!(lines.len(), 2, "{watch:?}");
+        for (line, suffix) in lines.iter().zip(["UPLOAD uploaded", "CONFLICT kept"]) {
+            let (timestamp, rest) = line.split_once(' ').expect("timestamped line");
+            assert_eq!(rest, suffix, "{watch:?}");
+            assert!(
+                timestamp == before || timestamp == after,
+                "{timestamp} not in [{before}, {after}]"
+            );
+        }
         Ok(())
     }
 
