@@ -509,7 +509,18 @@ impl Watch<'_> {
                 self.peer.alias
             )));
         }
-        self.peer.signal("TERM", pid)?;
+        let term = self.peer.signal("TERM", pid)?;
+        if !term.status.success() && self.peer.is_watcher(pid)? {
+            // The signal genuinely failed to deliver to a still-live
+            // watcher (a nonzero `kill` on an already-exited pid is instead
+            // the normal race — the poll below confirms it fast). Fail now
+            // with `kill`'s own stderr, not a misleading deadline timeout.
+            return Err(self.peer.fail(format!(
+                "{}: sending SIGTERM to flocal watch (pid {pid}) failed: {}",
+                self.peer.alias,
+                String::from_utf8_lossy(&term.stderr).trim()
+            )));
+        }
         // Leave the SIGKILL backstop armed until exit is confirmed: if the
         // wait below times out, Drop still force-kills the survivor. The
         // identity check means a pid recycled after exit reads as gone.
