@@ -20,8 +20,12 @@ fn watch_notices_an_atomic_rename_save() -> Result<()> {
     let watch = a.watch_start()?;
     a.write(".notes.txt.tmp", "v2")?; // editor safe-save: temp file...
     a.rename(".notes.txt.tmp", "notes.txt")?; // ...renamed over the original
-    b.wait_for_file("notes.txt", "v2")?; // the assertion: fails (with the dump)
-    watch.stop() // if v2 never arrives by the deadline
+    // The assertion: this fails with the dump if v2 never arrives by the
+    // deadline, returning early — in which case the watcher is torn down by
+    // `Watch`'s Drop backstop, not the `stop()` below. On success, `stop()`
+    // terminates it and reports any teardown failure.
+    b.wait_for_file("notes.txt", "v2")?;
+    watch.stop()
 }
 
 #[test]

@@ -1223,7 +1223,10 @@ update:
     in sections 6 and 14.1 wherever the two readings would differ.
 - *Catalog #13 and #14 are implemented* in
   =tests/e2e/scenarios/watching.rs=, both running the watcher at the
-  one-second floor. #13 is example 2.2.4 verbatim. #14 takes the peer
+  one-second floor. #13 mirrors example 2.2.4 (its trailing comment
+  clarified to match the actual early-return control flow: a failed
+  =wait_for_file= returns before =stop()=, so =Watch='s Drop tears the
+  watcher down). #14 takes the peer
   offline under a running watcher, edits and deletes on the connector,
   reconnects, and asserts the unattended catch-up through =wait_*=
   primitives (bracketed by an initial-sync precondition and a final
