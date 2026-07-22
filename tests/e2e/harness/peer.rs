@@ -8,6 +8,10 @@ use super::docker::{RunContext, SHARE, image_tag, unique_token};
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(30);
+/// Where a started watcher records its pid inside the container. One watch
+/// per scenario container, so a fixed path suffices — and keeps the start
+/// command a constant string with nothing interpolated into it.
+const WATCH_PIDFILE: &str = "/tmp/flocal-watch.pid";
 /// The product's status JSON schema this harness is written against:
 /// schema 2, which the tombstone-retention fix introduced together with
 /// promoting the scenarios that read `tombstones`.
@@ -70,9 +74,12 @@ pub struct Peer {
 }
 
 /// The initiating peer. Dereferences to `Peer` for the shared vocabulary;
-/// only a `Connector` can `sync`.
+/// only a `Connector` can `sync` or `watch`.
 pub struct Connector {
     peer: Peer,
+    /// `pair_with`'s rescan knob, exported to `watch` invocations as
+    /// `FLOCAL_WATCH_RESCAN_SECONDS`. `None` leaves the product default.
+    watch_rescan_seconds: Option<u64>,
 }
 
 impl std::ops::Deref for Connector {
@@ -177,6 +184,20 @@ pub fn pair() -> Result<(Connector, Peer)> {
     Ok((connector, responder))
 }
 
+/// The knobs `pair_with` accepts beyond the standard opening. Currently:
+/// the watch rescan interval (design section 14.1), which watch scenarios
+/// set to the one-second floor so a cycle costs a second, not thirty.
+pub struct Config {
+    pub watch_rescan_seconds: u64,
+}
+
+/// `pair()` with knobs applied to the returned handles.
+pub fn pair_with(config: Config) -> Result<(Connector, Peer)> {
+    let (mut connector, responder) = pair()?;
+    connector.watch_rescan_seconds = Some(config.watch_rescan_seconds);
+    Ok((connector, responder))
+}
+
 /// Strict expected failure: passes while the wrapped scenario fails, and
 /// fails loudly the moment the scenario starts passing, so the fixing pull
 /// request must promote the scenario (delete this wrapper) in the same
@@ -276,7 +297,13 @@ impl PeerBox {
             SHARE,
         ])?;
         drop(output);
-        Ok((Connector { peer: self.peer }, other.peer))
+        Ok((
+            Connector {
+                peer: self.peer,
+                watch_rescan_seconds: None,
+            },
+            other.peer,
+        ))
     }
 }
 
@@ -388,6 +415,56 @@ impl Connector {
         ))
     }
 
+    /// Starts a foreground `flocal watch` inside the container (detached
+    /// from the harness process) and returns the guard holding it. The
+    /// start command records the shell's pid before `exec`ing `flocal`, so
+    /// the recorded pid *is* the watcher's — both the wrapper and the
+    /// product are reached by `exec`. Waits until the watcher is running:
+    /// a watch that dies on startup fails here, with the dump (its stderr
+    /// is in the captured flocal log).
+    pub fn watch_start(&self) -> Result<Watch<'_>> {
+        let start = format!("echo \"$$\" >{WATCH_PIDFILE} && exec flocal watch {SHARE}");
+        let rescan = self
+            .watch_rescan_seconds
+            .map(|seconds| format!("FLOCAL_WATCH_RESCAN_SECONDS={seconds}"));
+        let mut args = vec!["exec", "-d", "-u", "peer"];
+        if let Some(rescan) = &rescan {
+            args.extend_from_slice(&["-e", rescan]);
+        }
+        args.extend_from_slice(&[&self.container.name, "sh", "-c", &start]);
+        self.context.docker_ok(&args)?;
+        let started = Instant::now();
+        let pid = loop {
+            let output = self.exec_raw(&["cat", WATCH_PIDFILE])?;
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                break text
+                    .trim()
+                    .parse::<u32>()
+                    .context("parsing the recorded watch pid")?
+                    .to_string();
+            }
+            if started.elapsed() >= DEADLINE {
+                return Err(self.fail(format!(
+                    "{}: flocal watch never recorded its pid",
+                    self.alias
+                )));
+            }
+            std::thread::sleep(POLL);
+        };
+        if !self.signal("0", &pid)?.status.success() {
+            return Err(self.fail(format!(
+                "{}: flocal watch exited during startup; see its captured stderr",
+                self.alias
+            )));
+        }
+        Ok(Watch {
+            peer: &self.peer,
+            pid,
+            stopped: false,
+        })
+    }
+
     /// Restores a conflict's losing input to a scratch path outside the
     /// share and returns its content.
     pub fn restore_loser(&self, id: &str) -> Result<String> {
@@ -404,6 +481,56 @@ impl Connector {
         ])?;
         let output = self.exec_ok(&["cat", "--", &destination])?;
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+/// A running `flocal watch`, held as a guard. `stop(self)` consumes the
+/// guard, so double-stop is unrepresentable; `Drop` is the never-panicking
+/// best-effort backstop. Even SIGKILL is lock-safe by the product's own
+/// construction: `flock` releases on process exit, SQLite WAL recovers,
+/// and `recover_installs` repairs any interrupted install.
+pub struct Watch<'a> {
+    peer: &'a Peer,
+    pid: String,
+    stopped: bool,
+}
+
+impl Watch<'_> {
+    /// Terminates the watcher inside the container — killing the `docker
+    /// exec` client would not, and a surviving watcher would keep holding
+    /// the share and global locks — and waits for it to exit. Fails, with
+    /// the dump, if the watcher had already died: an unnoticed mid-scenario
+    /// watcher death would silence everything the scenario claims to test.
+    pub fn stop(mut self) -> Result<()> {
+        self.stopped = true;
+        if !self.peer.signal("TERM", &self.pid)?.status.success() {
+            return Err(self.peer.fail(format!(
+                "{}: flocal watch (pid {}) was no longer running at stop; \
+                 see its captured stderr",
+                self.peer.alias, self.pid
+            )));
+        }
+        let started = Instant::now();
+        loop {
+            if !self.peer.signal("0", &self.pid)?.status.success() {
+                return Ok(());
+            }
+            if started.elapsed() >= DEADLINE {
+                return Err(self.peer.fail(format!(
+                    "{}: flocal watch (pid {}) did not exit after SIGTERM",
+                    self.peer.alias, self.pid
+                )));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+impl Drop for Watch<'_> {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let _ = self.peer.signal("KILL", &self.pid);
+        }
     }
 }
 
@@ -522,12 +649,19 @@ impl Peer {
         self.check(self.file_condition(path, content)?, Duration::ZERO)
     }
 
-    // The `wait_*` twins of these assertions arrive with the first watch
-    // scenario; each will call `check` with the nonzero deadline over the
-    // same Condition its assertion uses.
+    /// `assert_file` with the default deadline: polls the same Condition
+    /// until it holds, or dumps and fails when the deadline expires.
+    pub fn wait_for_file(&self, path: &str, content: &str) -> Result<()> {
+        self.check(self.file_condition(path, content)?, DEADLINE)
+    }
 
     pub fn assert_absent(&self, path: &str) -> Result<()> {
         self.check(self.absent_condition(path)?, Duration::ZERO)
+    }
+
+    /// `assert_absent` with the default deadline.
+    pub fn wait_absent(&self, path: &str) -> Result<()> {
+        self.check(self.absent_condition(path)?, DEADLINE)
     }
 
     pub fn assert_status(&self, predicate: impl Fn(&Status) -> bool + 'static) -> Result<()> {
@@ -789,6 +923,14 @@ impl Peer {
     fn fail(&self, message: String) -> anyhow::Error {
         self.context.dump_once();
         anyhow::anyhow!(message)
+    }
+
+    /// Sends a signal to a process inside the container. `kill` is a shell
+    /// builtin here — the slim image ships no standalone binary — and the
+    /// pid travels as a positional argument, never spliced into the script.
+    fn signal(&self, signal: &str, pid: &str) -> Result<std::process::Output> {
+        let script = format!("kill -{signal} \"$1\"");
+        self.exec_raw(&["sh", "-c", &script, "kill", pid])
     }
 
     fn flocal_ok(&self, args: &[&str]) -> Result<std::process::Output> {

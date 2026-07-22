@@ -7,3 +7,4 @@ mod offline;
 mod pairing;
 mod syncing;
 mod transitions;
+mod watching;

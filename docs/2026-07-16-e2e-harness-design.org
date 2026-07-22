@@ -1197,3 +1197,47 @@ pin remains in the catalog. The wrapper itself stays as standing
 vocabulary — the AGENTS.md bug workflow pins newly reported bugs with it
 where possible — and its semantics are exercised by a Docker-free self-test in the
 harness.
+
+* Update 2026-07-22: the watch slice and the section 14.1 hook
+
+The watch slice landed (=agent/watch-rescan-hook=), closing unresolved
+decision 1 in favor of the recommendation: approve the hook with the clamp.
+As of this update:
+
+- *The =FLOCAL_WATCH_RESCAN_SECONDS= hook exists* exactly as section 6
+  specified: =watch= reads it with a default of 30, and zero or an
+  unparseable value falls back to the default — the deliberate deviation
+  from the unclamped =FLOCAL_MAX_*= siblings, because a zero interval would
+  hot-loop full rescans and connection attempts. The interval is parsed
+  once at watch startup (=watch_rescan_interval= in =src/main.rs=, unit
+  tested) and threaded into =watch_loop= as a parameter, keeping the loop
+  deterministic in tests.
+- *Catalog #13 and #14 are implemented* in
+  =tests/e2e/scenarios/watching.rs=, both running the watcher at the
+  one-second floor. #13 is example 2.2.4 verbatim. #14 takes the peer
+  offline under a running watcher, edits and deletes on the connector,
+  reconnects, and asserts unattended catch-up purely through =wait_*=
+  primitives — no observing verb over the watcher's stderr, as its catalog
+  row promised. The suite is now eighteen scenarios; the remaining "later"
+  rows are #15–#16, still blocked on their named vocabulary extensions.
+- *The reserved watch vocabulary arrived with its scenarios*, per the slice
+  policy: =pair_with(Config)= (currently one knob, =watch_rescan_seconds=,
+  applied to the connector's =watch= invocations), =watch_start()= /
+  =watch.stop()=, and the =wait_for_file= / =wait_absent= twins of the
+  existing assertion Conditions. =wait_status= remains reserved on paper —
+  no implemented scenario reads status eventually. The =mod.rs= re-export
+  surface of section 8 grew from four names to six (=pair_with= and
+  =Config=; =Watch= stays reachable only by inference).
+- *=watch_start()= mechanics.* =docker exec -d= runs a constant
+  =sh -c= start command that records the shell's pid and =exec=s =flocal
+  watch=, so the recorded pid is the watcher's own (the =flocal= wrapper
+  also =exec=s). The rescan knob travels as an environment variable on that
+  exec. Start-up is verified — the primitive fails, with the dump, if the
+  watcher dies before or during the wait for its pid. =stop()= signals the
+  recorded pid inside the container per section 2.3 and additionally fails
+  if the watcher had already died, so an unnoticed mid-scenario watcher
+  death cannot pass. Signals go through the shell's =kill= builtin (the
+  slim image ships no standalone =kill=), with the pid as a positional
+  argument, preserving section 9's no-interpolation rule. The watcher's
+  stderr reaches the failure dump through the existing wrapper tee; its
+  stdout under =-d= is discarded.

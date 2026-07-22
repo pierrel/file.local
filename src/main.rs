@@ -834,13 +834,30 @@ fn watch(state: &mut State, path: &Path) -> Result<()> {
         let _ = tx.send(event);
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
+    let rescan = watch_rescan_interval(std::env::var("FLOCAL_WATCH_RESCAN_SECONDS").ok());
     watch_loop(
         state,
         path,
         &root,
         &rx,
+        rescan,
         &mut io::stdout(),
         &mut io::stderr(),
+    )
+}
+
+/// The interval after which `watch` rescans and attempts a sync even
+/// without a filesystem event: `FLOCAL_WATCH_RESCAN_SECONDS`, default 30.
+/// Unlike the unclamped `FLOCAL_MAX_*` budget variables, zero (or an
+/// unparseable value) falls back to the default instead of being honored —
+/// a zero interval would hot-loop full rescans and connection attempts,
+/// and nothing needs it.
+fn watch_rescan_interval(configured: Option<String>) -> Duration {
+    Duration::from_secs(
+        configured
+            .and_then(|value| value.parse().ok())
+            .filter(|&seconds| seconds != 0)
+            .unwrap_or(30),
     )
 }
 
@@ -855,6 +872,7 @@ fn watch_loop(
     path: &Path,
     root: &Path,
     rx: &std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    rescan: Duration,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<()> {
@@ -868,7 +886,7 @@ fn watch_loop(
         offline = true;
     }
     loop {
-        match rx.recv_timeout(Duration::from_secs(30)) {
+        match rx.recv_timeout(rescan) {
             Ok(Ok(_)) => {
                 std::thread::sleep(Duration::from_millis(250));
                 while rx.try_recv().is_ok() {}
@@ -1421,6 +1439,32 @@ mod tests {
     }
 
     #[test]
+    fn watch_rescan_interval_defaults_to_30_and_refuses_zero() {
+        assert_eq!(watch_rescan_interval(None), Duration::from_secs(30));
+        assert_eq!(
+            watch_rescan_interval(Some("1".into())),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            watch_rescan_interval(Some("120".into())),
+            Duration::from_secs(120)
+        );
+        // Zero would hot-loop; it and unparseable values fall back.
+        assert_eq!(
+            watch_rescan_interval(Some("0".into())),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            watch_rescan_interval(Some("-5".into())),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            watch_rescan_interval(Some("soon".into())),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
     fn watch_loop_retries_offline_and_exits_once_the_watcher_disconnects() -> Result<()> {
         // No dependency on a live filesystem watcher or network: the share
         // has no peer configured, so every run_sync attempt inside the loop
@@ -1440,7 +1484,8 @@ mod tests {
         drop(tx);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let error = watch_loop(&mut state, &root, &root, &rx, &mut out, &mut err)
+        let rescan = watch_rescan_interval(None);
+        let error = watch_loop(&mut state, &root, &root, &rx, rescan, &mut out, &mut err)
             .expect_err("disconnect ends the loop");
         assert!(
             error
