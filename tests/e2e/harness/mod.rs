@@ -6,7 +6,7 @@ mod docker;
 mod dump;
 mod peer;
 
-pub use peer::{assert_trees_equal, containers, known_failure, pair};
+pub use peer::{Config, assert_trees_equal, containers, known_failure, pair, pair_with};
 
 /// With every catalog pin promoted, no scenario currently wraps
 /// `known_failure` — but it is standing vocabulary (the AGENTS.md bug
