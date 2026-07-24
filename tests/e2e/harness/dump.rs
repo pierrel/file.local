@@ -2,8 +2,9 @@ use super::docker::{RunContext, SHARE};
 
 /// The failure diagnostics: transcript tail, each container's tree listing,
 /// raw `status --json` (printed unparsed, so a schema mismatch is visible in
-/// the dump rather than able to break it), captured flocal stderr, and sshd
-/// logs. A failing scenario must be diagnosable from this output alone.
+/// the dump rather than able to break it), captured flocal stderr and watch
+/// stdout, and sshd logs. A failing scenario must be diagnosable from this
+/// output alone.
 pub fn print_dump(context: &RunContext) {
     eprintln!("==== e2e failure dump (run {}) ====", context.run_id);
     eprintln!("---- transcript tail ----");
@@ -28,7 +29,17 @@ pub fn print_dump(context: &RunContext) {
         eprintln!("---- {name}: raw status --json ----");
         print_exec(context, name, &["flocal", "status", SHARE, "--json"]);
         eprintln!("---- {name}: captured flocal stderr ----");
-        print_exec(context, name, &["cat", "/home/peer/.flocal-stderr.log"]);
+        print_exec(
+            context,
+            name,
+            &["cat", "--", "/home/peer/.flocal-stderr.log"],
+        );
+        eprintln!("---- {name}: captured watch stdout ----");
+        print_exec(
+            context,
+            name,
+            &["cat", "--", "/home/peer/.flocal-watch.log"],
+        );
         eprintln!("---- {name}: docker logs ----");
         match context.docker_raw(&["logs", "--tail", "50", name]) {
             Ok(output) => {
