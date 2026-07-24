@@ -147,7 +147,7 @@ fn run() -> Result<()> {
             if !dry_run {
                 recover_installs(&mut state)?;
             }
-            run_sync(&mut state, &path, dry_run, yes, json, PlanReport::Full)?;
+            let _ = run_sync(&mut state, &path, dry_run, yes, json, PlanReport::Full)?;
         }
         Commands::Status { path, json } => status(&state, &path, json)?,
         Commands::Conflicts { command } => conflicts(&state, command)?,
@@ -250,6 +250,12 @@ enum PlanReport {
     Watch,
 }
 
+#[derive(Default)]
+struct SyncCompletion {
+    watch_report: Option<Vec<u8>>,
+    post_commit_error: Option<anyhow::Error>,
+}
+
 fn run_sync(
     state: &mut State,
     path: &Path,
@@ -257,7 +263,7 @@ fn run_sync(
     yes: bool,
     json: bool,
     report: PlanReport,
-) -> Result<()> {
+) -> Result<SyncCompletion> {
     let _global_lock = state.lock_global_sync()?;
     let (share, _) = state.find_share(path)?;
     let _share_lock = state.lock_share(&share)?;
@@ -290,14 +296,18 @@ fn run_sync(
     }
     let remote_records = sync::read_snapshot(&mut remote.output)?;
     let plan = sync::plan(&local, &remote_records);
-    print_plan(&local, &remote_records, &plan, json, report)?;
+    if report == PlanReport::Full {
+        print_plan(&local, &remote_records, &plan, json, report)?;
+    }
     if dry_run {
         sync::write_message(&mut remote.input, &Message::Cancel)?;
-        return remote.finish();
+        remote.finish()?;
+        return Ok(SyncCompletion::default());
     }
     if !state.initial_complete(&share)? && !yes && !confirm("Apply this initial plan?")? {
         sync::write_message(&mut remote.input, &Message::Cancel)?;
-        return remote.finish();
+        remote.finish()?;
+        return Ok(SyncCompletion::default());
     }
 
     let root = state.root_for(&share)?;
@@ -386,9 +396,24 @@ fn run_sync(
     state.add_conflicts(&share, &plan.conflicts)?;
     state.set_initial_complete(&share)?;
     state.prune_unreferenced_objects()?;
-    sync::write_message(&mut remote.input, &Message::Done)?;
-    remote.finish()?;
-    Ok(())
+    let committed_report = if report == PlanReport::Watch {
+        let mut output = Vec::new();
+        write_plan_report(&mut output, &local, &remote_records, &plan, json, report)?;
+        Some(output)
+    } else {
+        None
+    };
+    let finalization =
+        sync::write_message(&mut remote.input, &Message::Done).and_then(|()| remote.finish());
+    if report == PlanReport::Watch {
+        Ok(SyncCompletion {
+            watch_report: committed_report,
+            post_commit_error: finalization.err(),
+        })
+    } else {
+        finalization?;
+        Ok(SyncCompletion::default())
+    }
 }
 
 fn serve(state: &mut State) -> Result<()> {
@@ -877,14 +902,8 @@ fn watch_loop(
     err: &mut impl Write,
 ) -> Result<()> {
     watch_log(out, &format!("Watching {}", root.display()))?;
-    let mut offline = false;
-    if let Err(error) = run_sync(state, path, false, true, false, PlanReport::Watch) {
-        watch_log(
-            err,
-            &format!("peer offline; watching locally and retrying: {error:#}"),
-        )?;
-        offline = true;
-    }
+    let mut failures = WatchFailures::default();
+    watch_cycle(state, path, out, err, &mut failures)?;
     loop {
         match rx.recv_timeout(rescan) {
             Ok(Ok(_)) => {
@@ -895,36 +914,121 @@ fn watch_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => return Err(error.into()),
         }
-        let outcome = run_sync(state, path, false, true, false, PlanReport::Watch);
-        let (message, next_offline) = watch_sync_edge(&outcome, offline);
-        if let Some(message) = message {
-            watch_log(err, &message)?;
-        }
-        offline = next_offline;
+        watch_cycle(state, path, out, err, &mut failures)?;
     }
 }
 
-/// The status line (if any) a watch cycle's sync outcome should print,
-/// given the previous `offline` state, and the resulting `offline` state
-/// to carry into the next cycle. This is the single source of truth
-/// `watch_loop` reads from for both the transition and its exact wording,
-/// so a swapped or misattributed message cannot pass unnoticed; all four
-/// online/offline transitions and their messages are pinned directly by
-/// `watch_sync_edge_covers_all_four_online_offline_transitions` below,
-/// independent of a live sync.
-fn watch_sync_edge(outcome: &Result<()>, was_offline: bool) -> (Option<String>, bool) {
-    match (outcome, was_offline) {
-        (Ok(()), true) => (
-            Some("peer reconnected; synchronization resumed".to_string()),
-            false,
-        ),
-        (Ok(()), false) => (None, false),
-        (Err(_), true) => (None, true),
-        (Err(error), false) => (
-            Some(format!("peer offline; retrying in background: {error:#}")),
-            true,
-        ),
+const WATCH_FAILURE_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+struct WatchFailures {
+    count: u64,
+    last_reported: Option<std::time::Instant>,
+}
+
+enum WatchEvent {
+    First { error: String },
+    Periodic { count: u64, error: String },
+    Recovered { count: u64 },
+}
+
+impl WatchFailures {
+    fn failed(
+        &mut self,
+        error: &anyhow::Error,
+        now: std::time::Instant,
+        interval: Duration,
+    ) -> Option<WatchEvent> {
+        self.count = self.count.saturating_add(1);
+        let error = watch_error(error);
+        if self.count == 1 {
+            self.last_reported = Some(now);
+            return Some(WatchEvent::First { error });
+        }
+        if self
+            .last_reported
+            .is_some_and(|last| now.duration_since(last) < interval)
+        {
+            return None;
+        }
+        self.last_reported = Some(now);
+        Some(WatchEvent::Periodic {
+            count: self.count,
+            error,
+        })
     }
+
+    fn succeeded(&mut self) -> Option<WatchEvent> {
+        let count = std::mem::take(&mut self.count);
+        self.last_reported = None;
+        (count != 0).then_some(WatchEvent::Recovered { count })
+    }
+}
+
+fn watch_cycle(
+    state: &mut State,
+    path: &Path,
+    out: &mut impl Write,
+    err: &mut impl Write,
+    failures: &mut WatchFailures,
+) -> Result<()> {
+    match run_sync(state, path, false, true, false, PlanReport::Watch) {
+        Ok(completion) => {
+            handle_watch_completion(completion, out, err, failures)?;
+        }
+        Err(error) => {
+            if let Some(event) = failures.failed(
+                &error,
+                std::time::Instant::now(),
+                WATCH_FAILURE_REPORT_INTERVAL,
+            ) {
+                write_watch_event(err, event)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_watch_completion(
+    completion: SyncCompletion,
+    out: &mut impl Write,
+    err: &mut impl Write,
+    failures: &mut WatchFailures,
+) -> Result<()> {
+    if let Some(report) = completion.watch_report {
+        out.write_all(&report)?;
+    }
+    if let Some(error) = completion.post_commit_error {
+        if let Some(event) = failures.failed(
+            &error,
+            std::time::Instant::now(),
+            WATCH_FAILURE_REPORT_INTERVAL,
+        ) {
+            write_watch_event(err, event)?;
+        }
+    } else if let Some(event) = failures.succeeded() {
+        write_watch_event(err, event)?;
+    }
+    Ok(())
+}
+
+fn watch_error(error: &anyhow::Error) -> String {
+    escaped(&format!("{error:#}"))
+}
+
+fn write_watch_event(destination: &mut impl Write, event: WatchEvent) -> Result<()> {
+    let message = match event {
+        WatchEvent::First { error } => {
+            format!("peer offline; retrying in background: {error}")
+        }
+        WatchEvent::Periodic { count, error } => {
+            format!("peer still offline after {count} failed attempts; retrying: {error}")
+        }
+        WatchEvent::Recovered { count } => {
+            format!("peer reconnected; synchronization resumed after {count} failed attempts")
+        }
+    };
+    watch_log(destination, &message)
 }
 
 /// Writes one of watch's own status lines with a UTC timestamp prefix,
@@ -1414,28 +1518,104 @@ mod tests {
     }
 
     #[test]
-    fn watch_sync_edge_covers_all_four_online_offline_transitions() {
-        let (message, next_offline) = watch_sync_edge(&Ok(()), true);
-        assert_eq!(
-            message.as_deref(),
-            Some("peer reconnected; synchronization resumed")
+    fn watch_failures_rate_limit_changing_errors_and_report_recovery() {
+        let start = std::time::Instant::now();
+        let interval = Duration::from_secs(300);
+        let mut failures = WatchFailures::default();
+
+        assert!(matches!(
+            failures.failed(&anyhow::anyhow!("first\nline"), start, interval),
+            Some(WatchEvent::First { error }) if error == "first\\nline"
+        ));
+        assert!(
+            failures
+                .failed(
+                    &anyhow::anyhow!("different peer-controlled text"),
+                    start + Duration::from_secs(299),
+                    interval,
+                )
+                .is_none()
         );
-        assert!(!next_offline);
+        assert!(matches!(
+            failures.failed(
+                &anyhow::anyhow!("latest"),
+                start + interval,
+                interval,
+            ),
+            Some(WatchEvent::Periodic { count: 3, error }) if error == "latest"
+        ));
+        assert!(matches!(
+            failures.succeeded(),
+            Some(WatchEvent::Recovered { count: 3 })
+        ));
+        assert!(failures.succeeded().is_none());
+    }
 
-        let (message, next_offline) = watch_sync_edge(&Ok(()), false);
-        assert_eq!(message, None);
-        assert!(!next_offline);
+    #[test]
+    fn committed_watch_report_survives_finalization_error() -> Result<()> {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut failures = WatchFailures::default();
+        handle_watch_completion(
+            SyncCompletion {
+                watch_report: Some(b"UPLOAD applied.txt\n".to_vec()),
+                post_commit_error: Some(anyhow::anyhow!("final ssh teardown failed")),
+            },
+            &mut out,
+            &mut err,
+            &mut failures,
+        )
+        .expect("post-commit outcome is writable");
+        assert_eq!(out, b"UPLOAD applied.txt\n");
+        assert!(String::from_utf8(err)?.contains("final ssh teardown failed"));
+        assert_eq!(failures.count, 1);
+        handle_watch_completion(
+            SyncCompletion::default(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut failures,
+        )
+        .expect("recovery outcome is writable");
+        assert_eq!(failures.count, 0);
+        Ok(())
+    }
 
-        let (message, next_offline) = watch_sync_edge(&Err(anyhow::anyhow!("boom")), true);
-        assert_eq!(message, None);
-        assert!(next_offline);
-
-        let (message, next_offline) = watch_sync_edge(&Err(anyhow::anyhow!("boom")), false);
-        assert_eq!(
-            message.as_deref(),
-            Some("peer offline; retrying in background: boom")
+    #[test]
+    fn watch_errors_are_single_line_and_bounded() {
+        let error = anyhow::anyhow!("{}\n{}", "é".repeat(5000), "x".repeat(5000));
+        let rendered = watch_error(&error);
+        assert_eq!(rendered.chars().count(), 4096);
+        assert!(!rendered.contains('\n') && !rendered.contains('\r'));
+        assert!(
+            rendered.is_ascii(),
+            "non-ASCII is escaped before truncation"
         );
-        assert!(next_offline);
+    }
+
+    #[test]
+    fn periodic_and_recovery_watch_events_have_operator_context() -> Result<()> {
+        let mut output = Vec::new();
+        write_watch_event(
+            &mut output,
+            WatchEvent::Periodic {
+                count: 7,
+                error: "still unreachable".into(),
+            },
+        )
+        .expect("periodic event is writable");
+        write_watch_event(&mut output, WatchEvent::Recovered { count: 7 })?;
+        let output = String::from_utf8(output)?;
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].ends_with(
+                "peer still offline after 7 failed attempts; retrying: still unreachable"
+            )
+        );
+        assert!(
+            lines[1].ends_with("peer reconnected; synchronization resumed after 7 failed attempts")
+        );
+        Ok(())
     }
 
     #[test]
@@ -1501,15 +1681,12 @@ mod tests {
         let err = String::from_utf8(err)?;
         let err_lines: Vec<&str> = err.lines().collect();
         // The pre-loop attempt fails (no peer configured) and reports it;
-        // the in-loop attempt fails too, but silently, matching
-        // watch_sync_edge's (Err(_), true) => no message case — offline was
-        // already true, so this is a steady-state retry, not a fresh
-        // transition, and must not repeat the line every cycle.
+        // the immediate in-loop retry is rate-limited.
         assert_eq!(err_lines.len(), 1, "{err:?}");
         let (_, rest) = err_lines[0].split_once(' ').context("timestamped line")?;
         assert_eq!(
             rest,
-            "peer offline; watching locally and retrying: no peer configured; \
+            "peer offline; retrying in background: no peer configured; \
              run `flocal peer add`"
         );
         Ok(())

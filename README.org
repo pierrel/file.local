@@ -94,7 +94,14 @@ alpha currently performs a full reconciliation scan on a fixed interval —
 30 seconds by default, overridable with =FLOCAL_WATCH_RESCAN_SECONDS= (a zero
 or unparseable value keeps the default) — while =watch= is running; avoiding
 those idle scans remains deferred. While disconnected, the connector retries
-and synchronizes recorded changes when the connection returns.
+and synchronizes recorded changes when the connection returns. Filesystem
+notifications are hints; the periodic full scan is the correctness backstop
+after sleep, wake, or missed events. In =watch= output, path actions are printed
+only after both peers successfully apply them. The first failed attempt is
+reported immediately, continuing failures are summarized every five minutes
+without log flooding, and recovery reports how many attempts failed. Explicit
+=flocal sync= output remains a proposed plan because it may precede initial
+confirmation.
 
 See [[file:docs/2026-07-14-v0.0.1-design.org][the proposed detailed design]] for the CLI, wire behavior, recovery commands,
 security model, platform constraints, and acceptance criteria. The README is
