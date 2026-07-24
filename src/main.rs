@@ -147,7 +147,7 @@ fn run() -> Result<()> {
             if !dry_run {
                 recover_installs(&mut state)?;
             }
-            let _ = run_sync(&mut state, &path, dry_run, yes, json, PlanReport::Full)?;
+            run_sync(&mut state, &path, dry_run, yes, json, PlanReport::Full)?;
         }
         Commands::Status { path, json } => status(&state, &path, json)?,
         Commands::Conflicts { command } => conflicts(&state, command)?,

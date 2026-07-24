@@ -451,7 +451,7 @@ impl Connector {
         // reads an empty file successfully: an empty or unparseable read
         // means "not recorded yet", not a failure — keep polling.
         let pid = self.poll_until("flocal watch never recorded its pid", DEADLINE, |peer| {
-            let output = peer.exec_raw(&["cat", WATCH_PIDFILE])?;
+            let output = peer.exec_raw(&["cat", "--", WATCH_PIDFILE])?;
             if !output.status.success() {
                 return Ok(None);
             }
@@ -536,7 +536,7 @@ impl Watch<'_> {
     }
 
     pub fn assert_log_absent(&self, needle: &str) -> Result<()> {
-        let output = self.peer.exec_ok(&["cat", WATCH_LOG])?;
+        let output = self.peer.exec_ok(&["cat", "--", WATCH_LOG])?;
         let log = String::from_utf8_lossy(&output.stdout);
         if log.contains(needle) {
             return Err(self.peer.fail(format!(
@@ -631,7 +631,7 @@ impl Peer {
             &format!("{path} never contained {needle:?}"),
             DEADLINE,
             |peer| {
-                let output = peer.exec_raw(&["cat", path])?;
+                let output = peer.exec_raw(&["cat", "--", path])?;
                 Ok((output.status.success()
                     && String::from_utf8_lossy(&output.stdout).contains(needle))
                 .then_some(()))
@@ -1032,7 +1032,7 @@ impl Peer {
     /// against a live watcher pid. `cmdline` is NUL-separated; match on
     /// substrings.
     fn is_watcher(&self, pid: u32) -> Result<bool> {
-        let output = self.exec_raw(&["cat", &format!("/proc/{pid}/cmdline")])?;
+        let output = self.exec_raw(&["cat", "--", &format!("/proc/{pid}/cmdline")])?;
         if !output.status.success() {
             return Ok(false); // no such process
         }
