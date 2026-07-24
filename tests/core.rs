@@ -4,7 +4,7 @@ use anyhow::Result;
 use flocal::model::Entry;
 use flocal::scan::scan;
 use flocal::state::State;
-use flocal::sync::{apply_plan, plan, refresh};
+use flocal::sync::{ShareRoot, apply_plan, plan, refresh, refresh_with_root};
 use tempfile::tempdir;
 
 #[test]
@@ -40,6 +40,36 @@ fn scan_apply_and_delete_round_trip() -> Result<()> {
     );
     apply_plan(&mut target_state, &source_share, &second)?;
     assert!(!target.join("hello.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn held_share_root_rejects_path_replacement_without_tombstones() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let held_tree = temp.path().join("held-tree");
+    fs::create_dir(&root)?;
+    fs::write(root.join("kept.txt"), "kept")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    refresh(&mut state, &share)?;
+    let capability = ShareRoot::open(&state, &share)?;
+
+    fs::rename(&root, &held_tree)?;
+    fs::create_dir(&root)?;
+    let before = state.records(&share)?;
+    let error = refresh_with_root(&mut state, &share, &capability)
+        .expect_err("replacement path must invalidate the held session");
+    assert!(error.to_string().contains("root identity changed"));
+    assert_eq!(state.records(&share)?, before);
+    assert!(
+        state
+            .records(&share)?
+            .iter()
+            .all(|record| !matches!(record.version.entry, Entry::Tombstone))
+    );
+    assert!(fs::read_dir(&root)?.next().is_none());
+    assert_eq!(fs::read_to_string(held_tree.join("kept.txt"))?, "kept");
     Ok(())
 }
 

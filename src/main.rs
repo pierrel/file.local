@@ -8,8 +8,47 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use flocal::model::{Entry, PeerConfig, ShareId};
 use flocal::state::State;
-use flocal::sync::{self, Message};
+use flocal::sync::{self, InitialMessage, Message, V2Envelope, V2RoundFrame, V2SessionFrame};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
+#[derive(Debug)]
+struct RemoteWatchError {
+    retryable: bool,
+    message: String,
+}
+
+impl std::fmt::Display for RemoteWatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "remote watch rejected the session: {}",
+            escaped(&self.message)
+        )
+    }
+}
+
+impl std::error::Error for RemoteWatchError {}
+
+#[derive(Debug)]
+struct WatchProtocolError(String);
+
+impl std::fmt::Display for WatchProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WatchProtocolError {}
+
+fn watch_protocol_error(message: impl Into<String>) -> anyhow::Error {
+    WatchProtocolError(message.into()).into()
+}
+
+macro_rules! watch_protocol_bail {
+    ($($argument:tt)*) => {
+        return Err(watch_protocol_error(format!($($argument)*)))
+    };
+}
 
 #[derive(Parser)]
 #[command(
@@ -251,6 +290,7 @@ enum PlanReport {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct SyncCompletion {
     watch_report: Option<Vec<u8>>,
     post_commit_error: Option<anyhow::Error>,
@@ -419,18 +459,42 @@ fn run_sync(
 fn serve(state: &mut State) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut input = BufReader::new(TimedReader::new(stdin.lock()));
-    let mut output = BufWriter::new(stdout.lock());
-    serve_io(state, &mut input, &mut output)
+    let initial = sync::read_initial_message_until(
+        &stdin,
+        std::time::Instant::now() + sync::default_frame_deadline(),
+    )?;
+    match initial {
+        InitialMessage::WatchOpen {
+            protocol,
+            share,
+            peer,
+        } => serve_watch_open(state, protocol, share, peer, &stdin, &stdout),
+        initial => {
+            let mut input = BufReader::new(TimedReader::new(stdin));
+            let mut output = BufWriter::new(stdout.lock());
+            serve_initial(state, initial, &mut input, &mut output)
+        }
+    }
 }
 
+#[cfg(test)]
 fn serve_io(
     state: &mut State,
+    mut input: &mut (impl Read + Send),
+    output: &mut impl Write,
+) -> Result<()> {
+    let initial = sync::read_initial_message(&mut input)?;
+    serve_initial(state, initial, input, output)
+}
+
+fn serve_initial(
+    state: &mut State,
+    initial: InitialMessage,
     mut input: &mut impl Read,
     mut output: &mut impl Write,
 ) -> Result<()> {
-    match sync::read_message(&mut input)? {
-        Message::Register {
+    match initial {
+        InitialMessage::Register {
             protocol,
             share,
             peer,
@@ -486,7 +550,7 @@ fn serve_io(
                 },
             )?;
         }
-        Message::Sync {
+        InitialMessage::Sync {
             protocol,
             share,
             peer,
@@ -549,9 +613,527 @@ fn serve_io(
             sync::write_snapshot(&mut output, &records)?;
             serve_sync(state, &share, &records, &mut input, &mut output)?;
         }
-        other => bail!("unexpected initial message: {other:?}"),
+        InitialMessage::WatchOpen { .. } => {
+            bail!("persistent watch requires a descriptor-backed protocol transport")
+        }
     }
     Ok(())
+}
+
+fn serve_watch_open(
+    state: &mut State,
+    protocol: u32,
+    share: ShareId,
+    peer: flocal::model::PeerId,
+    input: &impl AsFd,
+    output: &impl AsFd,
+) -> Result<()> {
+    if protocol != sync::WATCH_PROTOCOL_VERSION {
+        return write_v2_session(
+            output,
+            V2SessionFrame::Error {
+                retryable: false,
+                message: format!("unsupported persistent watch protocol version {protocol}"),
+            },
+        );
+    }
+    let _global_lock = match state.lock_global_sync() {
+        Ok(lock) => lock,
+        Err(error) => {
+            return write_v2_session(
+                output,
+                V2SessionFrame::Error {
+                    retryable: true,
+                    message: format!("{error:#}"),
+                },
+            );
+        }
+    };
+    let _share_lock = match state.lock_share(&share) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return write_v2_session(
+                output,
+                V2SessionFrame::Error {
+                    retryable: true,
+                    message: format!("{error:#}"),
+                },
+            );
+        }
+    };
+    if state.bound_peer(&share)?.as_ref() != Some(&peer) {
+        return write_v2_session(
+            output,
+            V2SessionFrame::Error {
+                retryable: false,
+                message: "peer identity mismatch".into(),
+            },
+        );
+    }
+    let share_root = match sync::ShareRoot::open(state, &share) {
+        Ok(root) => root,
+        Err(error) => {
+            return write_v2_session(
+                output,
+                V2SessionFrame::Error {
+                    retryable: false,
+                    message: format!("{error:#}"),
+                },
+            );
+        }
+    };
+    let root = state.root_for(&share)?;
+    let watch_state = flocal::watch::WatchState::default();
+    let (watch_tx, watch_rx) = std::sync::mpsc::sync_channel(1);
+    let callback_state = watch_state.clone();
+    let mut watcher: RecommendedWatcher =
+        match notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+            Ok(event) if event.need_rescan() => {
+                callback_state.lost("filesystem watcher reported an event gap", &watch_tx, ())
+            }
+            Ok(_) => callback_state.changed(&watch_tx, ()),
+            Err(error) => callback_state.lost(error, &watch_tx, ()),
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                return write_v2_session(
+                    output,
+                    V2SessionFrame::Error {
+                        retryable: true,
+                        message: format!("cannot create filesystem watcher: {error}"),
+                    },
+                );
+            }
+        };
+    if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+        return write_v2_session(
+            output,
+            V2SessionFrame::Error {
+                retryable: true,
+                message: format!("cannot watch share root: {error}"),
+            },
+        );
+    }
+    write_v2_session(
+        output,
+        V2SessionFrame::WatchAccepted {
+            protocol: sync::WATCH_PROTOCOL_VERSION,
+            peer: state.peer_id()?,
+        },
+    )?;
+    write_v2_session(output, V2SessionFrame::Ready { generation: 0 })?;
+
+    let config = flocal::watch::WatchConfig::default();
+    let mut debounce = flocal::watch::Debounce::default();
+    let mut advertised_generation = 0u64;
+    let mut round = 0u64;
+    loop {
+        if watch_rx.try_recv().is_ok() {
+            debounce.notify(std::time::Instant::now());
+        }
+        let generation = match watch_state.snapshot() {
+            flocal::watch::WatchSnapshot::Healthy { generation } => generation,
+            flocal::watch::WatchSnapshot::Lost(error) => {
+                write_v2_session(
+                    output,
+                    V2SessionFrame::Error {
+                        retryable: true,
+                        message: format!("filesystem watcher stopped: {error}"),
+                    },
+                )?;
+                return Ok(());
+            }
+        };
+        if generation > advertised_generation
+            && debounce.take_due(std::time::Instant::now(), &config)
+        {
+            write_v2_session(output, V2SessionFrame::Changed { generation })?;
+            advertised_generation = generation;
+        }
+        if !sync::input_ready_until(input, std::time::Instant::now() + Duration::from_millis(50))? {
+            continue;
+        }
+        let envelope = sync::read_v2_envelope_until(
+            input,
+            std::time::Instant::now() + sync::default_frame_deadline(),
+        )?;
+        match envelope {
+            V2Envelope::Session {
+                frame: V2SessionFrame::Ping { nonce },
+            } => write_v2_session(output, V2SessionFrame::Pong { nonce })?,
+            V2Envelope::Session {
+                frame: V2SessionFrame::Ready { .. },
+            } => {}
+            V2Envelope::Round {
+                round: incoming,
+                frame:
+                    V2RoundFrame::SyncStart {
+                        connector_generation: _,
+                        responder_generation: _,
+                    },
+            } if incoming == round + 1 => {
+                round = incoming;
+                if let Err(error) = serve_v2_round(state, &share, &share_root, round, input, output)
+                {
+                    let retryable = error.downcast_ref::<WatchProtocolError>().is_none();
+                    write_v2_session(
+                        output,
+                        V2SessionFrame::Error {
+                            retryable,
+                            message: format!("{error:#}"),
+                        },
+                    )?;
+                    return Ok(());
+                }
+            }
+            other => {
+                write_v2_session(
+                    output,
+                    V2SessionFrame::Error {
+                        retryable: false,
+                        message: format!("unexpected persistent watch frame: {other:?}"),
+                    },
+                )?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn write_v2_session(output: &impl AsFd, frame: V2SessionFrame) -> Result<()> {
+    sync::write_v2_envelope_until(
+        output,
+        &V2Envelope::Session { frame },
+        std::time::Instant::now() + sync::default_frame_deadline(),
+    )
+}
+
+fn write_v2_round(
+    output: &impl AsFd,
+    round: u64,
+    frame: V2RoundFrame,
+    budget: &sync::RoundBudget,
+) -> Result<()> {
+    sync::write_v2_envelope_until(
+        output,
+        &V2Envelope::Round { round, frame },
+        budget.frame_deadline()?,
+    )
+}
+
+fn recv_v2_round(
+    input: &impl AsFd,
+    expected_round: u64,
+    budget: &sync::RoundBudget,
+) -> Result<V2RoundFrame> {
+    match sync::read_v2_envelope_until(input, budget.frame_deadline()?)? {
+        V2Envelope::Round { round, frame } if round == expected_round => Ok(frame),
+        other => Err(watch_protocol_error(format!(
+            "unexpected persistent round frame: {other:?}"
+        ))),
+    }
+}
+
+fn write_v2_snapshot(
+    output: &impl AsFd,
+    round: u64,
+    records: &[flocal::model::Record],
+    budget: &sync::RoundBudget,
+) -> Result<()> {
+    let mut start = 0;
+    while start < records.len() {
+        let mut end = start + 1;
+        while end < records.len()
+            && end - start < 256
+            && v2_frame_fits(
+                round,
+                V2RoundFrame::SnapshotChunk {
+                    records: records[start..=end].to_vec(),
+                },
+            )?
+        {
+            end += 1;
+        }
+        write_v2_round(
+            output,
+            round,
+            V2RoundFrame::SnapshotChunk {
+                records: records[start..end].to_vec(),
+            },
+            budget,
+        )?;
+        start = end;
+    }
+    write_v2_round(output, round, V2RoundFrame::SnapshotEnd, budget)
+}
+
+fn v2_frame_fits(round: u64, frame: V2RoundFrame) -> Result<bool> {
+    Ok(serde_json::to_vec(&V2Envelope::Round { round, frame })?.len() <= sync::MAX_FRAME)
+}
+
+fn read_v2_snapshot(
+    input: &impl AsFd,
+    round: u64,
+    budget: &mut sync::RoundBudget,
+) -> Result<Vec<flocal::model::Record>> {
+    let mut records = Vec::new();
+    loop {
+        match recv_v2_round(input, round, budget)? {
+            V2RoundFrame::SnapshotChunk { records: chunk } => {
+                budget
+                    .add_metadata(serde_json::to_vec(&chunk)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                records.extend(chunk);
+                if records.len() > sync::MAX_RECORDS_PER_SESSION {
+                    watch_protocol_bail!("snapshot exceeds session record limit");
+                }
+            }
+            V2RoundFrame::SnapshotEnd => return Ok(records),
+            other => watch_protocol_bail!("expected persistent snapshot, got {other:?}"),
+        }
+    }
+}
+
+fn write_v2_plan(
+    output: &impl AsFd,
+    round: u64,
+    plan: &flocal::reconcile::Plan,
+    budget: &sync::RoundBudget,
+) -> Result<()> {
+    let mut start = 0;
+    while start < plan.records.len() {
+        let mut end = start + 1;
+        while end < plan.records.len()
+            && end - start < 256
+            && v2_frame_fits(
+                round,
+                V2RoundFrame::ApplyChunk {
+                    records: plan.records[start..=end].to_vec(),
+                    conflicts: Vec::new(),
+                },
+            )?
+        {
+            end += 1;
+        }
+        write_v2_round(
+            output,
+            round,
+            V2RoundFrame::ApplyChunk {
+                records: plan.records[start..end].to_vec(),
+                conflicts: Vec::new(),
+            },
+            budget,
+        )?;
+        start = end;
+    }
+    let mut start = 0;
+    while start < plan.conflicts.len() {
+        let mut end = start + 1;
+        while end < plan.conflicts.len()
+            && end - start < 128
+            && v2_frame_fits(
+                round,
+                V2RoundFrame::ApplyChunk {
+                    records: Vec::new(),
+                    conflicts: plan.conflicts[start..=end].to_vec(),
+                },
+            )?
+        {
+            end += 1;
+        }
+        write_v2_round(
+            output,
+            round,
+            V2RoundFrame::ApplyChunk {
+                records: Vec::new(),
+                conflicts: plan.conflicts[start..end].to_vec(),
+            },
+            budget,
+        )?;
+        start = end;
+    }
+    write_v2_round(output, round, V2RoundFrame::ApplyEnd, budget)
+}
+
+fn read_v2_plan(
+    input: &impl AsFd,
+    round: u64,
+    budget: &mut sync::RoundBudget,
+) -> Result<flocal::reconcile::Plan> {
+    let mut plan = flocal::reconcile::Plan {
+        records: Vec::new(),
+        conflicts: Vec::new(),
+    };
+    loop {
+        match recv_v2_round(input, round, budget)? {
+            V2RoundFrame::ApplyChunk { records, conflicts } => {
+                budget
+                    .add_metadata(serde_json::to_vec(&records)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                budget
+                    .add_metadata(serde_json::to_vec(&conflicts)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                plan.records.extend(records);
+                plan.conflicts.extend(conflicts);
+                if plan.records.len() > sync::MAX_RECORDS_PER_SESSION {
+                    watch_protocol_bail!("apply plan exceeds session record limit");
+                }
+            }
+            V2RoundFrame::ApplyEnd => return Ok(plan),
+            other => watch_protocol_bail!("expected persistent apply plan, got {other:?}"),
+        }
+    }
+}
+
+fn send_v2_object(
+    state: &State,
+    hash: &flocal::model::ObjectHash,
+    round: u64,
+    output: &impl AsFd,
+    budget: &mut sync::RoundBudget,
+) -> Result<()> {
+    let mut file = state.open_verified_object(hash)?;
+    let size = file.metadata()?.len();
+    budget.add_transfer(size)?;
+    write_v2_round(
+        output,
+        round,
+        V2RoundFrame::ObjectStart {
+            hash: hash.clone(),
+            size,
+        },
+        budget,
+    )?;
+    let mut buffer = vec![0; 256 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        write_v2_round(
+            output,
+            round,
+            V2RoundFrame::ObjectChunk {
+                data: buffer[..count].to_vec(),
+            },
+            budget,
+        )?;
+    }
+    write_v2_round(output, round, V2RoundFrame::ObjectEnd, budget)?;
+    Ok(())
+}
+
+fn receive_v2_object(
+    state: &State,
+    hash: flocal::model::ObjectHash,
+    size: u64,
+    round: u64,
+    input: &impl AsFd,
+    budget: &sync::RoundBudget,
+) -> Result<()> {
+    let mut sink = state.begin_object(hash, size)?;
+    loop {
+        match recv_v2_round(input, round, budget)? {
+            V2RoundFrame::ObjectChunk { data } => sink.write_chunk(&data)?,
+            V2RoundFrame::ObjectEnd => return sink.finish(),
+            other => watch_protocol_bail!("unexpected persistent object frame: {other:?}"),
+        }
+    }
+}
+
+fn serve_v2_round(
+    state: &mut State,
+    share: &ShareId,
+    root: &sync::ShareRoot,
+    round: u64,
+    input: &impl AsFd,
+    output: &impl AsFd,
+) -> Result<()> {
+    let mut budget =
+        sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
+    budget.check()?;
+    let advertised = sync::refresh_with_root(state, share, root)?;
+    budget.check()?;
+    write_v2_round(output, round, V2RoundFrame::SyncAccepted, &budget)?;
+    write_v2_snapshot(output, round, &advertised, &budget)?;
+
+    let requested = match recv_v2_round(input, round, &budget)? {
+        V2RoundFrame::Need { hashes } => hashes,
+        other => watch_protocol_bail!("expected persistent object request, got {other:?}"),
+    };
+    let unique: std::collections::HashSet<_> = requested.iter().collect();
+    if unique.len() != requested.len() {
+        watch_protocol_bail!("object request contains duplicate hashes");
+    }
+    let allowed: std::collections::HashSet<_> = advertised.iter().filter_map(record_hash).collect();
+    for hash in requested {
+        if !allowed.contains(&hash) {
+            watch_protocol_bail!("peer requested an object outside this share");
+        }
+        send_v2_object(state, &hash, round, output, &mut budget)?;
+    }
+    write_v2_round(output, round, V2RoundFrame::Done, &budget)?;
+
+    let peer_records = read_v2_snapshot(input, round, &mut budget)?;
+    let plan = read_v2_plan(input, round, &mut budget)?;
+    let expected = sync::plan(&advertised, &peer_records);
+    if plan.records != expected.records || plan.conflicts != expected.conflicts {
+        watch_protocol_bail!("peer apply plan differs from local reconciliation");
+    }
+    let mut required = plan.records.clone();
+    for conflict in &plan.conflicts {
+        required.push(conflict.winner.clone());
+        required.push(conflict.loser.clone());
+    }
+    let needs = sync::required_hashes_for_share(state, share, &required)?;
+    let mut expected_sizes = std::collections::HashMap::new();
+    for record in &required {
+        if let Entry::File { hash, size, .. } = &record.version.entry {
+            expected_sizes.insert(hash.clone(), *size);
+        }
+    }
+    write_v2_round(
+        output,
+        round,
+        V2RoundFrame::Need {
+            hashes: needs.clone(),
+        },
+        &budget,
+    )?;
+    for expected_hash in needs {
+        match recv_v2_round(input, round, &budget)? {
+            V2RoundFrame::ObjectStart { hash, size } if hash == expected_hash => {
+                if expected_sizes.get(&hash) != Some(&size) {
+                    watch_protocol_bail!("peer object size differs from the validated plan");
+                }
+                budget
+                    .add_transfer(size)
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                receive_v2_object(state, hash, size, round, input, &budget)?;
+            }
+            other => {
+                watch_protocol_bail!("expected persistent object {expected_hash}, got {other:?}")
+            }
+        }
+    }
+    match recv_v2_round(input, round, &budget)? {
+        V2RoundFrame::Done => {}
+        other => watch_protocol_bail!("expected persistent object completion, got {other:?}"),
+    }
+    budget.check()?;
+    sync::apply_plan_with_root(state, share, root, &plan.records)?;
+    budget.check()?;
+    state.add_conflicts(share, &plan.conflicts)?;
+    budget.check()?;
+    state.set_initial_complete(share)?;
+    budget.check()?;
+    state.prune_unreferenced_objects()?;
+    budget.check()?;
+    write_v2_round(output, round, V2RoundFrame::Applied, &budget)?;
+    match recv_v2_round(input, round, &budget)? {
+        V2RoundFrame::SyncFinished => Ok(()),
+        other => watch_protocol_bail!("expected persistent round completion, got {other:?}"),
+    }
 }
 
 fn serve_sync(
@@ -854,67 +1436,566 @@ fn watch(state: &mut State, path: &Path) -> Result<()> {
     if !state.initial_complete(&share)? {
         bail!("initial synchronization is incomplete; run `flocal sync PATH` and confirm it first");
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
-        let _ = tx.send(event);
-    })?;
-    watcher.watch(&root, RecursiveMode::Recursive)?;
-    let rescan = watch_rescan_interval(std::env::var("FLOCAL_WATCH_RESCAN_SECONDS").ok());
-    watch_loop(
-        state,
-        path,
-        &root,
-        &rx,
-        rescan,
-        &mut io::stdout(),
-        &mut io::stderr(),
-    )
+    let _global_lock = state.lock_global_sync()?;
+    let _share_lock = state.lock_share(&share)?;
+    watch_log(&mut io::stdout(), &format!("Watching {}", root.display()))?;
+    persistent_watch_loop(state, &share, &root, &mut io::stdout(), &mut io::stderr())
 }
 
-/// The interval after which `watch` rescans and attempts a sync even
-/// without a filesystem event: `FLOCAL_WATCH_RESCAN_SECONDS`, default 30.
-/// Unlike the unclamped `FLOCAL_MAX_*` budget variables, zero (or an
-/// unparseable value) falls back to the default instead of being honored —
-/// a zero interval would hot-loop full rescans and connection attempts,
-/// and nothing needs it.
-fn watch_rescan_interval(configured: Option<String>) -> Duration {
-    Duration::from_secs(
-        configured
-            .and_then(|value| value.parse().ok())
-            .filter(|&seconds| seconds != 0)
-            .unwrap_or(30),
-    )
-}
-
-/// The reconciliation loop, taking an already-set-up event receiver and the
-/// destinations for its status lines, so both the control flow and the
-/// exact text it prints can be driven and asserted deterministically in
-/// tests, without a live filesystem watcher or terminal. A disconnected
-/// receiver ends the loop the same way tearing down the real watcher
-/// would, via `rx.recv_timeout`'s own `Disconnected` error.
-fn watch_loop(
+#[allow(clippy::too_many_arguments)]
+fn persistent_watch_loop(
     state: &mut State,
-    path: &Path,
-    root: &Path,
-    rx: &std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
-    rescan: Duration,
+    share: &ShareId,
+    root_path: &Path,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<()> {
-    watch_log(out, &format!("Watching {}", root.display()))?;
+    let peer = state
+        .peer(share)?
+        .context("no peer configured; run `flocal peer add`")?;
+    let config = flocal::watch::WatchConfig::default();
+    let retry_policy = flocal::watch::RetryPolicy::default();
+    let mut backoff = flocal::watch::RetryBackoff::default();
     let mut failures = WatchFailures::default();
-    watch_cycle(state, path, out, err, &mut failures)?;
+    let mut connected = false;
+    let mut connecting_logged = false;
     loop {
-        match rx.recv_timeout(rescan) {
-            Ok(Ok(_)) => {
-                std::thread::sleep(Duration::from_millis(250));
-                while rx.try_recv().is_ok() {}
-            }
-            Ok(Err(error)) => watch_log(err, &format!("watch error, rescanning: {error}"))?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(error) => return Err(error.into()),
+        if !connecting_logged {
+            watch_log(out, "Connecting to peer")?;
+            connecting_logged = true;
         }
-        watch_cycle(state, path, out, err, &mut failures)?;
+        let root = sync::ShareRoot::open(state, share)?;
+        let (watch_state, events_rx, _watcher) = match create_local_watcher(root_path) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                if let Some(event) = failures.failed(
+                    &error,
+                    std::time::Instant::now(),
+                    WATCH_FAILURE_REPORT_INTERVAL,
+                ) {
+                    write_watch_event(err, event)?;
+                }
+                let delay = backoff.failed(&retry_policy, rand::random_range(-2_000..=2_000));
+                std::thread::sleep(delay);
+                continue;
+            }
+        };
+        let outcome = persistent_watch_session(
+            state,
+            share,
+            &root,
+            &watch_state,
+            &peer,
+            &events_rx,
+            out,
+            err,
+            &config,
+            &mut backoff,
+            &mut failures,
+            &mut connected,
+        );
+        match outcome {
+            Ok(()) => bail!("persistent watch session ended unexpectedly"),
+            Err(error) => {
+                if std::mem::take(&mut connected) {
+                    watch_log(err, "Peer connection lost; retrying")?;
+                }
+                let error = match watch_state.snapshot() {
+                    flocal::watch::WatchSnapshot::Lost(lost) => {
+                        anyhow::anyhow!("filesystem watcher stopped; recreating: {lost}")
+                    }
+                    flocal::watch::WatchSnapshot::Healthy { .. } => error,
+                };
+                if is_terminal_watch_error(&error) {
+                    return Err(error);
+                }
+                if let Some(event) = failures.failed(
+                    &error,
+                    std::time::Instant::now(),
+                    WATCH_FAILURE_REPORT_INTERVAL,
+                ) {
+                    write_watch_event(err, event)?;
+                }
+                let delay = backoff.failed(&retry_policy, rand::random_range(-2_000..=2_000));
+                std::thread::sleep(delay);
+            }
+        }
+    }
+}
+
+fn create_local_watcher(
+    root: &Path,
+) -> Result<(
+    flocal::watch::WatchState,
+    std::sync::mpsc::Receiver<PersistentEvent>,
+    RecommendedWatcher,
+)> {
+    let watch_state = flocal::watch::WatchState::default();
+    let (events_tx, events_rx) = std::sync::mpsc::sync_channel(1);
+    let callback_state = watch_state.clone();
+    let mut watcher =
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+            Ok(event) if event.need_rescan() => callback_state.lost(
+                "filesystem watcher reported an event gap",
+                &events_tx,
+                PersistentEvent::Wake,
+            ),
+            Ok(_) => callback_state.changed(&events_tx, PersistentEvent::Wake),
+            Err(error) => callback_state.lost(error, &events_tx, PersistentEvent::Wake),
+        })
+        .context("cannot create filesystem watcher")?;
+    watcher
+        .watch(root, RecursiveMode::Recursive)
+        .context("cannot watch share root")?;
+    Ok((watch_state, events_rx, watcher))
+}
+
+fn is_terminal_watch_error(error: &anyhow::Error) -> bool {
+    if let Some(remote) = error.downcast_ref::<RemoteWatchError>() {
+        return !remote.retryable;
+    }
+    if error.downcast_ref::<WatchProtocolError>().is_some() {
+        return true;
+    }
+    let message = format!("{error:#}");
+    message.contains("root identity changed")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persistent_watch_session(
+    state: &mut State,
+    share: &ShareId,
+    root: &sync::ShareRoot,
+    watch_state: &flocal::watch::WatchState,
+    peer: &flocal::model::PeerConfig,
+    events_rx: &std::sync::mpsc::Receiver<PersistentEvent>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+    config: &flocal::watch::WatchConfig,
+    backoff: &mut flocal::watch::RetryBackoff,
+    failures: &mut WatchFailures,
+    connected: &mut bool,
+) -> Result<()> {
+    while events_rx.try_recv().is_ok() {}
+    let remote = PersistentRemote::spawn(&peer.host, &peer.executable)?;
+    persistent_watch_session_io(
+        state,
+        share,
+        root,
+        watch_state,
+        peer,
+        events_rx,
+        out,
+        err,
+        config,
+        backoff,
+        failures,
+        connected,
+        &remote.output,
+        &remote.input,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persistent_watch_session_io(
+    state: &mut State,
+    share: &ShareId,
+    root: &sync::ShareRoot,
+    watch_state: &flocal::watch::WatchState,
+    peer: &flocal::model::PeerConfig,
+    events_rx: &std::sync::mpsc::Receiver<PersistentEvent>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+    config: &flocal::watch::WatchConfig,
+    backoff: &mut flocal::watch::RetryBackoff,
+    failures: &mut WatchFailures,
+    connected: &mut bool,
+    remote_input: &impl AsFd,
+    remote_output: &impl AsFd,
+) -> Result<()> {
+    sync::write_initial_message_until(
+        remote_output,
+        &InitialMessage::WatchOpen {
+            protocol: sync::WATCH_PROTOCOL_VERSION,
+            share: share.clone(),
+            peer: state.peer_id()?,
+        },
+        std::time::Instant::now() + sync::default_frame_deadline(),
+    )?;
+    let accepted = sync::read_v2_envelope_until(
+        remote_input,
+        std::time::Instant::now() + sync::default_frame_deadline(),
+    )?;
+    match accepted {
+        V2Envelope::Session {
+            frame:
+                V2SessionFrame::WatchAccepted {
+                    protocol,
+                    peer: actual,
+                },
+        } if protocol == sync::WATCH_PROTOCOL_VERSION && actual == peer.peer_id => {}
+        V2Envelope::Session {
+            frame: V2SessionFrame::Error { retryable, message },
+        } => return Err(RemoteWatchError { retryable, message }.into()),
+        other => {
+            return Err(watch_protocol_error(format!(
+                "remote does not support persistent watch protocol version 2: {other:?}; upgrade flocal on both peers"
+            )));
+        }
+    }
+    match sync::read_v2_envelope_until(
+        remote_input,
+        std::time::Instant::now() + sync::default_frame_deadline(),
+    )? {
+        V2Envelope::Session {
+            frame: V2SessionFrame::Ready { .. },
+        } => {}
+        V2Envelope::Session {
+            frame: V2SessionFrame::Error { retryable, message },
+        } => return Err(RemoteWatchError { retryable, message }.into()),
+        other => {
+            return Err(watch_protocol_error(format!(
+                "unexpected persistent readiness frame: {other:?}"
+            )));
+        }
+    }
+    write_v2_session(remote_output, V2SessionFrame::Ready { generation: 0 })?;
+
+    let mut remote_generation = 0u64;
+    let mut round = 1u64;
+    let mut completed_local = 0u64;
+    let startup_local_generation = match watch_state.snapshot() {
+        flocal::watch::WatchSnapshot::Healthy { generation } => generation,
+        flocal::watch::WatchSnapshot::Lost(error) => bail!("filesystem watcher stopped: {error}"),
+    };
+    let report = connector_v2_round(
+        state,
+        share,
+        root,
+        round,
+        startup_local_generation,
+        0,
+        remote_input,
+        remote_output,
+        &mut remote_generation,
+    )?;
+    out.write_all(&report)?;
+    watch_state
+        .complete(startup_local_generation, &mut completed_local)
+        .map_err(|error| anyhow::anyhow!("filesystem watcher stopped: {error}"))?;
+    backoff.startup_round_succeeded();
+    let recovery = failures.succeeded();
+    if recovery.is_none() {
+        watch_log(out, "Peer connected")?;
+    }
+    *connected = true;
+    if let Some(event) = recovery {
+        write_watch_event(err, event)?;
+    }
+    let now = std::time::Instant::now();
+    let mut audit = flocal::watch::AuditSchedule::new(now);
+    let mut heartbeat = flocal::watch::Heartbeat::new(now);
+    let mut debounce = flocal::watch::Debounce::default();
+    let mut scheduled_local_generation = completed_local;
+    let mut scheduled_remote_generation = remote_generation;
+    loop {
+        let now = std::time::Instant::now();
+        let local_generation = match watch_state.snapshot() {
+            flocal::watch::WatchSnapshot::Healthy { generation } => generation,
+            flocal::watch::WatchSnapshot::Lost(error) => {
+                bail!("filesystem watcher stopped: {error}")
+            }
+        };
+        if local_generation > scheduled_local_generation {
+            debounce.notify(now);
+            scheduled_local_generation = local_generation;
+        }
+        if remote_generation > scheduled_remote_generation {
+            debounce.notify(now);
+            scheduled_remote_generation = remote_generation;
+        }
+        let round_due = debounce.take_due(now, config) || audit.is_due(now, config);
+        if round_due {
+            round = round.checked_add(1).context("watch round exhausted")?;
+            let frozen_local = local_generation;
+            let frozen_remote = remote_generation;
+            let report = connector_v2_round(
+                state,
+                share,
+                root,
+                round,
+                frozen_local,
+                frozen_remote,
+                remote_input,
+                remote_output,
+                &mut remote_generation,
+            )?;
+            out.write_all(&report)?;
+            watch_state
+                .complete(frozen_local, &mut completed_local)
+                .map_err(|error| anyhow::anyhow!("filesystem watcher stopped: {error}"))?;
+            audit.completed_full_round(std::time::Instant::now());
+            heartbeat.activity(std::time::Instant::now());
+            continue;
+        }
+        if let Some(action) = heartbeat.due(now, config) {
+            match action {
+                flocal::watch::HeartbeatAction::Ping { nonce } => {
+                    write_v2_session(remote_output, V2SessionFrame::Ping { nonce })?;
+                }
+                flocal::watch::HeartbeatAction::TimedOut => bail!("peer heartbeat timed out"),
+            }
+        }
+        let deadlines = [
+            debounce.deadline(config),
+            audit.deadline(config),
+            heartbeat.deadline(config),
+        ];
+        let deadline = deadlines
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(now + config.heartbeat);
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        let poll_deadline = std::cmp::min(
+            std::time::Instant::now() + Duration::from_millis(50),
+            std::time::Instant::now() + timeout,
+        );
+        if sync::input_ready_until(remote_input, poll_deadline)? {
+            match sync::read_v2_envelope_until(
+                remote_input,
+                std::time::Instant::now() + sync::default_frame_deadline(),
+            )? {
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Changed { generation },
+                } => remote_generation = remote_generation.max(generation),
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Pong { nonce },
+                } if heartbeat.pong(nonce, std::time::Instant::now()) => {}
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Error { retryable, message },
+                } => return Err(RemoteWatchError { retryable, message }.into()),
+                other => {
+                    return Err(watch_protocol_error(format!(
+                        "unexpected persistent idle frame: {other:?}"
+                    )));
+                }
+            }
+        }
+        while events_rx.try_recv().is_ok() {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connector_v2_round(
+    state: &mut State,
+    share: &ShareId,
+    root: &sync::ShareRoot,
+    round: u64,
+    connector_generation: u64,
+    responder_generation: u64,
+    input: &impl AsFd,
+    output: &impl AsFd,
+    pending_remote_generation: &mut u64,
+) -> Result<Vec<u8>> {
+    let mut budget =
+        sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
+    write_v2_round(
+        output,
+        round,
+        V2RoundFrame::SyncStart {
+            connector_generation,
+            responder_generation,
+        },
+        &budget,
+    )?;
+    budget.check()?;
+    let local = sync::refresh_with_root(state, share, root)?;
+    budget.check()?;
+    match recv_connector_round(input, round, &budget, pending_remote_generation, true)? {
+        V2RoundFrame::SyncAccepted => {}
+        other => watch_protocol_bail!("expected persistent sync acceptance, got {other:?}"),
+    }
+    let remote_records =
+        read_connector_snapshot(input, round, &mut budget, pending_remote_generation)?;
+    let plan = sync::plan(&local, &remote_records);
+    let mut required = plan.records.clone();
+    for conflict in &plan.conflicts {
+        required.push(conflict.winner.clone());
+        required.push(conflict.loser.clone());
+    }
+    let needs = sync::required_hashes_for_share(state, share, &required)?;
+    let mut expected_sizes = std::collections::HashMap::new();
+    for record in &required {
+        if let Entry::File { hash, size, .. } = &record.version.entry {
+            expected_sizes.insert(hash.clone(), *size);
+        }
+    }
+    write_v2_round(
+        output,
+        round,
+        V2RoundFrame::Need {
+            hashes: needs.clone(),
+        },
+        &budget,
+    )?;
+    for expected in needs {
+        match recv_connector_round(input, round, &budget, pending_remote_generation, false)? {
+            V2RoundFrame::ObjectStart { hash, size } if hash == expected => {
+                if expected_sizes.get(&hash) != Some(&size) {
+                    watch_protocol_bail!("peer object size differs from the validated plan");
+                }
+                budget
+                    .add_transfer(size)
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                receive_connector_object(
+                    state,
+                    hash,
+                    size,
+                    round,
+                    input,
+                    &budget,
+                    pending_remote_generation,
+                )?;
+            }
+            other => watch_protocol_bail!("expected persistent object {expected}, got {other:?}"),
+        }
+    }
+    match recv_connector_round(input, round, &budget, pending_remote_generation, false)? {
+        V2RoundFrame::Done => {}
+        other => watch_protocol_bail!("expected persistent object completion, got {other:?}"),
+    }
+
+    write_v2_snapshot(output, round, &local, &budget)?;
+    write_v2_plan(output, round, &plan, &budget)?;
+    let remote_needs =
+        match recv_connector_round(input, round, &budget, pending_remote_generation, false)? {
+            V2RoundFrame::Need { hashes } => hashes,
+            other => {
+                watch_protocol_bail!("expected remote persistent object request, got {other:?}")
+            }
+        };
+    let unique: std::collections::HashSet<_> = remote_needs.iter().collect();
+    if unique.len() != remote_needs.len() {
+        watch_protocol_bail!("peer object request contains duplicate hashes");
+    }
+    let mut allowed: std::collections::HashSet<_> = local.iter().filter_map(record_hash).collect();
+    for conflict in &plan.conflicts {
+        allowed.extend(
+            [record_hash(&conflict.winner), record_hash(&conflict.loser)]
+                .into_iter()
+                .flatten(),
+        );
+    }
+    for hash in remote_needs {
+        if !allowed.contains(&hash) {
+            watch_protocol_bail!("peer requested an object outside this share");
+        }
+        send_v2_object(state, &hash, round, output, &mut budget)?;
+    }
+    write_v2_round(output, round, V2RoundFrame::Done, &budget)?;
+    match recv_connector_round(input, round, &budget, pending_remote_generation, false)? {
+        V2RoundFrame::Applied => {}
+        other => watch_protocol_bail!("expected persistent apply response, got {other:?}"),
+    }
+    budget.check()?;
+    sync::apply_plan_with_root(state, share, root, &plan.records)?;
+    budget.check()?;
+    state.add_conflicts(share, &plan.conflicts)?;
+    budget.check()?;
+    state.set_initial_complete(share)?;
+    budget.check()?;
+    state.prune_unreferenced_objects()?;
+    budget.check()?;
+    let mut report = Vec::new();
+    write_plan_report(
+        &mut report,
+        &local,
+        &remote_records,
+        &plan,
+        false,
+        PlanReport::Watch,
+    )?;
+    write_v2_round(output, round, V2RoundFrame::SyncFinished, &budget)?;
+    Ok(report)
+}
+
+fn recv_connector_round(
+    input: &impl AsFd,
+    expected_round: u64,
+    budget: &sync::RoundBudget,
+    pending_remote_generation: &mut u64,
+    allow_prior_session_frames: bool,
+) -> Result<V2RoundFrame> {
+    loop {
+        match sync::read_v2_envelope_until(input, budget.frame_deadline()?)? {
+            V2Envelope::Round {
+                round,
+                frame: V2RoundFrame::SyncFailed { retryable, message },
+            } if round == expected_round => {
+                return Err(RemoteWatchError { retryable, message }.into());
+            }
+            V2Envelope::Round { round, frame } if round == expected_round => return Ok(frame),
+            V2Envelope::Session {
+                frame: V2SessionFrame::Error { retryable, message },
+            } => return Err(RemoteWatchError { retryable, message }.into()),
+            V2Envelope::Session {
+                frame: V2SessionFrame::Changed { generation },
+            } if allow_prior_session_frames => {
+                *pending_remote_generation = (*pending_remote_generation).max(generation);
+            }
+            V2Envelope::Session {
+                frame: V2SessionFrame::Pong { .. },
+            } if allow_prior_session_frames => {}
+            other => {
+                return Err(watch_protocol_error(format!(
+                    "unexpected persistent round frame: {other:?}"
+                )));
+            }
+        }
+    }
+}
+
+fn read_connector_snapshot(
+    input: &impl AsFd,
+    round: u64,
+    budget: &mut sync::RoundBudget,
+    pending_remote_generation: &mut u64,
+) -> Result<Vec<flocal::model::Record>> {
+    let mut records = Vec::new();
+    loop {
+        match recv_connector_round(input, round, budget, pending_remote_generation, false)? {
+            V2RoundFrame::SnapshotChunk { records: chunk } => {
+                budget
+                    .add_metadata(serde_json::to_vec(&chunk)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                records.extend(chunk);
+                if records.len() > sync::MAX_RECORDS_PER_SESSION {
+                    watch_protocol_bail!("snapshot exceeds session record limit");
+                }
+            }
+            V2RoundFrame::SnapshotEnd => return Ok(records),
+            other => watch_protocol_bail!("expected persistent snapshot, got {other:?}"),
+        }
+    }
+}
+
+fn receive_connector_object(
+    state: &State,
+    hash: flocal::model::ObjectHash,
+    size: u64,
+    round: u64,
+    input: &impl AsFd,
+    budget: &sync::RoundBudget,
+    pending_remote_generation: &mut u64,
+) -> Result<()> {
+    let mut sink = state.begin_object(hash, size)?;
+    loop {
+        match recv_connector_round(input, round, budget, pending_remote_generation, false)? {
+            V2RoundFrame::ObjectChunk { data } => sink.write_chunk(&data)?,
+            V2RoundFrame::ObjectEnd => return sink.finish(),
+            other => watch_protocol_bail!("unexpected persistent object frame: {other:?}"),
+        }
     }
 }
 
@@ -926,12 +2007,14 @@ struct WatchFailures {
     last_reported: Option<std::time::Instant>,
 }
 
+#[allow(dead_code)]
 enum WatchEvent {
     First { error: String },
     Periodic { count: u64, error: String },
     Recovered { count: u64 },
 }
 
+#[allow(dead_code)]
 impl WatchFailures {
     fn failed(
         &mut self,
@@ -964,53 +2047,6 @@ impl WatchFailures {
         self.last_reported = None;
         (count != 0).then_some(WatchEvent::Recovered { count })
     }
-}
-
-fn watch_cycle(
-    state: &mut State,
-    path: &Path,
-    out: &mut impl Write,
-    err: &mut impl Write,
-    failures: &mut WatchFailures,
-) -> Result<()> {
-    match run_sync(state, path, false, true, false, PlanReport::Watch) {
-        Ok(completion) => {
-            handle_watch_completion(completion, out, err, failures)?;
-        }
-        Err(error) => {
-            if let Some(event) = failures.failed(
-                &error,
-                std::time::Instant::now(),
-                WATCH_FAILURE_REPORT_INTERVAL,
-            ) {
-                write_watch_event(err, event)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn handle_watch_completion(
-    completion: SyncCompletion,
-    out: &mut impl Write,
-    err: &mut impl Write,
-    failures: &mut WatchFailures,
-) -> Result<()> {
-    if let Some(report) = completion.watch_report {
-        out.write_all(&report)?;
-    }
-    if let Some(error) = completion.post_commit_error {
-        if let Some(event) = failures.failed(
-            &error,
-            std::time::Instant::now(),
-            WATCH_FAILURE_REPORT_INTERVAL,
-        ) {
-            write_watch_event(err, event)?;
-        }
-    } else if let Some(event) = failures.succeeded() {
-        write_watch_event(err, event)?;
-    }
-    Ok(())
 }
 
 fn watch_error(error: &anyhow::Error) -> String {
@@ -1185,6 +2221,75 @@ struct Remote {
     input: BufWriter<ChildStdin>,
     output: BufReader<TimedReader<ChildStdout>>,
     stderr: std::thread::JoinHandle<Vec<u8>>,
+}
+
+enum PersistentEvent {
+    Wake,
+}
+
+struct PersistentRemote {
+    child: Child,
+    input: ChildStdin,
+    output: ChildStdout,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl PersistentRemote {
+    fn spawn(host: &str, executable: &str) -> Result<Self> {
+        validate_host(host)?;
+        validate_executable(executable)?;
+        let command = format!("{executable} protocol serve");
+        let mut child = Command::new("ssh")
+            .args([
+                "-T",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                host,
+                &command,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let input = child.stdin.take().context("ssh stdin unavailable")?;
+        let output = child.stdout.take().context("ssh stdout unavailable")?;
+        let mut child_stderr = child.stderr.take().context("ssh stderr unavailable")?;
+        let stderr = std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                match child_stderr.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) if kept.len() < 64 * 1024 => {
+                        let remaining = 64 * 1024 - kept.len();
+                        kept.extend_from_slice(&buffer[..count.min(remaining)]);
+                    }
+                    Ok(_) => {}
+                }
+            }
+            kept
+        });
+        Ok(Self {
+            child,
+            input,
+            output,
+            stderr: Some(stderr),
+        })
+    }
+}
+
+impl Drop for PersistentRemote {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
+    }
 }
 
 impl Remote {
@@ -1555,35 +2660,6 @@ mod tests {
     }
 
     #[test]
-    fn committed_watch_report_survives_finalization_error() -> Result<()> {
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let mut failures = WatchFailures::default();
-        handle_watch_completion(
-            SyncCompletion {
-                watch_report: Some(b"UPLOAD applied.txt\n".to_vec()),
-                post_commit_error: Some(anyhow::anyhow!("final ssh teardown failed")),
-            },
-            &mut out,
-            &mut err,
-            &mut failures,
-        )
-        .expect("post-commit outcome is writable");
-        assert_eq!(out, b"UPLOAD applied.txt\n");
-        assert!(String::from_utf8(err)?.contains("final ssh teardown failed"));
-        assert_eq!(failures.count, 1);
-        handle_watch_completion(
-            SyncCompletion::default(),
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &mut failures,
-        )
-        .expect("recovery outcome is writable");
-        assert_eq!(failures.count, 0);
-        Ok(())
-    }
-
-    #[test]
     fn watch_errors_are_single_line_and_bounded() {
         let error = anyhow::anyhow!("{}\n{}", "é".repeat(5000), "x".repeat(5000));
         let rendered = watch_error(&error);
@@ -1593,6 +2669,328 @@ mod tests {
             rendered.is_ascii(),
             "non-ASCII is escaped before truncation"
         );
+    }
+
+    #[test]
+    fn watch_retry_policy_is_typed_and_transport_failures_retry() {
+        let transport = anyhow::anyhow!(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "protocol version text from a broken transport",
+        ));
+        assert!(!is_terminal_watch_error(&transport));
+        assert!(is_terminal_watch_error(&watch_protocol_error(
+            "unexpected round frame"
+        )));
+        assert!(is_terminal_watch_error(
+            &RemoteWatchError {
+                retryable: false,
+                message: "identity mismatch".into(),
+            }
+            .into()
+        ));
+        assert!(!is_terminal_watch_error(
+            &RemoteWatchError {
+                retryable: true,
+                message: "lock busy".into(),
+            }
+            .into()
+        ));
+    }
+
+    #[test]
+    fn persistent_responder_rejects_setup_failures_with_typed_frames() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("watch-root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("watch-state"))?;
+        let share = state.init_share(&root)?;
+        let bound_peer = flocal::model::PeerId("bound-peer".into());
+        state.register_share_bound(&share, &root, &bound_peer)?;
+        state.set_peer(
+            &share,
+            &flocal::model::PeerConfig {
+                host: "host".into(),
+                executable: "/flocal".into(),
+                remote_path: path_bytes(&root),
+                peer_id: bound_peer.clone(),
+            },
+        )?;
+
+        let reject = |state: &mut State, protocol, peer| -> Result<V2SessionFrame> {
+            let (server_input, _client_output) = UnixStream::pair()?;
+            let (server_output, client_input) = UnixStream::pair()?;
+            serve_watch_open(
+                state,
+                protocol,
+                share.clone(),
+                peer,
+                &server_input,
+                &server_output,
+            )?;
+            match sync::read_v2_envelope_until(
+                &client_input,
+                std::time::Instant::now() + sync::default_frame_deadline(),
+            )? {
+                V2Envelope::Session { frame } => Ok(frame),
+                other => anyhow::bail!("expected session rejection, got {other:?}"),
+            }
+        };
+
+        assert!(matches!(
+            reject(
+                &mut state,
+                sync::WATCH_PROTOCOL_VERSION + 1,
+                bound_peer.clone()
+            )?,
+            V2SessionFrame::Error {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            reject(
+                &mut state,
+                sync::WATCH_PROTOCOL_VERSION,
+                flocal::model::PeerId("wrong-peer".into())
+            )?,
+            V2SessionFrame::Error {
+                retryable: false,
+                ..
+            }
+        ));
+
+        let mut competing = State::open(temp.path().join("watch-state"))?;
+        let global_lock = state.lock_global_sync()?;
+        assert!(matches!(
+            reject(
+                &mut competing,
+                sync::WATCH_PROTOCOL_VERSION,
+                bound_peer.clone()
+            )?,
+            V2SessionFrame::Error {
+                retryable: true,
+                ..
+            }
+        ));
+        drop(global_lock);
+        let share_lock = state.lock_share(&share)?;
+        assert!(matches!(
+            reject(
+                &mut competing,
+                sync::WATCH_PROTOCOL_VERSION,
+                bound_peer.clone()
+            )?,
+            V2SessionFrame::Error {
+                retryable: true,
+                ..
+            }
+        ));
+        drop(share_lock);
+
+        let displaced = temp.path().join("watch-root-old");
+        std::fs::rename(&root, displaced)?;
+        std::fs::create_dir(&root)?;
+        assert!(matches!(
+            reject(&mut state, sync::WATCH_PROTOCOL_VERSION, bound_peer)?,
+            V2SessionFrame::Error {
+                retryable: false,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn connector_round_dispatches_session_and_terminal_frames() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let receive = |envelope: V2Envelope,
+                       allow_session|
+         -> Result<(Result<V2RoundFrame>, u64)> {
+            let (writer, reader) = UnixStream::pair()?;
+            sync::write_v2_envelope_until(
+                &writer,
+                &envelope,
+                std::time::Instant::now() + sync::default_frame_deadline(),
+            )?;
+            drop(writer);
+            let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
+            let mut generation = 0;
+            let result = recv_connector_round(&reader, 7, &budget, &mut generation, allow_session);
+            Ok((result, generation))
+        };
+
+        let (result, generation) = receive(
+            V2Envelope::Session {
+                frame: V2SessionFrame::Changed { generation: 9 },
+            },
+            true,
+        )?;
+        assert!(result.is_err(), "EOF follows the consumed Changed frame");
+        assert_eq!(generation, 9);
+        assert!(
+            receive(
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Pong { nonce: 1 },
+                },
+                true,
+            )?
+            .0
+            .is_err()
+        );
+        for envelope in [
+            V2Envelope::Round {
+                round: 7,
+                frame: V2RoundFrame::SyncFailed {
+                    retryable: false,
+                    message: "bad round".into(),
+                },
+            },
+            V2Envelope::Session {
+                frame: V2SessionFrame::Error {
+                    retryable: false,
+                    message: "bad session".into(),
+                },
+            },
+            V2Envelope::Round {
+                round: 8,
+                frame: V2RoundFrame::Done,
+            },
+        ] {
+            assert!(receive(envelope, false)?.0.is_err());
+        }
+        assert!(matches!(
+            receive(
+                V2Envelope::Round {
+                    round: 7,
+                    frame: V2RoundFrame::Done,
+                },
+                false,
+            )?
+            .0?,
+            V2RoundFrame::Done
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_plan_writer_chunks_conflicts() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let version = flocal::model::Version {
+            peer: flocal::model::PeerId("peer".into()),
+            sequence: 1,
+            timestamp_ns: 1,
+            seen: Vec::new(),
+            entry: Entry::Directory,
+        };
+        let winner = flocal::model::Record {
+            path: flocal::model::RelativePath::from_bytes(b"conflict".to_vec())?,
+            version,
+        };
+        let mut loser = winner.clone();
+        loser.version.peer = flocal::model::PeerId("other".into());
+        let plan = flocal::reconcile::Plan {
+            records: Vec::new(),
+            conflicts: vec![flocal::reconcile::Conflict {
+                path: winner.path.clone(),
+                winner,
+                loser,
+            }],
+        };
+        let (writer, reader) = UnixStream::pair()?;
+        let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
+        write_v2_plan(&writer, 3, &plan, &budget)?;
+        assert!(matches!(
+            sync::read_v2_envelope_until(&reader, budget.frame_deadline()?)?,
+            V2Envelope::Round {
+                round: 3,
+                frame: V2RoundFrame::ApplyChunk { conflicts, .. }
+            } if conflicts.len() == 1
+        ));
+        assert!(matches!(
+            sync::read_v2_envelope_until(&reader, budget.frame_deadline()?)?,
+            V2Envelope::Round {
+                round: 3,
+                frame: V2RoundFrame::ApplyEnd
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_responder_handles_idle_frames_and_rejects_wrong_phase() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("idle-root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("idle-state"))?;
+        let share = state.init_share(&root)?;
+        let peer = flocal::model::PeerId("idle-peer".into());
+        state.register_share_bound(&share, &root, &peer)?;
+        state.set_peer(
+            &share,
+            &flocal::model::PeerConfig {
+                host: "host".into(),
+                executable: "/flocal".into(),
+                remote_path: path_bytes(&root),
+                peer_id: peer.clone(),
+            },
+        )?;
+        let (client_output, server_input) = UnixStream::pair()?;
+        let (server_output, client_input) = UnixStream::pair()?;
+        let responder = std::thread::spawn(move || {
+            serve_watch_open(
+                &mut state,
+                sync::WATCH_PROTOCOL_VERSION,
+                share,
+                peer,
+                &server_input,
+                &server_output,
+            )
+        });
+        let read = || {
+            sync::read_v2_envelope_until(
+                &client_input,
+                std::time::Instant::now() + sync::default_frame_deadline(),
+            )
+        };
+        assert!(matches!(
+            read()?,
+            V2Envelope::Session {
+                frame: V2SessionFrame::WatchAccepted { .. }
+            }
+        ));
+        assert!(matches!(
+            read()?,
+            V2Envelope::Session {
+                frame: V2SessionFrame::Ready { .. }
+            }
+        ));
+        write_v2_session(&client_output, V2SessionFrame::Ping { nonce: 42 })?;
+        assert!(matches!(
+            read()?,
+            V2Envelope::Session {
+                frame: V2SessionFrame::Pong { nonce: 42 }
+            }
+        ));
+        write_v2_session(&client_output, V2SessionFrame::Ready { generation: 0 })?;
+        let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
+        write_v2_round(&client_output, 1, V2RoundFrame::Done, &budget)?;
+        assert!(matches!(
+            read()?,
+            V2Envelope::Session {
+                frame: V2SessionFrame::Error {
+                    retryable: false,
+                    ..
+                }
+            }
+        ));
+        responder.join().expect("responder joins")?;
+        Ok(())
     }
 
     #[test]
@@ -1618,76 +3016,172 @@ mod tests {
     }
 
     #[test]
-    fn watch_rescan_interval_defaults_to_30_and_refuses_zero() {
-        assert_eq!(watch_rescan_interval(None), Duration::from_secs(30));
-        assert_eq!(
-            watch_rescan_interval(Some("1".into())),
-            Duration::from_secs(1)
-        );
-        // Zero would hot-loop, so it falls back rather than being honored;
-        // negatives and non-numbers fail the u64 parse and fall back too.
-        assert_eq!(
-            watch_rescan_interval(Some("0".into())),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            watch_rescan_interval(Some("-5".into())),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            watch_rescan_interval(Some("soon".into())),
-            Duration::from_secs(30)
-        );
+    fn persistent_v2_round_converges_both_filesystem_trees_in_process() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir()?;
+        let local_root = temp.path().join("local");
+        let remote_root = temp.path().join("remote");
+        std::fs::create_dir_all(&local_root)?;
+        std::fs::create_dir_all(&remote_root)?;
+        std::fs::write(local_root.join("from-local"), b"local")?;
+        std::fs::write(remote_root.join("from-remote"), b"remote")?;
+        let mut local_state = State::open(temp.path().join("local-state"))?;
+        let mut remote_state = State::open(temp.path().join("remote-state"))?;
+        let local_share = local_state.init_share(&local_root)?;
+        let remote_share = remote_state.init_share(&remote_root)?;
+        let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
+        let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
+
+        let (connector_stream, responder_reader) = UnixStream::pair()?;
+        let (responder_stream, connector_reader) = UnixStream::pair()?;
+        let responder = std::thread::spawn(move || -> Result<()> {
+            let first = sync::read_v2_envelope_until(
+                &responder_reader,
+                std::time::Instant::now() + sync::default_frame_deadline(),
+            )?;
+            assert!(matches!(
+                first,
+                V2Envelope::Round {
+                    round: 1,
+                    frame: V2RoundFrame::SyncStart { .. }
+                }
+            ));
+            serve_v2_round(
+                &mut remote_state,
+                &remote_share,
+                &remote_cap,
+                1,
+                &responder_reader,
+                &responder_stream,
+            )?;
+            Ok(())
+        });
+        let mut pending_remote = 0;
+        let report = connector_v2_round(
+            &mut local_state,
+            &local_share,
+            &local_cap,
+            1,
+            0,
+            0,
+            &connector_reader,
+            &connector_stream,
+            &mut pending_remote,
+        )?;
+        responder.join().expect("responder joins")?;
+
+        assert_eq!(std::fs::read(local_root.join("from-remote"))?, b"remote");
+        assert_eq!(std::fs::read(remote_root.join("from-local"))?, b"local");
+        let report = String::from_utf8(report)?;
+        assert!(report.contains("UPLOAD from-local"), "{report}");
+        assert!(report.contains("DOWNLOAD from-remote"), "{report}");
+        Ok(())
     }
 
     #[test]
-    fn watch_loop_retries_offline_and_exits_once_the_watcher_disconnects() -> Result<()> {
-        // No dependency on a live filesystem watcher or network: the share
-        // has no peer configured, so every run_sync attempt inside the loop
-        // fails fast, in-process; one queued event drives the loop through
-        // both its match arms before the sender is dropped, which ends the
-        // loop deterministically via Disconnected exactly as tearing down a
-        // real watcher would. Capturing both writers pins the exact printed
-        // text, not just that the loop ran — a message swapped between the
-        // pre-loop and in-loop offline cases would fail this test.
+    fn persistent_session_handshake_startup_and_disconnect_run_in_process() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
         let temp = tempdir()?;
-        let root = temp.path().join("root");
-        std::fs::create_dir_all(&root)?;
-        let mut state = State::open(temp.path().join("state"))?;
-        state.init_share(&root)?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Ok(notify::Event::default()))?;
-        drop(tx);
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let rescan = watch_rescan_interval(None);
-        let error = watch_loop(&mut state, &root, &root, &rx, rescan, &mut out, &mut err)
-            .expect_err("disconnect ends the loop");
-        assert!(
-            error
-                .downcast_ref::<std::sync::mpsc::RecvTimeoutError>()
-                .is_some()
-        );
+        let local_root = temp.path().join("session-local");
+        let remote_root = temp.path().join("session-remote");
+        std::fs::create_dir_all(&local_root)?;
+        std::fs::create_dir_all(&remote_root)?;
+        std::fs::write(local_root.join("local"), b"local")?;
+        std::fs::write(remote_root.join("remote"), b"remote")?;
+        let mut local_state = State::open(temp.path().join("session-local-state"))?;
+        let mut remote_state = State::open(temp.path().join("session-remote-state"))?;
+        let local_share = local_state.init_share(&local_root)?;
+        let remote_share = remote_state.init_share(&remote_root)?;
+        let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
+        let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
+        let remote_peer = remote_state.peer_id()?;
+        let expected_remote_peer = remote_peer.clone();
 
-        let out = String::from_utf8(out)?;
-        let (timestamp, rest) = out
-            .trim_end()
-            .split_once(' ')
-            .context("expected a timestamped watch startup line")?;
-        assert_eq!(timestamp.len(), 20, "{timestamp:?}");
-        assert_eq!(rest, format!("Watching {}", root.display()));
+        let (connector_output, responder_input) = UnixStream::pair()?;
+        let (responder_output, connector_input) = UnixStream::pair()?;
+        let responder = std::thread::spawn(move || -> Result<()> {
+            assert!(matches!(
+                sync::read_initial_message_until(
+                    &responder_input,
+                    std::time::Instant::now() + sync::default_frame_deadline(),
+                )?,
+                InitialMessage::WatchOpen { .. }
+            ));
+            write_v2_session(
+                &responder_output,
+                V2SessionFrame::WatchAccepted {
+                    protocol: sync::WATCH_PROTOCOL_VERSION,
+                    peer: remote_peer,
+                },
+            )?;
+            write_v2_session(&responder_output, V2SessionFrame::Ready { generation: 0 })?;
+            assert!(matches!(
+                sync::read_v2_envelope_until(
+                    &responder_input,
+                    std::time::Instant::now() + sync::default_frame_deadline(),
+                )?,
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Ready { .. }
+                }
+            ));
+            let start = sync::read_v2_envelope_until(
+                &responder_input,
+                std::time::Instant::now() + sync::default_frame_deadline(),
+            )?;
+            assert!(matches!(
+                start,
+                V2Envelope::Round {
+                    round: 1,
+                    frame: V2RoundFrame::SyncStart { .. }
+                }
+            ));
+            serve_v2_round(
+                &mut remote_state,
+                &remote_share,
+                &remote_cap,
+                1,
+                &responder_input,
+                &responder_output,
+            )
+        });
 
-        let err = String::from_utf8(err)?;
-        let err_lines: Vec<&str> = err.lines().collect();
-        // The pre-loop attempt fails (no peer configured) and reports it;
-        // the immediate in-loop retry is rate-limited.
-        assert_eq!(err_lines.len(), 1, "{err:?}");
-        let (_, rest) = err_lines[0].split_once(' ').context("timestamped line")?;
-        assert_eq!(
-            rest,
-            "synchronization failed; retrying in background: no peer configured; \
-             run `flocal peer add`"
+        let peer = flocal::model::PeerConfig {
+            host: "in-process".into(),
+            executable: "/flocal".into(),
+            remote_path: path_bytes(&remote_root),
+            peer_id: expected_remote_peer,
+        };
+        let watch_state = flocal::watch::WatchState::default();
+        let (_events_tx, events_rx) = std::sync::mpsc::sync_channel(1);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let mut backoff = flocal::watch::RetryBackoff::default();
+        let mut failures = WatchFailures::default();
+        let mut connected = false;
+        let result = persistent_watch_session_io(
+            &mut local_state,
+            &local_share,
+            &local_cap,
+            &watch_state,
+            &peer,
+            &events_rx,
+            &mut output,
+            &mut errors,
+            &flocal::watch::WatchConfig::default(),
+            &mut backoff,
+            &mut failures,
+            &mut connected,
+            &connector_input,
+            &connector_output,
         );
+        assert!(result.is_err(), "responder EOF ends this one session");
+        assert!(connected, "startup round reached connected state");
+        responder.join().expect("responder joins")?;
+        assert_eq!(std::fs::read(local_root.join("remote"))?, b"remote");
+        assert_eq!(std::fs::read(remote_root.join("local"))?, b"local");
+        assert!(String::from_utf8(output)?.contains("Peer connected"));
         Ok(())
     }
 

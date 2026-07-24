@@ -2,10 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ignore::{
-    WalkBuilder,
-    gitignore::{Gitignore, GitignoreBuilder},
-};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
 use crate::model::{Entry, Record, RelativePath, ShareId};
 use crate::state::{State, file_record};
@@ -16,7 +13,8 @@ pub fn scan(
     root: &Path,
     previous: &[Record],
 ) -> Result<Vec<Record>> {
-    scan_mode(state, share, root, previous, true)
+    let root_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+    scan_cap(state, share, root, &root_dir, previous)
 }
 
 pub fn preview(
@@ -25,18 +23,39 @@ pub fn preview(
     root: &Path,
     previous: &[Record],
 ) -> Result<Vec<Record>> {
-    scan_mode(state, share, root, previous, false)
+    let root_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+    preview_cap(state, share, root, &root_dir, previous)
+}
+
+pub fn scan_cap(
+    state: &State,
+    share: &ShareId,
+    display_root: &Path,
+    root: &cap_std::fs::Dir,
+    previous: &[Record],
+) -> Result<Vec<Record>> {
+    scan_mode(state, share, display_root, root, previous, true)
+}
+
+pub fn preview_cap(
+    state: &State,
+    share: &ShareId,
+    display_root: &Path,
+    root: &cap_std::fs::Dir,
+    previous: &[Record],
+) -> Result<Vec<Record>> {
+    scan_mode(state, share, display_root, root, previous, false)
 }
 
 fn scan_mode(
     state: &State,
     share: &ShareId,
-    root: &Path,
+    display_root: &Path,
+    root_dir: &cap_std::fs::Dir,
     previous: &[Record],
     advance_sequence: bool,
 ) -> Result<Vec<Record>> {
     let peer = state.peer_id()?;
-    let root_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
     let mut preview_sequence = previous
         .iter()
         .map(|record| record.version.sequence)
@@ -46,23 +65,14 @@ fn scan_mode(
         .iter()
         .map(|record| (record.path.as_bytes().to_vec(), record))
         .collect();
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .ignore(false)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(false)
-        .follow_links(false);
+    let matcher = IgnoreMatcher::from_cap(display_root, root_dir)?;
+    let mut paths = Vec::new();
+    collect_paths(root_dir, Path::new(""), &mut paths)?;
+    paths.sort();
 
     let mut records = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for result in builder.build() {
-        let dent = result?;
-        if dent.path() == root {
-            continue;
-        }
-        let relative = dent.path().strip_prefix(root)?;
+    for relative in &paths {
         if state.is_owned_temp(share, relative)? {
             continue;
         }
@@ -73,8 +83,11 @@ fn scan_mode(
             continue;
         }
         let path = RelativePath::from_path(relative)?;
-        seen.insert(path.as_bytes().to_vec());
         let metadata = root_dir.symlink_metadata(relative)?;
+        if matcher.is_ignored(&path, metadata.is_dir()) {
+            continue;
+        }
+        seen.insert(path.as_bytes().to_vec());
         let entry = if metadata.file_type().is_symlink() {
             Entry::Symlink {
                 target: path_bytes(&root_dir.read_link_contents(relative)?),
@@ -82,13 +95,13 @@ fn scan_mode(
         } else if metadata.is_dir() {
             Entry::Directory
         } else if metadata.is_file() {
-            let input = open_regular_nofollow(&root_dir, relative)?;
+            let input = open_regular_nofollow(root_dir, relative)?;
             let (hash, size) = if advance_sequence {
                 state.store_object(input)
             } else {
                 state.hash_object(input)
             }
-            .with_context(|| format!("capturing {}", dent.path().display()))?;
+            .with_context(|| format!("capturing {}", display_root.join(relative).display()))?;
             Entry::File {
                 hash,
                 size,
@@ -205,20 +218,16 @@ pub struct IgnoreMatcher {
 
 impl IgnoreMatcher {
     pub fn new(root: &Path) -> Result<Self> {
-        let mut builder = GitignoreBuilder::new(root);
         let root_dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-        let mut walker = WalkBuilder::new(root);
-        walker
-            .hidden(false)
-            .ignore(false)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .follow_links(false);
+        Self::from_cap(root, &root_dir)
+    }
+
+    pub fn from_cap(root: &Path, root_dir: &cap_std::fs::Dir) -> Result<Self> {
+        let mut builder = GitignoreBuilder::new(root);
+        let mut paths = Vec::new();
+        collect_paths(root_dir, Path::new(""), &mut paths)?;
         let mut ignore_files = Vec::new();
-        for result in walker.build() {
-            let dent = result?;
-            let relative = dent.path().strip_prefix(root)?;
+        for relative in paths {
             if relative
                 .components()
                 .any(|component| component.as_os_str() == ".git")
@@ -228,7 +237,7 @@ impl IgnoreMatcher {
             if relative
                 .file_name()
                 .is_some_and(|name| name == ".gitignore")
-                && dent.file_type().is_some_and(|kind| kind.is_file())
+                && root_dir.symlink_metadata(&relative)?.is_file()
             {
                 ignore_files.push(relative.to_path_buf());
             }
@@ -277,6 +286,24 @@ impl IgnoreMatcher {
             _ => self.is_ignored(&record.path, false),
         }
     }
+}
+
+fn collect_paths(root: &cap_std::fs::Dir, relative: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    let directory = if relative.as_os_str().is_empty() {
+        root.try_clone()?
+    } else {
+        root.open_dir(relative)?
+    };
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let path = relative.join(entry.file_name());
+        let metadata = root.symlink_metadata(&path)?;
+        paths.push(path.clone());
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            collect_paths(root, &path, paths)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn is_ignored(root: &Path, relative: &RelativePath, is_dir: bool) -> Result<bool> {

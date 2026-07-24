@@ -2,6 +2,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use fs2::FileExt;
@@ -24,6 +27,12 @@ pub struct StoredConflict {
 pub struct State {
     pub dir: PathBuf,
     conn: Connection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RootIdentity {
+    pub device: u64,
+    pub inode: u64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -128,7 +137,7 @@ impl State {
         set_private_dir(&dir)?;
         set_private_dir(&dir.join("objects"))?;
         let database = dir.join("state.sqlite3");
-        let conn = Connection::open(&database)?;
+        let mut conn = Connection::open(&database)?;
         set_private_file(&database)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -144,7 +153,9 @@ impl State {
                 sequence INTEGER NOT NULL DEFAULT 0,
                 initial_complete INTEGER NOT NULL DEFAULT 0,
                 peer_json TEXT,
-                bound_peer TEXT
+                bound_peer TEXT,
+                root_device TEXT,
+                root_inode TEXT
             );
             CREATE TABLE IF NOT EXISTS records (
                 share_id TEXT NOT NULL,
@@ -171,9 +182,58 @@ impl State {
             stmt.query_map([], |row| row.get(1))?
                 .collect::<Result<_, _>>()?
         };
+        let transaction = conn.transaction()?;
         if !columns.iter().any(|name| name == "bound_peer") {
-            conn.execute("ALTER TABLE shares ADD COLUMN bound_peer TEXT", [])?;
+            transaction.execute("ALTER TABLE shares ADD COLUMN bound_peer TEXT", [])?;
         }
+        if !columns.iter().any(|name| name == "root_device") {
+            transaction.execute("ALTER TABLE shares ADD COLUMN root_device TEXT", [])?;
+        }
+        if !columns.iter().any(|name| name == "root_inode") {
+            transaction.execute("ALTER TABLE shares ADD COLUMN root_inode TEXT", [])?;
+        }
+        let legacy: Vec<(String, Vec<u8>)> = {
+            let mut statement = transaction.prepare(
+                "SELECT share_id, root FROM shares
+                 WHERE root_device IS NULL OR root_inode IS NULL",
+            )?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut backfill = Vec::with_capacity(legacy.len());
+        for (share, root) in legacy {
+            let root = bytes_path(root);
+            let identity = root_identity(&root).with_context(|| {
+                format!(
+                    "cannot bind legacy share {share} to {}; restore and verify the original root before retrying the upgrade",
+                    root.display()
+                )
+            })?;
+            backfill.push((share, root, identity));
+        }
+        for (share, root, identity) in backfill {
+            let verified = root_identity(&root).with_context(|| {
+                format!(
+                    "legacy share {share} root changed while upgrading; restore and verify {} before retrying",
+                    root.display()
+                )
+            })?;
+            if verified != identity {
+                bail!(
+                    "legacy share {share} root changed while upgrading; refusing to bind a stale filesystem identity"
+                );
+            }
+            transaction.execute(
+                "UPDATE shares SET root_device=?2, root_inode=?3 WHERE share_id=?1",
+                params![
+                    share,
+                    identity.device.to_string(),
+                    identity.inode.to_string()
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(Self { dir, conn })
     }
 
@@ -367,6 +427,7 @@ impl State {
             .canonicalize()
             .with_context(|| format!("cannot open {}", root.display()))?;
         let root_bytes = path_bytes(&root);
+        let identity = root_identity(&root)?;
         if self
             .conn
             .query_row("SELECT 1 FROM shares WHERE root=?1", [&root_bytes], |_| {
@@ -379,8 +440,13 @@ impl State {
         }
         let id = ShareId::generate();
         self.conn.execute(
-            "INSERT INTO shares(share_id, root) VALUES(?1, ?2)",
-            params![id.0, root_bytes],
+            "INSERT INTO shares(share_id, root, root_device, root_inode) VALUES(?1, ?2, ?3, ?4)",
+            params![
+                id.0,
+                root_bytes,
+                identity.device.to_string(),
+                identity.inode.to_string()
+            ],
         )?;
         Ok(id)
     }
@@ -389,44 +455,56 @@ impl State {
         fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
         let root_bytes = path_bytes(&root);
-        let existing: Option<(Vec<u8>,)> = self
+        let identity = root_identity(&root)?;
+        let existing: Option<(Vec<u8>, String, String)> = self
             .conn
-            .query_row("SELECT root FROM shares WHERE share_id=?1", [&id.0], |r| {
-                Ok((r.get(0)?,))
-            })
+            .query_row(
+                "SELECT root, root_device, root_inode FROM shares WHERE share_id=?1",
+                [&id.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .optional()?;
-        if let Some((path,)) = existing {
+        if let Some((path, device, inode)) = existing {
             if path != root_bytes {
                 bail!("share ID is already registered to a different directory");
             }
+            validate_identity_values(&root, identity, &device, &inode)?;
             return Ok(());
         }
         self.conn.execute(
-            "INSERT INTO shares(share_id, root) VALUES(?1, ?2)",
-            params![id.0, root_bytes],
+            "INSERT INTO shares(share_id, root, root_device, root_inode) VALUES(?1, ?2, ?3, ?4)",
+            params![
+                id.0,
+                root_bytes,
+                identity.device.to_string(),
+                identity.inode.to_string()
+            ],
         )?;
         Ok(())
     }
 
     pub fn register_share_bound(&mut self, id: &ShareId, root: &Path, peer: &PeerId) -> Result<()> {
         fs::create_dir_all(root)?;
-        let root_bytes = path_bytes(&root.canonicalize()?);
+        let root = root.canonicalize()?;
+        let root_bytes = path_bytes(&root);
+        let identity = root_identity(&root)?;
         let transaction = self.conn.transaction()?;
-        let existing: Option<(Vec<u8>, Option<String>)> = transaction
+        let existing: Option<(Vec<u8>, Option<String>, String, String)> = transaction
             .query_row(
-                "SELECT root, bound_peer FROM shares WHERE share_id=?1",
+                "SELECT root, bound_peer, root_device, root_inode FROM shares WHERE share_id=?1",
                 [&id.0],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
         match existing {
-            Some((path, _)) if path != root_bytes => {
+            Some((path, _, _, _)) if path != root_bytes => {
                 bail!("share ID is already registered to a different directory")
             }
-            Some((_, Some(bound))) if bound != peer.0 => {
+            Some((_, Some(bound), _, _)) if bound != peer.0 => {
                 bail!("share is bound to a different peer")
             }
-            Some(_) => {
+            Some((_, _, device, inode)) => {
+                validate_identity_values(&root, identity, &device, &inode)?;
                 transaction.execute(
                     "UPDATE shares SET bound_peer=?2 WHERE share_id=?1",
                     params![id.0, peer.0],
@@ -434,8 +512,15 @@ impl State {
             }
             None => {
                 transaction.execute(
-                    "INSERT INTO shares(share_id, root, bound_peer) VALUES(?1, ?2, ?3)",
-                    params![id.0, root_bytes, peer.0],
+                    "INSERT INTO shares(share_id, root, bound_peer, root_device, root_inode)
+                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id.0,
+                        root_bytes,
+                        peer.0,
+                        identity.device.to_string(),
+                        identity.inode.to_string()
+                    ],
                 )?;
             }
         }
@@ -470,6 +555,36 @@ impl State {
                     r.get(0)
                 })?;
         Ok(bytes_path(bytes))
+    }
+
+    pub fn expected_root_identity(&self, id: &ShareId) -> Result<RootIdentity> {
+        let (device, inode): (String, String) = self.conn.query_row(
+            "SELECT root_device, root_inode FROM shares WHERE share_id=?1",
+            [&id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(RootIdentity {
+            device: device.parse().context("stored root device is invalid")?,
+            inode: inode.parse().context("stored root inode is invalid")?,
+        })
+    }
+
+    pub fn validate_root_identity(&self, id: &ShareId) -> Result<RootIdentity> {
+        let root = self.root_for(id)?;
+        let expected = self.expected_root_identity(id)?;
+        let actual = root_identity(&root).with_context(|| {
+            format!(
+                "configured root {} is unavailable; restore the original directory before retrying",
+                root.display()
+            )
+        })?;
+        if actual != expected {
+            bail!(
+                "configured root identity changed at {}; restore the original directory or deliberately remove and reinitialize the share",
+                root.display()
+            );
+        }
+        Ok(actual)
     }
 
     pub fn next_sequence(&self, id: &ShareId) -> Result<u64> {
@@ -932,6 +1047,51 @@ fn same_file_snapshot(before: &fs::Metadata, after: &fs::Metadata) -> Result<boo
     }
     #[allow(unreachable_code)]
     Ok(true)
+}
+
+#[cfg(unix)]
+fn root_identity(path: &Path) -> Result<RootIdentity> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "cannot open root directory {} without following links",
+            path.display()
+        )
+    })?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        bail!("configured root {} is not a directory", path.display());
+    }
+    Ok(RootIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn validate_identity_values(
+    root: &Path,
+    actual: RootIdentity,
+    device: &str,
+    inode: &str,
+) -> Result<()> {
+    let expected = RootIdentity {
+        device: device.parse().context("stored root device is invalid")?,
+        inode: inode.parse().context("stored root inode is invalid")?,
+    };
+    if actual != expected {
+        bail!(
+            "configured root identity changed at {}; restore the original directory or deliberately remove and reinitialize the share",
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

@@ -43,11 +43,11 @@
 
 * Alpha limitations found during implementation
 
-- The foreground watcher currently uses native dirty notifications for prompt
-  local saves and a 30-second reconciliation connection to discover remote
-  edits. This performs a scan at that interval rather than the design's final
-  version-vector-only idle heartbeat. A persistent two-sided watcher protocol
-  remains required before calling the full v0.0.1 behavior complete.
+- The foreground watcher keeps one SSH session open and uses native
+  notifications on both peers for prompt saves. Each change-driven round still
+  performs a complete scan, and a 15-minute same-session safety audit bounds
+  silently missed notifications. Incremental dirty-path scans and the design's
+  final operation/version-vector exchange remain deferred.
 - Filesystem installation uses destination-local temporaries, fsync, atomic
   exchange/no-replace operations, displaced-entry verification/rollback, and a
   durable install intent replayed on startup. Directory fsync coverage and

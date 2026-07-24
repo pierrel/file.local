@@ -1262,3 +1262,14 @@ update:
   positional argument, preserving section 9's no-interpolation rule. The watcher's
   stderr reaches the failure dump through the existing wrapper tee; its
   stdout under =-d= is discarded.
+
+* Update 2026-07-24: persistent watch instrumentation
+
+The persistent-watch implementation removes =FLOCAL_WATCH_RESCAN_SECONDS= and
+the harness no longer shortens a polling interval. Watch scenarios exercise the
+real two-sided event protocol. The harness adds a five-second prompt file wait
+and an sshd accepted-session counter; the persistent-session scenario takes a
+post-pairing baseline, edits only the responder, requires prompt convergence,
+and proves that =watch= opened exactly one SSH session while remaining idle.
+=Config= now retains only the per-session transfer-budget override used by the
+committed-action failure scenario.
