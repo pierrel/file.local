@@ -940,10 +940,11 @@ impl WatchFailures {
         interval: Duration,
     ) -> Option<WatchEvent> {
         self.count = self.count.saturating_add(1);
-        let error = watch_error(error);
         if self.count == 1 {
             self.last_reported = Some(now);
-            return Some(WatchEvent::First { error });
+            return Some(WatchEvent::First {
+                error: watch_error(error),
+            });
         }
         if self
             .last_reported
@@ -954,7 +955,7 @@ impl WatchFailures {
         self.last_reported = Some(now);
         Some(WatchEvent::Periodic {
             count: self.count,
-            error,
+            error: watch_error(error),
         })
     }
 
