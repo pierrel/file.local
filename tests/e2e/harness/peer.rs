@@ -12,6 +12,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 /// per scenario container, so a fixed path suffices — and keeps the start
 /// command a constant string with nothing interpolated into it.
 const WATCH_PIDFILE: &str = "/tmp/flocal-watch.pid";
+const WATCH_LOG: &str = "/home/peer/.flocal-watch.log";
 /// The product's status JSON schema this harness is written against:
 /// schema 2, which the tombstone-retention fix introduced together with
 /// promoting the scenarios that read `tombstones`.
@@ -80,6 +81,7 @@ pub struct Connector {
     /// `pair_with`'s rescan knob, exported to `watch` invocations as
     /// `FLOCAL_WATCH_RESCAN_SECONDS`. `None` leaves the product default.
     watch_rescan_seconds: Option<u64>,
+    watch_max_session_bytes: Option<u64>,
 }
 
 impl std::ops::Deref for Connector {
@@ -189,12 +191,14 @@ pub fn pair() -> Result<(Connector, Peer)> {
 /// set to the one-second floor so a cycle costs a second, not thirty.
 pub struct Config {
     pub watch_rescan_seconds: u64,
+    pub watch_max_session_bytes: Option<u64>,
 }
 
 /// `pair()` with knobs applied to the returned handles.
 pub fn pair_with(config: Config) -> Result<(Connector, Peer)> {
     let (mut connector, responder) = pair()?;
     connector.watch_rescan_seconds = Some(config.watch_rescan_seconds);
+    connector.watch_max_session_bytes = config.watch_max_session_bytes;
     Ok((connector, responder))
 }
 
@@ -301,6 +305,7 @@ impl PeerBox {
             Connector {
                 peer: self.peer,
                 watch_rescan_seconds: None,
+                watch_max_session_bytes: None,
             },
             other.peer,
         ))
@@ -423,13 +428,21 @@ impl Connector {
     /// a watch that dies on startup fails here, with the dump (its stderr
     /// is in the captured flocal log).
     pub fn watch_start(&self) -> Result<Watch<'_>> {
-        let start = format!("echo \"$$\" >{WATCH_PIDFILE} && exec flocal watch {SHARE}");
+        let start = format!(
+            ": >{WATCH_LOG} && echo \"$$\" >{WATCH_PIDFILE} && exec flocal watch {SHARE} >{WATCH_LOG}"
+        );
         let rescan = self
             .watch_rescan_seconds
             .map(|seconds| format!("FLOCAL_WATCH_RESCAN_SECONDS={seconds}"));
+        let max_bytes = self
+            .watch_max_session_bytes
+            .map(|bytes| format!("FLOCAL_MAX_SESSION_BYTES={bytes}"));
         let mut args = vec!["exec", "-d", "-u", "peer"];
         if let Some(rescan) = &rescan {
             args.extend_from_slice(&["-e", rescan]);
+        }
+        if let Some(max_bytes) = &max_bytes {
+            args.extend_from_slice(&["-e", max_bytes]);
         }
         args.extend_from_slice(&[&self.container.name, "sh", "-c", &start]);
         self.context.docker_ok(&args)?;
@@ -438,7 +451,7 @@ impl Connector {
         // reads an empty file successfully: an empty or unparseable read
         // means "not recorded yet", not a failure — keep polling.
         let pid = self.poll_until("flocal watch never recorded its pid", DEADLINE, |peer| {
-            let output = peer.exec_raw(&["cat", WATCH_PIDFILE])?;
+            let output = peer.exec_raw(&["cat", "--", WATCH_PIDFILE])?;
             if !output.status.success() {
                 return Ok(None);
             }
@@ -491,6 +504,53 @@ pub struct Watch<'a> {
 }
 
 impl Watch<'_> {
+    pub fn suspend(&self) -> Result<()> {
+        let output = self.peer.signal("STOP", self.pid)?;
+        if !output.status.success() {
+            return Err(self.peer.fail(format!(
+                "{}: suspending flocal watch (pid {}) failed: {}",
+                self.peer.alias,
+                self.pid,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        let output = self.peer.signal("CONT", self.pid)?;
+        if !output.status.success() {
+            return Err(self.peer.fail(format!(
+                "{}: resuming flocal watch (pid {}) failed: {}",
+                self.peer.alias,
+                self.pid,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn wait_for_error(&self, needle: &str) -> Result<()> {
+        self.peer
+            .wait_for_text("/home/peer/.flocal-stderr.log", needle)
+    }
+
+    pub fn assert_log_absent(&self, needle: &str) -> Result<()> {
+        let output = self.peer.exec_ok(&["cat", "--", WATCH_LOG])?;
+        let log = String::from_utf8_lossy(&output.stdout);
+        if log.contains(needle) {
+            return Err(self.peer.fail(format!(
+                "{}: watch log prematurely contained {needle:?}: {log}",
+                self.peer.alias
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn wait_for_log(&self, needle: &str) -> Result<()> {
+        self.peer.wait_for_text(WATCH_LOG, needle)
+    }
+
     /// Terminates the watcher inside the container — killing the `docker
     /// exec` client would not, and a surviving watcher would keep holding
     /// the share and global locks — and waits for it to exit. Fails, with
@@ -564,6 +624,19 @@ impl Peer {
         let full = self.share_path(path)?;
         let output = self.exec_ok(&["cat", "--", &full])?;
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn wait_for_text(&self, path: &str, needle: &str) -> Result<()> {
+        self.poll_until(
+            &format!("{path} never contained {needle:?}"),
+            DEADLINE,
+            |peer| {
+                let output = peer.exec_raw(&["cat", "--", path])?;
+                Ok((output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(needle))
+                .then_some(()))
+            },
+        )
     }
 
     pub fn mkdir(&self, path: &str) -> Result<()> {
@@ -959,7 +1032,7 @@ impl Peer {
     /// against a live watcher pid. `cmdline` is NUL-separated; match on
     /// substrings.
     fn is_watcher(&self, pid: u32) -> Result<bool> {
-        let output = self.exec_raw(&["cat", &format!("/proc/{pid}/cmdline")])?;
+        let output = self.exec_raw(&["cat", "--", &format!("/proc/{pid}/cmdline")])?;
         if !output.status.success() {
             return Ok(false); // no such process
         }

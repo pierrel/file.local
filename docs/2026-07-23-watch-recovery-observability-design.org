@@ -1,0 +1,134 @@
+#+title: Truthful watch recovery and observability design
+
+* State
+
+Implemented 2026-07-23 after a production report that long-running =watch=
+sometimes prints an action without the file appearing, especially across
+laptop sleep and unreliable networking. The user delegated investigation,
+design approval, implementation, and review for this bug.
+
+* 1. Observed failure and pinned scenario
+
+=run_sync= prints the reconciled plan before object transfer, remote apply,
+local apply, and SSH completion. In =watch= those =UPLOAD=, =DOWNLOAD=,
+=MERGE=, and =DELETE= lines look like completed work. If a later phase fails,
+the line remains although neither tree necessarily changed. After its first
+failure, =watch= suppresses every subsequent error until one attempt succeeds,
+so hours of retries can look like successful but ineffective synchronization.
+
+The red end-to-end scenario pairs two Docker peers, completes initial sync,
+starts =watch= with the one-second test rescan and a deliberately insufficient
+session byte budget, edits the connector, and waits for the post-plan transfer
+failure. It asserts that no action line claims the unapplied edit. A separate
+scenario disconnects the responder, suspends the watcher, edits both peers
+while notifications cannot be observed, resumes while still offline, and
+reconnects. It requires unattended exact-content convergence in both
+directions and whole-tree equality. The first scenario failed against the old
+implementation under =known_failure= and was promoted after the fix.
+
+* 2. User-visible contract
+
+Explicit =flocal sync= continues to print its proposed plan before the initial
+confirmation and before application. A =watch= path-action line is instead a
+completion statement: both the responder and connector have successfully
+applied that plan at the application commit point. It is not a new power-loss
+or crash-durability guarantee. A session that fails before that point prints no
+path-action line. Conversely, conservative omission does not prove neither
+tree changed: a partial apply followed by an error is still reported as an
+error and recovered by a later reconciliation.
+
+=watch= reports the first failed attempt immediately and continuing failure
+periodically with its attempt count and latest error. Recovery reports the
+number of failed attempts. A single overall rate limit applies even when a
+hostile peer changes its error every retry. The reporting interval is five
+minutes in production and is injectable only inside unit tests. Retry frequency
+remains the existing rescan frequency. Representative lines are
+=synchronization failed; retrying in background: ERROR=, =synchronization still
+failing after N failed attempts; retrying: ERROR=, and =synchronization resumed
+after N failed attempts=. Neutral wording is required because failures can be
+local, protocol, filesystem, or transport errors rather than only an offline
+peer.
+
+* 3. Interfaces and data flow
+
+1. Keep =local=, =remote_records=, and =plan= alive throughout =run_sync=.
+2. For =PlanReport::Full=, write the proposed plan at its current pre-apply
+   location. For =PlanReport::Watch=, format the committed report into an
+   in-memory byte buffer only after remote =Applied=, local =apply_plan=,
+   conflict persistence, initial-complete persistence, and object pruning
+   succeed, and return it from =run_sync=. The watch caller writes that buffer
+   to stdout as a terminal operation: output failure exits =watch= rather than
+   masquerading as a retryable peer failure. The final =Done= and clean SSH
+   exit follow the application commit point and do not revoke work already
+   applied to both filesystems.
+3. Replace the =offline: bool= edge helper with a small =WatchFailures= value
+   holding consecutive failure count and the monotonic time of the last
+   report. It returns a narrow event enum carrying bounded error text for first,
+   periodic, or recovered transitions; =watch_loop= remains the formatter.
+   Errors are escaped first and then UTF-8-safely truncated to 4096 characters;
+   arbitrary changes never bypass the overall periodic limit. UTC is
+   presentation only; rate decisions use =Instant=.
+4. Preserve the existing =watch_log= output boundary. Peer-provided error text
+   remains escaped by the protocol path and stored/reportable failure text is
+   bounded.
+
+* 4. Alternatives and scope
+
+Labeling existing lines =PLAN= would be truthful but would still make users
+infer whether any later phase committed. Printing committed actions is the
+smaller useful contract for an unattended process. Printing every failure
+would flood logs every 30 seconds; printing only state edges caused the
+reported multi-hour silence, so bounded repetition is the middle ground.
+
+Periodic full scanning already recovers from lost filesystem notifications
+and laptop sleep. The fix does not change notify, SSH keepalives, protocol
+timeouts, reconciliation, or install transactions without a separate
+reproduction. A possible collision between two manually configured connector
+watches is also out of scope because standard pairing creates one connector.
+
+* 5. Failure and security boundaries
+
+- A logging write error continues to fail the foreground watcher as it does
+  today; successful synchronization is not silently hidden from its operator.
+- Action output occurs only after both application commit points. A failure after
+  that point may report a later session error but cannot make the action false.
+- Retry diagnostics are bounded and do not accumulate untrusted strings.
+- Paths retain the existing escaped display representation. No log content is
+  interpreted as protocol input.
+- Existing no-follow traversal, verified object, atomic replacement, and
+  install-intent recovery boundaries are unchanged and remain covered.
+
+* 6. Tests and red-green procedure
+
+1. Add harness capture for watcher stdout and safe STOP/CONT controls.
+2. Add a known-failure Docker scenario proving an offline failed attempt does
+   not emit a success-like action, then proving suspend/resume plus reconnection
+   converges without an explicit sync. Run it on the unfixed code to record
+   red, then remove =known_failure= after the fix.
+3. Add unit tests for first, repeated-before-deadline, periodic (including
+   alternating errors), and recovered failure-tracker transitions.
+4. Pin report ordering: Full output remains pre-apply while Watch output is
+   emitted only on the successful commit path.
+5. Retain the atomic-rename and offline-return end-to-end scenarios and run the
+   complete unit, lint, coverage, and Docker suites.
+
+* 7. Documentation
+
+Update =README.org= to distinguish explicit proposed plans from committed
+=watch= actions and describe first/periodic failure diagnostics. State
+that notify events are hints and periodic full scans are the sleep/wake
+correctness backstop.
+
+* 8. Acceptance criteria
+
+- The premature-action scenario fails against the old implementation and
+  passes after promotion.
+- No =watch= path action corresponds to a session that failed before both
+  peers applied it.
+- First failures are immediate; all continuing failures are periodically
+  visible but cannot flood each retry even when their text changes.
+- Network recovery after watcher suspension converges exact bytes and trees
+  without user action, and the watcher remains alive.
+- Explicit sync output and confirmation behavior do not change.
+- =make check= meets both 90% coverage gates and the complete Docker end-to-end
+  suite passes.
