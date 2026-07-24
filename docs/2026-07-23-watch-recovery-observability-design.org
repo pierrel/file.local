@@ -42,10 +42,12 @@ periodically with its attempt count and latest error. Recovery reports the
 number of failed attempts. A single overall rate limit applies even when a
 hostile peer changes its error every retry. The reporting interval is five
 minutes in production and is injectable only inside unit tests. Retry frequency
-remains the existing rescan frequency. Representative lines are =peer offline;
-retrying in background: ERROR=, =peer still offline after N failed attempts;
-retrying: ERROR=, and =peer reconnected; synchronization resumed after N failed
-attempts=.
+remains the existing rescan frequency. Representative lines are
+=synchronization failed; retrying in background: ERROR=, =synchronization still
+failing after N failed attempts; retrying: ERROR=, and =synchronization resumed
+after N failed attempts=. Neutral wording is required because failures can be
+local, protocol, filesystem, or transport errors rather than only an offline
+peer.
 
 * 3. Interfaces and data flow
 

@@ -1019,13 +1019,15 @@ fn watch_error(error: &anyhow::Error) -> String {
 fn write_watch_event(destination: &mut impl Write, event: WatchEvent) -> Result<()> {
     let message = match event {
         WatchEvent::First { error } => {
-            format!("peer offline; retrying in background: {error}")
+            format!("synchronization failed; retrying in background: {error}")
         }
         WatchEvent::Periodic { count, error } => {
-            format!("peer still offline after {count} failed attempts; retrying: {error}")
+            format!(
+                "synchronization still failing after {count} failed attempts; retrying: {error}"
+            )
         }
         WatchEvent::Recovered { count } => {
-            format!("peer reconnected; synchronization resumed after {count} failed attempts")
+            format!("synchronization resumed after {count} failed attempts")
         }
     };
     watch_log(destination, &message)
@@ -1607,14 +1609,10 @@ mod tests {
         let output = String::from_utf8(output)?;
         let lines: Vec<_> = output.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(
-            lines[0].ends_with(
-                "peer still offline after 7 failed attempts; retrying: still unreachable"
-            )
-        );
-        assert!(
-            lines[1].ends_with("peer reconnected; synchronization resumed after 7 failed attempts")
-        );
+        assert!(lines[0].ends_with(
+            "synchronization still failing after 7 failed attempts; retrying: still unreachable"
+        ));
+        assert!(lines[1].ends_with("synchronization resumed after 7 failed attempts"));
         Ok(())
     }
 
@@ -1686,7 +1684,7 @@ mod tests {
         let (_, rest) = err_lines[0].split_once(' ').context("timestamped line")?;
         assert_eq!(
             rest,
-            "peer offline; retrying in background: no peer configured; \
+            "synchronization failed; retrying in background: no peer configured; \
              run `flocal peer add`"
         );
         Ok(())
