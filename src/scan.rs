@@ -367,13 +367,6 @@ impl IgnoreMatcher {
     }
 
     pub fn is_ignored(&self, relative: &RelativePath, is_dir: bool) -> bool {
-        if relative
-            .to_path_buf()
-            .components()
-            .any(|component| component.as_os_str() == ".git")
-        {
-            return true;
-        }
         let path = relative.to_path_buf();
         let scope = path
             .ancestors()
@@ -497,7 +490,7 @@ mod tests {
             false
         ));
         let directory_rule = RelativePath::from_bytes(b"only-dir".to_vec())?;
-        assert!(matcher.is_ignored(&directory_rule, true));
+        assert!(is_ignored(&root, &directory_rule, true)?);
         assert!(!matcher.is_ignored(&directory_rule, false));
 
         fs::remove_file(root.join(".gitignore"))?;

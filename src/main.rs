@@ -2682,9 +2682,14 @@ mod tests {
             "protocol version text from a broken transport",
         ));
         assert!(!is_terminal_watch_error(&transport));
-        assert!(is_terminal_watch_error(&watch_protocol_error(
-            "unexpected round frame"
-        )));
+        let protocol_error = watch_protocol_error("unexpected round frame");
+        assert!(
+            protocol_error.to_string() == "unexpected round frame"
+                && is_terminal_watch_error(&protocol_error)
+                && is_terminal_watch_error(
+                    &sync::RootIdentityChanged::new("root identity changed").into()
+                )
+        );
         assert!(is_terminal_watch_error(
             &RemoteWatchError {
                 retryable: false,
