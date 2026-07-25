@@ -588,12 +588,16 @@ impl State {
 
     pub fn validate_root_identity(&self, id: &ShareId) -> Result<RootIdentity> {
         let root = self.root_for(id)?;
-        let expected = self.expected_root_identity(id)?;
-        let actual = root_identity(&root).with_context(|| {
-            format!(
-                "configured root {} is unavailable; restore the original directory before retrying",
+        let expected = self.expected_root_identity(id).map_err(|error| {
+            RootIdentityChanged::new(format!(
+                "configured root identity cannot be validated: {error:#}"
+            ))
+        })?;
+        let actual = root_identity(&root).map_err(|error| {
+            RootIdentityChanged::new(format!(
+                "configured root {} is unavailable: {error}; restore the original directory before retrying",
                 root.display()
-            )
+            ))
         })?;
         if actual != expected {
             return Err(RootIdentityChanged::new(format!(

@@ -224,6 +224,31 @@ fn root_identity_is_persisted_and_replacements_are_not_adopted() -> Result<()> {
     drop(state);
 
     fs::remove_dir(&root)?;
+    let state = State::open(&state_dir)?;
+    let missing = state
+        .validate_root_identity(&share)
+        .expect_err("missing root must be terminal");
+    assert!(
+        missing
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_some()
+    );
+    assert!(missing.to_string().contains("is unavailable"));
+    drop(state);
+
+    std::os::unix::fs::symlink(&original, &root)?;
+    let state = State::open(&state_dir)?;
+    let symlink = state
+        .validate_root_identity(&share)
+        .expect_err("symlinked root must be terminal");
+    assert!(
+        symlink
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_some()
+    );
+    drop(state);
+    fs::remove_file(&root)?;
+
     fs::rename(&original, &root)?;
     let state = State::open(&state_dir)?;
     assert_eq!(state.validate_root_identity(&share)?, expected);
