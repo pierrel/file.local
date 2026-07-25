@@ -524,6 +524,24 @@ impl Watch<'_> {
             .wait_for_text("/home/peer/.flocal-stderr.log", needle)
     }
 
+    pub fn wait_for_any_error_with_deadline(
+        &self,
+        needles: &[&str],
+        deadline: Duration,
+    ) -> Result<()> {
+        self.peer.poll_until(
+            &format!("watch stderr never contained any of {needles:?}"),
+            deadline,
+            |peer| {
+                let output = peer.exec_raw(&["cat", "--", "/home/peer/.flocal-stderr.log"])?;
+                let stderr = String::from_utf8_lossy(&output.stdout);
+                Ok((output.status.success()
+                    && needles.iter().any(|needle| stderr.contains(needle)))
+                .then_some(()))
+            },
+        )
+    }
+
     pub fn assert_log_absent(&self, needle: &str) -> Result<()> {
         let output = self.peer.exec_ok(&["cat", "--", WATCH_LOG])?;
         let log = String::from_utf8_lossy(&output.stdout);
@@ -735,9 +753,10 @@ impl Peer {
     /// Scenarios take a baseline so pairing and explicit sync are excluded.
     pub fn ssh_session_count(&self) -> Result<usize> {
         let output = self.context.docker_ok(&["logs", &self.container.name])?;
-        Ok(String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .filter(|line| line.contains("Accepted publickey for peer"))
+        Ok([output.stdout.as_slice(), output.stderr.as_slice()]
+            .concat()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| String::from_utf8_lossy(line).contains("Accepted publickey for peer"))
             .count())
     }
 

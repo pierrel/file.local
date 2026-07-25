@@ -95,18 +95,54 @@ fn watch_rescans_both_directions_after_process_suspension() -> Result<()> {
         watch_max_session_bytes: None,
     })?;
     let watch = a.watch_start()?;
-    b.offline()?;
     watch.suspend()?;
-    a.write("from-awake.txt", "written while disconnected")?;
+    a.write("from-awake.txt", "written while watch was suspended")?;
     b.write("from-sleep.txt", "written while watch was suspended")?;
     std::thread::sleep(std::time::Duration::from_secs(2));
     watch.resume()?;
-    b.online()?;
 
-    b.wait_for_file("from-awake.txt", "written while disconnected")?;
+    b.wait_for_file("from-awake.txt", "written while watch was suspended")?;
     a.wait_for_file("from-sleep.txt", "written while watch was suspended")?;
     watch.wait_for_log("UPLOAD from-awake.txt")?;
     watch.wait_for_log("DOWNLOAD from-sleep.txt")?;
+    e2e::assert_trees_equal(&a, &b)?;
+    watch.stop()
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn watch_recovers_after_network_loss_during_process_suspension() -> Result<()> {
+    let (a, b) = e2e::pair_with(e2e::Config {
+        watch_max_session_bytes: None,
+    })?;
+    let watch = a.watch_start()?;
+    let sessions_before_sleep = b.ssh_session_count()?;
+
+    // Model a laptop sleeping while its network disappears: stop the watch
+    // process, disconnect the peer's real Docker network, edit both mounted
+    // trees, then restore process and network without an explicit sync.
+    watch.suspend()?;
+    b.offline()?;
+    a.write("local-during-sleep.txt", "local offline edit")?;
+    b.write("remote-during-sleep.txt", "remote offline edit")?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    watch.resume()?;
+    watch.wait_for_any_error_with_deadline(
+        &[
+            "Peer connection lost; retrying",
+            "persistent peer closed the protocol stream",
+        ],
+        std::time::Duration::from_secs(60),
+    )?;
+    b.online()?;
+
+    b.wait_for_file("local-during-sleep.txt", "local offline edit")?;
+    a.wait_for_file("remote-during-sleep.txt", "remote offline edit")?;
+    let sessions_after_recovery = b.ssh_session_count()?;
+    anyhow::ensure!(
+        sessions_after_recovery > sessions_before_sleep,
+        "watch did not establish a new SSH session after network recovery"
+    );
     e2e::assert_trees_equal(&a, &b)?;
     watch.stop()
 }

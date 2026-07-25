@@ -15,6 +15,23 @@ use crate::model::{
 };
 use crate::reconcile::Conflict;
 
+#[derive(Debug)]
+pub struct RootIdentityChanged(String);
+
+impl RootIdentityChanged {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for RootIdentityChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RootIdentityChanged {}
+
 #[derive(Clone, serde::Serialize)]
 pub struct StoredConflict {
     pub id: String,
@@ -579,10 +596,11 @@ impl State {
             )
         })?;
         if actual != expected {
-            bail!(
+            return Err(RootIdentityChanged::new(format!(
                 "configured root identity changed at {}; restore the original directory or deliberately remove and reinitialize the share",
                 root.display()
-            );
+            ))
+            .into());
         }
         Ok(actual)
     }

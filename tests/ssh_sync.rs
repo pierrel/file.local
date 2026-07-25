@@ -269,20 +269,39 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
         .env("PATH", &path)
         .stdout(Stdio::piped())
         .spawn()?;
-    let mut stdout = std::io::BufReader::new(watcher.stdout.take().context("watch stdout")?);
-    let mut first_line = String::new();
-    stdout.read_line(&mut first_line)?;
-    let mut connected_line = String::new();
-    loop {
-        connected_line.clear();
-        anyhow::ensure!(
-            stdout.read_line(&mut connected_line)? != 0,
-            "watch exited before ready"
-        );
-        if connected_line.ends_with(" Peer connected\n") {
-            break;
+    let stdout = watcher.stdout.take().context("watch stdout")?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let ready_reader = std::thread::spawn(move || -> Result<()> {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut first_line = String::new();
+        stdout.read_line(&mut first_line)?;
+        let mut connected_line = String::new();
+        loop {
+            connected_line.clear();
+            anyhow::ensure!(
+                stdout.read_line(&mut connected_line)? != 0,
+                "watch exited before ready"
+            );
+            if connected_line.ends_with(" Peer connected\n") {
+                ready_tx
+                    .send(first_line)
+                    .map_err(|_| anyhow::anyhow!("watch readiness receiver disappeared"))?;
+                std::io::copy(&mut stdout, &mut std::io::sink())?;
+                return Ok(());
+            }
         }
-    }
+    });
+    let first_line = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(line) => line,
+        Err(error) => {
+            watcher.kill()?;
+            watcher.wait()?;
+            let reader = ready_reader
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("watch readiness reader panicked")));
+            anyhow::bail!("watch did not become ready within 10 seconds: {error}; {reader:?}");
+        }
+    };
 
     fs::write(remote_root.join("persistent-remote"), "from responder")?;
     wait_for_contents(&local_root.join("persistent-remote"), b"from responder")?;
@@ -306,6 +325,9 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
     assert!(!status.success(), "root identity change is terminal");
+    ready_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("watch readiness reader panicked"))??;
     let (timestamp, rest) = first_line
         .trim_end_matches('\n')
         .split_once(' ')

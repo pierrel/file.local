@@ -123,6 +123,95 @@ fn ignored_unsynchronized_collision_blocks_apply() -> Result<()> {
 }
 
 #[test]
+fn ignored_parent_cannot_be_reincluded_by_nested_rules_during_apply() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("private"))?;
+    fs::write(root.join(".gitignore"), "private/\n")?;
+    fs::write(root.join("private/.gitignore"), "!secret\n")?;
+    fs::write(root.join("private/secret"), "local secret")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let remote = flocal::model::Record {
+        path: flocal::model::RelativePath::from_bytes(b"private/secret".to_vec())?,
+        version: flocal::model::Version {
+            peer: flocal::model::PeerId("remote".into()),
+            sequence: 1,
+            timestamp_ns: 1,
+            seen: Vec::new(),
+            entry: Entry::Tombstone,
+        },
+    };
+
+    let error = apply_plan(&mut state, &share, &[remote]).expect_err("collision must block");
+    assert!(error.to_string().contains("ignored local content"));
+    assert_eq!(
+        fs::read_to_string(root.join("private/secret"))?,
+        "local secret"
+    );
+    Ok(())
+}
+
+#[test]
+fn ignored_parent_cannot_be_reincluded_in_advertised_records() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("private"))?;
+    fs::write(root.join("private/secret"), "local secret")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let initial = refresh(&mut state, &share)?;
+    assert!(
+        initial
+            .iter()
+            .any(|record| record.path.display() == "private/secret")
+    );
+
+    fs::write(root.join(".gitignore"), "private/\n")?;
+    fs::write(root.join("private/.gitignore"), "!secret\n")?;
+    let advertised = refresh(&mut state, &share)?;
+    assert!(
+        !advertised
+            .iter()
+            .any(|record| record.path.display().starts_with("private"))
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("private/secret"))?,
+        "local secret"
+    );
+    Ok(())
+}
+
+#[test]
+fn self_ignored_rule_file_still_filters_advertised_records() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("secret"), "local secret")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    assert!(
+        refresh(&mut state, &share)?
+            .iter()
+            .any(|record| record.path.display() == "secret")
+    );
+
+    fs::write(root.join(".gitignore"), ".gitignore\nsecret\n")?;
+    let advertised = refresh(&mut state, &share)?;
+    assert!(
+        !advertised
+            .iter()
+            .any(|record| record.path.display() == "secret")
+    );
+    assert!(
+        !advertised
+            .iter()
+            .any(|record| record.path.display() == ".gitignore")
+    );
+    Ok(())
+}
+
+#[test]
 fn directory_only_ignore_protects_against_tombstones() -> Result<()> {
     let temp = tempdir()?;
     let root = temp.path().join("root");

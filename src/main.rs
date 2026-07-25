@@ -775,7 +775,8 @@ fn serve_watch_open(
                 round = incoming;
                 if let Err(error) = serve_v2_round(state, &share, &share_root, round, input, output)
                 {
-                    let retryable = error.downcast_ref::<WatchProtocolError>().is_none();
+                    let retryable = error.downcast_ref::<WatchProtocolError>().is_none()
+                        && error.downcast_ref::<sync::RootIdentityChanged>().is_none();
                     write_v2_session(
                         output,
                         V2SessionFrame::Error {
@@ -1555,6 +1556,9 @@ fn is_terminal_watch_error(error: &anyhow::Error) -> bool {
         return !remote.retryable;
     }
     if error.downcast_ref::<WatchProtocolError>().is_some() {
+        return true;
+    }
+    if error.downcast_ref::<sync::RootIdentityChanged>().is_some() {
         return true;
     }
     let message = format!("{error:#}");

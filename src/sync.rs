@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::model::{Entry, ObjectHash, PeerId, Record, ShareId};
 use crate::reconcile::{Plan, reconcile};
-use crate::scan::{IgnoreMatcher, preview_cap, scan_cap};
+use crate::scan::{IgnoreMatcher, preview_cap_with_ignores, scan_cap, scan_cap_with_ignores};
+pub use crate::state::RootIdentityChanged;
 use crate::state::{InstallTempPhase, RootIdentity, State};
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
@@ -98,7 +99,10 @@ impl ShareRoot {
             }
         };
         if identity != state.expected_root_identity(share)? {
-            bail!("configured root changed while opening its directory capability");
+            return Err(RootIdentityChanged::new(
+                "configured root identity changed while opening its directory capability",
+            )
+            .into());
         }
         let directory = cap_std::fs::Dir::from_std_file(file);
         state.validate_root_identity(share)?;
@@ -111,7 +115,10 @@ impl ShareRoot {
 
     pub fn validate(&self, state: &State, share: &ShareId) -> Result<()> {
         if self.identity != state.expected_root_identity(share)? {
-            bail!("held root capability does not match the persisted root identity");
+            return Err(RootIdentityChanged::new(
+                "held root capability: configured root identity changed",
+            )
+            .into());
         }
         state.validate_root_identity(share)?;
         Ok(())
@@ -559,16 +566,17 @@ pub fn refresh_with_root(
 ) -> Result<Vec<Record>> {
     root.validate(state, share)?;
     let previous = state.records(share)?;
-    let records = scan_cap(state, share, &root.path, &root.directory, &previous)?;
+    let (records, matcher) =
+        scan_cap_with_ignores(state, share, &root.path, &root.directory, &previous)?;
     root.validate(state, share)?;
     state.replace_records(share, &records)?;
-    advertised_records(root, &records)
+    Ok(advertised_records(&matcher, &records))
 }
 
 pub fn preview_refresh(state: &State, share: &ShareId) -> Result<Vec<Record>> {
     let root = ShareRoot::open(state, share)?;
     root.validate(state, share)?;
-    let records = preview_cap(
+    let (records, matcher) = preview_cap_with_ignores(
         state,
         share,
         &root.path,
@@ -576,16 +584,15 @@ pub fn preview_refresh(state: &State, share: &ShareId) -> Result<Vec<Record>> {
         &state.records(share)?,
     )?;
     root.validate(state, share)?;
-    advertised_records(&root, &records)
+    Ok(advertised_records(&matcher, &records))
 }
 
-fn advertised_records(root: &ShareRoot, records: &[Record]) -> Result<Vec<Record>> {
-    let matcher = IgnoreMatcher::from_cap(&root.path, &root.directory)?;
-    Ok(records
+fn advertised_records(matcher: &IgnoreMatcher, records: &[Record]) -> Vec<Record> {
+    records
         .iter()
         .filter(|record| !matcher.is_record_ignored(record))
         .cloned()
-        .collect())
+        .collect()
 }
 
 pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Result<()> {
