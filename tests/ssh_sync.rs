@@ -4,6 +4,7 @@ use std::fs;
 use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use flocal::state::State;
@@ -257,11 +258,8 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
     assert!(!remote_root.join("cumulative-local-a").exists());
     assert!(!remote_root.join("cumulative-local-b").exists());
 
-    // `watch` on the real, already-paired, already-synced binary: its
-    // startup line is the one piece of watch's timestamped-output behavior
-    // this suite can drive through a real subprocess rather than only
-    // in-process. Reading exactly one line and killing the
-    // child keeps this bounded — nothing here waits on the 30-second loop.
+    // Drive the persistent connector and responder through the fake SSH
+    // process boundary, then edit in both directions without another command.
     let mut watcher = Command::new(binary)
         .args(["watch", local_root.to_str().unwrap()])
         .env("FLOCAL_STATE_DIR", &local_state)
@@ -271,11 +269,65 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
         .env("PATH", &path)
         .stdout(Stdio::piped())
         .spawn()?;
-    let mut stdout = std::io::BufReader::new(watcher.stdout.take().context("watch stdout")?);
-    let mut first_line = String::new();
-    stdout.read_line(&mut first_line)?;
-    watcher.kill()?;
-    watcher.wait()?;
+    let stdout = watcher.stdout.take().context("watch stdout")?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let ready_reader = std::thread::spawn(move || -> Result<()> {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut first_line = String::new();
+        stdout.read_line(&mut first_line)?;
+        let mut connected_line = String::new();
+        loop {
+            connected_line.clear();
+            anyhow::ensure!(
+                stdout.read_line(&mut connected_line)? != 0,
+                "watch exited before ready"
+            );
+            if connected_line.ends_with(" Peer connected\n") {
+                ready_tx
+                    .send(first_line)
+                    .map_err(|_| anyhow::anyhow!("watch readiness receiver disappeared"))?;
+                std::io::copy(&mut stdout, &mut std::io::sink())?;
+                return Ok(());
+            }
+        }
+    });
+    let first_line = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(line) => line,
+        Err(error) => {
+            watcher.kill()?;
+            watcher.wait()?;
+            let reader = ready_reader
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("watch readiness reader panicked")));
+            anyhow::bail!("watch did not become ready within 10 seconds: {error}; {reader:?}");
+        }
+    };
+
+    fs::write(remote_root.join("persistent-remote"), "from responder")?;
+    wait_for_contents(&local_root.join("persistent-remote"), b"from responder")?;
+    fs::write(local_root.join("persistent-local"), "from connector")?;
+    wait_for_contents(&remote_root.join("persistent-local"), b"from connector")?;
+    // End watch through its real terminal root-identity path rather than
+    // SIGKILL, so subprocess coverage and teardown both flush deterministically.
+    let displaced_root = temp.path().join("displaced-remote-root");
+    fs::rename(&remote_root, &displaced_root)?;
+    fs::create_dir(&remote_root)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = watcher.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            watcher.kill()?;
+            watcher.wait()?;
+            anyhow::bail!("watch did not stop after its registered root identity changed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert!(!status.success(), "root identity change is terminal");
+    ready_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("watch readiness reader panicked"))??;
     let (timestamp, rest) = first_line
         .trim_end_matches('\n')
         .split_once(' ')
@@ -298,4 +350,17 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
         format!("Watching {}", local_root.canonicalize()?.display())
     );
     Ok(())
+}
+
+fn wait_for_contents(path: &std::path::Path, expected: &[u8]) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read(path).is_ok_and(|contents| contents == expected) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("{} did not converge before the deadline", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }

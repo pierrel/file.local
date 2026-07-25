@@ -8,6 +8,7 @@ use super::docker::{RunContext, SHARE, image_tag, unique_token};
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(30);
+const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 /// Where a started watcher records its pid inside the container. One watch
 /// per scenario container, so a fixed path suffices — and keeps the start
 /// command a constant string with nothing interpolated into it.
@@ -78,9 +79,6 @@ pub struct Peer {
 /// only a `Connector` can `sync` or `watch`.
 pub struct Connector {
     peer: Peer,
-    /// `pair_with`'s rescan knob, exported to `watch` invocations as
-    /// `FLOCAL_WATCH_RESCAN_SECONDS`. `None` leaves the product default.
-    watch_rescan_seconds: Option<u64>,
     watch_max_session_bytes: Option<u64>,
 }
 
@@ -190,14 +188,12 @@ pub fn pair() -> Result<(Connector, Peer)> {
 /// the watch rescan interval (design section 14.1), which watch scenarios
 /// set to the one-second floor so a cycle costs a second, not thirty.
 pub struct Config {
-    pub watch_rescan_seconds: u64,
     pub watch_max_session_bytes: Option<u64>,
 }
 
 /// `pair()` with knobs applied to the returned handles.
 pub fn pair_with(config: Config) -> Result<(Connector, Peer)> {
     let (mut connector, responder) = pair()?;
-    connector.watch_rescan_seconds = Some(config.watch_rescan_seconds);
     connector.watch_max_session_bytes = config.watch_max_session_bytes;
     Ok((connector, responder))
 }
@@ -304,7 +300,6 @@ impl PeerBox {
         Ok((
             Connector {
                 peer: self.peer,
-                watch_rescan_seconds: None,
                 watch_max_session_bytes: None,
             },
             other.peer,
@@ -431,16 +426,10 @@ impl Connector {
         let start = format!(
             ": >{WATCH_LOG} && echo \"$$\" >{WATCH_PIDFILE} && exec flocal watch {SHARE} >{WATCH_LOG}"
         );
-        let rescan = self
-            .watch_rescan_seconds
-            .map(|seconds| format!("FLOCAL_WATCH_RESCAN_SECONDS={seconds}"));
         let max_bytes = self
             .watch_max_session_bytes
             .map(|bytes| format!("FLOCAL_MAX_SESSION_BYTES={bytes}"));
         let mut args = vec!["exec", "-d", "-u", "peer"];
-        if let Some(rescan) = &rescan {
-            args.extend_from_slice(&["-e", rescan]);
-        }
         if let Some(max_bytes) = &max_bytes {
             args.extend_from_slice(&["-e", max_bytes]);
         }
@@ -533,6 +522,24 @@ impl Watch<'_> {
     pub fn wait_for_error(&self, needle: &str) -> Result<()> {
         self.peer
             .wait_for_text("/home/peer/.flocal-stderr.log", needle)
+    }
+
+    pub fn wait_for_any_error_with_deadline(
+        &self,
+        needles: &[&str],
+        deadline: Duration,
+    ) -> Result<()> {
+        self.peer.poll_until(
+            &format!("watch stderr never contained any of {needles:?}"),
+            deadline,
+            |peer| {
+                let output = peer.exec_raw(&["cat", "--", "/home/peer/.flocal-stderr.log"])?;
+                let stderr = String::from_utf8_lossy(&output.stdout);
+                Ok((output.status.success()
+                    && needles.iter().any(|needle| stderr.contains(needle)))
+                .then_some(()))
+            },
+        )
     }
 
     pub fn assert_log_absent(&self, needle: &str) -> Result<()> {
@@ -736,6 +743,21 @@ impl Peer {
     /// until it holds, or dumps and fails when the deadline expires.
     pub fn wait_for_file(&self, path: &str, content: &str) -> Result<()> {
         self.check(self.file_condition(path, content)?, DEADLINE)
+    }
+
+    pub fn wait_for_file_promptly(&self, path: &str, content: &str) -> Result<()> {
+        self.check(self.file_condition(path, content)?, PROMPT_DEADLINE)
+    }
+
+    /// Counts authenticated SSH sessions accepted by this peer's real sshd.
+    /// Scenarios take a baseline so pairing and explicit sync are excluded.
+    pub fn ssh_session_count(&self) -> Result<usize> {
+        let output = self.context.docker_ok(&["logs", &self.container.name])?;
+        Ok([output.stdout.as_slice(), output.stderr.as_slice()]
+            .concat()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| String::from_utf8_lossy(line).contains("Accepted publickey for peer"))
+            .count())
     }
 
     pub fn assert_absent(&self, path: &str) -> Result<()> {

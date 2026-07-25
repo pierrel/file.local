@@ -4,7 +4,7 @@ use anyhow::Result;
 use flocal::model::{Entry, ObjectHash, PeerId, Record, RelativePath, Version};
 use flocal::reconcile::{Conflict, Plan};
 use flocal::state::State;
-use flocal::sync::{self, Message};
+use flocal::sync::{self, InitialMessage, Message, V2Envelope, V2RoundFrame, V2SessionFrame};
 use tempfile::tempdir;
 
 fn record(path: &[u8], entry: Entry) -> Result<Record> {
@@ -18,6 +18,214 @@ fn record(path: &[u8], entry: Entry) -> Result<Record> {
             entry,
         },
     })
+}
+
+#[test]
+fn v1_wire_format_and_initial_dispatch_remain_compatible() -> Result<()> {
+    let message = Message::Sync {
+        protocol: sync::SYNC_PROTOCOL_VERSION,
+        share: flocal::model::ShareId("share".into()),
+        peer: PeerId("peer".into()),
+        dry_run: false,
+    };
+    let mut wire = Vec::new();
+    sync::write_message(&mut wire, &message)?;
+    assert_eq!(
+        &wire[4..],
+        br#"{"type":"sync","protocol":1,"share":"share","peer":"peer","dry_run":false}"#
+    );
+    assert!(matches!(
+        sync::read_message(&mut wire.as_slice())?,
+        Message::Sync { protocol: 1, .. }
+    ));
+
+    let initial = InitialMessage::Sync {
+        protocol: sync::SYNC_PROTOCOL_VERSION,
+        share: flocal::model::ShareId("share".into()),
+        peer: PeerId("peer".into()),
+        dry_run: false,
+    };
+    let mut initial_wire = Vec::new();
+    sync::write_initial_message(&mut initial_wire, &initial)?;
+    assert_eq!(
+        sync::read_initial_message(&mut initial_wire.as_slice())?,
+        initial
+    );
+
+    let mut non_handshake = Vec::new();
+    sync::write_message(&mut non_handshake, &Message::Done)?;
+    assert!(sync::read_initial_message(&mut non_handshake.as_slice()).is_err());
+    Ok(())
+}
+
+#[test]
+fn v2_session_and_round_frames_are_closed_and_round_tagged() -> Result<()> {
+    let share = flocal::model::ShareId("share".into());
+    let peer = PeerId("peer".into());
+    let hash = ObjectHash::from_blake3(blake3::hash(b"object"));
+    let sample = record(b"file", Entry::Tombstone)?;
+    let conflict = Conflict {
+        path: sample.path.clone(),
+        winner: sample.clone(),
+        loser: record(b"loser", Entry::Directory)?,
+    };
+    let session_frames = vec![
+        V2SessionFrame::WatchOpen {
+            protocol: sync::WATCH_PROTOCOL_VERSION,
+            share,
+            peer: peer.clone(),
+        },
+        V2SessionFrame::WatchAccepted {
+            protocol: sync::WATCH_PROTOCOL_VERSION,
+            peer,
+        },
+        V2SessionFrame::Ready { generation: 3 },
+        V2SessionFrame::Changed { generation: 4 },
+        V2SessionFrame::Ping { nonce: 5 },
+        V2SessionFrame::Pong { nonce: 5 },
+    ];
+    for frame in session_frames {
+        let envelope = V2Envelope::Session { frame };
+        let mut wire = Vec::new();
+        sync::write_v2_envelope(&mut wire, &envelope)?;
+        assert_eq!(sync::read_v2_envelope(&mut wire.as_slice())?, envelope);
+        assert!(sync::read_message(&mut wire.as_slice()).is_err());
+    }
+
+    let round_frames = vec![
+        V2RoundFrame::SyncStart {
+            connector_generation: 7,
+            responder_generation: 8,
+        },
+        V2RoundFrame::SyncAccepted,
+        V2RoundFrame::SnapshotChunk {
+            records: vec![sample.clone()],
+        },
+        V2RoundFrame::SnapshotEnd,
+        V2RoundFrame::Need {
+            hashes: vec![hash.clone()],
+        },
+        V2RoundFrame::ObjectStart { hash, size: 6 },
+        V2RoundFrame::ObjectChunk {
+            data: b"object".to_vec(),
+        },
+        V2RoundFrame::ObjectEnd,
+        V2RoundFrame::ApplyChunk {
+            records: vec![sample],
+            conflicts: vec![conflict],
+        },
+        V2RoundFrame::ApplyEnd,
+        V2RoundFrame::Applied,
+        V2RoundFrame::Done,
+        V2RoundFrame::SyncFinished,
+        V2RoundFrame::SyncFailed {
+            retryable: true,
+            message: "temporary".into(),
+        },
+    ];
+    for frame in round_frames {
+        let envelope = V2Envelope::Round { round: 11, frame };
+        let mut wire = Vec::new();
+        sync::write_v2_envelope(&mut wire, &envelope)?;
+        assert_eq!(sync::read_v2_envelope(&mut wire.as_slice())?, envelope);
+        let json = std::str::from_utf8(&wire[4..])?;
+        assert!(json.contains("\"scope\":\"round\"") && json.contains("\"round\":11"));
+    }
+    Ok(())
+}
+
+#[test]
+fn versioned_decoders_reject_cross_version_untagged_unknown_and_oversized_frames() -> Result<()> {
+    let initial = InitialMessage::WatchOpen {
+        protocol: sync::WATCH_PROTOCOL_VERSION,
+        share: flocal::model::ShareId("share".into()),
+        peer: PeerId("peer".into()),
+    };
+    let mut wire = Vec::new();
+    sync::write_initial_message(&mut wire, &initial)?;
+    assert!(sync::read_message(&mut wire.as_slice()).is_err());
+    assert!(sync::read_v2_envelope(&mut wire.as_slice()).is_err());
+
+    fn framed(json: &[u8]) -> Vec<u8> {
+        let mut wire = (json.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(json);
+        wire
+    }
+    let untagged = framed(br#"{"type":"done"}"#);
+    assert!(sync::read_v2_envelope(&mut untagged.as_slice()).is_err());
+    let unknown = framed(br#"{"scope":"session","frame":{"type":"surprise"}}"#);
+    assert!(sync::read_v2_envelope(&mut unknown.as_slice()).is_err());
+    let extra = framed(br#"{"scope":"session","frame":{"type":"ping","nonce":1,"extra":2}}"#);
+    assert!(sync::read_v2_envelope(&mut extra.as_slice()).is_err());
+
+    let oversized = ((sync::MAX_FRAME as u32) + 1).to_be_bytes().to_vec();
+    assert!(sync::read_initial_message(&mut oversized.as_slice()).is_err());
+    assert!(sync::read_v2_envelope(&mut oversized.as_slice()).is_err());
+    assert!(
+        sync::write_v2_envelope(
+            &mut Vec::new(),
+            &V2Envelope::Round {
+                round: 1,
+                frame: V2RoundFrame::ObjectChunk {
+                    data: vec![0; sync::MAX_FRAME],
+                },
+            },
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn persistent_frames_have_absolute_slow_read_and_blocked_write_deadlines() -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    let (mut slow_writer, slow_reader) = UnixStream::pair()?;
+    let drip = std::thread::spawn(move || {
+        slow_writer.write_all(&[0]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = slow_writer.write_all(&[0, 0, 0]);
+    });
+    let error =
+        sync::read_v2_envelope_until(&slow_reader, Instant::now() + Duration::from_millis(20))
+            .expect_err("a slow-dripped prefix must time out absolutely");
+    assert!(
+        format!("{error:#}").contains("deadline exceeded"),
+        "{error:#}"
+    );
+    drip.join().expect("slow writer joins");
+
+    let (blocked_writer, _blocked_reader) = UnixStream::pair()?;
+    let large = V2Envelope::Round {
+        round: 1,
+        frame: V2RoundFrame::ObjectChunk {
+            data: vec![0; sync::MAX_FRAME / 4],
+        },
+    };
+    let error = sync::write_v2_envelope_until(
+        &blocked_writer,
+        &large,
+        Instant::now() + Duration::from_millis(20),
+    )
+    .expect_err("a peer that stops reading must not block a frame forever");
+    assert!(
+        format!("{error:#}").contains("deadline exceeded"),
+        "{error:#}"
+    );
+
+    let (writer, reader) = UnixStream::pair()?;
+    let envelope = V2Envelope::Session {
+        frame: V2SessionFrame::Ping { nonce: 9 },
+    };
+    sync::write_v2_envelope_until(&writer, &envelope, Instant::now() + Duration::from_secs(1))?;
+    assert_eq!(
+        sync::read_v2_envelope_until(&reader, Instant::now() + Duration::from_secs(1))?,
+        envelope
+    );
+    Ok(())
 }
 
 #[test]

@@ -1,0 +1,699 @@
+#+title: Persistent two-sided alpha watch protocol design
+
+* State
+
+Drafted and independently reviewed 2026-07-24. The user approved this reviewed
+design for implementation without integrating Automerge or p2panda. All
+required design-review lenses converged with no blocker or important finding;
+section 14 records the findings resolved during review.
+
+This document deliberately specifies a bounded alpha slice suitable for one
+pull request: one persistent SSH session, watchers on both peers, coalesced
+change notifications, serialized event-triggered reconciliation, heartbeat,
+reconnect recovery, and a low-frequency correctness audit. A real filesystem event still causes the existing full
+scan/reconciliation algorithm. Removing frequent scans while healthy and idle addresses
+the immediate SSH/disk/battery problem; the 15-minute audit bounds silent
+backend-notification loss without combining the feature with a new
+incremental filesystem index and acknowledgement protocol.
+
+* 1. User-visible contract
+
+1. =flocal watch PATH= on the connector opens one SSH session. The responder
+   starts a watcher for its registered share root inside that session.
+2. A filesystem event on either peer schedules synchronization 250 ms after the
+   last event, with a two-second maximum delay during a continuous burst.
+3. While healthy and idle, the peers exchange only a small heartbeat every 30
+   seconds. Every 15 minutes an internal safety timer requests one full audit
+   reconciliation over the same SSH session. No second SSH process is opened,
+   and empty heartbeats/audits produce no successful-action log. Thus normal
+   idle scan frequency falls from 30 seconds to 15 minutes (30x fewer scans)
+   rather than claiming that a fallible OS event backend needs no audit.
+4. Both peers perform a complete scan before the session becomes ready. A new
+   session after sleep, network loss, process death, or SSH failure therefore
+   catches edits made while either watcher was absent.
+5. A watcher error, overflow, backend loss, or channel disconnect marks watcher
+   health lost before attempting to wake the coordinator. It terminates the
+   session and requires watcher recreation plus mandatory startup scans; the
+   process never continues under a watcher whose completeness is unknown.
+6. The connector reconnects without intervention with bounded exponential
+   backoff. Existing truthful logging remains: proposed path actions are not
+   printed by =watch=; completed actions print only after both application
+   commit points; failures repeat at the existing bounded cadence; recovery is
+   logged only after reconciliation succeeds.
+7. Connector/responder remains a connection-lifecycle distinction only. Both
+   replicas retain equal read/write authority, but only the connector starts SSH
+   and coordinates rounds.
+
+The implementation PR must revise =README.org= accurately: routine events are
+prompt and the persistent session avoids per-round SSH startup; change-driven
+rounds still scan the whole tree; a 15-minute full safety audit bounds silent
+notification loss; operation/version-vector deltas remain deferred. README
+must not say that a healthy watcher performs no periodic scan in this alpha.
+Its build/try checklist must explicitly say:
+
+- install or upgrade the new =flocal= binary on both peers before using
+  persistent =watch=;
+- before first running the upgraded binary, verify every registered canonical
+  root path is mounted and names the intended directory because that one run
+  backfills its durable device/inode binding;
+- during a rolling upgrade, version-1 explicit =flocal sync= remains usable;
+- persistent =watch= is disabled until both peers support protocol 2; and
+- downgrading is state-safe because older code ignores the additive root-identity
+  columns, but the downgraded pair returns to explicit sync and cannot
+  persistent-watch.
+
+* 2. Protocol version and concrete frames
+
+Persistent watch is protocol version 2. Existing explicit one-shot =sync=
+continues using version 1 during rolling upgrades. A version-1 peer cannot
+satisfy persistent watch: =watch= remains in its bounded reconnect loop until
+both peers are upgraded rather than silently returning to periodic polling.
+EOF during negotiation is deliberately retryable because it is
+indistinguishable from a transient SSH loss or responder crash.
+
+The implementation uses separate wire types and constants, not one enum whose
+variants are accidentally accepted in both modes:
+
+#+begin_src rust
+const SYNC_PROTOCOL_VERSION: u32 = 1;
+const WATCH_PROTOCOL_VERSION: u32 = 2;
+
+enum V1Message { /* existing one-shot frames */ }
+enum V2Envelope {
+    Session(V2SessionFrame),
+    Round { round: u64, frame: V2RoundFrame },
+}
+#+end_src
+
+Initial dispatch reads only a small tagged handshake envelope and selects the
+V1 or V2 decoder. After selection, no cross-version variant is representable in
+that session. Protocol version is distinct from any future JSON output schema.
+
+Frames retain the four-byte big-endian length, JSON payload, 2 MiB per-frame
+limit, and existing path/record encodings. New frames are:
+
+#+begin_src rust
+WatchOpen {
+    protocol: 2,
+    share: ShareId,
+    peer: PeerId,
+}
+WatchAccepted {
+    protocol: 2,
+    peer: PeerId,
+}
+Ready {
+    generation: u64,
+}
+Changed {
+    generation: u64,
+}
+Ping {
+    nonce: u64,
+}
+Pong {
+    nonce: u64,
+}
+Error {
+    retryable: bool,
+    message: String,
+}
+SyncStart {
+    round: u64,
+    connector_generation: u64,
+    responder_generation: u64,
+}
+SyncAccepted {
+    round: u64,
+}
+SyncFinished {
+    round: u64,
+}
+SyncFailed {
+    round: u64,
+    retryable: bool,
+    message: String,
+}
+#+end_src
+
+After =SyncAccepted=, the round reuses the semantics, not the Rust wire type, of
+the version-1 bounded
+=SnapshotChunk/SnapshotEnd=, =Need=, object, =ApplyChunk/ApplyEnd=, =Applied=,
+and =Done= flow. Every one is a =V2RoundFrame= inside =V2Envelope::Round=;
+there are no untagged reused V1 frames. A late or duplicated frame therefore
+cannot satisfy another round. Frame direction and phase are closed: an unknown,
+unsolicited, wrong-direction, or wrong-round frame ends the session.
+
+The persistent session is intentionally half-duplex during a sync round. One
+coordinator is the sole protocol reader, writer, and state-machine owner. The
+SSH descriptors are polled directly and every prefix, payload, and write has an
+absolute deadline; no background protocol-reader thread can survive teardown or
+deliver a stale frame to a later connection. Notify callbacks never perform
+protocol I/O: they update coalesced generation state and nonblockingly
+=try_send= a capacity-one local wake. A full wake channel means work is already
+pending; generation state remains authoritative and is checked after every
+frame, wake, and deadline. This avoids competing readers, orphan reader threads,
+and an async runtime/general multiplexing layer.
+
+* 3. State and data flow
+
+1. The connector validates initial reconciliation, acquires the existing global
+   and share locks for the watcher's lifetime, opens and validates a stable root
+   capability as section 5 specifies, installs its local recommended watcher,
+   performs =sync::refresh= through that capability, starts one SSH responder,
+   and sends =WatchOpen=.
+2. The responder authenticates protocol, stable share, and bound peer exactly
+   as one-shot sync does. It acquires its locks for the session, installs a
+   watcher on the registered root, opens the same kind of stable root capability,
+   performs =sync::refresh= through it, replies
+   =WatchAccepted= and =Ready=. The connector replies =Ready=.
+3. The connector immediately runs one startup round using the already refreshed
+   snapshots. This is the connection commit point: only its successful
+   completion resets retry backoff and emits "synchronization resumed."
+4. Each watcher callback shares one authoritative value:
+
+   #+begin_src rust
+   struct WatchState {
+       generation: u64,
+       lost: Option<BoundedError>,
+   }
+   #+end_src
+
+   Debounce timing belongs solely to the coordinator, which records first/latest
+   wake instants. Under the =WatchState= mutex, a normal callback checked-increments the
+   generation, releases the mutex, and nonblockingly wakes the coordinator.
+   It does not retain paths, touch SQLite, scan, hash, log, or use protocol I/O.
+5. Round generation handling obeys an explicit invariant. At begin, under the
+   same mutex, the coordinator copies =frozen_generation= without clearing it.
+   On successful completion it advances
+   =completed_generation = max(completed_generation, frozen_generation)= and
+   work remains pending exactly when =generation > completed_generation=.
+   Completion performs a final locked =lost= check; loss advances nothing.
+   Failure advances nothing.
+   Thus a callback racing begin/complete cannot be erased.
+   On watcher error, overflow, backend loss, or channel disconnect, the callback
+   first stores the bounded cause in =lost= under the mutex, then best-effort
+   =try_send= of a capacity-one local wake. It does not depend on enqueueing a
+   distinct loss event: after every received session event and every deadline,
+   before scan/apply, and before declaring ready, the coordinator rechecks
+   =lost=. A full capacity-one channel therefore cannot erase watcher loss. Any
+   stored loss tears down the session, recreates watcher/session state, and
+   relies on mandatory startup scans.
+6. Outside a round, the responder coordinator sends =Changed= after its
+   debounce/max-burst deadline. The connector observes its own equivalent state
+   locally. Multiple notifications coalesce by generation.
+7. When either advertised generation is newer than the last successfully
+   reconciled generation, the connector sends =SyncStart=. Both peers freeze
+   the selected generations, run the existing complete no-follow refresh, then
+   execute one existing reconciliation and object/apply exchange within the
+   same SSH process.
+8. Events arriving during scanning, transfer, or apply increment a later
+   generation. Remote application may itself generate events. Those cause one
+   harmless follow-up round; equality against stored records makes unchanged
+   files no-ops. Correctness does not depend on suppressing self-generated
+   watcher events by timing.
+9. After both application commit points, the connector emits the existing
+   timestamped completed-action report and sends =SyncFinished=. Each side marks
+   only the frozen generation reconciled. If a newer generation exists, another
+   debounced round follows.
+10. A retryable round error closes the whole session. Reusing a possibly
+   desynchronized framed stream is forbidden. Reconnection performs fresh full
+   scans on both peers and starts a new round.
+
+Generations remain in-memory scheduling hints, but stable-root binding requires
+the schema migration in sections 5 and 13. Durable =Record= versions,
+tombstones, objects, conflicts, install intents, and the expected root identity
+remain the synchronization state and repair boundary.
+
+11. The coordinator owns session shutdown. On any exit it drops the transport
+    descriptors, kills the SSH child when necessary, waits/reaps it, and joins
+    the bounded stderr-drain thread before retrying or returning. No protocol
+    reader thread exists or can retain state across sessions. The responder's
+    descriptor-backed loop returns before releasing its share locks.
+
+* 4. Debounce, heartbeat, sleep, and retry
+
+1. Debounce is 250 ms after the latest event with a maximum two seconds after
+   the first pending event. Timing uses =Instant=, never wall time.
+2. While idle, the connector sends =Ping= every 30 seconds. The matching
+   =Pong= is required within 30 seconds; any valid round traffic also proves
+   liveness. Heartbeats are not sent mid-round.
+3. Independently, the connector schedules a safety audit every 15 minutes from
+   the completion of the last full round. It sends an ordinary =SyncStart= with
+   the current generations; "audit" is connector-local scheduling/observability
+   state and is not a wire field. It opens no new SSH process. The interval is
+   an internal =WatchConfig= value for deterministic tests, not a public
+   environment knob in this slice.
+4. SSH EOF, child exit, heartbeat timeout, protocol timeout, or a monotonic-time
+   jump greater than 60 seconds is possible sleep/network loss. The connector
+   terminates/reaps the old child and reconnects. Correctness does not depend on
+   Linux or macOS wake APIs.
+5. Retry delays are 1, 2, 4, 8, 16, 30, then 60 seconds, capped at 60 seconds,
+   with up to 20% random jitter. Only a completed startup round resets backoff.
+   Local events while offline merely ensure the reconnect scan has work; they
+   do not create concurrent SSH attempts.
+6. Reachability, timeout, EOF, remote-busy, and temporary watcher-capacity/setup
+   errors retry. Authentication, bound-peer mismatch, incompatible protocol,
+   unsafe path, persisted root-identity mismatch/missing root, and invalid peer
+   frames stop =watch= as actionable configuration/security errors.
+7. The existing first/five-minute/recovered error reporter remains the single
+   rate limit even when error text changes. Recovery says synchronization
+   resumed only after the startup round commits.
+   The first failure includes concrete remediation when known: a busy
+   share names the competing sync/watch and advises stopping/waiting for it; a
+   missing/replaced/mismatched root says watch stopped, identifies the configured
+   path, and says to restore the original identity or deliberately
+   remove/re-init/re-pair rather than retrying; watcher-capacity exhaustion identifies inotify/FSEvents
+   setup and points Linux users to their inotify watch limit or advises reducing
+   watched trees. Periodic summaries may be shorter but retain the latest cause.
+8. Every framed transport read and write has a 30-second hard absolute deadline
+   covering its four-byte prefix and entire payload; slow-drip bytes do not
+   reset it. Connector child stdin/stdout and responder stdin/stdout are put in
+   nonblocking mode and driven with =rustix= =poll= against the remaining
+   monotonic deadline. =WouldBlock= returns to polling; zero progress does not
+   extend the deadline. This makes a responder blocked on connector output, and
+   a connector blocked on responder output, terminate symmetrically instead of
+   hanging in =write_all=. EOF/timeout returns to coordinator-owned teardown;
+   the connector kills/waits its SSH child and joins its bounded stderr drain.
+9. Five minutes is a round budget checked before and after each synchronous
+   filesystem phase (scan, object open/hash/store, apply/install-temp recovery,
+   state commit/prune) and used as the tighter bound for every intervening
+   framed I/O deadline. This is not a hard preemption guarantee for filesystem
+   code: an individual blocking filesystem syscall cannot safely be forcibly
+   interrupted by this design. Once it returns, elapsed budget fails the round
+   before the next phase/commit where existing transaction boundaries permit.
+   Documentation and errors call this an elapsed round budget, not an absolute
+   five-minute completion promise. Existing byte/metadata limits also apply.
+10. Graceful signal-driven =Close= is deferred: the repository has no justified
+   signal-coordination dependency yet. Normal pipe/EOF teardown and process
+   termination rely on existing install-intent crash recovery. The protocol may
+   retain a future close capability only after lifecycle implementation needs
+   it; this PR does not add an unused signal path.
+
+* 5. Full-scan triggers and wake correctness
+
+A complete reconciliation scan occurs:
+
+- on both peers at every new persistent session;
+- after any coalesced local or remote change notification;
+- after notify error, overflow, channel disconnect, or ambiguous backend event;
+- after root loss/restoration or watcher recreation;
+- every 15 minutes as the low-frequency safety audit on the existing session;
+- and when explicit sync/control repair is added later.
+
+Sleep or stopped-watch edits are recovered by the mandatory next-session scan.
+If a supported OS watcher silently loses an event without reporting watcher loss
+while the SSH session remains healthy, the safety audit discovers it within 15
+minutes. The audit is intentionally much less frequent than the old 30-second
+poll and is the correctness backstop for imperfect OS notification semantics.
+
+At =init= and responder registration, persist the no-follow canonical root's
+stable Unix identity =(st_dev, st_ino)= in the =shares= row as =root_device= and
+=root_inode= (lossless decimal strings, avoiding SQLite signed-width ambiguity).
+The two supported platforms are Unix and expose these fields. A session opens
+the canonical share root once as a no-follow directory capability and requires
+its identity to equal that persisted expected identity before installing the
+watcher or scanning. That held
+capability is the sole filesystem authority for the entire session: scan,
+ignore-file discovery/open, object capture, apply, parent traversal, atomic
+replacement, install-temporary creation/recovery/rename, executable-bit update,
+and directory fsync are all descriptor-relative beneath it. These APIs accept a
+=ShareRoot= capability and cannot ambiently reopen =State::root_for= or join a
+stored path. The configured absolute path is used only for identity validation
+and display.
+
+Immediately before and after scan, and again immediately before and after the
+filesystem apply/install-temp phase, compare the held capability identity with
+a no-follow open/stat of the configured canonical root path and require both to
+equal the persisted expected identity. Root missing, non-directory, symlink,
+device/inode mismatch, or any pre/post mismatch is a terminal, actionable root
+identity error—not a retryable invitation to adopt a new root. A pre-scan
+mismatch occurs before tombstone generation; a
+post-scan mismatch occurs before =replace_records=; a pre-apply mismatch occurs
+before visible writes; a post-apply mismatch prevents metadata/generation
+completion and committed-action output, leaving existing install-intent recovery
+to reconcile the possibly applied held tree. The replacement path is never
+modified. Reconnect and process restart continue requiring the stored identity,
+so a replacement held at the configured path across retries is never scanned or
+adopted. A legitimate move, filesystem restore with a new inode, or recreated
+root requires a future explicit separately reviewed rebind workflow. This PR
+instead instructs the user to restore the original root or deliberately
+remove/re-init/re-pair the share; it never silently changes the binding.
+
+Legacy rows receive nullable columns transactionally, then the upgrade
+migration no-follow opens every configured canonical root and backfills its
+identity once. This is an explicit one-time trust boundary: users must ensure
+each configured path names the intended root while first opening the upgraded
+binary. If any root is missing, a symlink, replaced during pre/post stat, or
+cannot be opened, migration aborts without backfilling any row and reports how
+to restore/verify it before retry. Once populated, normal commands never
+overwrite these columns. Migration tests pin both this all-or-nothing backfill
+and the permanent post-migration identity requirement.
+
+* 6. Resource and security limits
+
+1. Retain the 2 MiB frame limit, one-million-record and 256 MiB metadata limits,
+   10 GiB default transfer budget, hash/size checks, normalized relative paths,
+   reserved-name exclusion, and descriptor-relative no-follow scan/apply.
+   Cumulative limits reset once per round, never once per chunk.
+2. Shared watcher state is one =WatchState { generation: u64, lost:
+   Option<BoundedError> }= and the notify wake channel has capacity
+   one, so an event storm has constant scheduling
+   memory. Generation increment is checked; exhaustion closes and restarts the
+   session rather than wrapping. One session, watcher, SSH child, in-flight
+   round, heartbeat, and reconnect attempt exist per connector share.
+3. Round IDs and heartbeat nonces are checked. Counts, frame phase, authenticated
+   peer/share identity, and =Accepted= identity retain fail-closed validation.
+   A hostile peer cannot cause unbounded threads, queued notifications, frames,
+   logs, or parallel syncs.
+4. Remote diagnostics are escaped into one line and UTF-8-safely bounded to
+   4096 characters. Filenames retain escaped display. Heartbeats and clean empty
+   scans do not flood human logs.
+5. SSH remains authentication/confidentiality. The configured host is passed to
+   the system SSH client, and the remote executable is invoked through the
+   existing constrained command construction. Remote root selection remains
+   registry-bound; =WatchOpen= cannot choose a path.
+6. The responder watcher observes only its canonical registered root through
+   the stable held capability and pre/post identity checks in section 5. A symlink
+   target is synchronized as bytes and never followed. Existing atomic
+   replacement, verified objects, state budget, and install recovery boundaries
+   are unchanged.
+
+* 7. Linux and macOS implications
+
+1. =notify::RecommendedWatcher= uses the platform backend (inotify on Linux,
+   FSEvents on macOS). Exact event kinds and rename correlation are irrelevant
+   in this slice because every event schedules a full scan.
+2. Inotify queue overflow/watch exhaustion and FSEvents dropped/must-scan
+   indications store watcher loss in authoritative shared state, terminate the session, and require watcher
+   recreation plus startup scans. Ordinary FSEvents coalescing is a normal
+   generation event because this slice scans the whole tree. Watch setup failure
+   cannot fall back to a one-sided session while claiming healthy operation.
+3. Recursive watcher behavior and atomic rename are integration-tested on both
+   OSes. Docker E2E covers Linux. A native macOS test must exercise a real
+   recommended watcher because containers cannot validate FSEvents semantics.
+4. Suspend/timer behavior differs by OS and runtime. The portable correctness
+   path is heartbeat/SSH failure followed by full reconnect scans, not a
+   platform wake callback.
+5. This remains a foreground feature. The later systemd-user/launchd work must
+   reuse this watch engine, not implement a second lifecycle or protocol.
+
+* 8. Failure modes
+
+- *Event during a round:* its newer generation schedules a follow-up round.
+- *Responder event while a round occupies the stream:* callback coalesces it;
+  =Changed= is sent only after the prescribed round finishes.
+- *Disconnect before either apply:* no action log; reconnect rescans and retries.
+- *Disconnect after responder apply:* connector may not yet apply. Reconnect
+  scans both visible trees and the existing reconciliation converges
+  idempotently; no recovery log precedes commit.
+- *Disconnect after both apply but before final frame:* reconnect scans produce
+  an empty/idempotent round. Previously committed action output remains truthful.
+- *Watcher cannot start or loses completeness:* setup failure reports actionable
+  remediation and retries when appropriate; overflow/backend/channel loss
+  terminates the session, recreates the watcher, and startup-scans both trees.
+- *Responder process dies:* EOF causes bounded reconnect and startup scans.
+- *Disk full, transfer budget, object corruption, or interrupted install:* no
+  generation is marked reconciled and no uncommitted path action is printed;
+  existing durable recovery runs before the next scan.
+- *Peer stalls or violates framing:* finite read/round deadlines end the child;
+  invalid identity/protocol is non-retryable.
+- *Event storm:* constant-memory coalescing and maximum-burst deadline produce
+  serialized rounds, never concurrent scans.
+- *Root disappears:* stop the session without manufacturing tombstones for the
+  entire tree; a held-capability/path-identity mismatch prevents committing the
+  scan. Watch exits terminally; a later explicit start accepts only restoration
+  of the persisted expected identity, never a fresh replacement root.
+- *Peer slow-drips a prefix, payload, or output consumption:* deadline-aware
+  nonblocking framed I/O expires and reaps the child; individual bytes cannot
+  keep a frame alive forever. The elapsed round budget is checked between
+  filesystem phases but cannot preempt one blocked filesystem syscall.
+
+* 9. Interfaces and ownership
+
+Protocol encoding, deadline-aware descriptor I/O, cumulative round budgets, and
+watch scheduling primitives live in =src/sync.rs= and =src/watch.rs=.
+CLI/session orchestration remains in =main.rs= for this alpha; extracting the
+connector/responder state machines is a maintainability follow-up:
+
+#+begin_src rust
+pub struct WatchConfig {
+    debounce: Duration,
+    max_burst: Duration,
+    heartbeat: Duration,
+    pong_timeout: Duration,
+    safety_audit: Duration,
+    frame_deadline: Duration,
+    round_budget: Duration,
+    retry: RetryPolicy,
+}
+
+pub struct RoundBudget {
+    deadline: Instant,
+    metadata_bytes: usize,
+    transfer_bytes: u64,
+}
+
+pub fn read_v2_envelope_until(
+    input: &impl AsFd,
+    deadline: Instant,
+) -> Result<V2Envelope>;
+
+pub fn write_v2_envelope_until(
+    output: &impl AsFd,
+    envelope: &V2Envelope,
+    deadline: Instant,
+) -> Result<()>;
+#+end_src
+
+Production adapters own real notify, SSH, and time. Tests inject clock and
+transport scheduling, but filesystem correctness tests use real temporary
+directories. =WatchOutput= preserves the existing distinction between committed
+action output, status, retryable failure, and terminal error. The session state
+machine consumes coalesced local watcher wakes and polls the transport
+descriptors itself. Exactly one coordinator owns both transport halves, timers,
+round state, child, and deterministic teardown/reaping; no protocol reader
+thread exists. Phase-specific validated
+V2 frames prevent matching a permissive cross-version enum everywhere.
+
+Implementation may reduce these types if equal clarity is achieved with fewer
+interfaces. It must not expose protocol frames to filesystem code or let notify
+callbacks enter synchronization/state code.
+
+* 10. Observability
+
+1. Human output prints lifecycle state changes only: watching, connecting,
+   connected, connection lost/retrying, synchronization failure summaries, and resumed.
+   Heartbeats, empty rounds, and =KEEP= paths remain silent. "Peer connected"
+   means protocol-v2 identity validation, both root/watcher setups, and the
+   startup round completed—not merely that SSH started. Before that point output
+   says "connecting" or reports the bounded failure.
+2. Completed per-path actions retain timestamps and print only after both peers'
+   application commit points. A finalization failure after commit follows the
+   existing truthful-observability rule.
+3. Errors distinguish incompatible protocol, identity mismatch, watcher setup,
+   heartbeat timeout, scan failure, apply failure, and transport loss without
+   blaming the peer for local failures or leaking raw hostile text.
+4. Internal tests may count scans, SSH spawns, rounds, heartbeats, and generation
+   transitions. A new public metrics system and =watch --json= are deferred.
+5. If the remote supports explicit sync but not persistent watch, negotiation
+   remains in the bounded reconnect/failure-report loop until both binaries
+   support watch protocol 2. It does not fall back to polling or claim the peer
+   connected.
+
+* 11. Red-green tests and acceptance criteria
+
+1. Add a Docker E2E =known_failure= before production code: after initial sync,
+   start watch with a heartbeat longer than the assertion window, edit only the
+   responder, and require connector convergence promptly (well below the old
+   30-second poll). It is red on main because no responder watcher exists, then
+   promoted to a normal test after the feature.
+2. Add a second red E2E test that records the responder process and SSH session,
+   alternates edits in both directions through multiple idle heartbeat periods,
+   and proves the same session remains alive. A test-only counter proves there
+   are no scans before the 15-minute audit deadline and no repeated SSH spawns;
+   advance the fake clock to prove exactly one audit scan occurs on the same
+   session. Log absence and wall-clock inference alone are insufficient.
+3. Adapt the existing suspension/offline E2E: suspend the connector watch, edit
+   both peers, disconnect networking, resume, reconnect, and require a new
+   session plus startup full scans, unattended exact-content convergence in both
+   directions, and truthful action/recovery logs. Only retry/heartbeat clocks,
+   not the 250 ms user debounce, are shortened by injected test configuration.
+   Assert the exact lifecycle order: =Watching=, =connecting=, first retryable
+   failure with remediation, optional bounded continuing summary, committed
+   startup-round path actions, then =synchronization resumed= (or =peer
+   connected= when there was no preceding failure). For every changed path
+   assert no proposed action and
+   exactly one completed action—never proposal-plus-completion or duplicate
+   completion across ambiguous reconnect.
+4. Add E2E cases for responder death, a partition at each apply boundary,
+   atomic-rename saves on both peers, an event storm, root disappearance without
+   mass deletion, and invalid/oversized persistent frames. Deliberately drop a
+   notification without a watcher-loss signal: assert the edit is initially
+   absent, advance the safety-audit clock, then require convergence on the same
+   SSH session. Deterministic
+   failpoints are acceptable only when assertions inspect real files and durable
+   state after restart.
+   Also swap the configured root during object transfer and during apply. Prove
+   all operations remain confined to the originally held capability, the
+   replacement path is untouched, post-identity validation suppresses committed
+   output/state completion, the harness restores the original root before retry,
+   restart recovery converges it, and no mass tombstones are recorded.
+5. Unit-test the shared generation/coordinator deadlines: first/latest event,
+   two-second max burst, checked/coalesced generations, capacity-one wake
+   saturation, events during a frozen round, and the atomic freeze/complete
+   invariant under a callback race. Fill the channel before injecting watcher
+   loss; prove =lost= is stored first, the failed =try_send= cannot erase it,
+   and the coordinator's next event/deadline check tears down rather than scans.
+6. Unit-test the session state machine with a fake monotonic clock and duplex
+   transport: handshake, startup round, local/remote changed, simultaneous
+   changed, heartbeat/pong, bad nonce, timeout, sleep-like clock jump, retry
+   sequence/jitter/reset, audit scheduling, wrong-phase/wrong-round frames, and
+   retryable versus terminal classification.
+7. Protocol tests separately round-trip V1 messages and V2 envelopes and reject
+   cross-version dispatch, untagged V2 round frames, unknown,
+   oversized, out-of-phase, wrong-direction, stale-round, wrong-identity, and
+   cumulative-budget inputs. Version-1 explicit sync remains covered.
+8. Real-filesystem integration tests prove notify-driven atomic rename, modify,
+   delete, executable-bit change, non-UTF-8 Unix name, symlink no-follow, events
+   during apply, and watcher root loss. Replace or unmount/remount the root
+   between pre-scan and post-scan checks and prove no mass tombstone/state
+   replacement commits; restore it and converge. Run the real recommended
+   watcher on both Linux and macOS CI.
+   After persisting the expected identity, hold a replacement root at the same
+   configured path across repeated explicit watch attempts separated by the
+   former retry delays and across a full process restart (there is no automatic
+   retry after identity mismatch). Assert terminal actionable failure on each
+   start and prove zero
+   scan, apply, state replacement, or tombstone creation. Restore the original
+   device/inode and then require normal convergence. Migration tests also prove
+   init/register persistence and all-or-nothing one-time legacy backfill.
+9. Transport tests slow-drip the length prefix and payload and block writes;
+   exercise connector child pipes and responder stdio through nonblocking poll;
+   assert absolute frame deadline, elapsed phase-budget checks, stderr-drain
+   join, descriptor closure, SSH child kill/wait, and exactly one subsequent
+   reconnect. A byte just before timeout cannot extend the frame deadline.
+10. Pair against a fixture implementing only protocol 1. Persistent watch must
+    remain in bounded offline retry without falling back to polling; explicit
+    version-1 sync against that same fixture must still succeed.
+11. Preserve all current synchronization, protocol, crash-recovery, ignore,
+   conflict, and truthful logging tests. =make check= must pass with at least 90%
+   whole-project and changed-line coverage, and every new =known_failure= must be
+   promoted before merge.
+
+* 12. Alternatives and trade-offs
+
+1. *Poll every 10 seconds.* Rejected: triples idle scan/hash/SSH/offline retry
+   work while retaining polling latency and the same sleep ambiguity.
+2. *Implement incremental dirty-path capture in this PR.* Deferred. It must
+   correctly handle directory deletion, ignore-rule changes, rename ambiguity,
+   scan/apply races, no-follow traversal, and Linux/macOS differences. Persistent
+   lifecycle can be proven independently, and an event still avoids all idle
+   cost even when its round scans the tree.
+3. *Add operation deltas and durable acknowledgement watermarks now.* Deferred.
+   Current =Record= state can likely support compact current-record deltas for
+   two peers, but conflict/apply crash acknowledgement needs its own reviewed
+   proof and schema migration. It is performance work, not required to stop idle
+   polling or recover across sleep.
+4. *Two symmetric dialing watchers.* Rejected: duplicate sessions, locks, and
+   leader election add failure modes without increasing data authority.
+5. *No periodic safety scan.* Rejected for the alpha: supported notification
+   backends can coalesce or lose signals, and a live SSH session would otherwise
+   hide an edit indefinitely. A 15-minute audit on the persistent session bounds
+   that risk while reducing old idle scan frequency 30-fold.
+6. *Platform wake APIs.* Rejected as a correctness dependency. Heartbeat failure
+   and mandatory reconnect scans cover sleep portably.
+7. *Async runtime/general multiplexing.* Deferred. A single serialized session
+   and coalesced callback state fit existing dependencies and make protocol phase
+   correctness inspectable.
+
+* 13. Migration, explicit scope, and deferred work
+
+The additive state migration adds nullable =root_device= and =root_inode=
+columns, transactionally backfills every legacy share once as section 5
+specifies, and makes populated identity immutable through normal APIs. New
+=init=/registration writes identity with the row. Protocol 2 is negotiated only
+for persistent watch, while version-1 explicit sync remains compatible.
+Downgrading leaves the additive columns untouched and remains state-safe;
+explicit sync works, but persistent watch is disabled. Returning to the new
+binary reuses the same expected identity rather than backfilling again.
+=FLOCAL_WATCH_RESCAN_SECONDS= is removed from production behavior.
+Tests receive timing through internal =WatchConfig= rather than undocumented
+environment-driven polling.
+
+In scope: separate protocol-2 watch negotiation/types; one persistent SSH child;
+responder and connector watchers; generation coalescing; 250 ms/two-second scheduling;
+serialized full reconciliation on change; idle heartbeat; bounded reconnect;
+mandatory startup/reconnect scans; 15-minute same-session safety audits;
+hard framed-I/O deadlines, elapsed filesystem-phase budget checks, and
+deterministic reader/child teardown; stable root identity validation and schema
+migration; truthful observability; Linux/macOS behavior;
+and red-green unit, integration, and Docker E2E coverage.
+
+Deferred: incremental path/subtree capture; operation/current-record deltas;
+durable acknowledgement watermarks; service installation/control socket;
+=watch --json=; public status metrics; three-way line merge; tombstone pruning;
+automatic Git handoff; connector-role transfer; more than two peers;
+invitations/discovery; non-SSH transports; partial-object transfer resume;
+public audit configuration; graceful signal-driven protocol close; and platform
+wake optimizations.
+
+* 14. Independent review disposition
+
+The independent reviews' blocker/important findings are resolved as follows:
+
+1. *Silent dropped notification could remain invisible indefinitely:* accepted.
+   Sections 1, 4, 5, 11, and 13 add a 15-minute same-session audit and a
+   deliberately dropped-notification red-green test.
+2. *Half-duplex ownership and wake-up were ambiguous:* accepted. Sections 2, 3,
+   and 9 define one coordinator owning both polled transport halves, a
+   capacity-one nonblocking notify wake, absolute deadlines, and deterministic
+   child join/reap ownership.
+3. *Root disappearance/replacement could redirect scan or apply and manufacture
+   mass tombstones:* accepted. Sections 3, 5, 6, 8, and 11 make the held no-follow
+   directory capability authoritative for scan, ignore, apply, install-temp,
+   rename and fsync; persist expected device/inode at init/register; migrate
+   legacy rows at one documented trust boundary; check around scan/apply; abort
+   before unsafe state completion; and test swaps during scan, transfer, apply,
+   retries, process restart, and unmount/remount. Identity mismatch is terminal;
+   explicit rebind is deferred and current guidance is restore or re-init/pair.
+4. *Generation completion could erase a racing event:* accepted. Section 3
+   specifies mutex-atomic freeze/complete rules and section 11 tests the race.
+5. *Reusing V1 frames made version and round separation porous:* accepted.
+   Section 2 defines separate constants/types, initial dispatch, and a
+   round-tagged V2 envelope for every reused semantic frame.
+6. *Timeout claims did not honestly cover partial transport I/O versus blocking
+   filesystem calls:* accepted. Sections 4, 8, 9, and 11 require nonblocking
+   =rustix poll= with hard framed-I/O deadlines on connector pipes and responder
+   stdio, elapsed checks between filesystem phases, explicit non-preemption of
+   an individual filesystem syscall, blocked-write tests, and teardown.
+7. *Connection/recovery/upgrade wording overstated readiness:* accepted.
+   Sections 1, 4, and 10 define readiness as a completed startup round and give
+   version-1 peer EOF remains in bounded retry because it cannot be
+   distinguished safely from transient SSH loss.
+8. *WatchChanges duplicated coordinator timing state and watcher loss could be
+   dropped with a saturated wake channel:* accepted. Section 3 uses authoritative
+   =WatchState { generation, lost }=; callbacks store loss before best-effort
+   wake; the coordinator rechecks after every event/deadline and before safety
+   boundaries. Debounce remains coordinator-owned.
+9. *Graceful signal close expanded dependencies without demonstrated need:*
+   accepted. Section 4 defers it and section 13 records that scope decision.
+10. *Rolling-upgrade documentation and coverage were incomplete:* accepted.
+    Sections 1, 10, 11, and 13 require both-peer watch upgrade guidance, retain
+    V1 explicit sync, describe state-safe downgrade/watch disablement, and test
+    V1-only remote bounded watch retry plus successful explicit sync.
+11. *Retry and lifecycle output was not pinned:* accepted. Sections 4, 10, and
+    11 add first-error remediation for busy/root/watcher-capacity failures,
+    readiness wording, exact lifecycle order, and no proposed/duplicate actions.
+12. *Audit reason appeared to be wire state:* accepted. Section 4 makes it
+    connector-local only; =SyncStart= carries ordinary generations.
+13. *Session-only root identity could silently adopt a persistent replacement on
+    reconnect:* accepted as part of disposition 3 and the additive migration in
+    section 13. The held-across-restart test proves no scan, apply, or tombstone.
+14. *Watcher-loss notification could be dropped when the capacity-one event
+    channel was full:* accepted as part of disposition 8; section 11 adds the
+    saturated-channel loss test.
+
+No blocker or important finding is intentionally left to implementation
+discretion. Affected reviewers must rerun; this disposition does not approve
+the architect's own design.

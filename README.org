@@ -18,6 +18,13 @@ non-interactive SSH sessions often use a smaller =PATH=. The remote directory
 must already exist, but it does not need to be initialized separately: pairing
 registers it under the initiating peer's share identity.
 
+Before the first command after upgrading an existing installation to this
+version, verify that every registered share path is the intended mounted
+directory on that machine. The upgrade records each legacy root's filesystem
+device and inode as its durable identity. A missing, symlinked, or later
+replaced root is rejected rather than being mistaken for an empty tree and
+propagating mass deletions.
+
 Then, on one peer only, initialize the local directory and pair the remote:
 
 #+begin_src sh
@@ -88,20 +95,31 @@ unavailable.
 The alpha proves the same flow with recoverable whole-file last-write-wins
 before three-way text merging is implemented.
 
-The target v0.0.1 behavior is event-driven synchronization after a short
-debounce, with only a small sequence heartbeat while idle. The proof-stage
-alpha currently performs a full reconciliation scan on a fixed interval —
-30 seconds by default, overridable with =FLOCAL_WATCH_RESCAN_SECONDS= (a zero
-or unparseable value keeps the default) — while =watch= is running; avoiding
-those idle scans remains deferred. While disconnected, the connector retries
-and synchronizes recorded changes when the connection returns. Filesystem
-notifications are hints; the periodic full scan is the correctness backstop
-after sleep, wake, or missed events. In =watch= output, path actions are printed
-only after both peers successfully apply them. The first failed attempt is
-reported immediately, continuing failures are summarized every five minutes
-without log flooding, and recovery reports how many attempts failed. Explicit
-=flocal sync= output remains a proposed plan because it may precede initial
-confirmation.
+=watch= keeps one SSH protocol session open and observes both peers. A local or
+remote filesystem event schedules synchronization after a 250-millisecond
+debounce, capped at two seconds during a continuous burst. Change-driven rounds
+still perform a complete reconciliation scan in this alpha; incremental
+dirty-path scanning and operation deltas remain deferred. While healthy and
+idle, peers exchange a small heartbeat every 30 seconds. A full safety audit
+runs every 15 minutes on the same session to bound silently missed filesystem
+notifications without returning to frequent SSH and scan polling.
+
+On startup and after sleep, network loss, or process failure, both peers scan
+before the session reports connected. The connector retries temporary failures
+with bounded backoff and synchronizes unattended when connectivity returns. In
+=watch= output, path actions are printed only after both peers successfully
+apply them. The first failed attempt is reported immediately, continuing
+failures are summarized every five minutes without log flooding, and recovery
+reports how many attempts failed. Explicit =flocal sync= output remains a
+proposed plan because it may precede initial confirmation.
+
+Persistent watch uses protocol version 2, so install or upgrade =flocal= on both
+peers before starting =watch=. During a rolling upgrade, explicit one-shot
+=flocal sync= remains available through protocol version 1. =watch= keeps retrying
+with bounded failure reports until both peers support version 2; it never silently
+falls back to polling. Downgrading
+does not change synchronized state, though persistent watch remains unavailable
+until both peers support version 2.
 
 See [[file:docs/2026-07-14-v0.0.1-design.org][the proposed detailed design]] for the CLI, wire behavior, recovery commands,
 security model, platform constraints, and acceptance criteria. The README is

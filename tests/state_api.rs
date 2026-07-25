@@ -9,6 +9,12 @@ use flocal::reconcile::Conflict;
 use flocal::state::{InstallTempPhase, State};
 use tempfile::tempdir;
 
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
 fn record(path: &[u8], peer: &str, sequence: u64, entry: Entry) -> Result<Record> {
     Ok(Record {
         path: RelativePath::from_bytes(path.to_vec())?,
@@ -190,6 +196,145 @@ fn bound_peer_of_an_unregistered_share_is_none() -> Result<()> {
         state
             .bound_peer(&ShareId("never-registered".into()))?
             .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn root_identity_is_persisted_and_replacements_are_not_adopted() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let original = temp.path().join("original-root");
+    fs::create_dir(&root)?;
+    let state_dir = temp.path().join("state");
+    let state = State::open(&state_dir)?;
+    let share = state.init_share(&root)?;
+    let expected = state.expected_root_identity(&share)?;
+    assert_eq!(state.validate_root_identity(&share)?, expected);
+    drop(state);
+
+    fs::rename(&root, &original)?;
+    fs::create_dir(&root)?;
+    let state = State::open(&state_dir)?;
+    let error = state
+        .validate_root_identity(&share)
+        .expect_err("replacement root must not be adopted");
+    assert!(error.to_string().contains("root identity changed"));
+    assert_eq!(state.expected_root_identity(&share)?, expected);
+    drop(state);
+
+    fs::remove_dir(&root)?;
+    let state = State::open(&state_dir)?;
+    let missing = state
+        .validate_root_identity(&share)
+        .expect_err("missing root must be terminal");
+    assert!(
+        missing
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_some()
+    );
+    assert!(missing.to_string().contains("is unavailable"));
+    drop(state);
+
+    std::os::unix::fs::symlink(&original, &root)?;
+    let state = State::open(&state_dir)?;
+    let symlink = state
+        .validate_root_identity(&share)
+        .expect_err("symlinked root must be terminal");
+    assert!(
+        symlink
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_some()
+    );
+    drop(state);
+    fs::remove_file(&root)?;
+
+    fs::rename(&original, &root)?;
+    let state = State::open(&state_dir)?;
+    assert_eq!(state.validate_root_identity(&share)?, expected);
+    let query_error = state
+        .expected_root_identity(&ShareId("missing-share".into()))
+        .expect_err("missing rows remain ordinary state/query errors");
+    assert!(
+        query_error
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_none()
+    );
+    drop(state);
+
+    let connection = rusqlite::Connection::open(state_dir.join("state.sqlite3"))?;
+    connection.execute(
+        "UPDATE shares SET root_device='invalid' WHERE share_id=?1",
+        [&share.0],
+    )?;
+    drop(connection);
+    let state = State::open(&state_dir)?;
+    let corrupt = state
+        .expected_root_identity(&share)
+        .expect_err("malformed persisted identity must be terminal");
+    assert!(
+        corrupt
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_root_identity_backfill_is_transactional() -> Result<()> {
+    let temp = tempdir()?;
+    let valid = temp.path().join("valid");
+    let missing = temp.path().join("missing");
+    fs::create_dir(&valid)?;
+    let state_dir = temp.path().join("state");
+    fs::create_dir(&state_dir)?;
+    let database = state_dir.join("state.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&database)?;
+        connection.execute_batch(
+            "CREATE TABLE shares (
+                share_id TEXT PRIMARY KEY,
+                root BLOB NOT NULL UNIQUE,
+                sequence INTEGER NOT NULL DEFAULT 0,
+                initial_complete INTEGER NOT NULL DEFAULT 0,
+                peer_json TEXT,
+                bound_peer TEXT
+            );",
+        )?;
+        connection.execute(
+            "INSERT INTO shares(share_id, root) VALUES(?1, ?2)",
+            rusqlite::params!["valid", path_bytes(&valid.canonicalize()?)],
+        )?;
+        connection.execute(
+            "INSERT INTO shares(share_id, root) VALUES(?1, ?2)",
+            rusqlite::params!["missing", path_bytes(&missing)],
+        )?;
+    }
+
+    let error = match State::open(&state_dir) {
+        Ok(_) => panic!("one invalid root must abort all backfill"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("cannot bind legacy share"));
+    let connection = rusqlite::Connection::open(&database)?;
+    let columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(shares)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<Result<_, _>>()?;
+    assert!(!columns.iter().any(|column| column == "root_device"));
+    drop(connection);
+
+    fs::create_dir(&missing)?;
+    let state = State::open(&state_dir)?;
+    assert!(
+        state
+            .expected_root_identity(&ShareId("valid".into()))
+            .is_ok()
+    );
+    assert!(
+        state
+            .expected_root_identity(&ShareId("missing".into()))
+            .is_ok()
     );
     Ok(())
 }
