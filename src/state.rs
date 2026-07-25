@@ -581,18 +581,18 @@ impl State {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(RootIdentity {
-            device: device.parse().context("stored root device is invalid")?,
-            inode: inode.parse().context("stored root inode is invalid")?,
+            device: device.parse().map_err(|error| {
+                RootIdentityChanged::new(format!("stored root device is invalid: {error}"))
+            })?,
+            inode: inode.parse().map_err(|error| {
+                RootIdentityChanged::new(format!("stored root inode is invalid: {error}"))
+            })?,
         })
     }
 
     pub fn validate_root_identity(&self, id: &ShareId) -> Result<RootIdentity> {
         let root = self.root_for(id)?;
-        let expected = self.expected_root_identity(id).map_err(|error| {
-            RootIdentityChanged::new(format!(
-                "configured root identity cannot be validated: {error:#}"
-            ))
-        })?;
+        let expected = self.expected_root_identity(id)?;
         let actual = root_identity(&root).map_err(|error| {
             RootIdentityChanged::new(format!(
                 "configured root {} is unavailable: {error}; restore the original directory before retrying",

@@ -252,6 +252,31 @@ fn root_identity_is_persisted_and_replacements_are_not_adopted() -> Result<()> {
     fs::rename(&original, &root)?;
     let state = State::open(&state_dir)?;
     assert_eq!(state.validate_root_identity(&share)?, expected);
+    let query_error = state
+        .expected_root_identity(&ShareId("missing-share".into()))
+        .expect_err("missing rows remain ordinary state/query errors");
+    assert!(
+        query_error
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_none()
+    );
+    drop(state);
+
+    let connection = rusqlite::Connection::open(state_dir.join("state.sqlite3"))?;
+    connection.execute(
+        "UPDATE shares SET root_device='invalid' WHERE share_id=?1",
+        [&share.0],
+    )?;
+    drop(connection);
+    let state = State::open(&state_dir)?;
+    let corrupt = state
+        .expected_root_identity(&share)
+        .expect_err("malformed persisted identity must be terminal");
+    assert!(
+        corrupt
+            .downcast_ref::<flocal::state::RootIdentityChanged>()
+            .is_some()
+    );
     Ok(())
 }
 
