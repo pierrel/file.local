@@ -676,7 +676,7 @@ fn serve_watch_open(
             return write_v2_session(
                 output,
                 V2SessionFrame::Error {
-                    retryable: false,
+                    retryable: root_validation_retryable(&error),
                     message: format!("{error:#}"),
                 },
             );
@@ -1465,7 +1465,22 @@ fn persistent_watch_loop(
             watch_log(out, "Connecting to peer")?;
             connecting_logged = true;
         }
-        let root = sync::ShareRoot::open(state, share)?;
+        let root = match sync::ShareRoot::open(state, share) {
+            Ok(root) => root,
+            Err(error) if !root_validation_retryable(&error) => return Err(error),
+            Err(error) => {
+                if let Some(event) = failures.failed(
+                    &error,
+                    std::time::Instant::now(),
+                    WATCH_FAILURE_REPORT_INTERVAL,
+                ) {
+                    write_watch_event(err, event)?;
+                }
+                let delay = backoff.failed(&retry_policy, rand::random_range(-2_000..=2_000));
+                std::thread::sleep(delay);
+                continue;
+            }
+        };
         let (watch_state, events_rx, _watcher) = match create_local_watcher(root_path) {
             Ok(watcher) => watcher,
             Err(error) => {
@@ -1563,6 +1578,10 @@ fn is_terminal_watch_error(error: &anyhow::Error) -> bool {
     }
     let message = format!("{error:#}");
     message.contains("root identity changed")
+}
+
+fn root_validation_retryable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<sync::RootIdentityChanged>().is_none()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2682,11 +2701,15 @@ mod tests {
             "protocol version text from a broken transport",
         ));
         assert!(!is_terminal_watch_error(&transport));
+        assert!(root_validation_retryable(&transport));
         let protocol_error = watch_protocol_error("unexpected round frame");
         assert!(
             protocol_error.to_string() == "unexpected round frame"
                 && is_terminal_watch_error(&protocol_error)
                 && is_terminal_watch_error(
+                    &sync::RootIdentityChanged::new("root identity changed").into()
+                )
+                && !root_validation_retryable(
                     &sync::RootIdentityChanged::new("root identity changed").into()
                 )
         );
