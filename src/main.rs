@@ -1467,16 +1467,9 @@ fn persistent_watch_loop(
         }
         let root = match sync::ShareRoot::open(state, share) {
             Ok(root) => root,
-            Err(error) if !root_validation_retryable(&error) => return Err(error),
             Err(error) => {
-                if let Some(event) = failures.failed(
-                    &error,
-                    std::time::Instant::now(),
-                    WATCH_FAILURE_REPORT_INTERVAL,
-                ) {
-                    write_watch_event(err, event)?;
-                }
-                let delay = backoff.failed(&retry_policy, rand::random_range(-2_000..=2_000));
+                let delay =
+                    root_open_retry_delay(error, &mut failures, &mut backoff, &retry_policy, err)?;
                 std::thread::sleep(delay);
                 continue;
             }
@@ -1537,6 +1530,26 @@ fn persistent_watch_loop(
             }
         }
     }
+}
+
+fn root_open_retry_delay(
+    error: anyhow::Error,
+    failures: &mut WatchFailures,
+    backoff: &mut flocal::watch::RetryBackoff,
+    retry_policy: &flocal::watch::RetryPolicy,
+    err: &mut impl Write,
+) -> Result<Duration> {
+    if !root_validation_retryable(&error) {
+        return Err(error);
+    }
+    if let Some(event) = failures.failed(
+        &error,
+        std::time::Instant::now(),
+        WATCH_FAILURE_REPORT_INTERVAL,
+    ) {
+        write_watch_event(err, event)?;
+    }
+    Ok(backoff.failed(retry_policy, rand::random_range(-2_000..=2_000)))
 }
 
 fn create_local_watcher(
@@ -2727,6 +2740,31 @@ mod tests {
             }
             .into()
         ));
+
+        let mut failures = WatchFailures::default();
+        let mut backoff = flocal::watch::RetryBackoff::default();
+        let mut output = Vec::new();
+        assert!(
+            root_open_retry_delay(
+                anyhow::anyhow!("database busy"),
+                &mut failures,
+                &mut backoff,
+                &flocal::watch::RetryPolicy::default(),
+                &mut output,
+            )
+            .is_ok()
+                && String::from_utf8_lossy(&output).contains("retrying in background")
+        );
+        assert!(
+            root_open_retry_delay(
+                sync::RootIdentityChanged::new("root identity changed").into(),
+                &mut failures,
+                &mut backoff,
+                &flocal::watch::RetryPolicy::default(),
+                &mut output,
+            )
+            .is_err()
+        );
     }
 
     #[test]
