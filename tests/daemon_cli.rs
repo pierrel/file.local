@@ -391,6 +391,20 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLOCAL_BIN" protocol serve
         "--yes",
     ])?;
     assert!(repeat.status.success(), "{:?}", repeat);
+    let nested = local_root.join("nested");
+    std::fs::create_dir(&nested)?;
+    let nested_add = invoke(&[
+        "sync",
+        "add",
+        nested.to_str().context("test root is utf-8")?,
+        "--host",
+        "test-peer",
+        "--remote-path",
+        remote_root.to_str().context("test root is utf-8")?,
+        "--yes",
+    ])?;
+    assert!(!nested_add.status.success());
+    assert!(String::from_utf8_lossy(&nested_add.stderr).contains("inside an existing share"));
     let conflicting = invoke(&[
         "sync",
         "add",

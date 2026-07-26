@@ -38,7 +38,8 @@ flocal sync add ~/src/example --host buildbox --remote-path /srv/work/example
 #+end_src
 
 The =--host= value can be a hostname, address, or =~/.ssh/config= alias.
-=sync add= shows the first plan and asks before writing either directory. Once
+=sync add= shows the first plan and asks before changing file content in either
+directory. Pairing may create the missing remote root directory first. Once
 confirmed, it starts the initiating peer's managed watch. The responder accepts
 incoming sessions but cannot initiate them. Inspect or control local syncs with:
 

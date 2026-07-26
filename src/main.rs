@@ -387,9 +387,12 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
             yes,
         } => {
             validate_sync_add_path(&path)?;
-            ensure_daemon(state)?;
             let share = match state.find_share(&path) {
                 Ok((share, _)) => {
+                    let root = state.root_for(&share)?;
+                    if root != path.canonicalize()? {
+                        bail!("directory is inside an existing share; use the share root instead")
+                    }
                     if let Some(peer) = state.peer(&share)? {
                         if peer.host != host || peer.remote_path != path_bytes(&remote_path) {
                             bail!(
@@ -407,6 +410,7 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                     share
                 }
             };
+            ensure_daemon(state)?;
             let generation = if state.initial_complete(&share)? {
                 None
             } else {
