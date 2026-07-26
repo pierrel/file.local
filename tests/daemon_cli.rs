@@ -107,6 +107,7 @@ fn daemon_stop_disables_a_share_durably() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn daemon_cli_follows_paginated_sync_lists() -> Result<()> {
     #[cfg(target_os = "macos")]
