@@ -92,6 +92,30 @@ second state/socket layout.
    reuse of the same held-descriptor, no-follow construction boundary, not a
    second service-specific helper or a post-creation chmod repair.
 
+6. *Make legacy =sync= options conflict with managed subcommands.*
+
+   The legacy =flocal sync PATH [--dry-run] [--yes] [--json]= form and the
+   managed =sync add/list/start/stop= form share a command.  Clap currently
+   accepts a legacy flag before a subcommand, then the managed dispatch ignores
+   that flag.  Validate the parsed command before state opening: reject parent
+   flags when Clap identifies a managed subcommand and when a leading flag made
+   a reserved managed name parse as the legacy path.  Retain both valid
+   grammars unchanged, and add parser/validation regressions for representative
+   mixed invocations.
+
+7. *Isolate environment-sensitive tests and coverage.*
+
+   Two tests currently alter =HOME=, =PATH=, and a manager-test variable in
+   their own process.  A mutex and serial CI test runner do not make Rust's
+   process-global environment mutation safe when another test thread may read
+   it.  Move each environment-sensitive assertion into its own exact test
+   subprocess, passing all variables with =Command::env= and keeping fixtures
+   in the parent-created temporary directory.  Remove the process-global
+   environment lock and every unsafe environment mutation.  Add
+   =-- --test-threads=1= to the coverage command in =.github/workflows/ci.yml=
+   (the Makefile already supplies it), so its deterministic test schedule
+   matches the ordinary test job.
+
 * 3. Interfaces, state, and failure boundaries
 
 The private-directory helper accepts a requested absolute/relative private path
@@ -118,6 +142,15 @@ as =DaemonResponse::Error= when that serialized response fits the existing
 message cap.  Transport I/O and over-cap responses may still terminate the
 connection because no trustworthy complete response can be sent.  Error
 messages remain bounded by the protocol cap and contain no secret material.
+
+CLI parsing has one grammar invariant: either legacy sync arguments are present
+with no managed subcommand, or a managed subcommand and only its own arguments
+are present.  A mixed form is a parse error before state opening or service
+activation.
+
+Test-only environment values are process-launch inputs, never mutable shared
+state.  Each subprocess owns its temporary fixtures and no test depends on
+global harness serialization for soundness.
 
 * 4. Tests and acceptance criteria
 
@@ -149,10 +182,18 @@ messages remain bounded by the protocol cap and contain no secret material.
 5. Add an isolated permissive-umask service-installation regression that
    directly exercises the service-directory wrapper and proves each created
    parent is owner-only before a service file is written.
+6. Add parser tests rejecting a legacy flag combined with =sync list= or
+   =sync add= while retaining valid legacy and managed forms.
+7. Run the state-marker and systemd-install assertions in subprocesses with
+   their test environment supplied by =Command::env=, then run the complete
+   suite under the default parallel test harness as well as the repository's
+   serialized checker.
 
 The work is accepted when a permissive umask never exposes a new private state
 or service directory; an unsafe =run= path prevents daemon startup without
 replacement; a missing, non-directory, or symlinked =sync add= path starts
 neither service, registration, nor pairing; and an invalid list cursor produces
-a valid daemon error response.  No documented daemon command, storage schema,
-or successful pagination behavior regresses.
+a valid daemon error response.  Mixed legacy/managed sync syntax is rejected;
+environment-sensitive tests are safe under the default parallel harness.  No
+documented daemon command, storage schema, or successful pagination behavior
+regresses.

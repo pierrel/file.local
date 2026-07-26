@@ -229,6 +229,14 @@ fn state_refuses_a_symlinked_state_directory() -> Result<()> {
 fn private_managed_state_marker_selects_an_absolute_state_directory() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    const HOME: &str = "FLOCAL_TEST_MANAGED_STATE_MARKER_HOME";
+    if let Some(home) = std::env::var_os(HOME) {
+        let home = std::path::PathBuf::from(home);
+        let state_dir = home.parent().expect("temporary parent").join("state");
+        assert_eq!(State::managed_state_dir()?, Some(state_dir));
+        return Ok(());
+    }
+
     let temp = tempdir()?;
     let home = temp.path().join("home");
     let state_dir = temp.path().join("state");
@@ -236,18 +244,15 @@ fn private_managed_state_marker_selects_an_absolute_state_directory() -> Result<
     fs::create_dir_all(marker.parent().expect("marker parent"))?;
     fs::write(&marker, format!("{}\n", state_dir.display()))?;
     fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))?;
-    let previous = std::env::var_os("HOME");
-    // SAFETY: the deterministic test command runs one test at a time and restores HOME.
-    unsafe { std::env::set_var("HOME", &home) };
-    let selected = State::managed_state_dir();
-    // SAFETY: restore this process's environment before propagating the assertion result.
-    unsafe {
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-    assert_eq!(selected?, Some(state_dir));
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "private_managed_state_marker_selects_an_absolute_state_directory",
+        ])
+        .env("HOME", &home)
+        .env(HOME, &home)
+        .output()?;
+    assert!(output.status.success(), "{:?}", output);
     Ok(())
 }
 

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use flocal::model::{Entry, PeerConfig, ShareId};
 use flocal::state::State;
 use flocal::sync::{self, InitialMessage, Message, V2Envelope, V2RoundFrame, V2SessionFrame};
@@ -77,17 +77,7 @@ enum Commands {
         #[command(subcommand)]
         command: PeerCommand,
     },
-    Sync {
-        #[command(subcommand)]
-        command: Option<SyncCommand>,
-        path: Option<PathBuf>,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    Sync(SyncArgs),
     Status {
         path: PathBuf,
         #[arg(long)]
@@ -118,6 +108,19 @@ enum Commands {
         #[command(subcommand)]
         command: ProtocolCommand,
     },
+}
+
+#[derive(Args)]
+struct SyncArgs {
+    #[command(subcommand)]
+    command: Option<SyncCommand>,
+    path: Option<PathBuf>,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -207,6 +210,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Commands::Sync(arguments) = &cli.command {
+        validate_sync_arguments(arguments)?;
+    }
     let mut state = State::open_default()?;
     match cli.command {
         Commands::Init { path } => {
@@ -226,13 +232,13 @@ fn run() -> Result<()> {
             } => add_peer(&state, &path, &host, &remote_path)?,
             PeerCommand::List { path, json } => list_peer(&state, &path, json)?,
         },
-        Commands::Sync {
+        Commands::Sync(SyncArgs {
             command,
             path,
             dry_run,
             yes,
             json,
-        } => match command {
+        }) => match command {
             Some(command) => sync_command(&mut state, command)?,
             None => {
                 let path = path.context("sync requires a subcommand or PATH")?;
@@ -270,6 +276,20 @@ fn run() -> Result<()> {
             recover_installs(&mut state)?;
             serve(&mut state)?
         }
+    }
+    Ok(())
+}
+
+fn validate_sync_arguments(arguments: &SyncArgs) -> Result<()> {
+    let managed_name = arguments
+        .path
+        .as_deref()
+        .and_then(Path::to_str)
+        .is_some_and(|name| matches!(name, "add" | "list" | "start" | "stop"));
+    if (arguments.command.is_some() || managed_name)
+        && (arguments.dry_run || arguments.yes || arguments.json)
+    {
+        bail!("legacy sync options cannot be combined with a managed sync subcommand");
     }
     Ok(())
 }
@@ -3810,7 +3830,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(target_os = "linux")]
-    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+    const SYSTEMD_INSTALL_TEST_ROOT: &str = "FLOCAL_TEST_SYSTEMD_INSTALL_ROOT";
 
     #[cfg(unix)]
     const PERMISSIVE_UMASK_SERVICE_ROOT: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_SERVICE_ROOT";
@@ -4003,6 +4023,38 @@ mod tests {
             PlanReport::Full,
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn sync_rejects_mixed_legacy_and_managed_syntax() {
+        assert!(Cli::try_parse_from(["flocal", "sync", "/tmp/root", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["flocal", "sync", "list"]).is_ok());
+        for arguments in [
+            ["flocal", "sync", "--dry-run", "list"],
+            ["flocal", "sync", "--json", "start"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("the ambiguous form parses first");
+            let Commands::Sync(arguments) = cli.command else {
+                unreachable!()
+            };
+            assert!(validate_sync_arguments(&arguments).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "flocal",
+            "sync",
+            "--dry-run",
+            "add",
+            "/tmp/root",
+            "--host",
+            "host",
+            "--remote-path",
+            "/tmp/remote",
+        ])
+        .expect("the mixed add form parses first");
+        let Commands::Sync(arguments) = cli.command else {
+            unreachable!()
+        };
+        assert!(validate_sync_arguments(&arguments).is_err());
     }
 
     #[test]
@@ -5210,7 +5262,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn systemd_install_uses_manager_config_and_commits_the_state_marker() -> Result<()> {
-        let _environment = ENVIRONMENT_LOCK.lock().unwrap();
+        if let Some(root) = std::env::var_os(SYSTEMD_INSTALL_TEST_ROOT) {
+            return assert_systemd_install(Path::new(&root));
+        }
+
         let temp = tempdir()?;
         let bin = temp.path().join("bin");
         let manager_home = temp.path().join("manager-home");
@@ -5228,32 +5283,40 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700))?;
         }
-        let previous_path = std::env::var_os("PATH");
-        let previous_home = std::env::var_os("HOME");
-        // SAFETY: this test holds the module-wide environment lock and restores both values.
-        unsafe {
-            std::env::set_var(
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::systemd_install_uses_manager_config_and_commits_the_state_marker",
+            ])
+            .env(SYSTEMD_INSTALL_TEST_ROOT, temp.path())
+            .env(
                 "PATH",
                 format!(
                     "{}:{}",
                     bin.display(),
-                    previous_path
+                    std::env::var_os("PATH")
                         .as_deref()
                         .unwrap_or_default()
                         .to_string_lossy()
                 ),
-            );
-            std::env::set_var("HOME", &client_home);
-            std::env::set_var("FLOCAL_TEST_MANAGER_HOME", &manager_home);
-        }
-        let state = State::open(temp.path().join("state"))?;
+            )
+            .env("HOME", &client_home)
+            .env("FLOCAL_TEST_MANAGER_HOME", &manager_home)
+            .output()?;
+        assert!(output.status.success(), "{:?}", output);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_systemd_install(root: &Path) -> Result<()> {
+        let manager_home = root.join("manager-home");
+        let client_home = root.join("client-home");
+        let state = State::open(root.join("state"))?;
         let executable = std::env::current_exe()?.canonicalize()?;
         preflight_daemon_service(&state, &executable)?;
         use std::os::unix::ffi::OsStringExt;
-        let invalid_state = State::open(
-            temp.path()
-                .join(std::ffi::OsString::from_vec(b"state-\xff".to_vec())),
-        )?;
+        let invalid_state =
+            State::open(root.join(std::ffi::OsString::from_vec(b"state-\xff".to_vec())))?;
         assert!(install_systemd_service(&invalid_state, &executable).is_err());
         assert!(
             !manager_home
@@ -5263,20 +5326,7 @@ mod tests {
         assert!(systemd_quote(Path::new("/tmp/invalid%path")).is_err());
         assert!(run_manager("/bin/false", &[]).is_err());
         assert!(ensure_daemon(&state).is_err());
-        let result = install_daemon_service(&state);
-        // SAFETY: restore this process's environment before any assertion can return.
-        unsafe {
-            match previous_path {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-            match previous_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            std::env::remove_var("FLOCAL_TEST_MANAGER_HOME");
-        }
-        result?;
+        install_daemon_service(&state)?;
         assert!(
             manager_home
                 .join(".config/systemd/user/flocal-daemon.service")
