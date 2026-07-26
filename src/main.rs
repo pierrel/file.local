@@ -521,8 +521,17 @@ fn daemon_socket(state: &State) -> PathBuf {
 }
 
 fn ensure_daemon(state: &State) -> Result<()> {
-    if daemon_request_inner(&daemon_socket(state), &DaemonRequest::List { cursor: None }).is_ok() {
+    let socket = daemon_socket(state);
+    if daemon_request_inner(&socket, &DaemonRequest::List { cursor: None }).is_ok() {
         return Ok(());
+    }
+    if socket.exists() {
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            if daemon_request_inner(&socket, &DaemonRequest::List { cursor: None }).is_ok() {
+                return Ok(());
+            }
+        }
     }
     if std::env::var_os("FLOCAL_STATE_DIR").is_some()
         && State::managed_state_dir()?.as_deref() != Some(state.dir.as_path())
@@ -559,9 +568,7 @@ fn ensure_daemon(state: &State) -> Result<()> {
     }
     eprintln!("flocal: waiting for the daemon control socket");
     for _ in 0..20 {
-        if daemon_request_inner(&daemon_socket(state), &DaemonRequest::List { cursor: None })
-            .is_ok()
-        {
+        if daemon_request_inner(&socket, &DaemonRequest::List { cursor: None }).is_ok() {
             eprintln!("flocal: daemon is ready");
             return Ok(());
         }
