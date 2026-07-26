@@ -33,8 +33,10 @@ second state/socket layout.
    following symlinks, then validates the opened directory's ownership and
    permissions before descending.  This makes the owner-only bound true at
    creation and prevents pathname substitution between validation and use.  A
-   pre-existing component is never chmodded merely because this process needs
-   it: invalid ownership, type, symlink, or permissions fail closed.  On macOS,
+   the helper never chmods a pre-existing component merely because this process
+   needs it: invalid ownership, type, symlink, or permissions fail closed.
+   Existing final-state permission tightening remains the responsibility of
+   =State::open=.  On macOS,
    preserve the existing narrow exception for the root-owned system aliases
    =/var= and =/tmp=: resolve only that validated alias before beginning the
    descriptor-relative walk, never a user-controlled descendant.  Existing
