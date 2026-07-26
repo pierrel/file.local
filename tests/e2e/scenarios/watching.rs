@@ -10,6 +10,35 @@ use crate::harness as e2e;
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
+fn daemon_managed_sync_starts_stops_and_restores_watch_ownership() -> Result<()> {
+    let (a, b) = e2e::managed_pair()?;
+    a.write("managed.txt", "first")?;
+    b.wait_for_file("managed.txt", "first")?;
+
+    a.sync_stop()?;
+    a.write("stopped.txt", "must stay local while stopped")?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    b.assert_absent("stopped.txt")?;
+
+    a.sync_start()?;
+    b.wait_for_file("stopped.txt", "must stay local while stopped")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn daemon_restart_restores_enabled_watches() -> Result<()> {
+    let (a, b) = e2e::managed_pair()?;
+    a.write("before-restart.txt", "first")?;
+    b.wait_for_file("before-restart.txt", "first")?;
+    a.restart_daemon()?;
+    a.write("after-restart.txt", "restored watch")?;
+    b.wait_for_file("after-restart.txt", "restored watch")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
 fn persistent_watch_reuses_one_ssh_session_while_idle() -> Result<()> {
     let (a, b) = e2e::pair_with(e2e::Config {
         watch_max_session_bytes: None,

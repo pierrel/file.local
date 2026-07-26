@@ -41,6 +41,16 @@ pub struct StoredConflict {
     pub created_ns: i64,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct ManagedShare {
+    pub id: ShareId,
+    pub root: PathBuf,
+    pub peer: Option<PeerConfig>,
+    pub initial_complete: bool,
+    pub watch_enabled: bool,
+    pub blocked_diagnostic: Option<String>,
+}
+
 pub struct State {
     pub dir: PathBuf,
     conn: Connection,
@@ -137,6 +147,9 @@ impl State {
         if let Some(path) = std::env::var_os("FLOCAL_STATE_DIR") {
             return Self::open(path);
         }
+        if let Some(path) = Self::managed_state_dir()? {
+            return Self::open(path);
+        }
         let dirs = ProjectDirs::from("local", "file.local", "file.local")
             .context("could not determine user state directory")?;
         #[cfg(target_os = "linux")]
@@ -148,16 +161,51 @@ impl State {
         Self::open(path)
     }
 
+    pub fn managed_state_dir() -> Result<Option<PathBuf>> {
+        let home = match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => return Ok(None),
+        };
+        let marker = home.join(".config/file.local/managed-state");
+        let metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("managed daemon state marker is not a regular file");
+        }
+        #[cfg(unix)]
+        {
+            let uid = rustix::process::geteuid().as_raw();
+            if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+                bail!("managed daemon state marker is not private");
+            }
+        }
+        let path = PathBuf::from(fs::read_to_string(&marker)?.trim_end());
+        if !path.is_absolute() {
+            bail!("managed daemon state marker is not an absolute path");
+        }
+        Ok(Some(path))
+    }
+
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(dir.join("objects"))?;
+        ensure_private_state_dir(&dir)?;
+        ensure_private_state_dir(&dir.join("objects"))?;
         set_private_dir(&dir)?;
         set_private_dir(&dir.join("objects"))?;
         let database = dir.join("state.sqlite3");
+        if let Ok(metadata) = fs::symlink_metadata(&database)
+            && (!metadata.file_type().is_file() || metadata.file_type().is_symlink())
+        {
+            bail!("state database is not a regular file");
+        }
         let mut conn = Connection::open(&database)?;
         set_private_file(&database)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS installation (
@@ -172,7 +220,10 @@ impl State {
                 peer_json TEXT,
                 bound_peer TEXT,
                 root_device TEXT,
-                root_inode TEXT
+                root_inode TEXT,
+                watch_enabled INTEGER NOT NULL DEFAULT 0,
+                blocked_diagnostic TEXT,
+                intent_generation INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS records (
                 share_id TEXT NOT NULL,
@@ -208,6 +259,21 @@ impl State {
         }
         if !columns.iter().any(|name| name == "root_inode") {
             transaction.execute("ALTER TABLE shares ADD COLUMN root_inode TEXT", [])?;
+        }
+        if !columns.iter().any(|name| name == "watch_enabled") {
+            transaction.execute(
+                "ALTER TABLE shares ADD COLUMN watch_enabled INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|name| name == "blocked_diagnostic") {
+            transaction.execute("ALTER TABLE shares ADD COLUMN blocked_diagnostic TEXT", [])?;
+        }
+        if !columns.iter().any(|name| name == "intent_generation") {
+            transaction.execute(
+                "ALTER TABLE shares ADD COLUMN intent_generation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         let legacy: Vec<(String, Vec<u8>)> = {
             let mut statement = transaction.prepare(
@@ -439,7 +505,22 @@ impl State {
         Ok(file)
     }
 
+    fn lock_registration(&self) -> Result<File> {
+        let path = self.dir.join("registration.lock");
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        set_private_file(&path)?;
+        file.try_lock_exclusive()
+            .context("another share registration is in progress")?;
+        Ok(file)
+    }
+
     pub fn init_share(&self, root: &Path) -> Result<ShareId> {
+        let _registration_lock = self.lock_registration()?;
+        let metadata = fs::symlink_metadata(root)
+            .with_context(|| format!("cannot inspect {}", root.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("sync root must be an existing directory, not a symbolic link");
+        }
         let root = root
             .canonicalize()
             .with_context(|| format!("cannot open {}", root.display()))?;
@@ -455,6 +536,7 @@ impl State {
         {
             bail!("directory is already registered");
         }
+        self.reject_overlapping_root(&root)?;
         let id = ShareId::generate();
         self.conn.execute(
             "INSERT INTO shares(share_id, root, root_device, root_inode) VALUES(?1, ?2, ?3, ?4)",
@@ -469,6 +551,7 @@ impl State {
     }
 
     pub fn register_share(&self, id: &ShareId, root: &Path) -> Result<()> {
+        let _registration_lock = self.lock_registration()?;
         fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
         let root_bytes = path_bytes(&root);
@@ -488,6 +571,7 @@ impl State {
             validate_identity_values(&root, identity, &device, &inode)?;
             return Ok(());
         }
+        self.reject_overlapping_root(&root)?;
         self.conn.execute(
             "INSERT INTO shares(share_id, root, root_device, root_inode) VALUES(?1, ?2, ?3, ?4)",
             params![
@@ -501,10 +585,12 @@ impl State {
     }
 
     pub fn register_share_bound(&mut self, id: &ShareId, root: &Path, peer: &PeerId) -> Result<()> {
+        let _registration_lock = self.lock_registration()?;
         fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
         let root_bytes = path_bytes(&root);
         let identity = root_identity(&root)?;
+        self.reject_overlapping_root_except(&root, Some(id))?;
         let transaction = self.conn.transaction()?;
         let existing: Option<(Vec<u8>, Option<String>, String, String)> = transaction
             .query_row(
@@ -763,6 +849,151 @@ impl State {
             [&id.0],
             |r| r.get::<_, i64>(0),
         )? != 0)
+    }
+
+    pub fn managed_shares(&self) -> Result<Vec<ManagedShare>> {
+        let mut statement = self.conn.prepare(
+            "SELECT share_id, root, peer_json, initial_complete, watch_enabled, blocked_diagnostic
+             FROM shares ORDER BY share_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                let peer: Option<String> = row.get(2)?;
+                Ok(ManagedShare {
+                    id: ShareId(row.get(0)?),
+                    root: bytes_path(row.get::<_, Vec<u8>>(1)?),
+                    peer: peer
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                    initial_complete: row.get::<_, i64>(3)? != 0,
+                    watch_enabled: row.get::<_, i64>(4)? != 0,
+                    blocked_diagnostic: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn managed_share(&self, id: &ShareId) -> Result<ManagedShare> {
+        self.managed_shares()?
+            .into_iter()
+            .find(|share| &share.id == id)
+            .context("share not found")
+    }
+
+    pub fn set_watch_enabled(&self, id: &ShareId, enabled: bool) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE shares SET watch_enabled=?2, intent_generation=intent_generation+1 WHERE share_id=?1",
+            params![id.0, i64::from(enabled)],
+        )?;
+        if changed == 0 {
+            bail!("share not found");
+        }
+        Ok(())
+    }
+
+    pub fn set_watch_enabled_if_generation(
+        &self,
+        id: &ShareId,
+        enabled: bool,
+        expected_generation: i64,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE shares SET watch_enabled=?2, intent_generation=intent_generation+1
+             WHERE share_id=?1 AND intent_generation=?3",
+            params![id.0, i64::from(enabled), expected_generation],
+        )?;
+        if changed == 0 {
+            bail!("sync was stopped or reconfigured while its initial plan was running");
+        }
+        Ok(())
+    }
+
+    pub fn watch_intent_generation(&self, id: &ShareId) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT intent_generation FROM shares WHERE share_id=?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .context("share not found")
+    }
+
+    pub fn set_initial_complete_and_watch_enabled(
+        &mut self,
+        id: &ShareId,
+        expected_generation: i64,
+    ) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE shares SET initial_complete=1, watch_enabled=1, blocked_diagnostic=NULL,
+             intent_generation=intent_generation+1 WHERE share_id=?1 AND intent_generation=?2",
+            params![id.0, expected_generation],
+        )?;
+        if changed == 0 {
+            bail!("sync was stopped or reconfigured while its initial plan was running");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_blocked(&self, id: &ShareId, diagnostic: &str) -> Result<()> {
+        let diagnostic = diagnostic.chars().take(4096).collect::<String>();
+        let changed = self.conn.execute(
+            "UPDATE shares SET blocked_diagnostic=?2 WHERE share_id=?1",
+            params![id.0, diagnostic],
+        )?;
+        if changed == 0 {
+            bail!("share not found");
+        }
+        Ok(())
+    }
+
+    pub fn clear_blocked(&self, id: &ShareId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE shares SET blocked_diagnostic=NULL WHERE share_id=?1",
+            [&id.0],
+        )?;
+        if changed == 0 {
+            bail!("share not found");
+        }
+        Ok(())
+    }
+
+    fn reject_overlapping_root(&self, candidate: &Path) -> Result<()> {
+        self.reject_overlapping_root_except(candidate, None)
+    }
+
+    fn reject_overlapping_root_except(
+        &self,
+        candidate: &Path,
+        except: Option<&ShareId>,
+    ) -> Result<()> {
+        let mut statement = self.conn.prepare("SELECT share_id, root FROM shares")?;
+        let rows = statement.query_map([], |row| {
+            Ok((ShareId(row.get(0)?), bytes_path(row.get::<_, Vec<u8>>(1)?)))
+        })?;
+        for row in rows {
+            let (id, root) = row?;
+            if except == Some(&id) {
+                continue;
+            }
+            if candidate.starts_with(&root) || root.starts_with(candidate) {
+                bail!(
+                    "directory overlaps registered share {} at {}",
+                    id.0,
+                    root.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn store_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {
@@ -1029,6 +1260,56 @@ impl State {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn ensure_private_state_dir(path: &Path) -> Result<()> {
+    let mut existing = path;
+    while matches!(fs::symlink_metadata(existing), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        existing = existing
+            .parent()
+            .context("state directory has no existing parent")?;
+    }
+    validate_state_dir_chain(existing)?;
+    fs::create_dir_all(path)?;
+    validate_state_dir_chain(path)
+}
+
+#[cfg(not(unix))]
+fn ensure_private_state_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_state_dir_chain(path: &Path) -> Result<()> {
+    let uid = rustix::process::geteuid().as_raw();
+    for component in path.ancestors() {
+        let metadata = fs::symlink_metadata(component)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "state directory contains an unsafe path component {}",
+                component.display()
+            );
+        }
+        let owner = metadata.uid();
+        let mode = metadata.mode();
+        let root_owned_sticky = owner == 0 && mode & 0o1000 != 0;
+        if owner != uid && owner != 0 {
+            bail!(
+                "state directory component {} has an unexpected owner",
+                component.display()
+            );
+        }
+        if mode & 0o022 != 0 && !root_owned_sticky {
+            bail!(
+                "state directory component {} is writable by another user",
+                component.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn remember_entry_hash(hashes: &mut std::collections::HashSet<ObjectHash>, entry: &Entry) {

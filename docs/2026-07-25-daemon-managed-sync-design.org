@@ -1,6 +1,19 @@
 #+title: Daemon-managed sync interface
 #+date: 2026-07-25
-#+status: proposed
+#+status: superseded design record
+
+* Implementation note
+
+The shipped alpha deliberately keeps the daemon smaller than this document's
+early protocol sketches. The implemented contract is: the CLI performs pairing
+and initial-plan confirmation; one private per-user daemon owns enabled
+persistent watches; its owner-only socket lives under the selected state root;
+and the managed-state marker makes normal clients select that same root. There
+are no daemon-issued review tokens, plan spools, XDG-runtime socket contract,
+peer-credential check, or client-side service-asset revalidation in this alpha.
+The numbered sections below are retained as the pre-implementation design
+record, not an implemented security or acceptance-test claim. The README and
+implementation are the durable alpha contract.
 
 * 1. Decision and user contract
 
@@ -71,8 +84,9 @@ flocal sync start (PATH | --share SHARE_ID) [--yes]
 flocal sync stop (PATH | --share SHARE_ID)
 #+end_example
 
-This is an explicit CLI break: =flocal sync PATH= is removed, rather than kept
-as a compatibility one-shot path alongside the daemon controls.  Existing
+The daemon controls are the normal interface. =flocal sync PATH= remains as a
+temporary compatibility one-shot path for existing scripts and test fixtures;
+it does not enable a managed watch. Existing
 =status=, =conflicts=, and =restore= remain read/control views of a path;
 =init=, =peer add=, and =watch= are removed from the documented setup path.
 The transition mapping is in section 10.
@@ -315,20 +329,14 @@ bound to the calling user, share, intent generation, root/peer fingerprint,
 plan digest, and a five-minute expiry.  The daemon holds no request connection
 while a user considers a plan.
 
-On Linux the socket is the =XDG_RUNTIME_DIR/flocal/daemon.sock= derived from
-the *systemd user manager's* environment, not merely the caller's inherited
-environment.  Installation and every daemon-control client first query that
-manager environment, require an absolute =XDG_RUNTIME_DIR= owned by this user
-and not group/other writable, and require the caller's =XDG_RUNTIME_DIR= to be
-the same absolute directory.  A missing, relative, unsafe, or mismatched value
-is an actionable error; the client must not start a unit whose daemon will
-publish a socket in a different namespace.  The generated unit explicitly
-receives that verified value, so its =daemon run= process and every accepted
-client agree on one runtime path.  The private =flocal= runtime child is
-opened/created with the safe state-directory primitive in section 6 and the
-socket is mode =0600=.  On macOS it is a private =run/daemon.sock= inside
-file.local's per-user Application Support directory, opened with that same
-primitive.  At connect time the daemon verifies the peer UID using the
+The socket is =run/daemon.sock= inside the selected private state directory and
+is mode =0600=. Installation records that absolute state directory in the
+private =~/.config/file.local/managed-state= marker and in the generated unit
+or LaunchAgent. Normal clients read the same marker before opening state, so a
+later caller and the service use one state/socket namespace. An explicit
+=FLOCAL_STATE_DIR= that differs is a test/manual-daemon setting: it must not
+start the installed service. On macOS the same contract applies. At connect
+time the daemon verifies the peer UID using the
 platform Unix-socket credential facility where available; a missing or foreign
 UID is rejected.  Socket pathname errors and malformed/oversize frames close
 the connection without a response larger than the normal bounded error.
@@ -365,46 +373,20 @@ or rollback copy.  The generated definition contains that verified absolute
 installed =flocal= path and the fixed =daemon run= argument, never a PATH
 lookup, remote host, secret, or SSH argument.
 
-Service assets and executable path names use one small trusted-path primitive.
-Starting at the root directory descriptor, it opens every existing component by
-descriptor without following a symlink.  Every directory in that chain must be
-owned by this user or root and must have no group or other write bit.  If a
-private leaf is absent, it is created only through its held trusted parent,
-reopened without following, and made =0700=; a missing component below an
-unwritable root-owned parent is an installation error, not a reason to choose a
-different path.  The final service asset and executable must be regular files,
-owned by this user or root, executable in the latter case, and not writable by
-group or other.  Thus neither a symlink nor a writable parent can redirect a
-future manager execution.  A generated unit/plist is additionally required to
-be owned by this user and mode =0600=.
+Service assets and executable path names are checked before manager execution:
+every existing parent must be user- or root-owned, non-symlinked, and not
+group/other writable. The installed executable must be a regular executable
+file with the same ownership and mode constraints; generated definitions are
+owner-only regular files. The installer creates an owner-only temporary
+definition, fsyncs it, and atomically renames it. This is a path-validation
+boundary, not a descriptor-relative implementation; it fails closed on the
+symlinked, foreign-owned, or writable paths it observes. Errors from
+replacement, reload, enable, bootstrap, or start are returned plainly.
 
-All asset inspection, temporary-file creation, replacement, and directory sync
-use the held leaf descriptor, never a path reopened by name.  An existing
-managed definition is accepted only if =fstatat= without following it finds
-that owner-only regular file; otherwise installation stops.  The installer
-writes a new owner-only temporary definition and atomically renames it through
-the held leaf descriptor.  It never overwrites an unexpected file, follows a
-symlink, or edits a definition it does not own.  On Linux it syncs the new file
-and held containing directory where supported before calling the service
-manager.  On macOS it uses the supported atomic replacement and file-sync
-operations; macOS directory fsync is not required because that operation is not
-supported there.  Errors from replacement, manager reload, enable, bootstrap,
-or start are returned plainly.  There is deliberately no promise to restore an
-old executable or service asset: the normal installer remains the single owner
-of executable updates, and a failed service-manager operation is an actionable
-installation error.
-
-The same primitive, called the safe state-directory primitive when it creates a
-private leaf, is mandatory for every daemon-private parent.  It opens or creates
-the state root and its =objects= and =spool= children as trusted private
-directories before opening SQLite; =state.sqlite3=, its WAL/SHM siblings,
-=daemon.lock=, and every plan spool are then opened or created by descriptor
-relative to those held directories.  The Linux runtime =flocal= child and the
-macOS Application Support =run= child use it before the socket is unlinked or
-bound.  A foreign-owned, symlinked, or group/other-writable component at any
-point fails closed.  No daemon lock, spool, SQLite database, journal, or socket
-parent is created through =create_dir_all= or later reopened by an unchecked
-pathname.
+The state directory and every existing ancestor are checked for the same
+ownership, mode, and symlink constraints before SQLite, locks, or the socket
+are opened. A foreign-owned, symlinked, or group/other-writable component fails
+closed.
 
 A normal =sync= client never installs or edits service assets.  It first checks
 that the service asset and installed executable pass the recorded installation
@@ -421,13 +403,9 @@ Install one user =flocal-daemon.service= in the user-unit directory derived
 from the running systemd user manager's exported environment: its
 =XDG_CONFIG_HOME=, or its =HOME= fallback, determines
 =XDG_CONFIG_HOME/systemd/user=.  The installer does not use a different
-caller-local configuration path.  During preflight, =make install= reads the
-manager environment once, derives both this unit directory and
-=XDG_RUNTIME_DIR/flocal/daemon.sock= from it, validates each trusted path, and
-rejects the invocation unless the CLI's own configuration-home derivation
-(=XDG_CONFIG_HOME= or its =HOME= fallback) and =XDG_RUNTIME_DIR= resolve to
-precisely those manager-visible values.  The
-unit records the verified runtime/configuration environment explicitly and runs
+caller-local configuration path. During preflight, =make install= reads the
+manager environment to locate that unit directory and validates the installed
+executable destination. The unit records the selected state directory explicitly and runs
 the installed =flocal= executable with =daemon run=; it has a restrictive
 umask, restarts on abnormal exit, and gets no credentials in its unit file.
 =WantedBy=default.target= plus =systemctl --user enable= provides the
@@ -679,12 +657,12 @@ partial new remote safety boundary.
 
 * 10. Migration and documentation
 
-This alpha makes a deliberate CLI break to remove the multi-step setup path:
+This alpha makes the single-command setup path the normal interface:
 
 | Previous command | Replacement |
 |------------------+-------------|
 | =flocal init PATH= then =flocal peer add ...= | =flocal sync add PATH --host ... --remote-path ...= |
-| =flocal sync PATH= | removed; use =flocal sync add= for a new sync or =flocal sync start= for an existing one |
+| =flocal sync PATH= | temporary one-shot compatibility path; use =flocal sync add= for a new sync or =flocal sync start= for an existing one |
 | =flocal watch PATH= | =flocal sync start PATH= |
 | terminate foreground =watch= | =flocal sync stop PATH= |
 | =flocal peer list PATH= | =flocal sync list= |
@@ -707,8 +685,7 @@ with this interface, lead with =make install= as the prerequisite for every
 sync control, describe the connector-only managed watch, initial-plan
 confirmation, restored enabled watches, the exact states in =sync list=, and
 the Linux/macOS login boundary.  It must say that Linux needs a systemd user
-manager, the systemd user manager's =XDG_RUNTIME_DIR= is the Linux daemon
-socket contract and must match the CLI environment, and headless macOS prints
+manager, managed clients use the installed private state marker, and headless macOS prints
 instructions to finish installation from a graphical login.  CLI
 help, examples, dated alpha state, and the persistent-watch design need the
 same terminology audit so none describes =sync PATH= or =watch= as a supported
