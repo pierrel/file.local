@@ -1,0 +1,740 @@
+#+title: Daemon-managed sync interface
+#+date: 2026-07-25
+#+status: proposed
+
+* 1. Decision and user contract
+
+Replace the foreground =flocal watch PATH= ownership model with one local,
+per-user daemon.  The daemon owns every connector-side persistent watch; the
+=flocal= executable is a short-lived client for configuration and control.
+This is deliberately one daemon per logged-in user, not one service or socket
+per share.
+
+The normal interface is:
+
+#+begin_src sh
+flocal sync add ~/src/example --host buildbox --remote-path /srv/work/example
+flocal sync list
+flocal sync start ~/src/example
+flocal sync stop ~/src/example
+#+end_src
+
+=sync add= creates a registration for an existing local directory, pairs it
+using the current safe SSH registration handshake, completes the reviewable
+initial sync, and enables its watch.  It never creates =PATH= or treats a
+missing path as an empty share.  Thus its successful result is a paired,
+actively managed sync, rather than a sequence of =init=, =peer add=, =sync=,
+and =watch=.  The remote directory remains a deliberate prerequisite: it must
+already exist and be an intended directory on the remote machine.
+
+=make install= is a prerequisite for every =sync= control command, including
+=list=.  It updates the normal installed =flocal= executable and its one
+platform user-service asset, then starts the daemon.  It is deliberately a
+per-user install: it rejects =sudo= / root invocation rather than creating a
+root-owned service that cannot safely use the user's state or SSH credentials.
+On a platform with a usable user-service manager, its single ordered operation
+is: preflight the manager, stop or boot out the old managed daemon, atomically
+replace the ordinary installed executable, atomically replace the service
+asset, reload or bootstrap the manager, then enable and start it.  There is no
+second daemon executable, updater, or rollback copy.  The macOS headless case
+is the explicit exception: it replaces the ordinary executable but does not
+claim to install or start a LaunchAgent; it prints the exact graphical-login
+completion command instead.
+
+If the daemon is not already running when the user first invokes a =sync=
+control command, that command asks the already-installed service manager to
+start it.  On later logins the platform user service starts it itself; whichever
+comes first wins.  An enabled sync survives daemon, user-service, and machine
+restart and is restored automatically.  =sync stop= disables that specific
+sync durably; it does not stop the daemon or affect another sync.
+
+The existing two-peer roles remain unchanged.  Only the connector, the peer
+that stores =peer_json= and opens SSH, has a local managed watch.  The paired
+responder remains an on-demand process launched inside the connector's SSH
+session.  Data authority stays equal on both replicas.
+
+* 2. Concrete CLI and output
+
+The =sync= command becomes a subcommand group:
+
+#+begin_example
+flocal sync add PATH --host HOST --remote-path ABSOLUTE_PATH [--yes]
+flocal sync list [--json]
+flocal sync start (PATH | --share SHARE_ID) [--yes]
+flocal sync stop (PATH | --share SHARE_ID)
+#+end_example
+
+This is an explicit CLI break: =flocal sync PATH= is removed, rather than kept
+as a compatibility one-shot path alongside the daemon controls.  Existing
+=status=, =conflicts=, and =restore= remain read/control views of a path;
+=init=, =peer add=, and =watch= are removed from the documented setup path.
+The transition mapping is in section 10.
+
+=sync list= is the only overview command.  One human row per locally known
+share has: root, remote host and path (or =responder only=), desired state, and
+live state.  Its machine form is one versioned object:
+
+#+begin_src json
+{"schema":1,"syncs":[{"share":"quiet-river-7f3a","root":{"encoding":"base64","data":"L2hvbWUvbWUvc3JjL2V4YW1wbGU="},"peer":{"host":"buildbox","remote_path":{"encoding":"base64","data":"L3Nydi93b3JrL2V4YW1wbGU="}},"enabled":true,"initial_complete":true,"initial_confirmation_pending":false,"state":"watching","diagnostic":null}],"next":null}
+#+end_src
+
+=state= is one of =stopped= (disabled), =starting=, =watching=,
+=reconnecting=, =stopping=, or =blocked=.  =blocked= carries a durable,
+bounded, escaped diagnostic and means no worker is running because retrying
+would repeat a local or identity/configuration error.  =reconnecting= means a worker is still running
+and will perform the established scan-before-connected recovery.  Therefore
+the list never claims that an offline peer is synchronized, and the separate
+=enabled= field makes the durable request distinct from the instantaneous
+connection state.  Every row also reports =initial_complete= and a live
+=initial_confirmation_pending= flag.  The latter says a review token exists,
+not that the plan was approved.  =diagnostic= is the most recent bounded
+transient or terminal reason, with an explicit machine code and at most 4096
+escaped UTF-8 bytes.  Paths are always byte-safe =encoding/data= objects in
+JSON, never lossy Unicode strings; human output uses the established escaped
+path rendering.  Its human row says =stopped; initial sync needs confirmation=
+whenever initial completion is pending.  A responder-only registration appears
+in the list but cannot be started locally; its row says =responder only=.
+
+Every daemon-control command, including =list=, requires a completed =make
+install=.  It then ensures the installed daemon is available before sending its
+request.  A missing service asset, socket, or service-manager setup reports
+=run make install=; a fresh installation never partially bootstraps itself from
+a control command.  The client never launches an untracked background daemon.
+=start= and =stop= require exactly one selector:
+=PATH= or =--share SHARE_ID=.  A normal =PATH= selector is canonicalized only
+to find a healthy registered share.  The explicit =--share= selector uses the
+stable share ID and stored root without canonicalizing user input, so it can
+stop or retry a share whose root is missing or replaced.
+
+* 3. Initial add and confirmation flow
+
+Initial reconciliation can change both trees, so daemon ownership must not
+turn it into an invisible background write.  =sync add= and =sync start= on a
+paired but initial-incomplete share use this sequence:
+
+1. For =sync add=, the client asks the daemon to register the existing local
+   directory, pair the remote root, and calculate the initial plan.  Pairing
+   may persist its otherwise harmless local and remote registration before the
+   user sees the plan, just as today; it never changes user files.  For a
+   previously paired but initial-incomplete share, =sync start PATH= or
+   =sync start --share SHARE_ID= asks =PrepareInitial= to calculate that same
+   plan from the stored registration.  It never needs a new host or remote
+   path and it cannot silently re-pair a different endpoint.
+2. The daemon writes the complete proposed plan to a private, quota-bounded
+   spool file and returns its first page plus an opaque, short-lived review
+   token.  The client fetches every subsequent page and prints the whole plan
+   before asking for confirmation unless =--yes= was passed.  On decline the
+   client sends =DiscardInitial= for the review token.  The daemon deletes the
+   matching spool and invalidates that token; the share remains paired but
+   disabled and plainly listed as =stopped; initial sync needs confirmation=.
+3. Confirmation asks the daemon to calculate the plan again.  It applies it
+   only if its digest equals the reviewed plan.  If either replica changed,
+   the daemon returns =plan changed; review again= and performs no file write.
+4. On a committed initial round the daemon records =initial_complete= and
+   =watch_enabled= in one SQLite transaction, starts the worker, and replies
+   only once the worker has either entered =watching= or =reconnecting=.
+
+This keeps the existing confirmation boundary.  A failed pairing or initial
+sync leaves =watch_enabled= false.  Retrying =sync add= or =sync start= is
+idempotent for the same registration tuple and repeats the safe review.
+
+Before registration, the handler rejects any =.= or =..= component.  It
+normalizes the local =PATH= to a stored absolute root, opens that existing
+directory without following a final symlink, and captures its device/inode
+through the opened descriptor.  It rechecks that local identity immediately
+before the registration commit.  This is the daemon's local safety boundary:
+it never turns a missing or replaced local root into an empty share.
+
+The remote pairing and root contract are unchanged from the current protocol.
+This feature neither adds responder-side no-follow traversal nor a new remote
+root binding, endpoint namespace, or remote-overlap admission scheme.  Those
+are valuable separate hardening work, listed in section 9, and must not be
+implied by this daemon interface.
+
+* 4. State, ownership, and concurrency
+
+Add =watch_enabled INTEGER NOT NULL DEFAULT 0=,
+=blocked_diagnostic TEXT NULL=, and =intent_generation INTEGER NOT NULL DEFAULT
+0= to =shares=.  No new registry duplicates the existing share, root identity,
+peer, and initial-complete data.  A non-null =blocked_diagnostic= is the
+durable blocked marker: it contains the bounded machine code and escaped
+diagnostic for a terminal safety/configuration failure.  It is cleared only by
+an explicit =sync start= after revalidation or by an intentional
+reconfiguration.  The durable predicate for automatic restoration is exactly:
+
+#+begin_example
+connector configuration exists AND initial_complete = true AND watch_enabled = true
+AND blocked_diagnostic IS NULL
+#+end_example
+
+Nested or overlapping local share roots are forbidden, rather than attempting
+overlap locking.  Initialization compares every local candidate with every
+registered local root by path components and rejects either containment
+direction, including a responder-only registration.  Admission holds a
+serialized SQLite write transaction/registration lock while it checks the
+local root set.  It revalidates the already-opened candidate descriptor and
+rechecks that set immediately before every insert or root update.  A
+busy/conflicting transaction discards its snapshot and retries validation from
+the beginning; no stale preflight can admit an overlap.  Startup and =list=
+repeat the local check for legacy state: no member of a detected legacy local
+overlap can start, and each row is =blocked= with the conflicting share IDs.
+The additive migration preserves their data and defaults them disabled; the
+user must remove or reinitialize one root before enabling either.  This makes
+one filesystem path belong to exactly one worker.
+
+On startup, the daemon enumerates this predicate and starts one worker per
+matching share.  It derives =blocked= from
+the durable marker, but records every other live state only in daemon memory;
+stale statuses therefore disappear across a daemon crash rather than being
+mistaken for present activity.  A worker owns its share-worker slot for its
+full lifetime.  Its transition stream is:
+
+#+begin_example
+stopped --start--> starting --session ready--> watching
+starting --temporary transport failure--> reconnecting --session ready--> watching
+watching --temporary transport/watcher failure--> reconnecting --ready--> watching
+starting/reconnecting --terminal safety/configuration failure--> blocked (persist diagnostic)
+blocked --start after operator repair--> starting
+any live state --stop--> stopping --worker joined--> stopped
+#+end_example
+
+The current global sync lock cannot remain held by a persistent worker: it
+would make more than one configured sync impossible.  Retain it instead as a
+global *per-round* lock: a worker acquires it immediately before a
+share-mutating scan/transfer/apply round and releases it on every round exit.
+Workers can wait, reconnect, and receive stop requests concurrently, but no two
+rounds overlap.  This deliberately preserves the existing object-store and
+filesystem serialization contract instead of claiming that independent roots
+are safe to mutate concurrently.  Each worker opens its own SQLite connection
+and uses the same private state directory.  SQLite WAL serializes short
+metadata transactions; configure a finite busy timeout and return a bounded
+operational error instead of an unbounded retry.
+
+The daemon request handler owns the worker map and an in-memory, per-share
+operation lease.  The durable =intent_generation= is the share's configuration
+epoch; a lease is =(kind, generation, cancellation)= and is never recovered
+after a daemon crash.  Its kinds are =worker= and =confirm-initial=.  A live
+worker owns the =worker= lease for its full lifetime.  =ConfirmInitial=
+atomically compares and increments the durable generation, then acquires
+=confirm-initial=; after its successful commit it changes that lease to
+=worker=.  Conversely, =Start= is a no-op only for the same live worker; it
+cannot run beside =confirm-initial=.  A pending review token owns no operation
+lease, so =Stop= or reconfiguration can invalidate it promptly.
+
+For a =blocked= share, =start= validates the stored root/peer configuration
+again, clears its durable blocked marker only after that validation succeeds,
+and launches a fresh worker; it is the explicit retry after repair, not an
+automatic busy loop.  For an initial-incomplete share, =start= prepares a new
+review and does not set =watch_enabled=; only its later confirmation may take
+the =confirm-initial= lease.  For an initial-complete =stopped= share, it first
+sets =watch_enabled= true and acquires a =worker= lease; for an already
+=watching= or =reconnecting= share it returns its current state.
+
+Every durable configuration change increments =intent_generation=: pairing or
+peer replacement, root registration/reinitialization, start/enable, and stop/
+disable.  A review token binds the share ID, its generation, peer/root identity
+fingerprint, plan digest, calling UID, and expiry.  =ConfirmInitial= consumes it
+with one SQLite compare-and-increment transaction; no confirmation proceeds
+unless the stored generation still equals the token generation.  It reserves the
+succeeding generation for that initial operation and its =confirm-initial=
+lease.  =stop= and every reconfiguration increment the generation and cancel
+any operation holding the prior generation.  A lease holder validates its
+reserved generation before each irreversible local phase and before recording
+=initial_complete= or enabled.  This makes an old confirmation token and a
+stop/reconfigure race unable to enable a watch or write beside another
+operation.
+
+Stop first disables durably, clears any durable blocked marker, and increments
+the generation, signals cancellation to the worker, closes its SSH child, and
+waits at most ten seconds for the worker and global round lock.  If joined, it returns =stopped=.  If the deadline
+expires it returns a non-success =still stopping= outcome, keeps the live state
+=stopping=, and continues reaping; a list or repeated stop can observe the
+final =stopped= state.  The disabled state is already durable, so daemon
+restart never restores that worker.  On daemon crash the operating system kills
+workers with their parent; startup reconstructs only the durable enabled set.
+It does not attempt to preserve in-memory backoff or reported-error counters.
+
+The watch engine itself is reused, not copied.  Its persistent SSH protocol,
+startup scans, root identity checks, retry/backoff policy, notifier-loss
+handling, bounded errors, and committed-action reporting remain the source of
+truth.  Its current stdout/stderr lifecycle messages become daemon log records
+and typed worker transitions; the command client prints only the requested
+control result and list data.
+
+* 5. Local control protocol
+
+The client and daemon use one daemon-owned Unix-domain stream socket, never
+TCP.  Before it creates, unlinks, or binds that socket, a daemon opens the
+private, no-follow =daemon.lock= as an owner-only regular file and acquires a
+non-blocking exclusive advisory lock for its entire lifetime.  A second daemon
+that cannot acquire it exits successfully without touching the socket; only
+the lock owner may remove a stale socket and bind a replacement.  This makes
+simultaneous service starts and a service restart racing an old daemon one
+owner, rather than two daemons deleting each other's endpoint.  Requests and
+responses are a small, versioned, length-delimited serde message enum with a
+strict 64 KiB maximum frame.  =List= and =PlanPage= take an opaque cursor and
+return at most 48 KiB of records/action lines plus =next=; the client reads
+through =next=null=.  =PrepareAdd= writes a complete immutable plan spool under
+the private state directory and returns its first =PlanPage=.
+The spool is an atomic, owner-only file, has a 64 MiB per-plan and 256 MiB
+total pending-plan quota, expires after five minutes, and is deleted on
+confirmation, =DiscardInitial=, invalidation, expiry, or daemon restart.  The
+daemon owns one global pending-spool byte reservation behind a mutex.  After it
+has calculated a complete plan's serialized size but before it creates a
+temporary spool file, it atomically reserves that size against the 256 MiB
+limit.  A failed write releases the reservation immediately; consuming,
+discarding, invalidating, or expiring a spool releases exactly its reservation.
+Daemon startup removes every leftover private spool before accepting requests
+and initializes the counter to zero, so a crash cannot leak capacity.  The
+lifetime daemon lock makes that cleanup and the counter one owner.  If a plan
+cannot fit those explicit bounds, no files change and the command tells the
+user to reduce the scope before trying again.
+
+The local request variants are =List=, =PlanPage=, =PrepareAdd=,
+=PrepareInitial=, =ConfirmInitial=, =DiscardInitial=, =Start=, and =Stop=;
+responses are =Ok=, =ListPage=, =PlanPage=, or structured =Error=.  It does
+not change the connector-to-responder pairing or protocol frames.  A request
+requiring an existing share names it by exactly one healthy path or stable
+share ID;
+=PrepareAdd= uses its separately required candidate path, =PrepareInitial=
+uses that existing-share selector, and confirmation or discard uses a
+daemon-issued review token.  No client-provided root, peer identity, or remote
+executable bypasses the current registration validation.
+
+One request has one response and the daemon closes the connection.  The
+protocol has no subscription, streaming log, arbitrary SQL, shell, or
+filesystem operation.  Server-generated review tokens are random, single-use,
+bound to the calling user, share, intent generation, root/peer fingerprint,
+plan digest, and a five-minute expiry.  The daemon holds no request connection
+while a user considers a plan.
+
+On Linux the socket is the =XDG_RUNTIME_DIR/flocal/daemon.sock= derived from
+the *systemd user manager's* environment, not merely the caller's inherited
+environment.  Installation and every daemon-control client first query that
+manager environment, require an absolute =XDG_RUNTIME_DIR= owned by this user
+and not group/other writable, and require the caller's =XDG_RUNTIME_DIR= to be
+the same absolute directory.  A missing, relative, unsafe, or mismatched value
+is an actionable error; the client must not start a unit whose daemon will
+publish a socket in a different namespace.  The generated unit explicitly
+receives that verified value, so its =daemon run= process and every accepted
+client agree on one runtime path.  The private =flocal= runtime child is
+opened/created with the safe state-directory primitive in section 6 and the
+socket is mode =0600=.  On macOS it is a private =run/daemon.sock= inside
+file.local's per-user Application Support directory, opened with that same
+primitive.  At connect time the daemon verifies the peer UID using the
+platform Unix-socket credential facility where available; a missing or foreign
+UID is rejected.  Socket pathname errors and malformed/oversize frames close
+the connection without a response larger than the normal bounded error.
+
+* 6. Service integration
+
+The executable contains a non-normal but supported =flocal daemon run= entry
+point, used only by generated service definitions.  It is not the normal user
+interface.  =make install= installs the normal runnable =flocal= executable in
+the same location used by its CLI today, and one per-user service definition
+which runs that installed executable with =daemon run=.  It does not copy a
+second daemon binary or own an update mechanism: the normal package/install
+upgrade supplies the executable used by both CLI and service.
+
+There is one platform-aware installer order, deliberately shared by the
+=Makefile= target and its testable installer helper.  It first rejects root or
+=sudo= use and preflights the relevant user-service manager/domain *without
+changing the running service*.  If that preflight succeeds, it stops the
+existing managed daemon (Linux) or bootouts its existing LaunchAgent (macOS),
+atomically replaces the ordinary installed =flocal= binary, atomically replaces
+the generated service asset, reloads or bootstraps the manager, then enables
+and starts the service.  No load-bearing action follows a potentially
+backgrounded manager command in the same shell pipeline; each stop/bootout,
+replacement, reload/bootstrap, and enable/start is observed before the next
+step.  This ordering prevents a running old daemon from using a binary while it
+is replaced and makes a fresh service point at the new normal binary.
+
+The normal =make install= binary-update step owns replacement of that
+executable.  Before it writes a service definition or asks a manager to execute
+the daemon, the installer validates the installed executable's absolute path
+with the trusted-path primitive below.  This is only an execution-path safety
+check; there is no second daemon binary, updater, descriptor-binding protocol,
+or rollback copy.  The generated definition contains that verified absolute
+installed =flocal= path and the fixed =daemon run= argument, never a PATH
+lookup, remote host, secret, or SSH argument.
+
+Service assets and executable path names use one small trusted-path primitive.
+Starting at the root directory descriptor, it opens every existing component by
+descriptor without following a symlink.  Every directory in that chain must be
+owned by this user or root and must have no group or other write bit.  If a
+private leaf is absent, it is created only through its held trusted parent,
+reopened without following, and made =0700=; a missing component below an
+unwritable root-owned parent is an installation error, not a reason to choose a
+different path.  The final service asset and executable must be regular files,
+owned by this user or root, executable in the latter case, and not writable by
+group or other.  Thus neither a symlink nor a writable parent can redirect a
+future manager execution.  A generated unit/plist is additionally required to
+be owned by this user and mode =0600=.
+
+All asset inspection, temporary-file creation, replacement, and directory sync
+use the held leaf descriptor, never a path reopened by name.  An existing
+managed definition is accepted only if =fstatat= without following it finds
+that owner-only regular file; otherwise installation stops.  The installer
+writes a new owner-only temporary definition and atomically renames it through
+the held leaf descriptor.  It never overwrites an unexpected file, follows a
+symlink, or edits a definition it does not own.  On Linux it syncs the new file
+and held containing directory where supported before calling the service
+manager.  On macOS it uses the supported atomic replacement and file-sync
+operations; macOS directory fsync is not required because that operation is not
+supported there.  Errors from replacement, manager reload, enable, bootstrap,
+or start are returned plainly.  There is deliberately no promise to restore an
+old executable or service asset: the normal installer remains the single owner
+of executable updates, and a failed service-manager operation is an actionable
+installation error.
+
+The same primitive, called the safe state-directory primitive when it creates a
+private leaf, is mandatory for every daemon-private parent.  It opens or creates
+the state root and its =objects= and =spool= children as trusted private
+directories before opening SQLite; =state.sqlite3=, its WAL/SHM siblings,
+=daemon.lock=, and every plan spool are then opened or created by descriptor
+relative to those held directories.  The Linux runtime =flocal= child and the
+macOS Application Support =run= child use it before the socket is unlinked or
+bound.  A foreign-owned, symlinked, or group/other-writable component at any
+point fails closed.  No daemon lock, spool, SQLite database, journal, or socket
+parent is created through =create_dir_all= or later reopened by an unchecked
+pathname.
+
+A normal =sync= client never installs or edits service assets.  It first checks
+that the service asset and installed executable pass the recorded installation
+preflight; if not, it reports =run make install= and does nothing else.  Only
+then, after a socket connection fails, does it ask the already-installed
+service manager to start the daemon and perform one bounded connection attempt.
+The daemon, not the service manager, owns and creates its socket after startup.
+Any missing, stale, or unsafe service setup tells the user to rerun =make
+install=; the client never launches an untracked background child.
+
+** Linux
+
+Install one user =flocal-daemon.service= in the user-unit directory derived
+from the running systemd user manager's exported environment: its
+=XDG_CONFIG_HOME=, or its =HOME= fallback, determines
+=XDG_CONFIG_HOME/systemd/user=.  The installer does not use a different
+caller-local configuration path.  During preflight, =make install= reads the
+manager environment once, derives both this unit directory and
+=XDG_RUNTIME_DIR/flocal/daemon.sock= from it, validates each trusted path, and
+rejects the invocation unless the CLI's own configuration-home derivation
+(=XDG_CONFIG_HOME= or its =HOME= fallback) and =XDG_RUNTIME_DIR= resolve to
+precisely those manager-visible values.  The
+unit records the verified runtime/configuration environment explicitly and runs
+the installed =flocal= executable with =daemon run=; it has a restrictive
+umask, restarts on abnormal exit, and gets no credentials in its unit file.
+=WantedBy=default.target= plus =systemctl --user enable= provides the
+subsequent-login case.
+
+=make install= rejects root/sudo use and first proves that =systemctl --user=
+can control this user's manager and that the manager-visible paths agree with
+the client, before touching the old service or either asset.  It then runs, as
+separate observed operations, =systemctl --user stop flocal-daemon.service=
+(an absent unit is harmless), atomically replaces the normal executable,
+atomically replaces the checked owner-only generated unit, runs
+=systemctl --user daemon-reload=, then =systemctl --user enable --now
+flocal-daemon.service=.  Thus installation starts the daemon now and every
+later user login starts it automatically.  On a first sync action, the client
+repeats the manager-environment agreement check, uses =systemctl --user start
+flocal-daemon.service= when the installed daemon is absent, then performs the
+bounded socket connection at that verified manager-derived socket path; there
+is no socket unit or socket activation.  A usable systemd user manager is
+required; without one, or without matching trustworthy runtime/config paths,
+the preflight fails before stopping an old daemon or replacing any asset, with
+a clear explanation that managed sync requires systemd user services on Linux.
+
+** macOS
+
+Install one user LaunchAgent at
+=~/Library/LaunchAgents/local.file-local.flocal-daemon.plist=.  Its =Program=
+is the installed =flocal= executable, arguments are separate plist strings,
+and =RunAtLoad= plus =KeepAlive= start/restart it while the graphical user
+session exists.  It has no =Sockets= entry: the daemon owns its socket.
+When a GUI launchd domain is available, =make install= rejects root/sudo use,
+preflights that =gui/$UID= domain, bootouts an existing label, atomically
+replaces the normal executable, atomically replaces the checked owner-only
+generated plist, then bootstraps =gui/$UID= and kickstarts the label.  A first
+sync action uses =launchctl kickstart= for an installed, absent daemon and then
+performs the bounded connection.  It states plainly that it runs only while
+that user is logged in.
+
+An SSH/headless macOS session may not have a =gui/$UID= launchd domain.  This
+is a distinct, honest branch after root/sudo rejection: it atomically replaces
+the normal executable, does not bootout, create, replace, bootstrap, enable, or
+start any LaunchAgent asset, and prints an actionable completion command.
+It therefore never falsely claims that a service was installed or restarted.
+A =make install= invocation records its canonical source checkout and prints,
+with that concrete absolute path substituted:
+
+#+begin_src sh
+Log into the macOS GUI as this user, then run:
+cd -- /absolute/path/to/file.local && make install
+#+end_src
+
+The same guidance is retained for later control-client bootstrap failures; if
+the command was invoked from an absolute installed executable rather than a
+known checkout, it prints that executable's absolute invocation and explains
+that the user must rerun =make install= from the checkout that installed it.
+It never suggests a bare relative =make install= whose working directory is
+unknown.  After the graphical command is run, it installs and starts the
+LaunchAgent.
+
+A client without a reachable GUI agent reports those instructions rather than
+launching an unmanaged daemon.  A stale socket, service crash loop, or
+service-manager error is shown as such; the client does not bypass the service
+manager with a duplicate child.
+
+* 7. Failure handling and security boundaries
+
+1. Network, SSH, remote process, and transient local watcher errors leave the
+   watch enabled and the worker in =reconnecting=.  The existing bounded
+   backoff and recovery scans continue unattended.
+2. A root identity mismatch, peer identity mismatch, unsupported persistent
+   protocol, unsafe stored executable, or unrepairable local watcher setup
+   moves the worker to =blocked= and persists its bounded diagnostic.  It
+   remains enabled so =list= exposes the user's requested configuration, but
+   restart does not retry it until =sync start= explicitly revalidates and
+   clears the marker.  A missing/replaced root can be stopped or retried by =--share=;
+   path canonicalization is never required to control it.  It never treats a
+   different directory as an empty tree.
+3. A daemon crash, kill, or laptop sleep cannot claim a live connection.  The
+   platform service restarts it when installed.  Startup revalidates roots and
+   runs the established startup reconciliation before reporting =watching=;
+   a durably blocked share remains =blocked= until explicitly retried.
+4. A stop racing a recovery/transfer wins: its cancellation closes the SSH
+   child at a protocol boundary, releases the global round lock if held, and leaves the
+   existing install-intent recovery mechanism to complete or recover a partial
+   filesystem apply on the next operation.  It does not erase objects,
+   conflicts, pairing, or user files.
+5. The daemon keeps the present SSH security model: host values are validated,
+   remote executable discovery is constrained, paths travel in framed protocol
+   data, and SSH authentication/host verification stay in the user's SSH
+   configuration.  Every daemon SSH invocation adds =BatchMode=yes= and uses
+   bounded connection and protocol errors.  A noninteractive service
+   environment must already have usable SSH credentials; the daemon never
+   prompts, waits for an interactive password, or records credentials.
+6. Logs are private user files, rotate by a fixed size/count, and use the
+   existing escaped, UTF-8-safe bounded formatter.  No peer-controlled error,
+   path, or host text can forge a log line or command.
+7. A malformed local registration cannot create an overlap or redirect a local
+   root: registration checks already-opened local roots against every existing
+   local share before commit.  An existing legacy local overlap is a durable
+   operator problem surfaced in =list=, not a reason to run two workers on the
+   same files.
+
+* 8. Tests and acceptance criteria
+
+Unit and integration tests must prove:
+
+1. Schema migration gives every existing share =watch_enabled=false=,
+   =blocked_diagnostic=NULL=, and =intent_generation= zero without changing
+   roots, pairing, identities, records, conflicts, or installs.  Legacy
+   nested/overlapping roots are detected, remain disabled, are visible by share
+   ID, and cannot start.
+2. Local initialization/registration rejects parent/child and exact root
+   overlaps, including connector versus responder-only roots.  A local commit
+   race that replaces the accepted root fails its identity recheck.  Two
+   independent non-overlapping connector workers may be live, but their
+   mutating rounds are globally serialized.  A concurrent admission race
+   between overlapping candidates has exactly one success; the loser rereads
+   fresh roots and receives the overlap error.  Existing pairing and responder
+   protocol tests remain unchanged; this feature makes no new remote-root
+   safety claim.
+3. List pagination never exceeds 64 KiB, terminates correctly, and contains
+   connector/responder-only rows, durable enabled, initial-complete, pending
+   confirmation, live state, and bounded diagnostic separately.  JSON schema
+   1 base64-encodes non-UTF-8 local and remote paths without loss.
+4. A plan with more than one response page is printed in full before the
+   confirmation prompt.  =PrepareInitial= by path and stable share ID reviews
+   a paired initial-incomplete registration without re-pairing; =DiscardInitial=
+   deletes exactly its matching spool and makes that token unusable.  Per-page
+   and total plan quotas, expiry, cleanup, and an over-quota no-write failure
+   are direct tests.  Concurrent preparations reserve serialized spool bytes
+   under the daemon mutex before creating their temporary files, so their total
+   can never exceed 256 MiB; failed writes and every consume/discard/expiry
+   release the exact reservation.  Crash startup removes leftover spools and
+   starts with no leaked reservation.
+5. =sync add= uses the current pairing contract after local
+   existing-directory/identity validation.  It presents the initial plan,
+   refuses to apply a changed reviewed plan, and ends with an enabled watcher
+   only after confirmed success.  Decline and failure leave it paired but
+   disabled.
+6. Confirmation rejects an expired, reused, discarded, wrong-UID,
+   wrong-generation, or reconfigured token.  Stop and peer/root reconfiguration
+   invalidate a token; the atomic compare-and-increment plus cancellation
+   prevents the old initial operation from setting initial-complete or enabled.
+   Direct races prove that one per-share lease excludes =ConfirmInitial= from
+   =Start=/worker, and that stop/reconfiguration cancels a running confirmation
+   before it can write or enable.
+7. Duplicate start has one worker.  A terminal failure persists =blocked= and
+   its diagnostic across daemon restart; it is retried only by explicit start
+   after revalidation.  Stop joins within ten seconds and reports
+   =stopped=; an intentionally non-joining worker reports =still stopping=,
+   stays disabled, and is eventually reaped before a later start.
+8. Daemon restart restores every and only enabled, initial-complete connector
+   share.  Stopped and initial-incomplete shares do not start.  An enabled
+   worker survives real Docker network loss/restoration, watcher
+   suspension/resume, and responder restart; a daemon restart during offline
+   recovery restores the watch and later converges both trees without a new
+   user command.  A first start with the peer already offline enters
+   =reconnecting=, rather than =blocked=, and transitions to =watching= after
+   the peer returns and its initial recovery round succeeds.
+9. Root replacement controlled through =--share=, wrong peer, incompatible
+   protocol, and unavailable SSH credentials surface as =blocked= or
+   =reconnecting= as appropriate; list never labels them =watching=.  Daemon
+   SSH argv always contains =BatchMode=yes=; an authentication prompt, connect
+   timeout, or protocol failure becomes one bounded diagnostic rather than an
+   indefinitely blocked service process.
+10. Socket permissions and foreign-UID rejection where supported, malformed
+    and over-limit frames, stale socket/service crash handling, and two daemon
+    processes concurrently starting or a replacement racing an old daemon prove
+    that the lifetime advisory lock is acquired before socket creation and the
+    losing daemon exits without unlinking or serving the winner's socket.
+    Ordinary CI tests generated-definition argument escaping, absolute installed
+    executable paths, and the trusted-path primitive: it rejects a symlink,
+    foreign owner, or group/other-writable mode in *every* ancestor, and accepts
+    only owner- or root-owned non-writable chains; it also rejects a
+    symlink/non-owner-only/unexpected definition and creates and replaces the
+    owner-only definition only through its held directory fd.  The same walk
+    rejects an unsafe installed executable before a manager can run it.  State
+    directory tests prove the primitive is used for SQLite and its WAL/SHM
+    parents, =daemon.lock=, =objects=, =spool=, and runtime socket parents:
+    each rejects an unsafe pre-existing component and creates private missing
+    components only through a held trusted parent.  Linux tests file and
+    directory sync where supported; macOS tests
+    supported atomic replacement and file sync and does not require directory
+    fsync.  Fake manager tests
+    prove the one =make install= ordering: reject root/sudo, preflight the
+    manager without disruption, stop/bootout the existing managed daemon,
+    atomically replace the ordinary installed binary, atomically replace the
+    service asset, reload/bootstrap, then enable/start.  They prove that a
+    preflight failure leaves the prior service and assets untouched, that later
+    failures are reported without a promised rollback, and that no manager
+    action is hidden behind a shell pipeline.  Headless macOS tests prove
+    binary replacement plus the precise GUI completion command and prove no
+    plist mutation, bootout, bootstrap, enable, or start is attempted.
+    Until named provisioned runners exist, real systemd-user and GUI-launchd
+    lifecycle checks are a manual release gate: Linux evidence must prove
+    =make install= preflight/stop/binary-replace/unit-replace/daemon-reload/
+    enable/start plus later-login start, and macOS evidence must prove GUI
+    preflight/bootout/binary-replace/plist-replace/bootstrap/kickstart and
+    =RunAtLoad= from a GUI login.  Normal CI does not claim either manager
+    lifecycle; it covers generated definitions and client bootstrap behavior.
+    Linux manager-environment tests prove the unit directory and daemon socket
+    derive from the manager rather than a caller default, that the generated
+    unit receives those verified values, and that a missing, unsafe, or
+    caller/manager-mismatched runtime/configuration path rejects before any
+    service stop, asset replacement, or start.  Linux without a user manager
+    fails clearly before interrupting the existing daemon; headless macOS prints the concrete absolute-checkout rerun command,
+    or the absolute installed-executable guidance when no checkout is known,
+    after updating only the normal binary and without any managed-service
+    action.  Linux socket tests derive the path from the validated systemd
+    user-manager =XDG_RUNTIME_DIR= and reject a missing, relative,
+    foreign-owned, group/other-writable, or caller-mismatched runtime
+    directory.
+11. Every daemon-control client operation, including =list=, first verifies the
+    same completed-install/start/connect path.  A fresh, missing, or unsafe
+    installation says =run make install= and does not try a partial bootstrap.
+    =flocal sync PATH= and foreground =watch= are rejected with the documented
+    replacement commands.  All current protocol, filesystem, recovery,
+    coverage, lint, and Docker end-to-end gates remain green.
+
+* 9. Trade-offs and rejected alternatives
+
+One daemon with a local socket is smaller and more truthful than a separate
+systemd/launchd definition, log, PID, and lock for each share.  It gives list
+an authoritative live answer and lets one service restart all desired watches.
+It does require an internal control protocol and per-worker SQLite connections;
+these are justified by multiple managed shares and cannot be represented by the
+current one foreground process.
+
+Starting a detached daemon directly from the CLI was rejected.  It races login
+services, leaves ambiguous ownership after upgrades, and cannot honestly offer
+"starts at login."  A private copied, content-hashed daemon binary and custom
+updater were rejected as needless lifecycle machinery: the normally installed
+=flocal= executable is the one service executable and normal installation
+upgrades it.  A TCP control listener was rejected because it introduces network
+authentication and exposure for no user benefit.  Turning each remote responder
+into a daemon was rejected because SSH already provides the intended
+authenticated on-demand launch and it would alter the one-connector topology.
+
+Persisting only a last known status was rejected: after a crash it would show
+activity that no longer exists.  Persisting only the enabled boolean gives
+restart correctness while live state remains truthful.  Retaining separate
+=service start/stop= and foreground =watch= command paths was rejected because
+they recreate the duplicate-owner problem this feature removes.
+
+Responder-side remote-root identity binding, no-follow remote-root traversal,
+and remote endpoint namespaces are deferred hardening work.  They change the
+pairing trust contract and deserve their own design and review; this interface
+continues to use the established pairing behavior rather than presenting a
+partial new remote safety boundary.
+
+* 10. Migration and documentation
+
+This alpha makes a deliberate CLI break to remove the multi-step setup path:
+
+| Previous command | Replacement |
+|------------------+-------------|
+| =flocal init PATH= then =flocal peer add ...= | =flocal sync add PATH --host ... --remote-path ...= |
+| =flocal sync PATH= | removed; use =flocal sync add= for a new sync or =flocal sync start= for an existing one |
+| =flocal watch PATH= | =flocal sync start PATH= |
+| terminate foreground =watch= | =flocal sync stop PATH= |
+| =flocal peer list PATH= | =flocal sync list= |
+
+Run =make install= before any of these controls.  A fresh, missing, or unsafe
+service setup says =run make install= rather than starting an ad hoc daemon.
+Existing state opens through the additive migration with every old share
+disabled.  It is never auto-enabled merely because someone used foreground
+=watch= before upgrading; the user opts in with =sync start=.  This avoids
+surprising unattended writes after an upgrade.  Existing paired shares can be
+started without re-pairing once their already-required initial sync is
+complete.  If an old state contains overlapping roots, it stays readable but
+all conflicting shares remain disabled and =sync list= identifies the share
+IDs; choose one root to keep before either can be started.  A missing legacy
+root is stopped or inspected with =--share=, not a path that may no longer
+canonicalize.
+
+README.org must replace its alpha foreground instructions and service roadmap
+with this interface, lead with =make install= as the prerequisite for every
+sync control, describe the connector-only managed watch, initial-plan
+confirmation, restored enabled watches, the exact states in =sync list=, and
+the Linux/macOS login boundary.  It must say that Linux needs a systemd user
+manager, the systemd user manager's =XDG_RUNTIME_DIR= is the Linux daemon
+socket contract and must match the CLI environment, and headless macOS prints
+instructions to finish installation from a graphical login.  CLI
+help, examples, dated alpha state, and the persistent-watch design need the
+same terminology audit so none describes =sync PATH= or =watch= as a supported
+entry point or claims that an offline state is synced.
+The release checklist must retain real per-user systemd and GUI-launchd
+lifecycle verification as a manual gate until named provisioned runners are
+available; ordinary CI validates only generated service assets and unit-level
+bootstrap behavior.
+
+* 11. Implementation sequence
+
+1. Refactor the current foreground watch loop into a share worker with typed
+   transitions, cooperative cancellation, bounded join, daemon logging, and a
+   global lock held only for individual mutating rounds; preserve its
+   protocol/recovery tests first.
+2. Add the additive state migration, share enumeration, overlap rejection,
+   intent generations, durable enable/disable operations, and migration tests.
+3. Add the bounded Unix-socket protocol, pagination/spooling, and daemon
+   request loop, then cover byte-safe list/start/stop, review-token invalidation,
+   restart restoration, duplicate requests, and serialized distinct-share
+   rounds.
+4. Refactor current pairing and initial planning/application into reusable
+   daemon operations; add local existing-directory/identity validation,
+   review-token initial confirmation, and =sync add= tests without changing
+   the current responder protocol.
+5. Add =make install= service integration: Linux user-unit
+   preflight/stop/binary-replace/unit-replace/daemon-reload/enable/start and
+   macOS GUI LaunchAgent preflight/bootout/binary-replace/plist-replace/
+   bootstrap/kickstart.  Point both at the normal installed executable,
+   validate it and write generated definitions through the safe no-follow
+   service-directory primitive, handle the headless macOS binary-only/
+   instructions branch, test manager failures and spool-quota reservations,
+   then replace CLI/help/README documentation.
+6. Run the full local review loop, all deterministic gates, Docker recovery
+   scenarios, and platform service checks before presenting the result for
+   review.
