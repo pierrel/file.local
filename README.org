@@ -20,7 +20,7 @@ Run that command from a checkout of this repository on *both* peers. Ensure
 =~/.local/bin= is in =PATH= and that non-interactive SSH can run =flocal= on
 the remote peer. Pairing also checks =~/.local/bin/flocal= directly, since
 non-interactive SSH sessions often use a smaller =PATH=. The remote directory
-must already exist, but it does not need to be initialized separately: pairing
+does not need to be initialized separately: pairing creates it when needed and
 registers it under the initiating peer's share identity.
 
 Before the first command after upgrading an existing installation to this
@@ -30,8 +30,8 @@ device and inode as its durable identity. A missing, symlinked, or later
 replaced root is rejected rather than being mistaken for an empty tree and
 propagating mass deletions.
 
-Then, on one peer only, pair an existing local directory with an existing remote
-directory:
+Then, on one peer only, pair an existing local directory with an absolute
+remote path:
 
 #+begin_src sh
 flocal sync add ~/src/example --host buildbox --remote-path /srv/work/example

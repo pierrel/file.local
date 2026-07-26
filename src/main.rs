@@ -342,6 +342,7 @@ struct DaemonWorker {
     state: Arc<std::sync::atomic::AtomicU8>,
     stopping: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 enum WorkerEvent {
@@ -698,13 +699,13 @@ fn install_systemd_service(state: &State, executable: &Path) -> Result<()> {
     }
     let unit = config.join("systemd/user/flocal-daemon.service");
     let content = systemd_unit_content(executable, &state.dir)?;
+    install_managed_state_marker(state)?;
     install_text_file(&unit, &content)?;
     run_manager("systemctl", &["--user", "daemon-reload"])?;
     run_manager(
         "systemctl",
         &["--user", "enable", "--now", "flocal-daemon.service"],
     )?;
-    install_managed_state_marker(state)?;
     println!("Installed and started flocal-daemon.service");
     Ok(())
 }
@@ -714,10 +715,8 @@ fn systemd_quote(path: &Path) -> Result<String> {
     let path = path
         .to_str()
         .context("systemd service paths must be valid UTF-8")?;
-    if path
-        .chars()
-        .any(|character| character.is_control() || character == '%')
-    {
+    validate_service_path_characters(path)?;
+    if path.contains('%') {
         bail!("systemd service paths cannot contain control characters or %")
     }
     Ok(format!(
@@ -756,17 +755,25 @@ fn install_launch_agent(state: &State, executable: &Path) -> Result<()> {
     let home = std::env::var_os("HOME").context("could not determine home directory")?;
     let plist =
         PathBuf::from(home).join("Library/LaunchAgents/local.file-local.flocal-daemon.plist");
+    let executable = executable
+        .to_str()
+        .context("launchd executable path must be valid UTF-8")?;
+    let state_dir = state
+        .dir
+        .to_str()
+        .context("launchd state path must be valid UTF-8")?;
+    let plist = plist
+        .to_str()
+        .context("launchd service path must be valid UTF-8")?
+        .to_owned();
     let content = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>local.file-local.flocal-daemon</string><key>ProgramArguments</key><array><string>{}</string><string>daemon</string><string>run</string></array><key>EnvironmentVariables</key><dict><key>FLOCAL_STATE_DIR</key><string>{}</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n",
-        xml_escape(&executable.display().to_string()),
-        xml_escape(&state.dir.display().to_string()),
+        xml_escape(executable)?,
+        xml_escape(state_dir)?,
     );
-    install_text_file(&plist, &content)?;
-    run_manager(
-        "launchctl",
-        &["bootstrap", &domain, plist.to_string_lossy().as_ref()],
-    )?;
     install_managed_state_marker(state)?;
+    install_text_file(Path::new(&plist), &content)?;
+    run_manager("launchctl", &["bootstrap", &domain, &plist])?;
     println!("Installed and started local.file-local.flocal-daemon");
     Ok(())
 }
@@ -778,12 +785,26 @@ fn launchd_target() -> Result<String> {
     Ok(format!("gui/{uid}/local.file-local.flocal-daemon"))
 }
 
+fn validate_service_path_characters(value: &str) -> Result<()> {
+    if value.chars().any(|character| {
+        let code = character as u32;
+        character.is_control()
+            || (0xfdd0..=0xfdef).contains(&code)
+            || code & 0xffff == 0xfffe
+            || code & 0xffff == 0xffff
+    }) {
+        bail!("launchd service paths cannot contain control characters or XML noncharacters")
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
-fn xml_escape(value: &str) -> String {
-    value
+fn xml_escape(value: &str) -> Result<String> {
+    validate_service_path_characters(value)?;
+    Ok(value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
-        .replace('>', "&gt;")
+        .replace('>', "&gt;"))
 }
 
 #[cfg(target_os = "macos")]
@@ -939,10 +960,27 @@ fn daemon_run(mut state: State) -> Result<()> {
     ));
     let (events_tx, events_rx) = std::sync::mpsc::channel();
     let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())?;
     restore_watches(&state, &workers, &events_tx)?;
+    let mut shutdown_started = None;
     loop {
         while let Ok(event) = events_rx.try_recv() {
             apply_worker_event(&state, &workers, event)?;
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            let started = *shutdown_started.get_or_insert_with(std::time::Instant::now);
+            if stop_daemon_workers(&workers)? {
+                return Ok(());
+            }
+            if started.elapsed() >= Duration::from_secs(10) {
+                force_stop_daemon_workers(&workers)?;
+            }
+            if started.elapsed() >= Duration::from_secs(11) {
+                bail!("daemon shutdown timed out waiting for workers")
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
         }
         match listener.accept() {
             Ok((stream, _)) => {
@@ -1031,6 +1069,40 @@ fn restore_watches(
             && share.blocked_diagnostic.is_none()
         {
             start_worker(state, workers, events, share.id)?;
+        }
+    }
+    Ok(())
+}
+
+fn stop_daemon_workers(
+    workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
+) -> Result<bool> {
+    let workers = workers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
+    for worker in workers.values() {
+        worker.stopping.store(true, Ordering::Relaxed);
+        worker.stop.store(true, Ordering::Relaxed);
+    }
+    Ok(workers
+        .values()
+        .all(|worker| worker.finished.load(Ordering::Relaxed)))
+}
+
+fn force_stop_daemon_workers(
+    workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
+) -> Result<()> {
+    let workers = workers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
+    for worker in workers.values() {
+        let mut child = worker
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon worker child state is poisoned"))?;
+        if let Some(mut child) = child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
     Ok(())
@@ -1239,6 +1311,7 @@ fn start_worker(
     let live = Arc::new(std::sync::atomic::AtomicU8::new(WORKER_STARTING));
     let stopping = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
+    let child = Arc::new(Mutex::new(None));
     let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut workers = workers
@@ -1255,13 +1328,14 @@ fn start_worker(
                 state: live.clone(),
                 stopping,
                 finished: finished.clone(),
+                child: child.clone(),
             },
         );
     }
     let state_dir = state.dir.clone();
     let events = events.clone();
     std::thread::spawn(move || {
-        let result = run_daemon_worker(&state_dir, &share, &stop, &live);
+        let result = run_daemon_worker(&state_dir, &share, &stop, &live, child);
         let error = result.err().map(|error| format!("{error:#}"));
         finished.store(true, Ordering::Relaxed);
         let _ = events.send(WorkerEvent::Exited {
@@ -1278,6 +1352,7 @@ fn run_daemon_worker(
     share: &ShareId,
     stop: &AtomicBool,
     live: &std::sync::atomic::AtomicU8,
+    child: Arc<Mutex<Option<Child>>>,
 ) -> Result<()> {
     let mut state = State::open(state_dir)?;
     if !state.managed_share(share)?.watch_enabled {
@@ -1291,10 +1366,11 @@ fn run_daemon_worker(
         &mut state,
         share,
         &root,
-        &mut io::sink(),
-        &mut io::sink(),
+        &mut io::stderr(),
+        &mut io::stderr(),
         Some(stop),
         Some(live),
+        child,
     )
 }
 
@@ -2587,9 +2663,19 @@ fn persistent_watch_loop(
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<()> {
-    persistent_watch_loop_control(state, share, root_path, out, err, None, None)
+    persistent_watch_loop_control(
+        state,
+        share,
+        root_path,
+        out,
+        err,
+        None,
+        None,
+        Arc::new(Mutex::new(None)),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persistent_watch_loop_control(
     state: &mut State,
     share: &ShareId,
@@ -2598,6 +2684,7 @@ fn persistent_watch_loop_control(
     err: &mut impl Write,
     stop: Option<&AtomicBool>,
     worker_state: Option<&std::sync::atomic::AtomicU8>,
+    child: Arc<Mutex<Option<Child>>>,
 ) -> Result<()> {
     let peer = state
         .peer(share)?
@@ -2658,6 +2745,7 @@ fn persistent_watch_loop_control(
             &mut connected,
             stop,
             worker_state,
+            child.clone(),
         );
         match outcome {
             Ok(()) if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) => return Ok(()),
@@ -2783,9 +2871,16 @@ fn persistent_watch_session(
     connected: &mut bool,
     stop: Option<&AtomicBool>,
     worker_state: Option<&std::sync::atomic::AtomicU8>,
+    child: Arc<Mutex<Option<Child>>>,
 ) -> Result<()> {
     while events_rx.try_recv().is_ok() {}
-    let remote = PersistentRemote::spawn(&peer.host, &peer.executable)?;
+    if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+        return Ok(());
+    }
+    let remote = PersistentRemote::spawn(&peer.host, &peer.executable, child)?;
+    if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+        return Ok(());
+    }
     persistent_watch_session_io(
         state,
         share,
@@ -3449,14 +3544,14 @@ enum PersistentEvent {
 }
 
 struct PersistentRemote {
-    child: Child,
+    child: Arc<Mutex<Option<Child>>>,
     input: ChildStdin,
     output: ChildStdout,
     stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
 
 impl PersistentRemote {
-    fn spawn(host: &str, executable: &str) -> Result<Self> {
+    fn spawn(host: &str, executable: &str, child_slot: Arc<Mutex<Option<Child>>>) -> Result<Self> {
         validate_host(host)?;
         validate_executable(executable)?;
         let command = format!("{executable} protocol serve");
@@ -3494,8 +3589,12 @@ impl PersistentRemote {
             }
             kept
         });
+        *child_slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("persistent remote child state is poisoned"))? =
+            Some(child);
         Ok(Self {
-            child,
+            child: child_slot,
             input,
             output,
             stderr: Some(stderr),
@@ -3505,8 +3604,12 @@ impl PersistentRemote {
 
 impl Drop for PersistentRemote {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock()
+            && let Some(mut child) = child.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if let Some(stderr) = self.stderr.take() {
             let _ = stderr.join();
         }
@@ -3678,6 +3781,8 @@ fn bytes_path(bytes: &[u8]) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     fn serve_messages(messages: &[Message]) -> Result<(Result<()>, Vec<u8>)> {
         let temp = tempdir()?;
@@ -4730,6 +4835,7 @@ mod tests {
             }
         }
         assert_eq!(count, 20);
+        assert!(daemon_sync_page(&state, &workers, Some("missing".into())).is_err());
         Ok(())
     }
 
@@ -4743,6 +4849,287 @@ mod tests {
         state.set_install_intent(&share, &[])?;
         recover_daemon_share_install(&mut state, &share)?;
         assert!(state.install_intent(&share)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_controls_validate_state_and_stop_a_worker() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events, _events_rx) = std::sync::mpsc::channel();
+
+        assert!(
+            start_managed_share(&mut state, &workers, &events, share.clone(), None)
+                .expect_err("responder-only share must not start")
+                .to_string()
+                .contains("responder-only")
+        );
+
+        state.set_peer(
+            &share,
+            &PeerConfig {
+                peer_id: flocal::model::PeerId("peer-test".into()),
+                host: "example.invalid".into(),
+                remote_path: path_bytes(Path::new("/remote")),
+                executable: "/bin/false".into(),
+            },
+        )?;
+        assert!(
+            start_managed_share(&mut state, &workers, &events, share.clone(), None)
+                .expect_err("initial sync must be complete")
+                .to_string()
+                .contains("initial synchronization")
+        );
+
+        state.set_initial_complete(&share)?;
+        state.set_watch_enabled(&share, true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(true));
+        workers.lock().unwrap().insert(
+            share.clone(),
+            DaemonWorker {
+                id: 7,
+                stop: stop.clone(),
+                state: Arc::new(std::sync::atomic::AtomicU8::new(WORKER_WATCHING)),
+                stopping: stopping.clone(),
+                finished,
+                child: Arc::new(Mutex::new(None)),
+            },
+        );
+        stop_managed_share(&state, &workers, share.clone())?;
+        assert!(!state.managed_share(&share)?.watch_enabled);
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(stopping.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_worker_stops_during_an_unavailable_peer_retry() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_peer(
+            &share,
+            &PeerConfig {
+                peer_id: flocal::model::PeerId("peer-test".into()),
+                host: "127.0.0.1".into(),
+                remote_path: path_bytes(Path::new("/remote")),
+                executable: "/bin/false".into(),
+            },
+        )?;
+        state.set_initial_complete(&share)?;
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events, event_rx) = std::sync::mpsc::channel();
+        start_managed_share(&mut state, &workers, &events, share.clone(), None)?;
+        assert!(workers.lock().unwrap().contains_key(&share));
+        stop_managed_share(&state, &workers, share.clone())?;
+        let event = event_rx.recv_timeout(Duration::from_secs(3))?;
+        apply_worker_event(&state, &workers, event)?;
+        assert!(!state.managed_share(&share)?.watch_enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn service_path_validation_rejects_invalid_characters() -> Result<()> {
+        validate_service_path_characters("path<&>")?;
+        assert!(validate_service_path_characters("path\u{1}").is_err());
+        assert!(validate_service_path_characters("path\u{fdd0}").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_worker_exits_without_opening_a_remote_session() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events, event_rx) = std::sync::mpsc::channel();
+        start_worker(&state, &workers, &events, share.clone())?;
+        let event = event_rx.recv_timeout(Duration::from_secs(2))?;
+        apply_worker_event(&state, &workers, event)?;
+        assert!(workers.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_requests_return_structured_control_errors_and_live_states() -> Result<()> {
+        fn request(
+            state: &mut State,
+            workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
+            events: &std::sync::mpsc::Sender<WorkerEvent>,
+            request: DaemonRequest,
+        ) -> Result<DaemonResponse> {
+            let (server, mut client) = UnixStream::pair()?;
+            let workers = workers.clone();
+            let events = events.clone();
+            std::thread::scope(|scope| {
+                scope.spawn(|| handle_daemon_request(state, &workers, &events, server));
+                serde_json::to_writer(&mut client, &request)?;
+                client.write_all(b"\n")?;
+                serde_json::from_slice(&read_daemon_message(&mut client)?).map_err(Into::into)
+            })
+        }
+
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_initial_complete(&share)?;
+        state.set_watch_enabled(&share, true)?;
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events, _events_rx) = std::sync::mpsc::channel();
+
+        assert!(matches!(
+            request(
+                &mut state,
+                &workers,
+                &events,
+                DaemonRequest::Start {
+                    share: "missing".into(),
+                    generation: None
+                }
+            )?,
+            DaemonResponse::Error { .. }
+        ));
+        assert!(matches!(
+            request(
+                &mut state,
+                &workers,
+                &events,
+                DaemonRequest::Stop {
+                    share: "missing".into()
+                }
+            )?,
+            DaemonResponse::Error { .. }
+        ));
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        workers.lock().unwrap().insert(
+            share.clone(),
+            DaemonWorker {
+                id: 11,
+                stop: Arc::new(AtomicBool::new(false)),
+                state: Arc::new(std::sync::atomic::AtomicU8::new(WORKER_RECONNECTING)),
+                stopping: stopping.clone(),
+                finished: Arc::new(AtomicBool::new(true)),
+                child: Arc::new(Mutex::new(None)),
+            },
+        );
+        let DaemonResponse::List { syncs, .. } = request(
+            &mut state,
+            &workers,
+            &events,
+            DaemonRequest::List { cursor: None },
+        )?
+        else {
+            panic!("expected list")
+        };
+        assert_eq!(syncs[0].state, "reconnecting");
+        assert!(matches!(
+            request(
+                &mut state,
+                &workers,
+                &events,
+                DaemonRequest::Stop {
+                    share: share.0.clone()
+                }
+            )?,
+            DaemonResponse::Ok
+        ));
+        assert!(stopping.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_install_uses_manager_config_and_commits_the_state_marker() -> Result<()> {
+        let _environment = ENVIRONMENT_LOCK.lock().unwrap();
+        let temp = tempdir()?;
+        let bin = temp.path().join("bin");
+        let manager_home = temp.path().join("manager-home");
+        let client_home = temp.path().join("client-home");
+        std::fs::create_dir(&bin)?;
+        std::fs::create_dir(&manager_home)?;
+        std::fs::create_dir(&client_home)?;
+        let systemctl = bin.join("systemctl");
+        std::fs::write(
+            &systemctl,
+            "#!/bin/sh\nif [ \"$2\" = show-environment ]; then printf 'HOME=%s\\n' \"$FLOCAL_TEST_MANAGER_HOME\"; fi\nexit 0\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let previous_path = std::env::var_os("PATH");
+        let previous_home = std::env::var_os("HOME");
+        // SAFETY: this test holds the module-wide environment lock and restores both values.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    previous_path
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ),
+            );
+            std::env::set_var("HOME", &client_home);
+            std::env::set_var("FLOCAL_TEST_MANAGER_HOME", &manager_home);
+        }
+        let state = State::open(temp.path().join("state"))?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+        preflight_daemon_service(&state, &executable)?;
+        use std::os::unix::ffi::OsStringExt;
+        let invalid_state = State::open(
+            temp.path()
+                .join(std::ffi::OsString::from_vec(b"state-\xff".to_vec())),
+        )?;
+        assert!(install_systemd_service(&invalid_state, &executable).is_err());
+        assert!(
+            !manager_home
+                .join(".config/systemd/user/flocal-daemon.service")
+                .exists()
+        );
+        assert!(systemd_quote(Path::new("/tmp/invalid%path")).is_err());
+        assert!(run_manager("/bin/false", &[]).is_err());
+        assert!(ensure_daemon(&state).is_err());
+        let result = install_daemon_service(&state);
+        // SAFETY: restore this process's environment before any assertion can return.
+        unsafe {
+            match previous_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            std::env::remove_var("FLOCAL_TEST_MANAGER_HOME");
+        }
+        result?;
+        assert!(
+            manager_home
+                .join(".config/systemd/user/flocal-daemon.service")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(client_home.join(".config/file.local/managed-state"))?,
+            format!("{}\n", state.dir.display())
+        );
         Ok(())
     }
 

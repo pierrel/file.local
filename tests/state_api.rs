@@ -224,6 +224,33 @@ fn state_refuses_a_symlinked_state_directory() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn private_managed_state_marker_selects_an_absolute_state_directory() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir()?;
+    let home = temp.path().join("home");
+    let state_dir = temp.path().join("state");
+    let marker = home.join(".config/file.local/managed-state");
+    fs::create_dir_all(marker.parent().expect("marker parent"))?;
+    fs::write(&marker, format!("{}\n", state_dir.display()))?;
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))?;
+    let previous = std::env::var_os("HOME");
+    // SAFETY: the deterministic test command runs one test at a time and restores HOME.
+    unsafe { std::env::set_var("HOME", &home) };
+    let selected = State::managed_state_dir();
+    // SAFETY: restore this process's environment before propagating the assertion result.
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    assert_eq!(selected?, Some(state_dir));
+    Ok(())
+}
+
 #[test]
 fn concurrent_overlapping_registrations_admit_at_most_one_root() -> Result<()> {
     let temp = tempdir()?;
@@ -353,6 +380,41 @@ fn initialization_refuses_a_symlinked_root() -> Result<()> {
         .init_share(&root)
         .expect_err("a symlink must not become a managed root");
     assert!(error.to_string().contains("symbolic link"));
+    Ok(())
+}
+
+#[test]
+fn managed_share_state_changes_are_durable_and_generation_guarded() -> Result<()> {
+    let temporary = tempdir()?;
+    let root = temporary.path().join("root");
+    fs::create_dir(&root)?;
+    let mut state = State::open(temporary.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let initial = state.watch_intent_generation(&share)?;
+    state.set_watch_enabled_if_generation(&share, true, initial)?;
+    assert!(state.managed_share(&share)?.watch_enabled);
+    assert!(
+        state
+            .set_watch_enabled_if_generation(&share, false, initial)
+            .is_err()
+    );
+    let current = state.watch_intent_generation(&share)?;
+    state.set_initial_complete_and_watch_enabled(&share, current)?;
+    let managed = state.managed_share(&share)?;
+    assert!(managed.initial_complete);
+    assert!(managed.watch_enabled);
+    state.set_blocked(&share, &"x".repeat(5000))?;
+    assert_eq!(
+        state
+            .managed_share(&share)?
+            .blocked_diagnostic
+            .as_deref()
+            .unwrap()
+            .len(),
+        4096
+    );
+    state.clear_blocked(&share)?;
+    assert!(state.managed_share(&share)?.blocked_diagnostic.is_none());
     Ok(())
 }
 

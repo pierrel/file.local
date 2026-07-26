@@ -16,13 +16,13 @@ install: build
 	"$(PREFIX)/bin/flocal" daemon install-service
 
 test:
-	cargo test --all-targets
+	cargo test --all-targets -- --test-threads=1
 
 coverage-tools:
 	@cargo llvm-cov --version 2>/dev/null | grep -q 'cargo-llvm-cov 0.8.7' || cargo install cargo-llvm-cov --version 0.8.7 --locked
 
 coverage: coverage-tools
-	cargo llvm-cov --all-targets --all-features --ignore-filename-regex 'tests/e2e/' --cobertura --output-path target/coverage.xml --fail-under-lines 90
+	cargo llvm-cov --all-targets --all-features --ignore-filename-regex 'tests/e2e/' --cobertura --output-path target/coverage.xml --fail-under-lines 90 -- --test-threads=1
 	python3 tools/check_changed_coverage.py target/coverage.xml $(COVERAGE_BASE) 90
 
 e2e:
