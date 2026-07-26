@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -320,6 +320,12 @@ impl State {
         Ok(Self { dir, conn })
     }
 
+    pub fn ensure_private_state_child(&self, name: &str) -> Result<PathBuf> {
+        let path = self.dir.join(name);
+        ensure_private_state_dir(&path)?;
+        Ok(path)
+    }
+
     pub fn peer_id(&self) -> Result<PeerId> {
         if let Some(value) = self
             .conn
@@ -476,9 +482,7 @@ impl State {
     }
 
     pub fn lock_share(&self, id: &ShareId) -> Result<File> {
-        let locks = self.dir.join("locks");
-        fs::create_dir_all(&locks)?;
-        set_private_dir(&locks)?;
+        let locks = self.ensure_private_state_child("locks")?;
         let name = blake3::hash(id.0.as_bytes()).to_hex().to_string();
         let path = locks.join(name);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -1269,16 +1273,46 @@ impl State {
 
 #[cfg(unix)]
 fn ensure_private_state_dir(path: &Path) -> Result<()> {
-    let mut existing = path;
-    while matches!(fs::symlink_metadata(existing), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    {
-        existing = existing
-            .parent()
-            .context("state directory has no existing parent")?;
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
+    let path = state_dir_walk_path(path)?;
+    let mut current = if path.is_absolute() {
+        File::open("/")?
+    } else {
+        File::open(".")?
+    };
+    let mut current_path = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    validate_private_state_directory(&current, &current_path)?;
+
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::Prefix(_) => unreachable!("Unix paths have no prefix"),
+        };
+        let next_path = current_path.join(name);
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let next = match openat(&current, name, flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(rustix::io::Errno::NOENT) if !matches!(component, Component::ParentDir) => {
+                match mkdirat(&current, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                openat(&current, name, flags, Mode::empty())?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        current = File::from(next);
+        validate_private_state_directory(&current, &next_path)?;
+        current_path = next_path;
     }
-    validate_state_dir_chain(existing)?;
-    fs::create_dir_all(path)?;
-    validate_state_dir_chain(path)
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -1288,40 +1322,58 @@ fn ensure_private_state_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_state_dir_chain(path: &Path) -> Result<()> {
+fn validate_private_state_directory(directory: &File, path: &Path) -> Result<()> {
+    use rustix::fs::{FileType, Mode};
+
     let uid = rustix::process::geteuid().as_raw();
-    for component in path.ancestors() {
-        let metadata = fs::symlink_metadata(component)?;
-        #[cfg(target_os = "macos")]
-        if metadata.file_type().is_symlink()
-            && metadata.uid() == 0
-            && matches!(component, path if path == Path::new("/var") || path == Path::new("/tmp"))
-        {
-            continue;
-        }
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!(
-                "state directory contains an unsafe path component {}",
-                component.display()
-            );
-        }
-        let owner = metadata.uid();
-        let mode = metadata.mode();
-        let root_owned_sticky = owner == 0 && mode & 0o1000 != 0;
-        if owner != uid && owner != 0 {
-            bail!(
-                "state directory component {} has an unexpected owner",
-                component.display()
-            );
-        }
-        if mode & 0o022 != 0 && !root_owned_sticky {
-            bail!(
-                "state directory component {} is writable by another user",
-                component.display()
-            );
-        }
+    let metadata = rustix::fs::fstat(directory)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
+        bail!(
+            "state directory contains an unsafe path component {}",
+            path.display()
+        );
+    }
+    let owner = metadata.st_uid;
+    let mode = Mode::from_raw_mode(metadata.st_mode).as_raw_mode();
+    let root_owned_sticky = owner == 0 && mode & 0o1000 != 0;
+    if owner != uid && owner != 0 {
+        bail!(
+            "state directory component {} has an unexpected owner",
+            path.display()
+        );
+    }
+    if mode & 0o022 != 0 && !root_owned_sticky {
+        bail!(
+            "state directory component {} is writable by another user",
+            path.display()
+        );
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn state_dir_walk_path(path: &Path) -> Result<PathBuf> {
+    for alias in [Path::new("/var"), Path::new("/tmp")] {
+        let Ok(remainder) = path.strip_prefix(alias) else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(alias)?;
+        if metadata.file_type().is_symlink() {
+            if metadata.uid() != 0 {
+                bail!(
+                    "state directory system alias {} is not root-owned",
+                    alias.display()
+                );
+            }
+            return Ok(alias.canonicalize()?.join(remainder));
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn state_dir_walk_path(path: &Path) -> Result<PathBuf> {
+    Ok(path.to_path_buf())
 }
 
 fn remember_entry_hash(hashes: &mut std::collections::HashSet<ObjectHash>, entry: &Entry) {
@@ -1464,5 +1516,47 @@ pub fn file_record(
             seen,
             entry,
         },
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    const PERMISSIVE_UMASK_STATE_DIR: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_STATE_DIR";
+
+    #[test]
+    fn private_directory_creation_ignores_a_permissive_umask() -> Result<()> {
+        if let Some(path) = std::env::var_os(PERMISSIVE_UMASK_STATE_DIR) {
+            let state = PathBuf::from(path);
+            let old_umask = rustix::process::umask(rustix::fs::Mode::empty());
+            let result = (|| {
+                for directory in [
+                    state.clone(),
+                    state.join("objects"),
+                    state.join("locks"),
+                    state.join("run"),
+                ] {
+                    ensure_private_state_dir(&directory)?;
+                    assert_eq!(fs::metadata(directory)?.permissions().mode() & 0o077, 0);
+                }
+                Ok(())
+            })();
+            rustix::process::umask(old_umask);
+            return result;
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "state::tests::private_directory_creation_ignores_a_permissive_umask",
+            ])
+            .env(PERMISSIVE_UMASK_STATE_DIR, temporary.path().join("state"))
+            .output()?;
+        assert!(output.status.success(), "{:?}", output);
+        Ok(())
     }
 }

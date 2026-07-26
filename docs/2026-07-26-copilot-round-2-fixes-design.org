@@ -1,0 +1,141 @@
+#+title: Copilot round two daemon hardening fixes
+#+date: 2026-07-26
+#+status: accepted implementation plan
+
+* 1. Q&A and decision
+
+The user asked to fix every currently unaddressed actionable Copilot comment on
+the daemon-managed-sync pull request.  These are correctness and local
+filesystem-security fixes to the accepted daemon interface, not a change to its
+user-visible feature set.  The user also defined the normal development cycle:
+Q&A, an independently reviewed design, an optional user-review pause only when
+requested or a blocking decision remains, implementation with independent code
+reviews, then pull-request Copilot rounds until convergence or seven submitted
+rounds.
+
+There are no blocking questions.  The existing state directory, daemon socket,
+and daemon protocol are private, per-user facilities.  Their safe construction
+and useful errors are required by that contract.  The implementation may use
+the existing =rustix= filesystem dependency; it must not add a dependency or a
+second state/socket layout.
+
+* 2. Findings and plan
+
+1. *Create private state directories with their final permissions.*
+
+   =State::open= currently calls =create_dir_all= and only then changes the
+   mode to owner-only.  Under a permissive umask, a newly-created state,
+   object, or lock directory is briefly traversable by another local user.
+   Replace that creation path on Unix with one shared directory-creation
+   primitive that creates every missing component with requested mode =0700=
+   from a validated, held parent descriptor, without changing process-global
+   umask.  It opens each component relative to that descriptor without
+   following symlinks, then validates the opened directory's ownership and
+   permissions before descending.  This makes the owner-only bound true at
+   creation and prevents pathname substitution between validation and use.  A
+   pre-existing component is never chmodded merely because this process needs
+   it: invalid ownership, type, symlink, or permissions fail closed.  On macOS,
+   preserve the existing narrow exception for the root-owned system aliases
+   =/var= and =/tmp=: resolve only that validated alias before beginning the
+   descriptor-relative walk, never a user-controlled descendant.  Existing
+   correctly private directories retain their behavior.  The non-Unix fallback
+   remains the present standard-directory creation path.
+
+2. *Validate the daemon run directory before binding.*
+
+   =daemon_run= currently creates =STATE/run= but does not apply the private
+   state-directory validation before it creates =daemon.lock= or binds
+   =daemon.sock=.  It must use the same shared private-directory primitive as
+   state subdirectories.  A non-directory, symlink, foreign-owned, or
+   group/world-writable =run= path therefore fails before a lock or socket is
+   created.  The existing refusal to unlink a non-socket at =daemon.sock=
+   remains in force.  This boundary protects the daemon's local control
+   endpoint from pathname substitution and disclosure; it does not add a new
+   authentication protocol because the endpoint remains in an owner-only
+   directory and socket.
+
+3. *Validate =sync add= input before service activation.*
+
+   =sync add PATH= currently invokes =ensure_daemon= before checking that
+   =PATH= is an existing directory.  Reverse that order: use no-follow
+   metadata to validate that the direct CLI path is a real existing directory,
+   not a final symlink, before contacting or activating the installed user
+   service.  Then continue with the existing registration, pairing,
+   confirmation, and daemon-start path.  This avoids a surprising service
+   activation for a local argument error.  It intentionally does not replace
+   the later state/root identity checks: those protect the time between client
+   validation and registration and remain the authoritative admission boundary.
+
+4. *Encode invalid list continuations as daemon errors.*
+
+   An unrecognized =List.cursor= currently makes =daemon_sync_page= return an
+   error through =handle_daemon_request=, which closes the Unix stream without
+   a valid response.  Keep malformed request parsing as an =Error= response
+   and apply that same response boundary to every list-page error.  In
+   particular, an unknown cursor returns =DaemonResponse::Error= with the
+   bounded existing diagnostic text; the client reports it through the normal
+   =daemon_request= error path rather than reporting an empty/truncated socket
+   read.  The response is still size-checked before it is written.  Pagination
+   semantics, cursor format, and normal successful pages do not change.
+
+* 3. Interfaces, state, and failure boundaries
+
+The private-directory helper accepts a requested absolute/relative state child
+path and has one outcome: a real directory chain whose newly created nodes are
+owner-only and whose existing and final nodes meet the established ownership,
+symlink, and writable-by-other-user rules.  =State::open= uses it for the
+state root and =objects=; lock creation and daemon startup use it for their
+children.  The helper is not a general-purpose path sanitizer and must not be
+used to create share roots, which retain their existing user-facing directory
+semantics.
+
+No durable schema changes are needed.  The =run= directory is runtime state;
+the durable state root remains the authority for its location.  A failed
+validation or creation does not repair, delete, follow, or adopt a suspicious
+path, and it starts no daemon.  A failed invalid =sync add= argument creates no
+share registration or pairing and does not activate a service.  The existing
+top-level command dispatch may still open the default state before command
+validation; this hardening does not broaden into a global CLI-dispatch
+redesign.
+
+Daemon request processing has one response invariant: after an accepted client
+connection and a parseable request, every command-specific failure is encoded
+as =DaemonResponse::Error= when that serialized response fits the existing
+message cap.  Transport I/O and over-cap responses may still terminate the
+connection because no trustworthy complete response can be sent.  Error
+messages remain bounded by the protocol cap and contain no secret material.
+
+* 4. Tests and acceptance criteria
+
+1. Add Unix tests in an isolated subprocess with a permissive umask, then assert
+   each newly created state/object/lock/run directory is owner-only.  The test
+   must not mutate the parallel test process's global umask.  Exercise the
+   adversarial construction boundary rather than only final chmod: creation
+   from a permissive umask must still make every created component private.
+   Retain a macOS CI case whose state directory is under the existing =/var= or
+   =/tmp= system alias, proving that only the documented root-owned aliases are
+   traversed while descendant symlinks remain rejected.
+   Also cover refusal of a pre-existing unsafe run component (at least a
+   symlink or ordinary file) and verify daemon startup neither replaces it nor
+   creates its socket.
+2. Add a CLI-level test that passes a missing, non-directory, and final-symlink
+   =sync add= path with a deliberately unavailable/observable service-manager
+   path and proves each command returns the local path error before daemon
+   activation, registration, or pairing.  Retain the existing successful add
+   and pairing tests to prove the normal order still works.
+3. Add a daemon protocol test that sends a syntactically valid =List= request
+   with an unknown cursor over a connected Unix stream and receives a
+   =DaemonResponse::Error= describing the invalid continuation.  Keep the
+   existing multipage list test as the successful-path proof.
+4. Run the affected filesystem, daemon protocol, and CLI tests, then the full
+   =make check= and Docker E2E suite.  Run the required code-review lenses
+   after implementation, reconcile this record and the README if observable
+   wording changes, push the fixes, and resolve/reply to the four Copilot
+   threads only when their behavior is proved.
+
+The work is accepted when a permissive umask never exposes a new private state
+directory; an unsafe =run= path prevents daemon startup without replacement;
+a missing, non-directory, or symlinked =sync add= path starts neither service,
+registration, nor pairing; and an invalid list cursor produces a valid daemon
+error response.  No documented daemon command, storage schema, or successful
+pagination behavior regresses.

@@ -366,10 +366,8 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
             remote_path,
             yes,
         } => {
+            validate_sync_add_path(&path)?;
             ensure_daemon(state)?;
-            if !path.is_dir() {
-                bail!("sync root must be an existing directory");
-            }
             let share = match state.find_share(&path) {
                 Ok((share, _)) => {
                     if let Some(peer) = state.peer(&share)? {
@@ -486,6 +484,15 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
             let share = select_share(state, path.as_deref(), share.as_deref())?;
             daemon_request(state, DaemonRequest::Stop { share: share.0 })?;
         }
+    }
+    Ok(())
+}
+
+fn validate_sync_add_path(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect sync root {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("sync root must be an existing directory, not a symbolic link");
     }
     Ok(())
 }
@@ -956,8 +963,7 @@ fn run_manager(program: &str, arguments: &[&str]) -> Result<()> {
 
 fn daemon_run(mut state: State) -> Result<()> {
     recover_daemon_installs(&mut state)?;
-    let run = state.dir.join("run");
-    std::fs::create_dir_all(&run)?;
+    state.ensure_private_state_child("run")?;
     validate_private_file(&state.dir.join("daemon.lock"))?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -1144,7 +1150,12 @@ fn handle_daemon_request(
     let response = match read_daemon_message(&mut stream)
         .and_then(|message| serde_json::from_slice::<DaemonRequest>(&message).map_err(Into::into))
     {
-        Ok(DaemonRequest::List { cursor }) => daemon_sync_page(state, workers, cursor)?,
+        Ok(DaemonRequest::List { cursor }) => match daemon_sync_page(state, workers, cursor) {
+            Ok(response) => response,
+            Err(error) => DaemonResponse::Error {
+                message: format!("{error:#}"),
+            },
+        },
         Ok(DaemonRequest::Start { share, generation }) => {
             let share = ShareId(share);
             match start_managed_share(state, workers, events, share, generation) {
@@ -4798,6 +4809,89 @@ mod tests {
         std::fs::write(daemon_socket(&state), "not a socket")?;
         let error = daemon_run(state).expect_err("ordinary file must not be removed as a socket");
         assert!(error.to_string().contains("unexpected daemon socket path"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_refuses_a_symlinked_run_directory() -> Result<()> {
+        let temp = tempdir()?;
+        let state = State::open(temp.path().join("state"))?;
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target)?;
+        std::os::unix::fs::symlink(&target, state.dir.join("run"))?;
+        daemon_run(state).expect_err("symlinked run directory must be refused");
+        assert!(!target.join("daemon.sock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sync_add_rejects_invalid_paths_before_daemon_activation() -> Result<()> {
+        let temp = tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let missing = temp.path().join("missing");
+        let error = sync_command(
+            &mut state,
+            SyncCommand::Add {
+                path: missing,
+                host: "peer".into(),
+                remote_path: PathBuf::from("/remote"),
+                yes: true,
+            },
+        )
+        .expect_err("missing sync root must fail before daemon activation");
+        assert!(error.to_string().contains("cannot inspect sync root"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_add_rejects_a_symlink_before_daemon_activation() -> Result<()> {
+        let temp = tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&target)?;
+        std::os::unix::fs::symlink(target, &link)?;
+        let error = sync_command(
+            &mut state,
+            SyncCommand::Add {
+                path: link,
+                host: "peer".into(),
+                remote_path: PathBuf::from("/remote"),
+                yes: true,
+            },
+        )
+        .expect_err("symlinked sync root must fail before daemon activation");
+        assert!(error.to_string().contains("not a symbolic link"));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_control_reports_invalid_list_continuations() -> Result<()> {
+        let temp = tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let (server, mut client) = UnixStream::pair()?;
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events, _event_rx) = std::sync::mpsc::channel();
+        let worker_copy = workers.clone();
+        let thread = std::thread::spawn(move || {
+            handle_daemon_request(&mut state, &worker_copy, &events, server)
+        });
+        serde_json::to_writer(
+            &mut client,
+            &DaemonRequest::List {
+                cursor: Some("missing".into()),
+            },
+        )?;
+        client.write_all(b"\n")?;
+        let response: DaemonResponse = serde_json::from_slice(&read_daemon_message(&mut client)?)?;
+        assert!(
+            matches!(response, DaemonResponse::Error { message } if message.contains("continuation"))
+        );
+        thread
+            .join()
+            .expect("daemon request thread must not panic")?;
         Ok(())
     }
 
