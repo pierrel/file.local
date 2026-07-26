@@ -3785,6 +3785,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(target_os = "linux")]
     static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     fn serve_messages(messages: &[Message]) -> Result<(Result<()>, Vec<u8>)> {
