@@ -532,20 +532,28 @@ fn ensure_daemon(state: &State) -> Result<()> {
         );
     }
     eprintln!("flocal: daemon is not running; asking the service manager to start it");
-    #[cfg(target_os = "linux")]
-    let status = Command::new("systemctl")
-        .args(["--user", "start", "flocal-daemon.service"])
-        .status()
-        .context("cannot ask systemd to start flocal-daemon.service")?;
-    #[cfg(target_os = "macos")]
-    let status = Command::new("launchctl")
-        .arg("kickstart")
-        .arg("-k")
-        .arg(launchd_target()?)
-        .status()
-        .context("cannot ask launchd to start local.file-local.flocal-daemon")?;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let status = std::process::ExitStatus::from_raw(1);
+    let status = {
+        #[cfg(target_os = "linux")]
+        {
+            Command::new("systemctl")
+                .args(["--user", "start", "flocal-daemon.service"])
+                .status()
+                .context("cannot ask systemd to start flocal-daemon.service")?
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("launchctl")
+                .arg("kickstart")
+                .arg("-k")
+                .arg(launchd_target()?)
+                .status()
+                .context("cannot ask launchd to start local.file-local.flocal-daemon")?
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            bail!("managed sync is supported on Linux and macOS only")
+        }
+    };
     if !status.success() {
         bail!("daemon is unavailable; run `make install`");
     }
@@ -900,6 +908,13 @@ fn validate_service_dir_chain(path: &Path) -> Result<()> {
     let uid = rustix::process::geteuid().as_raw();
     for component in path.ancestors() {
         let metadata = std::fs::symlink_metadata(component)?;
+        #[cfg(target_os = "macos")]
+        if metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && matches!(component, path if path == Path::new("/var") || path == Path::new("/tmp"))
+        {
+            continue;
+        }
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             bail!(
                 "service directory contains an unsafe path component {}",
@@ -4803,7 +4818,10 @@ mod tests {
                 assert_eq!(syncs.len(), 1);
                 assert_eq!(next, None);
                 assert_eq!(syncs[0].share, share.0);
-                assert_eq!(daemon_path_bytes(&syncs[0].root)?, path_bytes(&root));
+                assert_eq!(
+                    daemon_path_bytes(&syncs[0].root)?,
+                    path_bytes(&root.canonicalize()?)
+                );
                 assert_eq!(syncs[0].state, "stopped");
                 assert!(syncs[0].enabled);
             }

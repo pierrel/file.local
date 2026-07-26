@@ -507,6 +507,11 @@ impl State {
 
     fn lock_registration(&self) -> Result<File> {
         let path = self.dir.join("registration.lock");
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (!metadata.file_type().is_file() || metadata.file_type().is_symlink())
+        {
+            bail!("registration lock is not a regular file");
+        }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         set_private_file(&path)?;
         file.try_lock_exclusive()
