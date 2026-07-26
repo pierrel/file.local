@@ -32,8 +32,8 @@ second state/socket layout.
    umask.  It opens each component relative to that descriptor without
    following symlinks, then validates the opened directory's ownership and
    permissions before descending.  This makes the owner-only bound true at
-   creation and prevents pathname substitution between validation and use.  A
-   the helper never chmods a pre-existing component merely because this process
+   creation and prevents pathname substitution between validation and use.  The
+   helper never chmods a pre-existing component merely because this process
    needs it: invalid ownership, type, symlink, or permissions fail closed.
    Existing final-state permission tightening remains the responsibility of
    =State::open=.  On macOS,
@@ -80,16 +80,28 @@ second state/socket layout.
    read.  The response is still size-checked before it is written.  Pagination
    semantics, cursor format, and normal successful pages do not change.
 
+5. *Use that construction boundary for service directories too.*
+
+   Service installation creates user-controlled parents such as
+   =~/.config/file.local= and =~/.config/systemd/user=.  It currently uses
+   =create_dir_all= followed by validation, so a permissive umask can leave a
+   newly-created parent group-writable and make first installation fail.  Move
+   the private-directory primitive out of state-only ownership and use it for
+   these paths as well.  Preserve the established behavior for existing
+   system-owned sticky parents and macOS =/var= or =/tmp= aliases.  This is a
+   reuse of the same held-descriptor, no-follow construction boundary, not a
+   second service-specific helper or a post-creation chmod repair.
+
 * 3. Interfaces, state, and failure boundaries
 
-The private-directory helper accepts a requested absolute/relative state child
-path and has one outcome: a real directory chain whose newly created nodes are
+The private-directory helper accepts a requested absolute/relative private path
+and has one outcome: a real directory chain whose newly created nodes are
 owner-only and whose existing and final nodes meet the established ownership,
 symlink, and writable-by-other-user rules.  =State::open= uses it for the
-state root and =objects=; lock creation and daemon startup use it for their
-children.  The helper is not a general-purpose path sanitizer and must not be
-used to create share roots, which retain their existing user-facing directory
-semantics.
+state root and =objects=; lock creation, daemon startup, and service
+installation use it for their private children.  The helper is not a
+general-purpose path sanitizer and must not be used to create share roots,
+which retain their existing user-facing directory semantics.
 
 No durable schema changes are needed.  The =run= directory is runtime state;
 the durable state root remains the authority for its location.  A failed
@@ -134,10 +146,13 @@ messages remain bounded by the protocol cap and contain no secret material.
    after implementation, reconcile this record and the README if observable
    wording changes, push the fixes, and resolve/reply to the four Copilot
    threads only when their behavior is proved.
+5. Add an isolated permissive-umask service-installation regression that
+   directly exercises the service-directory wrapper and proves each created
+   parent is owner-only before a service file is written.
 
 The work is accepted when a permissive umask never exposes a new private state
-directory; an unsafe =run= path prevents daemon startup without replacement;
-a missing, non-directory, or symlinked =sync add= path starts neither service,
-registration, nor pairing; and an invalid list cursor produces a valid daemon
-error response.  No documented daemon command, storage schema, or successful
-pagination behavior regresses.
+or service directory; an unsafe =run= path prevents daemon startup without
+replacement; a missing, non-directory, or symlinked =sync add= path starts
+neither service, registration, nor pairing; and an invalid list cursor produces
+a valid daemon error response.  No documented daemon command, storage schema,
+or successful pagination behavior regresses.

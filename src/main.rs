@@ -898,16 +898,7 @@ fn validate_trusted_executable(_: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn ensure_private_service_directory(path: &Path) -> Result<()> {
-    let mut existing = path;
-    while matches!(std::fs::symlink_metadata(existing), Err(error) if error.kind() == io::ErrorKind::NotFound)
-    {
-        existing = existing
-            .parent()
-            .context("service directory has no existing parent")?;
-    }
-    validate_service_dir_chain(existing)?;
-    std::fs::create_dir_all(path)?;
-    validate_service_dir_chain(path)
+    flocal::state::ensure_private_directory(path)
 }
 
 #[cfg(not(unix))]
@@ -3820,6 +3811,48 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    const PERMISSIVE_UMASK_SERVICE_ROOT: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_SERVICE_ROOT";
+
+    #[cfg(unix)]
+    #[test]
+    fn private_service_directory_creation_ignores_a_permissive_umask() -> Result<()> {
+        if let Some(root) = std::env::var_os(PERMISSIVE_UMASK_SERVICE_ROOT) {
+            let root = PathBuf::from(root);
+            let directory = root.join("config/file.local/systemd/user");
+            let old_umask = rustix::process::umask(rustix::fs::Mode::empty());
+            let result = (|| {
+                ensure_private_service_directory(&directory)?;
+                for relative in [
+                    "config",
+                    "config/file.local",
+                    "config/file.local/systemd",
+                    "config/file.local/systemd/user",
+                ] {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(root.join(relative))?.permissions().mode() & 0o077,
+                        0
+                    );
+                }
+                Ok(())
+            })();
+            rustix::process::umask(old_umask);
+            return result;
+        }
+
+        let temporary = tempdir()?;
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::private_service_directory_creation_ignores_a_permissive_umask",
+            ])
+            .env(PERMISSIVE_UMASK_SERVICE_ROOT, temporary.path())
+            .output()?;
+        assert!(output.status.success(), "{:?}", output);
+        Ok(())
+    }
 
     fn serve_messages(messages: &[Message]) -> Result<(Result<()>, Vec<u8>)> {
         let temp = tempdir()?;

@@ -191,8 +191,8 @@ impl State {
 
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        ensure_private_state_dir(&dir)?;
-        ensure_private_state_dir(&dir.join("objects"))?;
+        ensure_private_directory(&dir)?;
+        ensure_private_directory(&dir.join("objects"))?;
         set_private_dir(&dir)?;
         set_private_dir(&dir.join("objects"))?;
         let database = dir.join("state.sqlite3");
@@ -322,7 +322,7 @@ impl State {
 
     pub fn ensure_private_state_child(&self, name: &str) -> Result<PathBuf> {
         let path = self.dir.join(name);
-        ensure_private_state_dir(&path)?;
+        ensure_private_directory(&path)?;
         Ok(path)
     }
 
@@ -1272,10 +1272,10 @@ impl State {
 }
 
 #[cfg(unix)]
-fn ensure_private_state_dir(path: &Path) -> Result<()> {
+pub fn ensure_private_directory(path: &Path) -> Result<()> {
     use rustix::fs::{Mode, OFlags, mkdirat, openat};
 
-    let path = state_dir_walk_path(path)?;
+    let path = private_directory_walk_path(path)?;
     let mut current = if path.is_absolute() {
         File::open("/")?
     } else {
@@ -1286,7 +1286,7 @@ fn ensure_private_state_dir(path: &Path) -> Result<()> {
     } else {
         PathBuf::from(".")
     };
-    validate_private_state_directory(&current, &current_path)?;
+    validate_private_directory(&current, &current_path)?;
 
     for component in path.components() {
         let name = match component {
@@ -1309,27 +1309,27 @@ fn ensure_private_state_dir(path: &Path) -> Result<()> {
             Err(error) => return Err(error.into()),
         };
         current = File::from(next);
-        validate_private_state_directory(&current, &next_path)?;
+        validate_private_directory(&current, &next_path)?;
         current_path = next_path;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn ensure_private_state_dir(path: &Path) -> Result<()> {
+pub fn ensure_private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn validate_private_state_directory(directory: &File, path: &Path) -> Result<()> {
+fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
     use rustix::fs::{FileType, Mode};
 
     let uid = rustix::process::geteuid().as_raw();
     let metadata = rustix::fs::fstat(directory)?;
     if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
         bail!(
-            "state directory contains an unsafe path component {}",
+            "private directory contains an unsafe path component {}",
             path.display()
         );
     }
@@ -1338,13 +1338,13 @@ fn validate_private_state_directory(directory: &File, path: &Path) -> Result<()>
     let root_owned_sticky = owner == 0 && mode & 0o1000 != 0;
     if owner != uid && owner != 0 {
         bail!(
-            "state directory component {} has an unexpected owner",
+            "private directory component {} has an unexpected owner",
             path.display()
         );
     }
     if mode & 0o022 != 0 && !root_owned_sticky {
         bail!(
-            "state directory component {} is writable by another user",
+            "private directory component {} is writable by another user",
             path.display()
         );
     }
@@ -1352,7 +1352,7 @@ fn validate_private_state_directory(directory: &File, path: &Path) -> Result<()>
 }
 
 #[cfg(target_os = "macos")]
-fn state_dir_walk_path(path: &Path) -> Result<PathBuf> {
+fn private_directory_walk_path(path: &Path) -> Result<PathBuf> {
     for alias in [Path::new("/var"), Path::new("/tmp")] {
         let Ok(remainder) = path.strip_prefix(alias) else {
             continue;
@@ -1361,7 +1361,7 @@ fn state_dir_walk_path(path: &Path) -> Result<PathBuf> {
         if metadata.file_type().is_symlink() {
             if metadata.uid() != 0 {
                 bail!(
-                    "state directory system alias {} is not root-owned",
+                    "private directory system alias {} is not root-owned",
                     alias.display()
                 );
             }
@@ -1372,7 +1372,7 @@ fn state_dir_walk_path(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn state_dir_walk_path(path: &Path) -> Result<PathBuf> {
+fn private_directory_walk_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
@@ -1539,7 +1539,7 @@ mod tests {
                     state.join("locks"),
                     state.join("run"),
                 ] {
-                    ensure_private_state_dir(&directory)?;
+                    ensure_private_directory(&directory)?;
                     assert_eq!(fs::metadata(directory)?.permissions().mode() & 0o077, 0);
                 }
                 Ok(())
