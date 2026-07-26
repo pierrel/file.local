@@ -27,6 +27,13 @@ actively managed sync, rather than a sequence of =init=, =peer add=, =sync=,
 and =watch=.  The remote directory remains a deliberate prerequisite: it must
 already exist and be an intended directory on the remote machine.
 
+If the registered directory is renamed, deleted, replaced, or becomes a
+symlink, its stored device/inode identity no longer matches its stored path.
+The daemon moves that share to =blocked= with the reason; it never searches for
+or adopts a renamed directory automatically.  Restore the original path or
+reconfigure the share deliberately.  Until then, =flocal sync stop --share=
+remains available even though the old path cannot be resolved.
+
 =make install= is a prerequisite for every =sync= control command, including
 =list=.  It updates the normal installed =flocal= executable and its one
 platform user-service asset, then starts the daemon.  It is deliberately a
