@@ -531,6 +531,7 @@ fn ensure_daemon(state: &State) -> Result<()> {
             "FLOCAL_STATE_DIR selects an unmanaged state directory; run `flocal daemon run` there or rerun `make install` with that setting"
         );
     }
+    eprintln!("flocal: daemon is not running; asking the service manager to start it");
     #[cfg(target_os = "linux")]
     let status = Command::new("systemctl")
         .args(["--user", "start", "flocal-daemon.service"])
@@ -548,10 +549,12 @@ fn ensure_daemon(state: &State) -> Result<()> {
     if !status.success() {
         bail!("daemon is unavailable; run `make install`");
     }
+    eprintln!("flocal: waiting for the daemon control socket");
     for _ in 0..20 {
         if daemon_request_inner(&daemon_socket(state), &DaemonRequest::List { cursor: None })
             .is_ok()
         {
+            eprintln!("flocal: daemon is ready");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));

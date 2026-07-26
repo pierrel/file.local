@@ -62,11 +62,13 @@ claim to install or start a LaunchAgent; it prints the exact graphical-login
 completion command instead.
 
 If the daemon is not already running when the user first invokes a =sync=
-control command, that command asks the already-installed service manager to
-start it.  On later logins the platform user service starts it itself; whichever
-comes first wins.  An enabled sync survives daemon, user-service, and machine
-restart and is restored automatically.  =sync stop= disables that specific
-sync durably; it does not stop the daemon or affect another sync.
+control command, that command visibly reports that it is asking the
+already-installed service manager to start it, waits for the control socket,
+then reports that the daemon is ready.  On later logins the platform user
+service starts it itself; whichever comes first wins.  An enabled sync survives
+daemon, user-service, and machine restart and is restored automatically.
+=sync stop= disables that specific sync durably; it does not stop the daemon
+or affect another sync.
 
 The existing two-peer roles remain unchanged.  Only the connector, the peer
 that stores =peer_json= and opens SSH, has a local managed watch.  The paired
