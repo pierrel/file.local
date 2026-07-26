@@ -109,7 +109,7 @@ fn daemon_stop_disables_a_share_durably() -> Result<()> {
 
 #[test]
 fn daemon_cli_follows_paginated_sync_lists() -> Result<()> {
-    let temporary = tempdir()?;
+    let temporary = tempfile::Builder::new().prefix("f").tempdir_in("/tmp")?;
     let state_dir = temporary.path().join("state");
     let state = State::open(&state_dir)?;
     for index in 0..20 {
