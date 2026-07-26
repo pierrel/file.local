@@ -565,24 +565,6 @@ impl Watch<'_> {
             .wait_for_text("/home/peer/.flocal-stderr.log", needle)
     }
 
-    pub fn wait_for_any_error_with_deadline(
-        &self,
-        needles: &[&str],
-        deadline: Duration,
-    ) -> Result<()> {
-        self.peer.poll_until(
-            &format!("watch stderr never contained any of {needles:?}"),
-            deadline,
-            |peer| {
-                let output = peer.exec_raw(&["cat", "--", "/home/peer/.flocal-stderr.log"])?;
-                let stderr = String::from_utf8_lossy(&output.stdout);
-                Ok((output.status.success()
-                    && needles.iter().any(|needle| stderr.contains(needle)))
-                .then_some(()))
-            },
-        )
-    }
-
     pub fn assert_log_absent(&self, needle: &str) -> Result<()> {
         let output = self.peer.exec_ok(&["cat", "--", WATCH_LOG])?;
         let log = String::from_utf8_lossy(&output.stdout);

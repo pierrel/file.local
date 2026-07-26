@@ -156,13 +156,7 @@ fn watch_recovers_after_network_loss_during_process_suspension() -> Result<()> {
     b.write("remote-during-sleep.txt", "remote offline edit")?;
     std::thread::sleep(std::time::Duration::from_secs(2));
     watch.resume()?;
-    watch.wait_for_any_error_with_deadline(
-        &[
-            "Peer connection lost; retrying",
-            "persistent peer closed the protocol stream",
-        ],
-        std::time::Duration::from_secs(60),
-    )?;
+    watch.wait_for_error("synchronization failed; retrying in background")?;
     b.online()?;
 
     b.wait_for_file("local-during-sleep.txt", "local offline edit")?;
