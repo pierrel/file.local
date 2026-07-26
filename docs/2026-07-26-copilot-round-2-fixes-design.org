@@ -116,6 +116,17 @@ second state/socket layout.
    (the Makefile already supplies it), so its deterministic test schedule
    matches the ordinary test job.
 
+8. *Keep daemon state reads and list-page construction linear.*
+
+   =managed_share= should select one row by =share_id= rather than build every
+   managed share and filter in memory.  Extract the existing row decoding into
+   one private mapper so the list and targeted query keep exactly the same
+   peer parsing, field shape, and =share not found= error.  For daemon list
+   pages, push one candidate entry, serialize one clone for the existing size
+   check, and pop it when oversized.  This preserves the framing boundary and
+   continuation semantics without cloning the accumulated page twice for every
+   entry.
+
 * 3. Interfaces, state, and failure boundaries
 
 The private-directory helper accepts a requested absolute/relative private path
@@ -151,6 +162,10 @@ activation.
 Test-only environment values are process-launch inputs, never mutable shared
 state.  Each subprocess owns its temporary fixtures and no test depends on
 global harness serialization for soundness.
+
+Single-share daemon operations read only their selected record.  List-page
+construction remains bounded by the existing message cap and is linear in its
+accepted entries apart from the necessary serialization for each cap check.
 
 * 4. Tests and acceptance criteria
 
@@ -188,6 +203,9 @@ global harness serialization for soundness.
    their test environment supplied by =Command::env=, then run the complete
    suite under the default parallel test harness as well as the repository's
    serialized checker.
+8. Retain the missing-share and multipage-list regressions while checking that
+   targeted lookup uses one SQL row and page construction performs at most one
+   accumulated-page clone per attempted append.
 
 The work is accepted when a permissive umask never exposes a new private state
 or service directory; an unsafe =run= path prevents daemon startup without

@@ -1264,20 +1264,19 @@ fn daemon_sync_page(
         .unwrap_or(0);
     let mut page = Vec::new();
     for sync in syncs.into_iter().skip(start) {
-        let mut candidate = page.clone();
         let next = sync.share.clone();
-        candidate.push(sync);
+        page.push(sync);
         let response = DaemonResponse::List {
-            syncs: candidate.clone(),
+            syncs: page.clone(),
             next: Some(next),
         };
         if serde_json::to_vec(&response)?.len() + 1 > MAX_DAEMON_MESSAGE_BYTES {
+            page.pop();
             if page.is_empty() {
                 bail!("one managed sync exceeds the daemon list page limit");
             }
             break;
         }
-        page = candidate;
     }
     let next = (start + page.len() < total).then(|| page.last().unwrap().share.clone());
     Ok(DaemonResponse::List { syncs: page, next })

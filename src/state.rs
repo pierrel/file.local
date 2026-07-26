@@ -866,34 +866,20 @@ impl State {
              FROM shares ORDER BY share_id",
         )?;
         statement
-            .query_map([], |row| {
-                let peer: Option<String> = row.get(2)?;
-                Ok(ManagedShare {
-                    id: ShareId(row.get(0)?),
-                    root: bytes_path(row.get::<_, Vec<u8>>(1)?),
-                    peer: peer
-                        .map(|json| serde_json::from_str(&json))
-                        .transpose()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                    initial_complete: row.get::<_, i64>(3)? != 0,
-                    watch_enabled: row.get::<_, i64>(4)? != 0,
-                    blocked_diagnostic: row.get(5)?,
-                })
-            })?
+            .query_map([], managed_share_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
     pub fn managed_share(&self, id: &ShareId) -> Result<ManagedShare> {
-        self.managed_shares()?
-            .into_iter()
-            .find(|share| &share.id == id)
+        self.conn
+            .query_row(
+                "SELECT share_id, root, peer_json, initial_complete, watch_enabled, blocked_diagnostic
+                 FROM shares WHERE share_id=?1",
+                [&id.0],
+                managed_share_from_row,
+            )
+            .optional()?
             .context("share not found")
     }
 
@@ -1269,6 +1255,27 @@ impl State {
         }
         Ok(())
     }
+}
+
+fn managed_share_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedShare> {
+    let peer: Option<String> = row.get(2)?;
+    Ok(ManagedShare {
+        id: ShareId(row.get(0)?),
+        root: bytes_path(row.get::<_, Vec<u8>>(1)?),
+        peer: peer
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        initial_complete: row.get::<_, i64>(3)? != 0,
+        watch_enabled: row.get::<_, i64>(4)? != 0,
+        blocked_diagnostic: row.get(5)?,
+    })
 }
 
 #[cfg(unix)]
