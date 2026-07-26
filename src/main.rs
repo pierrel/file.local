@@ -838,7 +838,7 @@ fn validate_service_path_characters(value: &str) -> Result<()> {
             || code & 0xffff == 0xfffe
             || code & 0xffff == 0xffff
     }) {
-        bail!("launchd service paths cannot contain control characters or XML noncharacters")
+        bail!("service paths cannot contain control characters or XML noncharacters")
     }
     Ok(())
 }
@@ -1210,8 +1210,7 @@ fn daemon_syncs(
         .managed_shares()?
         .into_iter()
         .map(|share| {
-            let state_name = if let Some(diagnostic) = &share.blocked_diagnostic {
-                let _ = diagnostic;
+            let state_name = if share.blocked_diagnostic.is_some() {
                 "blocked"
             } else if let Some(worker) = workers.get(&share.id) {
                 if worker.stopping.load(Ordering::Relaxed) {
@@ -4988,6 +4987,7 @@ mod tests {
         let mut state = State::open(temp.path().join("state"))?;
         let share = state.init_share(&root)?;
         state.set_watch_enabled(&share, true)?;
+        state.set_blocked(&share, "repair required")?;
         let (server, mut client) = UnixStream::pair()?;
         let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (events, _event_rx) = std::sync::mpsc::channel();
@@ -5007,7 +5007,8 @@ mod tests {
                     daemon_path_bytes(&syncs[0].root)?,
                     path_bytes(&root.canonicalize()?)
                 );
-                assert_eq!(syncs[0].state, "stopped");
+                assert_eq!(syncs[0].state, "blocked");
+                assert_eq!(syncs[0].diagnostic.as_deref(), Some("repair required"));
                 assert!(syncs[0].enabled);
             }
             _ => panic!("unexpected daemon response"),
@@ -5146,7 +5147,11 @@ mod tests {
     #[test]
     fn service_path_validation_rejects_invalid_characters() -> Result<()> {
         validate_service_path_characters("path<&>")?;
-        assert!(validate_service_path_characters("path\u{1}").is_err());
+        let error = validate_service_path_characters("path\u{1}").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "service paths cannot contain control characters or XML noncharacters"
+        );
         assert!(validate_service_path_characters("path\u{fdd0}").is_err());
         Ok(())
     }

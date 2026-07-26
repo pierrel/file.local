@@ -127,6 +127,12 @@ second state/socket layout.
    continuation semantics without cloning the accumulated page twice for every
    entry.
 
+9. *Keep shared service diagnostics platform-neutral.*
+
+   The path-character validator is shared by systemd and launchd helpers, so
+   its error must name only service paths.  The blocked daemon state checks the
+   diagnostic's presence while retaining the value for the response.
+
 * 3. Interfaces, state, and failure boundaries
 
 The private-directory helper accepts a requested absolute/relative private path
@@ -206,6 +212,8 @@ accepted entries apart from the necessary serialization for each cap check.
 8. Retain the missing-share and multipage-list regressions while checking that
    targeted lookup uses one SQL row and page construction performs at most one
    accumulated-page clone per attempted append.
+9. Assert a blocked list entry retains its diagnostic and the shared
+   path-character validator reports platform-neutral wording.
 
 The work is accepted when a permissive umask never exposes a new private state
 or service directory; an unsafe =run= path prevents daemon startup without
