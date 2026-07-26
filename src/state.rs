@@ -1287,6 +1287,13 @@ fn validate_state_dir_chain(path: &Path) -> Result<()> {
     let uid = rustix::process::geteuid().as_raw();
     for component in path.ancestors() {
         let metadata = fs::symlink_metadata(component)?;
+        #[cfg(target_os = "macos")]
+        if metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && matches!(component, path if path == Path::new("/var") || path == Path::new("/tmp"))
+        {
+            continue;
+        }
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             bail!(
                 "state directory contains an unsafe path component {}",
