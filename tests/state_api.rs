@@ -37,10 +37,10 @@ fn state_metadata_and_install_intent_lifecycle() -> Result<()> {
     let mut state = State::open(temp.path().join("state"))?;
     let share = state.init_share(&root)?;
     assert_eq!(state.find_share(&nested)?.0, share);
-    let nested_share = state.init_share(&nested)?;
+    assert!(state.init_share(&nested).is_err());
     let deeper = nested.join("deeper");
     fs::create_dir_all(&deeper)?;
-    assert_eq!(state.find_share(&deeper)?.0, nested_share);
+    assert_eq!(state.find_share(&deeper)?.0, share);
     assert_eq!(state.root_for(&share)?, root.canonicalize()?);
     assert!(state.lock_share(&share).is_ok());
     assert!(state.lock_global_sync().is_ok());
@@ -75,6 +75,18 @@ fn state_metadata_and_install_intent_lifecycle() -> Result<()> {
     assert_eq!(state.records(&share)?, records);
     state.set_initial_complete(&share)?;
     assert!(state.initial_complete(&share)?);
+    state.set_watch_enabled(&share, true)?;
+    state.set_blocked(&share, "root identity changed")?;
+    let managed = state.managed_share(&share)?;
+    assert!(managed.watch_enabled);
+    assert_eq!(
+        managed.blocked_diagnostic.as_deref(),
+        Some("root identity changed")
+    );
+    state.clear_blocked(&share)?;
+    let generation = state.watch_intent_generation(&share)?;
+    state.set_initial_complete_and_watch_enabled(&share, generation)?;
+    assert!(state.managed_share(&share)?.initial_complete);
 
     let peer = PeerConfig {
         peer_id: PeerId("remote".into()),
@@ -200,6 +212,84 @@ fn bound_peer_of_an_unregistered_share_is_none() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn state_refuses_a_symlinked_state_directory() -> Result<()> {
+    let temp = tempdir()?;
+    let target = temp.path().join("target");
+    let link = temp.path().join("state");
+    fs::create_dir(&target)?;
+    std::os::unix::fs::symlink(&target, &link)?;
+    assert!(State::open(&link).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn private_managed_state_marker_selects_an_absolute_state_directory() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const HOME: &str = "FLOCAL_TEST_MANAGED_STATE_MARKER_HOME";
+    if let Some(home) = std::env::var_os(HOME) {
+        let home = std::path::PathBuf::from(home);
+        let state_dir = home.parent().expect("temporary parent").join("state");
+        assert_eq!(State::managed_state_dir()?, Some(state_dir));
+        return Ok(());
+    }
+
+    let temp = tempdir()?;
+    let home = temp.path().join("home");
+    let state_dir = temp.path().join("state");
+    let marker = home.join(".config/file.local/managed-state");
+    fs::create_dir_all(marker.parent().expect("marker parent"))?;
+    fs::write(&marker, format!("{}\n", state_dir.display()))?;
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "private_managed_state_marker_selects_an_absolute_state_directory",
+        ])
+        .env("HOME", &home)
+        .env(HOME, &home)
+        .output()?;
+    assert!(output.status.success(), "{:?}", output);
+    Ok(())
+}
+
+#[test]
+fn concurrent_overlapping_registrations_admit_at_most_one_root() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let nested = root.join("nested");
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&nested)?;
+    State::open(&state_dir)?;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let first_state = state_dir.clone();
+    let first_root = root.clone();
+    let first = std::thread::spawn(move || {
+        let state = State::open(first_state)?;
+        first_barrier.wait();
+        state.init_share(&first_root)
+    });
+    let second_barrier = barrier.clone();
+    let second_state = state_dir.clone();
+    let second_nested = nested.clone();
+    let second = std::thread::spawn(move || {
+        let state = State::open(second_state)?;
+        second_barrier.wait();
+        state.init_share(&second_nested)
+    });
+    let outcomes = [
+        first.join().expect("first registration thread"),
+        second.join().expect("second registration thread"),
+    ];
+    let successes = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(successes, 1);
+    Ok(())
+}
+
 #[test]
 fn root_identity_is_persisted_and_replacements_are_not_adopted() -> Result<()> {
     let temp = tempdir()?;
@@ -277,6 +367,59 @@ fn root_identity_is_persisted_and_replacements_are_not_adopted() -> Result<()> {
             .downcast_ref::<flocal::state::RootIdentityChanged>()
             .is_some()
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn initialization_refuses_a_symlinked_root() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempdir()?;
+    let target = temporary.path().join("target");
+    let root = temporary.path().join("root");
+    std::fs::create_dir(&target)?;
+    symlink(&target, &root)?;
+    let state = State::open(temporary.path().join("state"))?;
+    let error = state
+        .init_share(&root)
+        .expect_err("a symlink must not become a managed root");
+    assert!(error.to_string().contains("symbolic link"));
+    Ok(())
+}
+
+#[test]
+fn managed_share_state_changes_are_durable_and_generation_guarded() -> Result<()> {
+    let temporary = tempdir()?;
+    let root = temporary.path().join("root");
+    fs::create_dir(&root)?;
+    let mut state = State::open(temporary.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let initial = state.watch_intent_generation(&share)?;
+    state.set_watch_enabled_if_generation(&share, true, initial)?;
+    assert!(state.managed_share(&share)?.watch_enabled);
+    assert!(
+        state
+            .set_watch_enabled_if_generation(&share, false, initial)
+            .is_err()
+    );
+    let current = state.watch_intent_generation(&share)?;
+    state.set_initial_complete_and_watch_enabled(&share, current)?;
+    let managed = state.managed_share(&share)?;
+    assert!(managed.initial_complete);
+    assert!(managed.watch_enabled);
+    state.set_blocked(&share, &"x".repeat(5000))?;
+    assert_eq!(
+        state
+            .managed_share(&share)?
+            .blocked_diagnostic
+            .as_deref()
+            .unwrap()
+            .len(),
+        4096
+    );
+    state.clear_blocked(&share)?;
+    assert!(state.managed_share(&share)?.blocked_diagnostic.is_none());
     Ok(())
 }
 

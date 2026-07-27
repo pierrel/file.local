@@ -1,0 +1,225 @@
+#+title: Copilot round two daemon hardening fixes
+#+date: 2026-07-26
+#+status: accepted implementation plan
+
+* 1. Q&A and decision
+
+The user asked to fix every currently unaddressed actionable Copilot comment on
+the daemon-managed-sync pull request.  These are correctness and local
+filesystem-security fixes to the accepted daemon interface, not a change to its
+user-visible feature set.  The user also defined the normal development cycle:
+Q&A, an independently reviewed design, an optional user-review pause only when
+requested or a blocking decision remains, implementation with independent code
+reviews, then pull-request Copilot rounds until convergence or seven submitted
+rounds.
+
+There are no blocking questions.  The existing state directory, daemon socket,
+and daemon protocol are private, per-user facilities.  Their safe construction
+and useful errors are required by that contract.  The implementation may use
+the existing =rustix= filesystem dependency; it must not add a dependency or a
+second state/socket layout.
+
+* 2. Findings and plan
+
+1. *Create private state directories with their final permissions.*
+
+   =State::open= currently calls =create_dir_all= and only then changes the
+   mode to owner-only.  Under a permissive umask, a newly-created state,
+   object, or lock directory is briefly traversable by another local user.
+   Replace that creation path on Unix with one shared directory-creation
+   primitive that creates every missing component with requested mode =0700=
+   from a validated, held parent descriptor, without changing process-global
+   umask.  It opens each component relative to that descriptor without
+   following symlinks, then validates the opened directory's ownership and
+   permissions before descending.  This makes the owner-only bound true at
+   creation and prevents pathname substitution between validation and use.  The
+   helper never chmods a pre-existing component merely because this process
+   needs it: invalid ownership, type, symlink, or permissions fail closed.
+   Existing final-state permission tightening remains the responsibility of
+   =State::open=.  On macOS,
+   preserve the existing narrow exception for the root-owned system aliases
+   =/var= and =/tmp=: resolve only that validated alias before beginning the
+   descriptor-relative walk, never a user-controlled descendant.  Existing
+   correctly private directories retain their behavior.  The non-Unix fallback
+   remains the present standard-directory creation path.
+
+2. *Validate the daemon run directory before binding.*
+
+   =daemon_run= currently creates =STATE/run= but does not apply the private
+   state-directory validation before it creates =daemon.lock= or binds
+   =daemon.sock=.  It must use the same shared private-directory primitive as
+   state subdirectories.  A non-directory, symlink, foreign-owned, or
+   group/world-writable =run= path therefore fails before a lock or socket is
+   created.  The existing refusal to unlink a non-socket at =daemon.sock=
+   remains in force.  This boundary protects the daemon's local control
+   endpoint from pathname substitution and disclosure; it does not add a new
+   authentication protocol because the endpoint remains in an owner-only
+   directory and socket.
+
+3. *Validate =sync add= input before service activation.*
+
+   =sync add PATH= currently invokes =ensure_daemon= before checking that
+   =PATH= is an existing directory.  Reverse that order: use no-follow
+   metadata to validate that the direct CLI path is a real existing directory,
+   not a final symlink, before contacting or activating the installed user
+   service.  Then continue with the existing registration, pairing,
+   confirmation, and daemon-start path.  This avoids a surprising service
+   activation for a local argument error.  It intentionally does not replace
+   the later state/root identity checks: those protect the time between client
+   validation and registration and remain the authoritative admission boundary.
+
+4. *Encode invalid list continuations as daemon errors.*
+
+   An unrecognized =List.cursor= currently makes =daemon_sync_page= return an
+   error through =handle_daemon_request=, which closes the Unix stream without
+   a valid response.  Keep malformed request parsing as an =Error= response
+   and apply that same response boundary to every list-page error.  In
+   particular, an unknown cursor returns =DaemonResponse::Error= with the
+   bounded existing diagnostic text; the client reports it through the normal
+   =daemon_request= error path rather than reporting an empty/truncated socket
+   read.  The response is still size-checked before it is written.  Pagination
+   semantics, cursor format, and normal successful pages do not change.
+
+5. *Use that construction boundary for service directories too.*
+
+   Service installation creates user-controlled parents such as
+   =~/.config/file.local= and =~/.config/systemd/user=.  It currently uses
+   =create_dir_all= followed by validation, so a permissive umask can leave a
+   newly-created parent group-writable and make first installation fail.  Move
+   the private-directory primitive out of state-only ownership and use it for
+   these paths as well.  Preserve the established behavior for existing
+   system-owned sticky parents and macOS =/var= or =/tmp= aliases.  This is a
+   reuse of the same held-descriptor, no-follow construction boundary, not a
+   second service-specific helper or a post-creation chmod repair.
+
+6. *Make legacy =sync= options conflict with managed subcommands.*
+
+   The legacy =flocal sync PATH [--dry-run] [--yes] [--json]= form and the
+   managed =sync add/list/start/stop= form share a command.  Clap currently
+   accepts a legacy flag before a subcommand, then the managed dispatch ignores
+   that flag.  Validate the parsed command before state opening: reject parent
+   flags when Clap identifies a managed subcommand and when a leading flag made
+   a reserved managed name parse as the legacy path.  Retain both valid
+   grammars unchanged, and add parser/validation regressions for representative
+   mixed invocations.
+
+7. *Isolate environment-sensitive tests and coverage.*
+
+   Two tests currently alter =HOME=, =PATH=, and a manager-test variable in
+   their own process.  A mutex and serial CI test runner do not make Rust's
+   process-global environment mutation safe when another test thread may read
+   it.  Move each environment-sensitive assertion into its own exact test
+   subprocess, passing all variables with =Command::env= and keeping fixtures
+   in the parent-created temporary directory.  Remove the process-global
+   environment lock and every unsafe environment mutation.  Add
+   =-- --test-threads=1= to the coverage command in =.github/workflows/ci.yml=
+   (the Makefile already supplies it), so its deterministic test schedule
+   matches the ordinary test job.
+
+8. *Keep daemon state reads and list-page construction linear.*
+
+   =managed_share= should select one row by =share_id= rather than build every
+   managed share and filter in memory.  Extract the existing row decoding into
+   one private mapper so the list and targeted query keep exactly the same
+   peer parsing, field shape, and =share not found= error.  For daemon list
+   pages, push one candidate entry, serialize one clone for the existing size
+   check, and pop it when oversized.  This preserves the framing boundary and
+   continuation semantics without cloning the accumulated page twice for every
+   entry.
+
+9. *Keep shared service diagnostics platform-neutral.*
+
+   The path-character validator is shared by systemd and launchd helpers, so
+   its error must name only service paths.  The blocked daemon state checks the
+   diagnostic's presence while retaining the value for the response.
+
+* 3. Interfaces, state, and failure boundaries
+
+The private-directory helper accepts a requested absolute/relative private path
+and has one outcome: a real directory chain whose newly created nodes are
+owner-only and whose existing and final nodes meet the established ownership,
+symlink, and writable-by-other-user rules.  =State::open= uses it for the
+state root and =objects=; lock creation, daemon startup, and service
+installation use it for their private children.  The helper is not a
+general-purpose path sanitizer and must not be used to create share roots,
+which retain their existing user-facing directory semantics.
+
+No durable schema changes are needed.  The =run= directory is runtime state;
+the durable state root remains the authority for its location.  A failed
+validation or creation does not repair, delete, follow, or adopt a suspicious
+path, and it starts no daemon.  A failed invalid =sync add= argument creates no
+share registration or pairing and does not activate a service.  The existing
+top-level command dispatch may still open the default state before command
+validation; this hardening does not broaden into a global CLI-dispatch
+redesign.
+
+Daemon request processing has one response invariant: after an accepted client
+connection and a parseable request, every command-specific failure is encoded
+as =DaemonResponse::Error= when that serialized response fits the existing
+message cap.  Transport I/O and over-cap responses may still terminate the
+connection because no trustworthy complete response can be sent.  Error
+messages remain bounded by the protocol cap and contain no secret material.
+
+CLI parsing has one grammar invariant: either legacy sync arguments are present
+with no managed subcommand, or a managed subcommand and only its own arguments
+are present.  A mixed form is a parse error before state opening or service
+activation.
+
+Test-only environment values are process-launch inputs, never mutable shared
+state.  Each subprocess owns its temporary fixtures and no test depends on
+global harness serialization for soundness.
+
+Single-share daemon operations read only their selected record.  List-page
+construction remains bounded by the existing message cap and is linear in its
+accepted entries apart from the necessary serialization for each cap check.
+
+* 4. Tests and acceptance criteria
+
+1. Add Unix tests in an isolated subprocess with a permissive umask, then assert
+   each newly created state/object/lock/run directory is owner-only.  The test
+   must not mutate the parallel test process's global umask.  Exercise the
+   adversarial construction boundary rather than only final chmod: creation
+   from a permissive umask must still make every created component private.
+   Retain a macOS CI case whose state directory is under the existing =/var= or
+   =/tmp= system alias, proving that only the documented root-owned aliases are
+   traversed while descendant symlinks remain rejected.
+   Also cover refusal of a pre-existing unsafe run component (at least a
+   symlink or ordinary file) and verify daemon startup neither replaces it nor
+   creates its socket.
+2. Add a CLI-level test that passes a missing, non-directory, and final-symlink
+   =sync add= path with a deliberately unavailable/observable service-manager
+   path and proves each command returns the local path error before daemon
+   activation, registration, or pairing.  Retain the existing successful add
+   and pairing tests to prove the normal order still works.
+3. Add a daemon protocol test that sends a syntactically valid =List= request
+   with an unknown cursor over a connected Unix stream and receives a
+   =DaemonResponse::Error= describing the invalid continuation.  Keep the
+   existing multipage list test as the successful-path proof.
+4. Run the affected filesystem, daemon protocol, and CLI tests, then the full
+   =make check= and Docker E2E suite.  Run the required code-review lenses
+   after implementation, reconcile this record and the README if observable
+   wording changes, push the fixes, and resolve/reply to the four Copilot
+   threads only when their behavior is proved.
+5. Add an isolated permissive-umask service-installation regression that
+   directly exercises the service-directory wrapper and proves each created
+   parent is owner-only before a service file is written.
+6. Add parser tests rejecting a legacy flag combined with =sync list= or
+   =sync add= while retaining valid legacy and managed forms.
+7. Run the state-marker and systemd-install assertions in subprocesses with
+   their test environment supplied by =Command::env=, then run the complete
+   suite under the default parallel test harness as well as the repository's
+   serialized checker.
+8. Retain the missing-share and multipage-list regressions while checking that
+   targeted lookup uses one SQL row and page construction performs at most one
+   accumulated-page clone per attempted append.
+9. Assert a blocked list entry retains its diagnostic and the shared
+   path-character validator reports platform-neutral wording.
+
+The work is accepted when a permissive umask never exposes a new private state
+or service directory; an unsafe =run= path prevents daemon startup without
+replacement; a missing, non-directory, or symlinked =sync add= path starts
+neither service, registration, nor pairing; and an invalid list cursor produces
+a valid daemon error response.  Mixed legacy/managed sync syntax is rejected;
+environment-sensitive tests are safe under the default parallel harness.  No
+documented daemon command, storage schema, or successful pagination behavior
+regresses.

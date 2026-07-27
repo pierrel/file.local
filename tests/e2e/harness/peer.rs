@@ -14,6 +14,7 @@ const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 /// command a constant string with nothing interpolated into it.
 const WATCH_PIDFILE: &str = "/tmp/flocal-watch.pid";
 const WATCH_LOG: &str = "/home/peer/.flocal-watch.log";
+const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
 /// The product's status JSON schema this harness is written against:
 /// schema 2, which the tombstone-retention fix introduced together with
 /// promoting the scenarios that read `tombstones`.
@@ -184,6 +185,34 @@ pub fn pair() -> Result<(Connector, Peer)> {
     Ok((connector, responder))
 }
 
+/// The daemon-managed opening: start the connector daemon explicitly in the
+/// Docker test container, then use the public one-command setup flow. Docker
+/// has no systemd user manager, so this exercises the same installed daemon
+/// socket that a real user service owns without pretending the container has
+/// login-service integration.
+pub fn managed_pair() -> Result<(Connector, Peer)> {
+    let (a, b) = containers()?;
+    a.start_daemon()?;
+    let output = a.peer.flocal_ok(&[
+        "sync",
+        "add",
+        SHARE,
+        "--host",
+        &b.peer.alias,
+        "--remote-path",
+        SHARE,
+        "--yes",
+    ])?;
+    drop(output);
+    Ok((
+        Connector {
+            peer: a.peer,
+            watch_max_session_bytes: None,
+        },
+        b.peer,
+    ))
+}
+
 /// The knobs `pair_with` accepts beyond the standard opening. Currently:
 /// the watch rescan interval (design section 14.1), which watch scenarios
 /// set to the one-second floor so a cycle costs a second, not thirty.
@@ -319,6 +348,18 @@ impl Connector {
     /// conflict; a nonzero exit fails the scenario.
     pub fn sync(&self) -> Result<()> {
         self.flocal_ok(&["sync", SHARE, "--yes"]).map(|_| ())
+    }
+
+    pub fn sync_start(&self) -> Result<()> {
+        self.flocal_ok(&["sync", "start", SHARE]).map(|_| ())
+    }
+
+    pub fn sync_stop(&self) -> Result<()> {
+        self.flocal_ok(&["sync", "stop", SHARE]).map(|_| ())
+    }
+
+    pub fn restart_daemon(&self) -> Result<()> {
+        self.peer.restart_daemon()
     }
 
     /// `flocal sync --dry-run`; asserts the connector's tree is unchanged by
@@ -524,24 +565,6 @@ impl Watch<'_> {
             .wait_for_text("/home/peer/.flocal-stderr.log", needle)
     }
 
-    pub fn wait_for_any_error_with_deadline(
-        &self,
-        needles: &[&str],
-        deadline: Duration,
-    ) -> Result<()> {
-        self.peer.poll_until(
-            &format!("watch stderr never contained any of {needles:?}"),
-            deadline,
-            |peer| {
-                let output = peer.exec_raw(&["cat", "--", "/home/peer/.flocal-stderr.log"])?;
-                let stderr = String::from_utf8_lossy(&output.stdout);
-                Ok((output.status.success()
-                    && needles.iter().any(|needle| stderr.contains(needle)))
-                .then_some(()))
-            },
-        )
-    }
-
     pub fn assert_log_absent(&self, needle: &str) -> Result<()> {
         let output = self.peer.exec_ok(&["cat", "--", WATCH_LOG])?;
         let log = String::from_utf8_lossy(&output.stdout);
@@ -612,6 +635,30 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    fn start_daemon(&self) -> Result<()> {
+        self.context.docker_ok(&[
+            "exec",
+            "-d",
+            "-u",
+            "peer",
+            &self.container.name,
+            "sh",
+            "-c",
+            "echo \"$$\" >/home/peer/.flocal-daemon.pid && exec flocal daemon run >/home/peer/.flocal-daemon.log 2>&1",
+        ])?;
+        self.poll_until(
+            "daemon did not create its control socket",
+            DEADLINE,
+            |peer| {
+                let output = peer.exec_raw(&[
+                    "test",
+                    "-S",
+                    "/home/peer/.local/state/file.local/run/daemon.sock",
+                ])?;
+                Ok(output.status.success().then_some(()))
+            },
+        )
+    }
     // ----- file operations (inside the container, as the peer user) -----
 
     pub fn write(&self, path: &str, content: &str) -> Result<()> {
@@ -877,6 +924,20 @@ impl Peer {
                 })
             }),
         })
+    }
+
+    fn restart_daemon(&self) -> Result<()> {
+        let output = self.exec_ok(&["cat", "--", DAEMON_PIDFILE])?;
+        let pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .context("parsing daemon pid")?;
+        self.exec_ok(&["kill", "-TERM", &pid.to_string()])?;
+        self.poll_until("daemon did not stop", DEADLINE, move |peer| {
+            let output = peer.exec_raw(&["kill", "-0", &pid.to_string()])?;
+            Ok((!output.status.success()).then_some(()))
+        })?;
+        self.start_daemon()
     }
 
     fn absent_condition(&self, path: &str) -> Result<Condition> {
