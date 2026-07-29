@@ -57,6 +57,47 @@ not adopted automatically. Restore the original directory and run =sync start
 path is gone. =sync list= also shows the durable enabled setting separately
 from the current worker state.
 
+** Troubleshooting a managed watch
+
+Start with =flocal sync list=. A healthy connector is =watching=;
+=reconnecting= means it is connecting or retrying the watch session; and
+=blocked= includes the reason the watch needs attention. =starting= and
+=stopping= are transitional; =stopped= means the watch is disabled. A broken
+local root is one =blocked= case; restore it and start the share again.
+
+On Linux, the daemon is a systemd user service. Check its state, inspect the
+current-boot logs, or follow new lines with:
+
+#+begin_src sh
+systemctl --user status flocal-daemon.service
+journalctl --user -u flocal-daemon.service -b -n 200 --no-pager -o short-iso
+journalctl --user -u flocal-daemon.service -f -o short-iso
+#+end_src
+
+On macOS, inspect the LaunchAgent with:
+
+#+begin_src sh
+launchctl print gui/$(id -u)/local.file-local.flocal-daemon
+#+end_src
+
+=flocal= does not currently route LaunchAgent stdout/stderr to a retained
+macOS log. For live diagnostics, first stop the managed watch, run the watch
+in a terminal, then start it again when finished:
+
+#+begin_src sh
+flocal sync stop PATH
+flocal watch PATH
+flocal sync start PATH
+#+end_src
+
+Linux watch lines in the journal, and foreground macOS watch lines, have a UTC
+timestamp, for example
+=Peer connected=, =Peer connection lost; retrying=, =synchronization failed;
+retrying in background: ...=, or =synchronization resumed after N failed
+attempts=. File actions such as =UPLOAD=, =DOWNLOAD=, and =DELETE= appear only
+after both peers apply them. When asking for help, include =flocal sync list=
+and the recent Linux journal or macOS foreground-watch lines from both peers.
+
 The current code is proof-stage alpha software: review the explicit implementation gaps in
 [[file:docs/2026-07-14-alpha-implementation.org][the alpha implementation state]] before using it on irreplaceable data.
 
