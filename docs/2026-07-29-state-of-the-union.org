@@ -1,0 +1,634 @@
+#+title: file.local: State of the Union
+#+subtitle: Architecture, implementation tour, and a Rust reading guide
+#+date: 2026-07-29
+
+* What this project is
+
+=file.local= is a two-peer, local-first directory synchronizer.  Its executable
+is =flocal=.  Each peer owns an ordinary local directory and may work while
+offline; when the peers can reach each other over SSH, they reconcile their
+directory histories.  There is no central server and neither peer is
+authoritative.
+
+The current release is deliberately a proof-stage alpha.  It has a serious
+foundation for files, directories, symlinks, deletion tombstones, ignores,
+durable state, recovery, persistent watching, and conflict retention.  It is
+not yet a polished end-user sync product: read [[file:README.org][README.org]] and
+[[file:docs/2026-07-14-alpha-implementation.org][docs/2026-07-14-alpha-implementation.org]] before trusting it with irreplaceable
+data.
+
+* Quick mental model
+
+#+begin_example
+     local tree A                         local tree B
+          |                                    |
+        scan                                 scan
+          |                                    |
+     versioned records <--- SSH protocol ---> versioned records
+          |                                    |
+             reconcile: causal history first, deterministic tie-break second
+                                      |
+                              plan + retained conflicts
+                                      |
+                         apply safely on both trees
+                                      |
+                  durable SQLite state + content-addressed objects
+#+end_example
+
+An ordinary one-shot =flocal sync PATH= performs that loop once.  A managed
+sync adds a per-user daemon.  The daemon keeps a persistent SSH session open,
+watches both trees, performs a full safety scan after relevant events, retries
+temporary failures with bounded backoff, and restores enabled watches after a
+service restart or login.
+
+* Repository map
+
+Ignore =target/= in this map: it is Cargo's local build output, not source.
+
+#+begin_example
+README.org                         User-facing contract, install, operation, troubleshooting
+Cargo.toml                         Rust package metadata and dependencies
+Makefile                           build, check, E2E, and per-user service install entry points
+.github/workflows/ci.yml           Linux, macOS, coverage, and Docker E2E CI
+
+src/lib.rs                         Library module boundary; forbids unsafe Rust
+src/main.rs                        CLI, daemon, service integration, protocol orchestration, watch loop
+src/model.rs                       Validated model types: paths, entries, versions, peers, shares
+src/state.rs                       SQLite state, object store, root identity, private-directory handling
+src/scan.rs                        Capability-based directory scanning and .gitignore handling
+src/reconcile.rs                   Pure deterministic reconciliation algorithm
+src/sync.rs                        Wire frames, budgets, safe apply, object transfer, root capabilities
+src/watch.rs                       Small testable watch/retry/debounce/heartbeat state machines
+
+tests/core.rs                      filesystem, scan/apply, conflict, recovery integration tests
+tests/state_api.rs                 persistent state and identity tests
+tests/protocol.rs                  protocol-level tests
+tests/ssh_sync.rs                  real SSH one-shot sync tests
+tests/daemon_cli.rs                daemon/control CLI tests
+tests/e2e/                         Docker two-container acceptance scenarios
+
+docs/                              dated design records and implementation decisions
+references/                        background research, not runtime code
+#+end_example
+
+The useful reading order for someone new to the code is:
+
+1. [[file:README.org][README.org]] for behavior and commands.
+2. =src/main.rs= for how a CLI command reaches the system.
+3. =src/model.rs=, then =src/reconcile.rs= for the core data model and pure
+   convergence decision.
+4. =src/scan.rs=, =src/sync.rs=, and =src/state.rs= for the safety boundaries.
+5. =src/watch.rs= and the watch loop in =src/main.rs= for persistent operation.
+6. =tests/e2e/scenarios/watching.rs= for the behavior the system must exhibit
+   on a laptop-like network.
+
+* Rust orientation before reading the code
+
+The project is conventional stable Rust.  A few recurring pieces make the
+source much easier to read.
+
+** Error propagation with =Result= and =?=
+
+Most fallible functions return =anyhow::Result<T>=, usually written just
+=Result<T>=.  A success returns a =T=; a failure returns an error.  The =?=
+operator means: "if this failed, return that error to my caller; otherwise
+unwrap the successful value here."
+
+#+begin_src rust
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("flocal: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    if let Commands::Sync(arguments) = &cli.command {
+        validate_sync_arguments(arguments)?;
+    }
+    let mut state = State::open_default()?;
+    // ... dispatch a command ...
+    Ok(())
+}
+#+end_src
+
+This is from [[file:src/main.rs][src/main.rs]].  =Result<()>=' means success has no
+interesting value, just =()= (the unit value).  =if let Err(...)= matches only
+the error case.  The final =Ok(())= is the explicit successful return.
+
+** Enums model a closed set of states
+
+Rust =enum=s are richer than C enums: each case may carry data.  The sync model
+uses this for every filesystem entry kind:
+
+#+begin_src rust
+pub enum Entry {
+    File { hash: ObjectHash, size: u64, executable: bool },
+    Directory,
+    Symlink { target: Vec<u8> },
+    Tombstone,
+}
+#+end_src
+
+This real definition is in [[file:src/model.rs][src/model.rs]].  A =match= over
+an enum is checked for exhaustiveness by the compiler.  Adding an entry kind
+forces the author to consciously decide how scanning, reconciliation, transfer,
+and application should handle it.
+
+** Ownership is used as a resource discipline
+
+Values normally have one owner.  Passing a value can move it; borrowing with
+=&value= permits a function to inspect it without taking ownership.  You will
+see =Arc<Mutex<T>>= where a daemon needs shared mutable state across threads:
+
+#+begin_src rust
+fn daemon_syncs(
+    state: &State,
+    workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
+) -> Result<Vec<DaemonSync>> {
+    let workers = workers.lock()
+        .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
+    // Read the shared worker table while holding the lock.
+    // Build independent DaemonSync values before returning.
+    // ...
+}
+#+end_src
+
+This excerpt is from [[file:src/main.rs][src/main.rs]]. =Arc= gives multiple
+threads shared ownership; =Mutex= permits one thread at a time to mutate or
+read the protected map; =lock()= produces a guard that releases the lock when
+it goes out of scope.  The code converts a poisoned lock into an ordinary error
+rather than panicking the daemon.
+
+** Derives generate routine implementations
+
+Near model types, =#[derive(Clone, Debug, Eq, PartialEq, Serialize,
+Deserialize)]= asks the compiler or Serde to generate familiar behavior:
+
+- =Clone=: make an explicit copy of a value.
+- =Debug=: printable diagnostics for developers and tests.
+- =Eq= and =PartialEq=: equality comparison.
+- =Serialize= and =Deserialize=: JSON-compatible wire/storage conversion.
+
+The project begins [[file:src/lib.rs][src/lib.rs]] with =#![forbid(unsafe_code)]=.
+That does not make every bug impossible, but it makes uses of Rust's escape
+hatch a compilation error.  Filesystem and concurrency safety are instead
+expressed through ordinary APIs, validation, capabilities, and tests.
+
+* Major concern: command line and lifecycle
+
+** Entry point and command routing
+
+[[file:src/main.rs][src/main.rs]] owns the public CLI.  =clap= derives the parser
+from Rust types, then =run()= maps the parsed command to an operation.  The
+main command families are:
+
+- =init= creates a share identity for a local directory.
+- =peer add= records a peer and remote path for one-shot workflows.
+- =sync PATH= runs one planned or confirmed synchronization round.
+- =sync add/list/start/stop= manages durable daemon-owned watches.
+- =status=, =conflicts=, and =restore= expose state and recovery.
+- =watch PATH= runs a foreground persistent watcher, useful for diagnostics.
+- =daemon run/install-service= is the service-manager-facing daemon interface.
+
+The =SyncArgs= shape supports the original one-shot form and the managed
+subcommands.  The code deliberately validates ambiguous mixtures before it
+opens state or starts a service:
+
+#+begin_src rust
+if let Commands::Sync(arguments) = &cli.command {
+    validate_sync_arguments(arguments)?;
+}
+let mut state = State::open_default()?;
+#+end_src
+
+That ordering is a small but important example of design in this codebase:
+reject invalid user input before it can produce a side effect.
+
+** Installation and process ownership
+
+[[file:Makefile][Makefile]] is intentionally thin.  =make install= builds the
+release binary, stops a prior per-user service if one exists, installs the
+binary, and invokes =flocal daemon install-service=.  The Rust code generates
+the system-specific service definition.
+
+On Linux, [[file:src/main.rs][src/main.rs]] writes a per-user systemd unit,
+reloads the user manager, and enables/starts it:
+
+#+begin_src rust
+let unit = config.join("systemd/user/flocal-daemon.service");
+let content = systemd_unit_content(executable, &state.dir)?;
+install_managed_state_marker(state)?;
+install_text_file(&unit, &content)?;
+run_manager("systemctl", &["--user", "daemon-reload"])?;
+run_manager("systemctl", &["--user", "enable", "--now", "flocal-daemon.service"])?;
+#+end_src
+
+The generated service executes =flocal daemon run= with an explicit state
+directory and =Restart=on-failure=.  macOS uses a per-user LaunchAgent when a
+graphical launchd domain is available.  The resulting daemon owns workers; a
+CLI client talks to it over a private Unix socket rather than trying to manage
+long-running worker threads itself.
+
+* Major concern: durable state and trust boundaries
+
+[[file:src/state.rs][src/state.rs]] owns state under the user's private
+directory.  Its SQLite database records:
+
+- a persistent local peer ID;
+- share IDs, canonical roots, peer configuration, and durable watch intent;
+- root device/inode identity, preventing a replaced path from being adopted;
+- per-path version records;
+- retained conflict winner/loser records;
+- initial-install intent, for crash-safe recovery.
+
+Object contents are stored separately as hashes under =objects/=.  SQLite uses
+WAL mode and full synchronous writes:
+
+#+begin_src rust
+let mut conn = Connection::open(&database)?;
+set_private_file(&database)?;
+conn.pragma_update(None, "journal_mode", "WAL")?;
+conn.pragma_update(None, "synchronous", "FULL")?;
+conn.busy_timeout(std::time::Duration::from_secs(5))?;
+#+end_src
+
+The schema is initialized in =State::open= and receives small forward
+migrations there.  This keeps the durable format close to the operations that
+use it, but it also means =state.rs= is a high-leverage file: a schema change
+needs migration, recovery, and upgrade tests.
+
+** Private-directory construction
+
+The state root, object directory, locks, runtime socket directory, and service
+assets are security boundaries.  Existing paths are rejected if they are
+symlinks, unexpectedly writable, or owned incorrectly.  New private
+directories are constructed with descriptor-relative APIs and owner-only
+permissions, rather than relying on the caller's umask.  Start here when
+studying that boundary:
+
+#+begin_src rust
+pub fn ensure_private_state_child(&self, name: &str) -> Result<PathBuf> {
+    let path = self.dir.join(name);
+    ensure_private_directory(&path)?;
+    Ok(path)
+}
+#+end_src
+
+That small public method in [[file:src/state.rs][src/state.rs]] centralizes the
+policy.  Callers do not create a private child with a casual =create_dir_all=
+and hope a later chmod repairs it.
+
+** Root identity beats path spelling
+
+The configured root is not trusted forever just because its path still exists.
+It is bound to device/inode identity.  =ShareRoot::open= in
+[[file:src/sync.rs][src/sync.rs]] opens the root with =NOFOLLOW= and validates
+the identity before and after obtaining a directory capability:
+
+#+begin_src rust
+let fd = rustix::fs::open(
+    &path,
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    Mode::empty(),
+)?;
+// ... obtain metadata and compare it to expected_root_identity ...
+state.validate_root_identity(share)?;
+#+end_src
+
+This prevents a rename, delete-and-recreate, mount switch, or symlink swap from
+being mistaken for an empty version of the old share.  The safe behavior is to
+block the watch and make the user repair or deliberately reinitialize it.
+
+* Major concern: representing a filesystem tree
+
+[[file:src/model.rs][src/model.rs]] contains the types that all other subsystems
+agree on.  A =Record= is a relative path plus a =Version=.  A version contains
+a peer, monotonically assigned sequence, timestamp, causal history (=seen=),
+and one =Entry=.
+
+Relative paths are bytes rather than UTF-8 strings.  Unix filenames need not
+be valid Unicode, so this avoids losing or misrepresenting a real name.  Input
+validation also keeps paths inside the share and reserves internal names:
+
+#+begin_src rust
+for component in path.components() {
+    match component {
+        Component::Normal(name)
+            if name != ".git" && !name.as_encoded_bytes().starts_with(b".flocal-tmp-") =>
+        {
+            normalized.push(name)
+        }
+        Component::Normal(_) => bail!("reserved path is never synchronized"),
+        _ => bail!("path must be normalized and relative"),
+    }
+}
+if path_to_bytes(&normalized) != bytes {
+    bail!("path must use its canonical relative representation");
+}
+Ok(Self(bytes))
+#+end_src
+
+This selected excerpt from [[file:src/model.rs][src/model.rs]] is the narrow
+model boundary: it rejects unsafe components *and* alternate byte spellings of
+the same normalized relative path. If an incoming wire message cannot make a
+valid =RelativePath=, it never enters the scanner, reconciler, or apply code.
+
+* Major concern: scanning and ignores
+
+[[file:src/scan.rs][src/scan.rs]] walks a root through =cap_std::fs::Dir=, a
+directory capability.  The capability says "operations are relative to this
+already-opened directory"; it avoids repeatedly resolving an attacker- or
+racer-controlled absolute path.
+
+The scanner:
+
+1. opens directories relative to the held root capability;
+2. sorts entry names for deterministic output;
+3. excludes =.git=, internal temporary paths, and owned recovery temporaries;
+4. reads nested Git-compatible =.gitignore= rules;
+5. captures file content into the object store, preserves executable bits, and
+   represents symlinks without following them;
+6. reuses prior records when content/metadata did not change;
+7. emits tombstones for prior paths that disappear.
+
+The central dispatch is compact:
+
+#+begin_src rust
+let metadata = root_dir.symlink_metadata(&relative)?;
+let entry = if metadata.file_type().is_symlink() {
+    Entry::Symlink { target: path_bytes(&root_dir.read_link_contents(&relative)?) }
+} else if metadata.is_dir() {
+    directories.push((relative.clone(), scope.clone()));
+    Entry::Directory
+} else if metadata.is_file() {
+    let input = open_regular_nofollow(root_dir, &relative)?;
+    let (hash, size) = state.store_object(input)?;
+    Entry::File { hash, size, executable: is_executable(&metadata) }
+} else {
+    continue;
+};
+#+end_src
+
+That excerpt is adapted only for line length from [[file:src/scan.rs][src/scan.rs]].
+The key safety choices are =symlink_metadata= (do not follow a final symlink)
+and =open_regular_nofollow= (only regular files become object content).
+
+* Major concern: convergence and conflicts
+
+[[file:src/reconcile.rs][src/reconcile.rs]] is intentionally pure: it accepts
+two slices of records and returns a =Plan=.  It performs no I/O, opens no
+database, and starts no subprocess.  That makes it easier to test and reason
+about than the orchestration code around it.
+
+For each path it prefers:
+
+1. exactly equal versions, while merging their causal knowledge;
+2. a causally newer version (=has_seen=);
+3. identical concurrent entries, resolved deterministically;
+4. divergent concurrent entries, deterministic last-write-wins plus a retained
+   conflict record for file/file conflicts.
+
+#+begin_src rust
+(Some(a), Some(b)) if a.version.has_seen(&b.version.id()) => {
+    records.push((*a).clone());
+}
+(Some(a), Some(b)) if b.version.has_seen(&a.version.id()) => {
+    records.push((*b).clone());
+}
+(Some(a), Some(b)) => {
+    let (winner, loser) = if a.version.lww_cmp(&b.version).is_ge() {
+        ((*a).clone(), (*b).clone())
+    } else {
+        ((*b).clone(), (*a).clone())
+    };
+    // Retain file/file conflicts before returning the winning record.
+}
+#+end_src
+
+The actual full match is in [[file:src/reconcile.rs][src/reconcile.rs]].  The
+important distinction is causal order versus timestamp order.  If B edited a
+file after observing A's edit, B wins even if a clock anomaly would make its
+timestamp appear older.  Timestamp/peer/sequence ordering is only the
+deterministic fallback for genuinely concurrent versions.
+
+Conflict retention is why a last-write-wins result is recoverable rather than
+silently destructive.  Use =flocal conflicts list PATH= and =flocal restore=
+to inspect or restore a winner/loser version.
+
+* Major concern: protocol, resource bounds, and safe application
+
+[[file:src/sync.rs][src/sync.rs]] owns the SSH protocol types and the mechanics
+of turning a plan into durable filesystem changes.  It has a v1 one-shot
+protocol and a v2 persistent-watch protocol.  Both use typed serde messages,
+explicit phases, and bounded framing.
+
+The protocol has non-negotiable resource limits:
+
+#+begin_src rust
+pub const MAX_FRAME: usize = 2 * 1024 * 1024;
+pub const MAX_RECORDS_PER_SESSION: usize = 1_000_000;
+pub const MAX_METADATA_BYTES_PER_SESSION: usize = 256 * 1024 * 1024;
+
+pub fn add_transfer(&mut self, bytes: u64) -> Result<()> {
+    self.transfer_bytes = self.transfer_bytes.saturating_add(bytes);
+    if self.transfer_bytes > max_transfer_bytes_per_session() {
+        bail!("persistent round exceeds its cumulative transfer limit");
+    }
+    Ok(())
+}
+#+end_src
+
+This is from [[file:src/sync.rs][src/sync.rs]].  The methods are deliberately
+stateful: the budget records cumulative use, so a peer cannot evade a session
+limit by sending many individually valid frames.  =saturating_add= is a Rust
+choice that avoids integer wraparound; an enormous input becomes the maximum
+integer, then reliably fails the limit check.
+
+Application uses held root capabilities, verifies root identity during the
+operation, performs atomic replacement where appropriate, and records
+installation intent so a crash can be recovered rather than guessed through.
+The corresponding tests live in [[file:tests/core.rs][tests/core.rs]] and
+[[file:tests/protocol.rs][tests/protocol.rs]].
+
+* Major concern: watching, sleep, and unreliable networks
+
+Watching has two layers.
+
+1. [[file:src/watch.rs][src/watch.rs]] contains small deterministic state
+   machines: event generations, a one-slot wake channel, debounce, retry
+   backoff, heartbeat, and audit scheduling.
+2. [[file:src/main.rs][src/main.rs]] owns the operating-system watcher,
+   persistent SSH session, scan/reconcile/apply rounds, logging, and daemon
+   worker lifecycle.
+
+The event-generation design avoids treating a full wake channel as lost work:
+
+#+begin_src rust
+pub fn changed<T>(&self, wake: &SyncSender<T>, event: T) {
+    let mut state = self.lock();
+    if state.lost.is_none() {
+        match state.generation.checked_add(1) {
+            Some(generation) => state.generation = generation,
+            None => {
+                state.lost = Some(BoundedError::new("watch generation exhausted"));
+            }
+        }
+    }
+    drop(state);
+    best_effort_wake(wake, event);
+}
+#+end_src
+
+This is the implementation in [[file:src/watch.rs][src/watch.rs]]. It records
+the authoritative generation before the best-effort wake. Therefore a
+saturated channel may delay work, but cannot convince the coordinator that no
+work exists.
+
+The persistent loop in [[file:src/main.rs][src/main.rs]] begins every attempt by
+marking the worker reconnecting, opening a verified root capability, creating a
+local watcher, and starting a protocol session.  Its error path distinguishes
+terminal failures from retryable ones:
+
+#+begin_src rust
+if is_terminal_watch_error(&error) {
+    return Err(error);
+}
+if let Some(event) = failures.failed(&error, Instant::now(), WATCH_FAILURE_REPORT_INTERVAL) {
+    write_watch_event(err, event)?;
+}
+let delay = backoff.failed(&retry_policy, rand::random_range(-2_000..=2_000));
+sleep_until_stopped(delay, stop);
+#+end_src
+
+The daemon records a terminal worker error as a durable =blocked_diagnostic=.
+Temporary failures become =reconnecting= and retry with bounded, jittered
+backoff.  The log says the first failure immediately, summarizes persistent
+failure periodically, and reports recovery.  On reconnect, both sides scan
+before reporting the peer connected; this is the important safety net for
+laptop sleep, process suspension, filesystem event loss, and network changes.
+
+* Major concern: daemon control plane and observability
+
+The daemon is not a network listener.  It exposes a private local Unix socket
+inside the verified state directory.  The CLI sends JSON requests for =list=,
+=start=, and =stop=; the daemon responds with either data or a structured
+error.  This keeps service management and long-lived worker ownership in one
+process while keeping normal commands simple.
+
+The state presented by =flocal sync list= is assembled from durable shares and
+the in-memory worker map:
+
+#+begin_src rust
+let state_name = if share.blocked_diagnostic.is_some() {
+    "blocked"
+} else if let Some(worker) = workers.get(&share.id) {
+    if worker.stopping.load(Ordering::Relaxed) { "stopping" }
+    else {
+        match worker.state.load(Ordering::Relaxed) {
+            WORKER_STARTING => "starting",
+            WORKER_RECONNECTING => "reconnecting",
+            WORKER_WATCHING => "watching",
+            _ => "starting",
+        }
+    }
+} else {
+    "stopped"
+};
+#+end_src
+
+This is from [[file:src/main.rs][src/main.rs]].  Notice the distinction between
+durable intent (=enabled= in list output) and live worker state.  A sync can be
+enabled but be temporarily reconnecting, or blocked with a diagnostic.  This
+is much more useful operationally than a single Boolean.
+
+For present-day diagnostics, see the "Troubleshooting a managed watch" section
+in [[file:README.org][README.org]].  Linux uses the systemd user journal.
+macOS currently has no retained LaunchAgent stdout/stderr log; stop the managed
+watch and use foreground =flocal watch PATH= when live diagnostics are needed.
+
+* Testing: what gives confidence
+
+The test layout mirrors the architecture instead of relying on one giant
+end-to-end suite.
+
+| Test location | What it proves |
+|-
+| [[file:src/reconcile.rs][src/reconcile.rs]] and [[file:src/watch.rs][src/watch.rs]] | Pure convergence and timing-state invariants |
+| [[file:tests/core.rs][tests/core.rs]] | Scan/apply, ignores, tombstones, crash recovery, conflicts |
+| [[file:tests/state_api.rs][tests/state_api.rs]] | SQLite lifecycle, root identity, registration safety |
+| [[file:tests/protocol.rs][tests/protocol.rs]] | Frame ordering, bounded protocol behavior |
+| [[file:tests/ssh_sync.rs][tests/ssh_sync.rs]] | One-shot sync over actual SSH |
+| [[file:tests/daemon_cli.rs][tests/daemon_cli.rs]] | Control socket, service-facing CLI, start/stop durability |
+| [[file:tests/e2e/][tests/e2e/]] | Two Docker containers, SSH, network loss, sleep-like suspension |
+
+The E2E watch scenarios are unusually valuable because they test conditions
+unit tests cannot faithfully simulate.  For example,
+[[file:tests/e2e/scenarios/watching.rs][tests/e2e/scenarios/watching.rs]] verifies that a watch:
+
+- starts/stops and restores durable ownership after daemon restart;
+- uses one persistent SSH session while idle;
+- catches editor atomic-save rename patterns;
+- catches up after a peer disappears and returns;
+- does not claim a failed transfer was applied;
+- rescans both directions after process suspension;
+- recovers when suspension and network loss occur together.
+
+Run the ordinary verification suite with =make check=.  Run the Docker suite
+with =make e2e=.  GitHub CI runs Linux, macOS, changed-line coverage, and E2E.
+
+* Current operational limitations and sharp edges
+
+- This is alpha software, not a substitute for backups.
+- It is two peers per share, with SSH as the initial transport.
+- Persistent managed watch requires protocol version 2 on both peers; a rolling
+  upgrade blocks the enabled watch with an upgrade diagnostic until both peers
+  are upgraded and the user starts it again.
+- The daemon is supported on Linux user-systemd and macOS graphical sessions.
+- macOS service logs are not yet retained; foreground =flocal watch PATH= is
+  the current live diagnostic route.
+- Filesystem event notifications are an optimization, not the source of truth:
+  reconnect and audit rounds rescan.  This favors correctness over a minimal
+  incremental implementation.
+- Conflicting whole files use recoverable last-write-wins while richer three-way
+  text merging remains future work.
+- Git worktrees converge as files, but Git metadata is intentionally excluded.
+  Coordinate commits, branches, and staging outside =flocal=.
+
+* A concrete trace: saving a file on a laptop after sleep
+
+Suppose peer A sleeps, loses Wi-Fi, wakes, and a user saves =notes.txt= while
+peer B has also changed files.
+
+1. The daemon worker on A notices the old SSH session failed or cannot reopen.
+   Its live state is =reconnecting= and it logs the first failure.
+2. A local notification increments =WatchState= generation.  If the wake
+   channel is already full, that generation is still remembered.
+3. A retry opens the root with =NOFOLLOW= and checks device/inode identity.  A
+   replaced root becomes =blocked= rather than syncing a different directory.
+4. A fresh persistent session brings both peers through a scan, producing
+   versioned records.  This does not trust the lost notifications.
+5. =reconcile()= selects causally newer records or deterministic concurrent
+   winners, retaining divergent file conflicts.
+6. =sync.rs= transfers needed content in bounded frames and applies the plan on
+   both peers through held directory capabilities.
+7. Only after both sides successfully apply an action does the watch report an
+   =UPLOAD=, =DOWNLOAD=, or =DELETE= line.
+8. The worker becomes =watching= and logs recovery if prior attempts failed.
+
+That trace is the central architectural promise: local work survives a bad
+network, while recovery avoids guessing about a changed root, an untrusted path,
+or a half-applied transfer.
+
+* Where to go next
+
+- For a user-level overview: [[file:README.org][README.org]].
+- For protocol and recovery design decisions: [[file:docs/2026-07-24-persistent-watch-protocol-design.org][persistent watch design]] and
+  [[file:docs/2026-07-25-daemon-managed-sync-design.org][daemon-managed sync design]].
+- For the original product constraints and explicit gaps: [[file:docs/2026-07-14-alpha-implementation.org][alpha implementation state]].
+- For an approachable code exercise, read a test in
+  [[file:tests/e2e/scenarios/watching.rs][tests/e2e/scenarios/watching.rs]], then follow the called behavior into
+  =src/main.rs=.  Rust tests are ordinary functions marked =#[test]=; the
+  =?= operator makes setup failures return a helpful test error instead of
+  obscuring the cause.
