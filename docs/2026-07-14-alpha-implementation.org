@@ -178,7 +178,7 @@ In particular, the earlier statement that background services were deferred is
 obsolete. =make install= now installs one per-user daemon through systemd on
 Linux or a LaunchAgent in a macOS graphical session. The daemon owns enabled
 connector watches, restores them after restart, and exposes private local
-=list=, =start=, and =stop= control. Each worker keeps a version-3 SSH session,
+=list=, =start=, and =stop= control. Each worker keeps a version-4 SSH session,
 uses native events as scan hints, heartbeats while idle, performs periodic full
 audits, reconnects with bounded backoff, and reports connection and local
 unsettled-state transitions.

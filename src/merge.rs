@@ -51,25 +51,10 @@ pub fn merge(
     b: &[u8],
     a_wins_overlap: bool,
 ) -> Result<MergeResult, FallbackReason> {
-    for input in [base, a, b] {
-        if input.len() > MAX_INPUT_BYTES {
-            return Err(FallbackReason::InputBytes);
-        }
-        if input.contains(&0) {
-            return Err(FallbackReason::ContainsNul);
-        }
-        std::str::from_utf8(input).map_err(|_| FallbackReason::InvalidUtf8)?;
-    }
+    let work = comparison_work(base, a, b)?;
     let base = lines(base);
     let a = lines(a);
     let b = lines(b);
-    if [base.len(), a.len(), b.len()]
-        .into_iter()
-        .any(|count| count > MAX_INPUT_LINES)
-    {
-        return Err(FallbackReason::InputLines);
-    }
-    let work = comparison_work_for_lines(base.len(), a.len(), b.len())?;
     if work > MAX_WORK {
         return Err(FallbackReason::ComparisonWork);
     }
@@ -80,7 +65,20 @@ pub fn merge(
 }
 
 pub fn comparison_work(base: &[u8], a: &[u8], b: &[u8]) -> Result<usize, FallbackReason> {
-    comparison_work_for_lines(lines(base).len(), lines(a).len(), lines(b).len())
+    for input in [base, a, b] {
+        if input.len() > MAX_INPUT_BYTES {
+            return Err(FallbackReason::InputBytes);
+        }
+        if input.contains(&0) {
+            return Err(FallbackReason::ContainsNul);
+        }
+        std::str::from_utf8(input).map_err(|_| FallbackReason::InvalidUtf8)?;
+    }
+    let counts = [lines(base).len(), lines(a).len(), lines(b).len()];
+    if counts.into_iter().any(|count| count > MAX_INPUT_LINES) {
+        return Err(FallbackReason::InputLines);
+    }
+    comparison_work_for_lines(counts[0], counts[1], counts[2])
 }
 
 fn comparison_work_for_lines(base: usize, a: usize, b: usize) -> Result<usize, FallbackReason> {
@@ -384,6 +382,10 @@ mod tests {
         assert_eq!(
             merge(b"\xff", b"", b"", true),
             Err(FallbackReason::InvalidUtf8)
+        );
+        assert_eq!(
+            comparison_work(b"\0", b"", b""),
+            Err(FallbackReason::ContainsNul)
         );
         let too_many = "x\n".repeat(MAX_INPUT_LINES + 1);
         assert_eq!(

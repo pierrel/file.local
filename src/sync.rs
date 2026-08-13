@@ -574,7 +574,7 @@ pub fn intersect_heads(local: &[Record], remote: &[Record]) -> Result<Vec<Record
 
 pub fn validate_ack_heads(current: &[Record], proposed: &[Record]) -> Result<()> {
     let canonical = regular_file_heads(proposed);
-    if canonical != proposed {
+    if canonical != proposed || proposed.windows(2).any(|pair| pair[0].path == pair[1].path) {
         bail!("acknowledged heads are not sorted unique regular-file records");
     }
     let current: std::collections::HashMap<_, _> = current
@@ -1777,18 +1777,26 @@ fn compute_merge_outcomes(
         }
         let input = read_candidate(state, candidate)?;
         let candidate_work =
-            crate::merge::comparison_work(&input.base, &input.winner, &input.loser)
-                .unwrap_or(crate::merge::MAX_WORK.saturating_add(1));
-        if candidate_work <= crate::merge::MAX_WORK
-            && work
-                .checked_add(candidate_work)
-                .is_none_or(|total| total > MAX_MERGE_WORK_PER_ROUND)
+            match crate::merge::comparison_work(&input.base, &input.winner, &input.loser) {
+                Ok(work) if work <= crate::merge::MAX_WORK => work,
+                Ok(_) => {
+                    outcomes.push(Err(crate::merge::FallbackReason::ComparisonWork));
+                    continue;
+                }
+                Err(reason) => {
+                    outcomes.push(Err(reason));
+                    continue;
+                }
+            };
+        if work
+            .checked_add(candidate_work)
+            .is_none_or(|total| total > MAX_MERGE_WORK_PER_ROUND)
         {
             exhausted = true;
             outcomes.push(Err(crate::merge::FallbackReason::RoundMergeBudget));
             continue;
         }
-        work = work.saturating_add(candidate_work.min(crate::merge::MAX_WORK));
+        work += candidate_work;
         match crate::merge::merge(&input.base, &input.winner, &input.loser, true) {
             Ok(merged) => {
                 if hunks
@@ -2179,6 +2187,7 @@ mod tests {
         }
         let a = merge_record("a", 2, a_bytes, Some(base.clone()));
         let b = merge_record("b", 2, b_bytes, Some(base.clone()));
+        assert!(validate_ack_heads(std::slice::from_ref(&a), &[a.clone(), a.clone()]).is_err());
         let metadata = plan(std::slice::from_ref(&a), std::slice::from_ref(&b));
         assert_eq!(metadata.merges.len(), 1);
         let mut preview = metadata.clone();

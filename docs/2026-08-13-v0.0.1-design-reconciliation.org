@@ -72,7 +72,7 @@ The following behavior is present on =main= before the three-way work begins.
 2. =make install= installs =flocal= and one per-user daemon through systemd on
    Linux or a LaunchAgent in a macOS graphical session. The daemon restores
    enabled connector watches after restart and owns their worker threads.
-3. A managed worker keeps one version-3 persistent SSH session, observes both
+3. A managed worker keeps one version-4 persistent SSH session, observes both
    filesystems, debounces events, exchanges heartbeats, performs full safety
    audits, and reconnects temporary failures with bounded backoff. Filesystem
    notifications are hints; every synchronization round still scans.

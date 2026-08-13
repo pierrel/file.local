@@ -712,3 +712,13 @@ the state transition.  See
 [[file:2026-08-12-stale-watch-install-recovery-design.org][the recovery design]]
 for the current transition, authorization, durability, status, and acceptance
 contract.  Explicit one-shot sync remains protocol version 1.
+
+* Update 2026-08-13: protocol version 4
+
+Three-way merge adds authenticated shared-base acknowledgement, merge
+candidates, independently verified merged results, and post-commit head
+manifests. Persistent watch therefore advances to protocol version 4 and
+explicit one-shot sync advances to protocol version 2. Older peers are rejected
+rather than silently ignoring merge ancestry or acknowledgement semantics. See
+[[file:2026-08-13-v0.0.1-design-reconciliation.org][the current design reconciliation]] for the implemented wire, security, and
+upgrade contract.
