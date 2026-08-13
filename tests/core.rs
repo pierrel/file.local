@@ -1,7 +1,7 @@
 use std::fs;
 
 use anyhow::Result;
-use flocal::model::Entry;
+use flocal::model::{Entry, RelativePath};
 use flocal::scan::scan;
 use flocal::state::State;
 use flocal::sync::{ShareRoot, apply_plan, plan, refresh, refresh_with_root};
@@ -489,6 +489,89 @@ fn recovers_tombstone_after_exchange_crash() -> Result<()> {
     assert!(!root.join("gone").exists());
     assert!(!root.join(token).exists());
     assert!(state.install_intent(&share)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn invalidated_install_is_retired_with_recovered_state_and_unsettled_path() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("race.txt"), "local")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let recovered = scan(&state, &share, &root, &[])?;
+    let (intent, _) = state.set_install_intent(&share, &recovered)?;
+    let path = RelativePath::from_bytes(b"race.txt".to_vec())?;
+
+    let mut wrong = intent.clone();
+    wrong.temps[0].token.push_str("-wrong");
+    assert!(
+        state
+            .retire_invalidated_install(&share, &wrong, &recovered, &[], &path)
+            .is_err()
+    );
+    assert!(state.install_intent(&share)?.is_some());
+
+    state.retire_invalidated_install(&share, &intent, &recovered, &[], &path)?;
+    assert_eq!(state.records(&share)?, recovered);
+    assert!(state.install_intent(&share)?.is_none());
+    assert_eq!(state.unsettled_paths(&share)?, vec![path.clone()]);
+    assert_eq!(state.clear_unsettled_paths(&share)?, vec![path]);
+    assert!(state.unsettled_paths(&share)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn interrupted_exchange_with_a_new_local_edit_retires_the_attempt() -> Result<()> {
+    let temp = tempdir()?;
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    fs::create_dir_all(&source)?;
+    fs::create_dir_all(&target)?;
+    fs::write(source.join("z-race.txt"), "old")?;
+    let mut source_state = State::open(temp.path().join("source-state"))?;
+    let share = source_state.init_share(&source)?;
+    let mut target_state = State::open(temp.path().join("target-state"))?;
+    target_state.register_share(&share, &target)?;
+    let first = scan(&source_state, &share, &source, &[])?;
+    copy_objects(&source_state, &target_state, &first)?;
+    apply_plan(&mut target_state, &share, &first)?;
+    source_state.replace_records(&share, &first)?;
+
+    fs::write(source.join("a-stable.txt"), "stable")?;
+    fs::write(source.join("z-race.txt"), "remote")?;
+    let second = scan(&source_state, &share, &source, &first)?;
+    copy_objects(&source_state, &target_state, &second)?;
+    let (intent, _) = target_state.set_install_intent(&share, &second)?;
+    let race = intent
+        .temps
+        .iter()
+        .find(|temp| temp.path.as_bytes() == b"z-race.txt")
+        .expect("race install token")
+        .clone();
+    fs::write(target.join(&race.token), "old")?;
+    target_state.mark_install_temp_owned(&share, &race.path)?;
+    fs::write(target.join("z-race.txt"), "local edit after exchange")?;
+
+    let error = apply_plan(&mut target_state, &share, &second)
+        .expect_err("the live local edit must invalidate interrupted recovery");
+    assert!(
+        error
+            .downcast_ref::<flocal::sync::ApplyInvalidated>()
+            .is_some()
+    );
+    assert_eq!(fs::read_to_string(target.join("a-stable.txt"))?, "stable");
+    assert_eq!(
+        fs::read_to_string(target.join("z-race.txt"))?,
+        "local edit after exchange"
+    );
+    assert!(!target.join(&race.token).exists());
+    assert!(target_state.install_intent(&share)?.is_none());
+    assert_eq!(
+        target_state.unsettled_paths(&share)?,
+        vec![RelativePath::from_bytes(b"z-race.txt".to_vec())?]
+    );
     Ok(())
 }
 

@@ -332,6 +332,7 @@ struct DaemonSync {
     initial_complete: bool,
     state: String,
     diagnostic: Option<String>,
+    unsettled: usize,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -472,13 +473,23 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                         .map(|value| format!("; {value}"))
                         .unwrap_or_default();
                     let desired = if sync.enabled { "enabled" } else { "disabled" };
+                    let unsettled = if sync.unsettled == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            "; {} unsettled paths (see `flocal status {}`)",
+                            sync.unsettled,
+                            root.display()
+                        )
+                    };
                     println!(
-                        "{}  {}  {}  {}{}",
+                        "{}  {}  {}  {}{}{}",
                         root.display(),
                         peer,
                         desired,
                         sync.state,
-                        diagnostic
+                        diagnostic,
+                        unsettled,
                     );
                 }
             }
@@ -1231,7 +1242,7 @@ fn daemon_syncs(
                 "stopped"
             };
             Ok(DaemonSync {
-                share: share.id.0,
+                share: share.id.0.clone(),
                 root: daemon_path(&path_bytes(&share.root)),
                 host: share.peer.as_ref().map(|peer| peer.host.clone()),
                 remote_path: share
@@ -1242,6 +1253,7 @@ fn daemon_syncs(
                 initial_complete: share.initial_complete,
                 state: state_name.into(),
                 diagnostic: share.blocked_diagnostic,
+                unsettled: state.unsettled_paths(&share.id)?.len(),
             })
         })
         .collect()
@@ -1458,8 +1470,7 @@ fn recover_installs(state: &mut State) -> Result<()> {
     let _global_lock = state.lock_global_sync()?;
     for (share, intent) in state.install_intents()? {
         let _lock = state.lock_share(&share)?;
-        sync::apply_plan(state, &share, &intent.records)
-            .with_context(|| format!("recovering interrupted install for {}", share.0))?;
+        recover_install_plan(state, &share, &intent)?;
     }
     Ok(())
 }
@@ -1490,8 +1501,21 @@ fn recover_daemon_share_install_locked(
 ) -> Result<()> {
     state.validate_root_identity(share)?;
     let _lock = state.lock_share(share)?;
-    sync::apply_plan(state, share, &intent.records)
-        .with_context(|| format!("recovering interrupted install for {}", share.0))
+    recover_install_plan(state, share, intent)
+}
+
+fn recover_install_plan(
+    state: &mut State,
+    share: &ShareId,
+    intent: &flocal::state::InstallIntent,
+) -> Result<()> {
+    match sync::apply_plan(state, share, &intent.records) {
+        Ok(()) => Ok(()),
+        Err(error) if error.downcast_ref::<sync::ApplyInvalidated>().is_some() => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("recovering interrupted install for {}", share.0))
+        }
+    }
 }
 
 fn add_peer(state: &State, path: &Path, host: &str, remote_path: &Path) -> Result<()> {
@@ -1905,7 +1929,7 @@ fn serve_watch_open(
         return write_v2_session(
             output,
             V2SessionFrame::Error {
-                retryable: false,
+                retryable: true,
                 message: format!("unsupported persistent watch protocol version {protocol}"),
             },
         );
@@ -1982,12 +2006,23 @@ fn serve_watch_open(
             peer: state.peer_id()?,
         },
     )?;
-    write_v2_session(output, V2SessionFrame::Ready { generation: 0 })?;
+    write_watch_ready(output, 0, &state.unsettled_paths(&share)?)?;
+    if let Err(error) = read_watch_ready(state, &share, input) {
+        write_v2_session(
+            output,
+            V2SessionFrame::Error {
+                retryable: false,
+                message: format!("{error:#}"),
+            },
+        )?;
+        return Ok(());
+    }
 
     let config = flocal::watch::WatchConfig::default();
     let mut debounce = flocal::watch::Debounce::default();
     let mut advertised_generation = 0u64;
     let mut round = 0u64;
+    let mut invalidation_cycle = InvalidationCycle::default();
     loop {
         if watch_rx.try_recv().is_ok() {
             debounce.notify(std::time::Instant::now());
@@ -2022,9 +2057,6 @@ fn serve_watch_open(
             V2Envelope::Session {
                 frame: V2SessionFrame::Ping { nonce },
             } => write_v2_session(output, V2SessionFrame::Pong { nonce })?,
-            V2Envelope::Session {
-                frame: V2SessionFrame::Ready { .. },
-            } => {}
             V2Envelope::Round {
                 round: incoming,
                 frame:
@@ -2034,8 +2066,16 @@ fn serve_watch_open(
                     },
             } if incoming == round + 1 => {
                 round = incoming;
-                if let Err(error) = serve_v2_round(state, &share, &share_root, round, input, output)
-                {
+                let served = serve_v2_round(
+                    state,
+                    &share,
+                    &share_root,
+                    round,
+                    input,
+                    output,
+                    &invalidation_cycle.deferred,
+                );
+                if let Err(error) = served {
                     let retryable = error.downcast_ref::<WatchProtocolError>().is_none()
                         && error.downcast_ref::<sync::RootIdentityChanged>().is_none();
                     write_v2_session(
@@ -2046,6 +2086,14 @@ fn serve_watch_open(
                         },
                     )?;
                     return Ok(());
+                }
+                match served.expect("checked above") {
+                    ServedRound::Completed => {
+                        invalidation_cycle.reset();
+                    }
+                    ServedRound::Invalidated(path) => {
+                        invalidation_cycle.observe(path);
+                    }
                 }
             }
             other => {
@@ -2068,6 +2116,90 @@ fn write_v2_session(output: &impl AsFd, frame: V2SessionFrame) -> Result<()> {
         &V2Envelope::Session { frame },
         std::time::Instant::now() + sync::default_frame_deadline(),
     )
+}
+
+fn v2_session_frame_fits(frame: V2SessionFrame) -> Result<bool> {
+    Ok(serde_json::to_vec(&V2Envelope::Session { frame })?.len() <= sync::MAX_FRAME)
+}
+
+fn write_watch_ready(
+    output: &impl AsFd,
+    generation: u64,
+    unsettled: &[flocal::model::RelativePath],
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + sync::default_frame_deadline();
+    let mut budget = sync::RoundBudget::new(deadline);
+    let mut start = 0;
+    while start < unsettled.len() {
+        let mut end = start + 1;
+        while end < unsettled.len()
+            && end - start < 256
+            && v2_session_frame_fits(V2SessionFrame::UnsettledChunk {
+                paths: unsettled[start..=end].to_vec(),
+            })?
+        {
+            end += 1;
+        }
+        let frame = V2SessionFrame::UnsettledChunk {
+            paths: unsettled[start..end].to_vec(),
+        };
+        budget.add_metadata(serde_json::to_vec(&frame)?.len())?;
+        sync::write_v2_envelope_until(
+            output,
+            &V2Envelope::Session { frame },
+            budget.frame_deadline()?,
+        )?;
+        start = end;
+    }
+    sync::write_v2_envelope_until(
+        output,
+        &V2Envelope::Session {
+            frame: V2SessionFrame::Ready { generation },
+        },
+        budget.frame_deadline()?,
+    )
+}
+
+fn read_watch_ready(state: &mut State, share: &ShareId, input: &impl AsFd) -> Result<()> {
+    let mut unsettled = Vec::new();
+    let mut budget =
+        sync::RoundBudget::new(std::time::Instant::now() + sync::default_frame_deadline());
+    loop {
+        match sync::read_v2_envelope_until(input, budget.frame_deadline()?)? {
+            V2Envelope::Session {
+                frame: V2SessionFrame::UnsettledChunk { paths },
+            } => {
+                budget
+                    .add_metadata(serde_json::to_vec(&paths)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                let count = unsettled
+                    .len()
+                    .checked_add(paths.len())
+                    .context("persistent watch readiness path count overflow")?;
+                anyhow::ensure!(
+                    count <= sync::MAX_RECORDS_PER_SESSION,
+                    "persistent watch readiness has too many unsettled paths"
+                );
+                unsettled.extend(paths);
+            }
+            V2Envelope::Session {
+                frame: V2SessionFrame::Ready { .. },
+            } => {
+                unsettled.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                unsettled.dedup();
+                state.remember_unsettled_paths(share, &unsettled)?;
+                return Ok(());
+            }
+            V2Envelope::Session {
+                frame: V2SessionFrame::Error { retryable, message },
+            } => return Err(RemoteWatchError { retryable, message }.into()),
+            other => {
+                return Err(watch_protocol_error(format!(
+                    "unexpected persistent readiness frame: {other:?}"
+                )));
+            }
+        }
+    }
 }
 
 fn write_v2_round(
@@ -2303,6 +2435,11 @@ fn receive_v2_object(
     }
 }
 
+enum ServedRound {
+    Completed,
+    Invalidated(flocal::model::RelativePath),
+}
+
 fn serve_v2_round(
     state: &mut State,
     share: &ShareId,
@@ -2310,7 +2447,8 @@ fn serve_v2_round(
     round: u64,
     input: &impl AsFd,
     output: &impl AsFd,
-) -> Result<()> {
+    deferred: &std::collections::HashSet<Vec<u8>>,
+) -> Result<ServedRound> {
     let _global_lock = state.lock_global_sync()?;
     let mut budget =
         sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
@@ -2343,8 +2481,10 @@ fn serve_v2_round(
     if plan.records != expected.records || plan.conflicts != expected.conflicts {
         watch_protocol_bail!("peer apply plan differs from local reconciliation");
     }
-    let mut required = plan.records.clone();
-    for conflict in &plan.conflicts {
+    let applied_plan = effective_plan(&advertised, &peer_records, &plan, deferred);
+    let connector_plan = effective_plan(&peer_records, &advertised, &plan, deferred);
+    let mut required = applied_plan.plan.records.clone();
+    for conflict in &applied_plan.plan.conflicts {
         required.push(conflict.winner.clone());
         required.push(conflict.loser.clone());
     }
@@ -2384,9 +2524,28 @@ fn serve_v2_round(
         other => watch_protocol_bail!("expected persistent object completion, got {other:?}"),
     }
     budget.check()?;
-    sync::apply_plan_with_root(state, share, root, &plan.records)?;
+    if let Err(error) = sync::apply_plan_with_root_skipping(
+        state,
+        share,
+        root,
+        &applied_plan.plan.records,
+        &applied_plan.retained_paths,
+    ) {
+        if let Some(invalidated) = error.downcast_ref::<sync::ApplyInvalidated>() {
+            write_v2_round(
+                output,
+                round,
+                V2RoundFrame::RoundInvalidated {
+                    path: invalidated.path.clone(),
+                },
+                &budget,
+            )?;
+            return Ok(ServedRound::Invalidated(invalidated.path.clone()));
+        }
+        return Err(error);
+    }
     budget.check()?;
-    state.add_conflicts(share, &plan.conflicts)?;
+    state.add_conflicts(share, &applied_plan.plan.conflicts)?;
     budget.check()?;
     state.set_initial_complete(share)?;
     budget.check()?;
@@ -2394,7 +2553,16 @@ fn serve_v2_round(
     budget.check()?;
     write_v2_round(output, round, V2RoundFrame::Applied, &budget)?;
     match recv_v2_round(input, round, &budget)? {
-        V2RoundFrame::SyncFinished => Ok(()),
+        V2RoundFrame::SyncFinished => {
+            if deferred.is_empty() {
+                state.clear_unsettled_paths(share)?;
+            }
+            Ok(ServedRound::Completed)
+        }
+        V2RoundFrame::RoundInvalidated { path } if accepts_invalidation(&connector_plan, &path) => {
+            state.remember_unsettled_path(share, &path)?;
+            Ok(ServedRound::Invalidated(path))
+        }
         other => watch_protocol_bail!("expected persistent round completion, got {other:?}"),
     }
 }
@@ -2578,10 +2746,11 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         .install_intents()?
         .iter()
         .any(|(pending, _)| pending == &share);
+    let unsettled = state.unsettled_paths(&share)?;
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":2,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install})
+            serde_json::json!({"schema":3,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install,"unsettled":unsettled})
         );
     } else {
         println!("Share: {}", share.0);
@@ -2600,6 +2769,12 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         );
         if pending_install {
             println!("Warning: an interrupted install will be recovered by the next sync/watch");
+        }
+        if !unsettled.is_empty() {
+            println!("Unsettled paths:");
+            for path in unsettled {
+                println!("  {}", path.display());
+            }
         }
     }
     Ok(())
@@ -2992,30 +3167,20 @@ fn persistent_watch_session_io(
         } if protocol == sync::WATCH_PROTOCOL_VERSION && actual == peer.peer_id => {}
         V2Envelope::Session {
             frame: V2SessionFrame::Error { retryable, message },
-        } => return Err(RemoteWatchError { retryable, message }.into()),
+        } => {
+            let retryable =
+                retryable || message.starts_with("unsupported persistent watch protocol version ");
+            return Err(RemoteWatchError { retryable, message }.into());
+        }
         other => {
             return Err(watch_protocol_error(format!(
-                "remote does not support persistent watch protocol version 2: {other:?}; upgrade flocal on both peers"
+                "remote does not support persistent watch protocol version {}: {other:?}; upgrade flocal on both peers",
+                sync::WATCH_PROTOCOL_VERSION
             )));
         }
     }
-    match sync::read_v2_envelope_until(
-        remote_input,
-        std::time::Instant::now() + sync::default_frame_deadline(),
-    )? {
-        V2Envelope::Session {
-            frame: V2SessionFrame::Ready { .. },
-        } => {}
-        V2Envelope::Session {
-            frame: V2SessionFrame::Error { retryable, message },
-        } => return Err(RemoteWatchError { retryable, message }.into()),
-        other => {
-            return Err(watch_protocol_error(format!(
-                "unexpected persistent readiness frame: {other:?}"
-            )));
-        }
-    }
-    write_v2_session(remote_output, V2SessionFrame::Ready { generation: 0 })?;
+    read_watch_ready(state, share, remote_input)?;
+    write_watch_ready(remote_output, 0, &state.unsettled_paths(share)?)?;
 
     let mut remote_generation = 0u64;
     let mut round = 1u64;
@@ -3024,16 +3189,17 @@ fn persistent_watch_session_io(
         flocal::watch::WatchSnapshot::Healthy { generation } => generation,
         flocal::watch::WatchSnapshot::Lost(error) => bail!("filesystem watcher stopped: {error}"),
     };
-    let report = connector_v2_round(
+    let report = connector_round_until_completed(
         state,
         share,
         root,
-        round,
+        &mut round,
         startup_local_generation,
         0,
         remote_input,
         remote_output,
         &mut remote_generation,
+        out,
     )?;
     out.write_all(&report)?;
     watch_state
@@ -3081,16 +3247,17 @@ fn persistent_watch_session_io(
             round = round.checked_add(1).context("watch round exhausted")?;
             let frozen_local = local_generation;
             let frozen_remote = remote_generation;
-            let report = connector_v2_round(
+            let report = connector_round_until_completed(
                 state,
                 share,
                 root,
-                round,
+                &mut round,
                 frozen_local,
                 frozen_remote,
                 remote_input,
                 remote_output,
                 &mut remote_generation,
+                out,
             )?;
             out.write_all(&report)?;
             watch_state
@@ -3148,6 +3315,203 @@ fn persistent_watch_session_io(
     }
 }
 
+enum ConnectorRound {
+    Completed(Vec<u8>),
+    Invalidated(flocal::model::RelativePath),
+}
+
+#[derive(Default)]
+struct InvalidationCycle {
+    retried: bool,
+    first_path: Option<flocal::model::RelativePath>,
+    deferred: std::collections::HashSet<Vec<u8>>,
+}
+
+enum InvalidationAction {
+    Recalculate,
+    Deferred { same_path: bool },
+}
+
+impl InvalidationCycle {
+    fn observe(&mut self, path: flocal::model::RelativePath) -> InvalidationAction {
+        if self.retried {
+            self.deferred.insert(path.as_bytes().to_vec());
+            InvalidationAction::Deferred {
+                same_path: self.first_path.as_ref() == Some(&path),
+            }
+        } else {
+            self.retried = true;
+            self.first_path = Some(path);
+            InvalidationAction::Recalculate
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn accepts_invalidation(plan: &EffectivePlan, path: &flocal::model::RelativePath) -> bool {
+    plan.plan.records.iter().any(|record| record.path == *path)
+        && !plan.retained_paths.contains(path.as_bytes())
+}
+
+fn report_invalidation(
+    cycle: &mut InvalidationCycle,
+    path: flocal::model::RelativePath,
+    output: &mut impl Write,
+) -> Result<()> {
+    let display = path.display();
+    let message = match cycle.observe(path) {
+        InvalidationAction::Deferred { same_path: true } => {
+            format!("UNSETTLED {display} is still changing; stable paths will continue")
+        }
+        InvalidationAction::Deferred { same_path: false } => {
+            format!("UNSETTLED {display} changed during recalculation; stable paths will continue")
+        }
+        InvalidationAction::Recalculate => {
+            format!("UNSETTLED {display} changed while synchronizing; recalculating now")
+        }
+    };
+    watch_transition(output, &message)
+}
+
+fn report_settled(
+    paths: impl IntoIterator<Item = flocal::model::RelativePath>,
+    output: &mut impl Write,
+) -> Result<()> {
+    for path in paths {
+        watch_transition(
+            output,
+            &format!(
+                "SETTLED {} no longer blocks synchronization",
+                path.display()
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct EffectivePlan {
+    plan: flocal::reconcile::Plan,
+    retained_paths: std::collections::HashSet<Vec<u8>>,
+}
+
+fn effective_plan(
+    side: &[flocal::model::Record],
+    other: &[flocal::model::Record],
+    full: &flocal::reconcile::Plan,
+    deferred: &std::collections::HashSet<Vec<u8>>,
+) -> EffectivePlan {
+    if deferred.is_empty() {
+        return EffectivePlan {
+            plan: full.clone(),
+            retained_paths: std::collections::HashSet::new(),
+        };
+    }
+    let side_by_path: std::collections::HashMap<_, _> = side
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
+        .collect();
+    let other_by_path: std::collections::HashMap<_, _> = other
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
+        .collect();
+    let target_by_path: std::collections::HashMap<_, _> = full
+        .records
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
+        .collect();
+    let mut roots = std::collections::HashSet::new();
+    for seed in deferred {
+        let seed_path = bytes_path(seed);
+        let mut root = seed_path.as_path();
+        let mut ancestor = seed_path.parent();
+        while let Some(path) = ancestor.filter(|path| !path.as_os_str().is_empty()) {
+            let bytes = path_bytes(path);
+            let is_directory = |record: Option<&&flocal::model::Record>| {
+                record.is_some_and(|record| matches!(record.version.entry, Entry::Directory))
+            };
+            if !(is_directory(side_by_path.get(bytes.as_slice()))
+                && is_directory(other_by_path.get(bytes.as_slice()))
+                && is_directory(target_by_path.get(bytes.as_slice())))
+            {
+                root = path;
+            }
+            ancestor = path.parent();
+        }
+        roots.insert(root.to_path_buf());
+    }
+    let is_deferred = |path: &flocal::model::RelativePath| {
+        let path = path.to_path_buf();
+        path.ancestors().any(|ancestor| roots.contains(ancestor))
+    };
+    let mut records: Vec<_> = full
+        .records
+        .iter()
+        .filter(|record| !is_deferred(&record.path))
+        .cloned()
+        .collect();
+    let retained_paths: std::collections::HashSet<_> = side
+        .iter()
+        .filter(|record| is_deferred(&record.path))
+        .map(|record| record.path.as_bytes().to_vec())
+        .collect();
+    records.extend(
+        side.iter()
+            .filter(|record| is_deferred(&record.path))
+            .cloned(),
+    );
+    records.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    let conflicts = full
+        .conflicts
+        .iter()
+        .filter(|conflict| !is_deferred(&conflict.path))
+        .cloned()
+        .collect();
+    EffectivePlan {
+        plan: flocal::reconcile::Plan { records, conflicts },
+        retained_paths,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connector_round_until_completed(
+    state: &mut State,
+    share: &ShareId,
+    root: &sync::ShareRoot,
+    round: &mut u64,
+    connector_generation: u64,
+    responder_generation: u64,
+    input: &impl AsFd,
+    output: &impl AsFd,
+    pending_remote_generation: &mut u64,
+    watch_output: &mut impl Write,
+) -> Result<Vec<u8>> {
+    let mut invalidation_cycle = InvalidationCycle::default();
+    loop {
+        match connector_v2_round(
+            state,
+            share,
+            root,
+            *round,
+            connector_generation,
+            responder_generation,
+            input,
+            output,
+            pending_remote_generation,
+            &invalidation_cycle.deferred,
+        )? {
+            ConnectorRound::Completed(report) => return Ok(report),
+            ConnectorRound::Invalidated(path) => {
+                report_invalidation(&mut invalidation_cycle, path, watch_output)?;
+                *round = round.checked_add(1).context("watch round exhausted")?;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn connector_v2_round(
     state: &mut State,
@@ -3159,7 +3523,8 @@ fn connector_v2_round(
     input: &impl AsFd,
     output: &impl AsFd,
     pending_remote_generation: &mut u64,
-) -> Result<Vec<u8>> {
+    deferred: &std::collections::HashSet<Vec<u8>>,
+) -> Result<ConnectorRound> {
     let _global_lock = state.lock_global_sync()?;
     let mut budget =
         sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
@@ -3182,8 +3547,10 @@ fn connector_v2_round(
     let remote_records =
         read_connector_snapshot(input, round, &mut budget, pending_remote_generation)?;
     let plan = sync::plan(&local, &remote_records);
-    let mut required = plan.records.clone();
-    for conflict in &plan.conflicts {
+    let applied_plan = effective_plan(&local, &remote_records, &plan, deferred);
+    let responder_plan = effective_plan(&remote_records, &local, &plan, deferred);
+    let mut required = applied_plan.plan.records.clone();
+    for conflict in &applied_plan.plan.conflicts {
         required.push(conflict.winner.clone());
         required.push(conflict.loser.clone());
     }
@@ -3243,7 +3610,7 @@ fn connector_v2_round(
         watch_protocol_bail!("peer object request contains duplicate hashes");
     }
     let mut allowed: std::collections::HashSet<_> = local.iter().filter_map(record_hash).collect();
-    for conflict in &plan.conflicts {
+    for conflict in &responder_plan.plan.conflicts {
         allowed.extend(
             [record_hash(&conflict.winner), record_hash(&conflict.loser)]
                 .into_iter()
@@ -3259,28 +3626,72 @@ fn connector_v2_round(
     write_v2_round(output, round, V2RoundFrame::Done, &budget)?;
     match recv_connector_round(input, round, &budget, pending_remote_generation, false)? {
         V2RoundFrame::Applied => {}
+        V2RoundFrame::RoundInvalidated { path } if accepts_invalidation(&responder_plan, &path) => {
+            state.remember_unsettled_path(share, &path)?;
+            return Ok(ConnectorRound::Invalidated(path));
+        }
         other => watch_protocol_bail!("expected persistent apply response, got {other:?}"),
     }
     budget.check()?;
-    sync::apply_plan_with_root(state, share, root, &plan.records)?;
+    if let Err(error) = sync::apply_plan_with_root_skipping(
+        state,
+        share,
+        root,
+        &applied_plan.plan.records,
+        &applied_plan.retained_paths,
+    ) {
+        if let Some(invalidated) = error.downcast_ref::<sync::ApplyInvalidated>() {
+            write_v2_round(
+                output,
+                round,
+                V2RoundFrame::RoundInvalidated {
+                    path: invalidated.path.clone(),
+                },
+                &budget,
+            )?;
+            return Ok(ConnectorRound::Invalidated(invalidated.path.clone()));
+        }
+        return Err(error);
+    }
     budget.check()?;
-    state.add_conflicts(share, &plan.conflicts)?;
+    state.add_conflicts(share, &applied_plan.plan.conflicts)?;
     budget.check()?;
     state.set_initial_complete(share)?;
     budget.check()?;
     state.prune_unreferenced_objects()?;
     budget.check()?;
+    let settled = if deferred.is_empty() {
+        state.clear_unsettled_paths(share)?
+    } else {
+        Vec::new()
+    };
+    let responder_by_path: std::collections::HashMap<_, _> = responder_plan
+        .plan
+        .records
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
+        .collect();
+    let mut reported_plan = applied_plan.plan.clone();
+    reported_plan.records.retain(|record| {
+        responder_by_path
+            .get(record.path.as_bytes())
+            .is_some_and(|remote| {
+                remote.version.id() == record.version.id()
+                    && remote.version.entry == record.version.entry
+            })
+    });
     let mut report = Vec::new();
     write_plan_report(
         &mut report,
         &local,
         &remote_records,
-        &plan,
+        &reported_plan,
         false,
         PlanReport::Watch,
     )?;
+    report_settled(settled, &mut report)?;
     write_v2_round(output, round, V2RoundFrame::SyncFinished, &budget)?;
-    Ok(report)
+    Ok(ConnectorRound::Completed(report))
 }
 
 fn recv_connector_round(
@@ -3362,6 +3773,9 @@ fn receive_connector_object(
     }
 }
 
+#[cfg(feature = "e2e-test-hooks")]
+const WATCH_FAILURE_REPORT_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(not(feature = "e2e-test-hooks"))]
 const WATCH_FAILURE_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAX_DAEMON_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_DAEMON_CLIENTS: usize = 16;
@@ -3442,6 +3856,11 @@ fn write_watch_event(destination: &mut impl Write, event: WatchEvent) -> Result<
 fn watch_log(destination: &mut impl Write, message: &str) -> Result<()> {
     writeln!(destination, "{} {message}", utc_timestamp())?;
     Ok(())
+}
+
+fn watch_transition(destination: &mut impl Write, message: &str) -> Result<()> {
+    let bounded: String = message.chars().take(4096).collect();
+    watch_log(destination, &bounded)
 }
 
 /// The padded action label for a path that matches on both peers. Named
@@ -3830,6 +4249,215 @@ fn bytes_path(bytes: &[u8]) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn test_record(path: &[u8], peer: &str, entry: Entry) -> flocal::model::Record {
+        flocal::model::Record {
+            path: flocal::model::RelativePath::from_bytes(path.to_vec()).unwrap(),
+            version: flocal::model::Version {
+                peer: flocal::model::PeerId(peer.into()),
+                sequence: 1,
+                timestamp_ns: 1,
+                seen: Vec::new(),
+                entry,
+            },
+        }
+    }
+
+    #[test]
+    fn deferred_plan_keeps_each_sides_path_and_commits_stable_siblings() {
+        let local_dir = test_record(b"dir", "local", Entry::Directory);
+        let remote_dir = test_record(b"dir", "remote", Entry::Directory);
+        let local_noisy = test_record(b"dir/noisy", "local", Entry::Directory);
+        let remote_noisy = test_record(b"dir/noisy", "remote", Entry::Directory);
+        let remote_stable = test_record(b"dir/stable", "remote", Entry::Directory);
+        let full = flocal::reconcile::Plan {
+            records: vec![
+                remote_dir.clone(),
+                remote_noisy.clone(),
+                remote_stable.clone(),
+            ],
+            conflicts: Vec::new(),
+        };
+        let deferred = std::collections::HashSet::from([b"dir/noisy".to_vec()]);
+
+        let local = effective_plan(
+            &[local_dir.clone(), local_noisy.clone()],
+            &[
+                remote_dir.clone(),
+                remote_noisy.clone(),
+                remote_stable.clone(),
+            ],
+            &full,
+            &deferred,
+        );
+        assert!(local.plan.records.contains(&local_noisy));
+        assert!(local.plan.records.contains(&remote_stable));
+        assert!(!local.plan.records.contains(&remote_noisy));
+        assert!(local.retained_paths.contains(local_noisy.path.as_bytes()));
+
+        let remote = effective_plan(
+            &[remote_dir, remote_noisy.clone(), remote_stable],
+            &[local_dir, local_noisy.clone()],
+            &full,
+            &deferred,
+        );
+        assert!(remote.plan.records.contains(&remote_noisy));
+        assert!(!remote.plan.records.contains(&local_noisy));
+        assert!(remote.retained_paths.contains(remote_noisy.path.as_bytes()));
+    }
+
+    #[test]
+    fn deferred_plan_widens_across_an_ancestor_type_transition() {
+        let local_parent = test_record(b"node", "local", Entry::Directory);
+        let local_child = test_record(b"node/child", "local", Entry::Directory);
+        let target_parent = test_record(
+            b"node",
+            "remote",
+            Entry::Symlink {
+                target: b"elsewhere".to_vec(),
+            },
+        );
+        let full = flocal::reconcile::Plan {
+            records: vec![target_parent.clone()],
+            conflicts: Vec::new(),
+        };
+        let deferred = std::collections::HashSet::from([b"node/child".to_vec()]);
+        let effective = effective_plan(
+            &[local_parent.clone(), local_child.clone()],
+            std::slice::from_ref(&target_parent),
+            &full,
+            &deferred,
+        );
+
+        assert_eq!(effective.plan.records, vec![local_parent, local_child]);
+    }
+
+    #[test]
+    fn invalidation_cycle_retries_once_then_defers_and_resets() -> Result<()> {
+        let first = flocal::model::RelativePath::from_bytes(b"first".to_vec())?;
+        let second = flocal::model::RelativePath::from_bytes(b"second".to_vec())?;
+        let mut cycle = InvalidationCycle::default();
+
+        assert!(matches!(
+            cycle.observe(first.clone()),
+            InvalidationAction::Recalculate
+        ));
+        assert!(matches!(
+            cycle.observe(first.clone()),
+            InvalidationAction::Deferred { same_path: true }
+        ));
+        assert!(matches!(
+            cycle.observe(second.clone()),
+            InvalidationAction::Deferred { same_path: false }
+        ));
+        assert!(cycle.deferred.contains(first.as_bytes()));
+        assert!(cycle.deferred.contains(second.as_bytes()));
+
+        cycle.reset();
+        assert!(matches!(
+            cycle.observe(second),
+            InvalidationAction::Recalculate
+        ));
+        assert!(cycle.deferred.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn invalidation_reporting_and_validation_cover_every_transition() -> Result<()> {
+        let first = flocal::model::RelativePath::from_bytes(b"first".to_vec())?;
+        let second = flocal::model::RelativePath::from_bytes(b"second".to_vec())?;
+        let record = test_record(b"first", "peer", Entry::Directory);
+        let active = EffectivePlan {
+            plan: flocal::reconcile::Plan {
+                records: vec![record.clone()],
+                conflicts: Vec::new(),
+            },
+            retained_paths: std::collections::HashSet::new(),
+        };
+        assert!(accepts_invalidation(&active, &first));
+        assert!(!accepts_invalidation(&active, &second));
+        let retained = EffectivePlan {
+            retained_paths: std::collections::HashSet::from([b"first".to_vec()]),
+            ..active
+        };
+        assert!(!accepts_invalidation(&retained, &first));
+
+        let mut cycle = InvalidationCycle::default();
+        let mut output = Vec::new();
+        report_invalidation(&mut cycle, first.clone(), &mut output)?;
+        report_invalidation(&mut cycle, first.clone(), &mut output)?;
+        report_invalidation(&mut cycle, second.clone(), &mut output)?;
+        report_settled([first, second], &mut output)?;
+        let output = String::from_utf8(output)?;
+        for expected in [
+            "changed while synchronizing; recalculating now",
+            "is still changing; stable paths will continue",
+            "changed during recalculation; stable paths will continue",
+            "SETTLED first no longer blocks synchronization",
+            "SETTLED second no longer blocks synchronization",
+        ] {
+            assert!(output.contains(expected), "{output:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_errors_do_not_commit_partial_unsettled_paths() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let partial = flocal::model::RelativePath::from_bytes(b"partial".to_vec())?;
+
+        let (writer, reader) = UnixStream::pair()?;
+        drop(reader);
+        let error = write_watch_ready(&writer, 0, std::slice::from_ref(&partial))
+            .expect_err("readiness writes must surface a disconnected peer");
+        assert!(error.to_string().contains("Broken pipe"));
+
+        let (writer, reader) = UnixStream::pair()?;
+        write_v2_session(
+            &writer,
+            V2SessionFrame::UnsettledChunk {
+                paths: vec![partial.clone()],
+            },
+        )?;
+        write_v2_session(&writer, V2SessionFrame::Ping { nonce: 1 })?;
+        let error = read_watch_ready(&mut state, &share, &reader)
+            .expect_err("a non-readiness frame must fail the handshake");
+        assert!(error.downcast_ref::<WatchProtocolError>().is_some());
+        assert!(!state.unsettled_paths(&share)?.contains(&partial));
+
+        let (writer, reader) = UnixStream::pair()?;
+        write_v2_session(
+            &writer,
+            V2SessionFrame::Error {
+                retryable: false,
+                message: "peer rejected readiness".into(),
+            },
+        )?;
+        let error = read_watch_ready(&mut state, &share, &reader)
+            .expect_err("a remote error must fail the handshake");
+        let remote = error
+            .downcast_ref::<RemoteWatchError>()
+            .expect("the remote error remains typed");
+        assert!(!remote.retryable);
+        assert_eq!(remote.message, "peer rejected readiness");
+        Ok(())
+    }
+
+    #[test]
+    fn transition_log_is_timestamped_single_line_and_bounded() -> Result<()> {
+        let mut output = Vec::new();
+        watch_transition(&mut output, &format!("UNSETTLED {}", "x".repeat(5000)))?;
+        let output = String::from_utf8(output)?;
+        assert_eq!(output.lines().count(), 1);
+        assert_eq!(output.trim_end().chars().count(), 4096 + 21);
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     const SYSTEMD_INSTALL_TEST_ROOT: &str = "FLOCAL_TEST_SYSTEMD_INSTALL_ROOT";
@@ -4229,7 +4857,7 @@ mod tests {
                 bound_peer.clone()
             )?,
             V2SessionFrame::Error {
-                retryable: false,
+                retryable: true,
                 ..
             }
         ));
@@ -4263,13 +4891,17 @@ mod tests {
         let displaced = temp.path().join("watch-root-old");
         std::fs::rename(&root, displaced)?;
         std::fs::create_dir(&root)?;
-        assert!(matches!(
-            reject(&mut state, sync::WATCH_PROTOCOL_VERSION, bound_peer)?,
-            V2SessionFrame::Error {
-                retryable: false,
-                ..
-            }
-        ));
+        let replaced_root = reject(&mut state, sync::WATCH_PROTOCOL_VERSION, bound_peer)?;
+        assert!(
+            matches!(
+                replaced_root,
+                V2SessionFrame::Error {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "{replaced_root:?}"
+        );
         Ok(())
     }
 
@@ -4435,6 +5067,7 @@ mod tests {
                 frame: V2SessionFrame::WatchAccepted { .. }
             }
         ));
+        write_v2_session(&client_output, V2SessionFrame::Ready { generation: 0 })?;
         assert!(matches!(
             read()?,
             V2Envelope::Session {
@@ -4448,7 +5081,6 @@ mod tests {
                 frame: V2SessionFrame::Pong { nonce: 42 }
             }
         ));
-        write_v2_session(&client_output, V2SessionFrame::Ready { generation: 0 })?;
         let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
         write_v2_round(&client_output, 1, V2RoundFrame::Done, &budget)?;
         assert!(matches!(
@@ -4525,6 +5157,7 @@ mod tests {
                 1,
                 &responder_reader,
                 &responder_stream,
+                &Default::default(),
             )?;
             Ok(())
         });
@@ -4539,11 +5172,15 @@ mod tests {
             &connector_reader,
             &connector_stream,
             &mut pending_remote,
+            &Default::default(),
         )?;
         responder.join().expect("responder joins")?;
 
         assert_eq!(std::fs::read(local_root.join("from-remote"))?, b"remote");
         assert_eq!(std::fs::read(remote_root.join("from-local"))?, b"local");
+        let ConnectorRound::Completed(report) = report else {
+            bail!("test round unexpectedly invalidated");
+        };
         let report = String::from_utf8(report)?;
         assert!(report.contains("UPLOAD from-local"), "{report}");
         assert!(report.contains("DOWNLOAD from-remote"), "{report}");
@@ -4569,6 +5206,11 @@ mod tests {
         let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
         let remote_peer = remote_state.peer_id()?;
         let expected_remote_peer = remote_peer.clone();
+        let local_seed = flocal::model::RelativePath::from_bytes(b"local-seed".to_vec())?;
+        let remote_seed = flocal::model::RelativePath::from_bytes(b"remote-seed".to_vec())?;
+        local_state.remember_unsettled_path(&local_share, &local_seed)?;
+        let expected_local_seed = local_seed.clone();
+        let expected_remote_seed = remote_seed.clone();
 
         let (connector_output, responder_input) = UnixStream::pair()?;
         let (responder_output, connector_input) = UnixStream::pair()?;
@@ -4587,16 +5229,11 @@ mod tests {
                     peer: remote_peer,
                 },
             )?;
-            write_v2_session(&responder_output, V2SessionFrame::Ready { generation: 0 })?;
-            assert!(matches!(
-                sync::read_v2_envelope_until(
-                    &responder_input,
-                    std::time::Instant::now() + sync::default_frame_deadline(),
-                )?,
-                V2Envelope::Session {
-                    frame: V2SessionFrame::Ready { .. }
-                }
-            ));
+            write_watch_ready(&responder_output, 0, std::slice::from_ref(&remote_seed))?;
+            read_watch_ready(&mut remote_state, &remote_share, &responder_input)?;
+            let unsettled = remote_state.unsettled_paths(&remote_share)?;
+            assert!(unsettled.contains(&expected_local_seed));
+            assert!(unsettled.contains(&expected_remote_seed));
             let start = sync::read_v2_envelope_until(
                 &responder_input,
                 std::time::Instant::now() + sync::default_frame_deadline(),
@@ -4615,7 +5252,9 @@ mod tests {
                 1,
                 &responder_input,
                 &responder_output,
-            )
+                &Default::default(),
+            )?;
+            Ok(())
         });
 
         let peer = flocal::model::PeerConfig {
@@ -4654,6 +5293,7 @@ mod tests {
         responder.join().expect("responder joins")?;
         assert_eq!(std::fs::read(local_root.join("remote"))?, b"remote");
         assert_eq!(std::fs::read(remote_root.join("local"))?, b"local");
+        assert!(local_state.unsettled_paths(&local_share)?.is_empty());
         assert!(String::from_utf8(output)?.contains("Peer connected"));
         Ok(())
     }

@@ -697,3 +697,18 @@ The independent reviews' blocker/important findings are resolved as follows:
 No blocker or important finding is intentionally left to implementation
 discretion. Affected reviewers must rerun; this disposition does not approve
 the architect's own design.
+
+* Update 2026-08-12: protocol version 3
+
+The original version-2 state machine remains the base framing, reflected in
+the internal =V2Envelope= names.  Persistent watch protocol version 3 extends
+it with typed round invalidation and durable unsettled-path exchange.  A safe
+scan/install race now starts a fresh numbered round in the same SSH session;
+after a second race, each peer retains its own version inside the affected
+filesystem dependency closure while stable work converges.  Version-3
+=UnsettledChunk= frames exchange authenticated, bounded unsettled seeds and a
+single =Ready= frame closes each side's handshake phase, so a crash cannot lose
+the state transition.  See
+[[file:2026-08-12-stale-watch-install-recovery-design.org][the recovery design]]
+for the current transition, authorization, durability, status, and acceptance
+contract.  Explicit one-shot sync remains protocol version 1.

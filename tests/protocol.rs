@@ -80,6 +80,9 @@ fn v2_session_and_round_frames_are_closed_and_round_tagged() -> Result<()> {
             peer,
         },
         V2SessionFrame::Ready { generation: 3 },
+        V2SessionFrame::UnsettledChunk {
+            paths: vec![sample.path.clone()],
+        },
         V2SessionFrame::Changed { generation: 4 },
         V2SessionFrame::Ping { nonce: 5 },
         V2SessionFrame::Pong { nonce: 5 },
@@ -111,11 +114,14 @@ fn v2_session_and_round_frames_are_closed_and_round_tagged() -> Result<()> {
         },
         V2RoundFrame::ObjectEnd,
         V2RoundFrame::ApplyChunk {
-            records: vec![sample],
+            records: vec![sample.clone()],
             conflicts: vec![conflict],
         },
         V2RoundFrame::ApplyEnd,
         V2RoundFrame::Applied,
+        V2RoundFrame::RoundInvalidated {
+            path: sample.path.clone(),
+        },
         V2RoundFrame::Done,
         V2RoundFrame::SyncFinished,
         V2RoundFrame::SyncFailed {
