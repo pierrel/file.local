@@ -1,6 +1,5 @@
 #+title: Three-way merge implementation report
 #+date: 2026-08-13
-#+status: implementation and local validation complete; external review pending
 
 * What changed for the user
 
@@ -143,9 +142,10 @@ Every append uses checked size arithmetic.
 ** Version and base state
 
 =VersionId= and =BaseVersion= gained optional keyed authenticators, and
-=Version= gained =merge_base= plus tags for its identity, complete metadata,
-and base projection. The installation key is random and private to local state.
-An owner validates any locally owned ID or full Version echoed by its peer.
+=Version= gained =merge_base= plus tags for its identity, complete record
+metadata, and base projection. The complete-record tag includes the normalized
+path. The installation key is random and private to local state. An owner
+validates any locally owned ID or full Record echoed by its peer.
 
 The scanner chooses a base narrowly:
 
@@ -194,7 +194,7 @@ result.version.entry = Entry::File {
     size: merged.bytes.len() as u64,
     executable: merged.executable,
 };
-state.authenticate_version(share, &mut result.version)?;
+state.authenticate_record(share, &mut result)?;
 #+end_src
 
 The fresh sequence is reserved only for a committed attempt. Dry-run uses
@@ -322,7 +322,7 @@ differences, CRLF, repeated lines, files above 200 lines, binary rejection,
 per-file limits, and the 64-candidate cumulative boundary.
 
 =make check= passes formatting and Clippy with warnings denied. LLVM line
-coverage is 90.03 percent for the whole project and 90.03 percent for executable
+coverage is 91.73 percent for the whole project and 91.57 percent for executable
 lines changed from the review base, both above the mandatory 90 percent gate.
 
 Local review found and fixed the live pending-root race, absent cumulative
@@ -332,10 +332,24 @@ IDs, and false recovery conflicts for unapplied actions. No finding was reduced
 to a lower probability; each fix narrows the representation or serialized
 state transition that permits it.
 
-The complete Docker suite passes all 28 product scenarios over real SSH. The
-final local review round, GitHub CI, and Copilot bridge review are recorded in
-the pull request before it is ready for the user's merge. This report is
-reconciled again if those reviews change the implementation.
+The external bridge review also found and fixed duplicate path acceptance in
+chunked head manifests, stale protocol documentation, premature cumulative
+budget accounting, and incomplete canonical identity checks. The last issue
+was closed by requiring one owner/sequence pair to name one complete Record,
+including its path and authentication metadata. This prevents a valid version
+from being replayed under a second path. The incomplete pathless tag existed
+only on this unmerged feature branch, so review removed it instead of shipping
+a permanent compatibility mechanism that could not recover already-forgotten
+historical paths.
+
+For a first upgraded dry-run, an untagged legacy Record is previewable only if
+it is byte-for-byte identical on both frozen snapshots. This read-only rule
+introduces no new trusted metadata; divergent legacy state is normalized by
+the next ordinary sync.
+
+The complete Docker suite passes all 28 product scenarios over real SSH. GitHub
+CI runs the native suite on Linux and macOS, the coverage gate, and the Docker
+suite. The feature branch remains unmerged for the user's approval.
 
 * Limits and upgrade note
 

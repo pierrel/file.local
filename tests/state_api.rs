@@ -41,12 +41,32 @@ fn version_authentication_rejects_forged_local_history() -> Result<()> {
     let share = state.init_share(&root)?;
     let local = state.peer_id()?;
     let mut record = record(b"file", &local.0, 1, Entry::Directory)?;
-    state.authenticate_version(&share, &mut record.version)?;
-    state.validate_remote_records(&share, std::slice::from_ref(&record))?;
+    state.authenticate_record(&share, &mut record)?;
+    state.validate_remote_records(&share, &[], std::slice::from_ref(&record))?;
 
-    let mut forged = record;
+    let mut replayed = record.clone();
+    replayed.path = RelativePath::from_bytes(b"replayed".to_vec())?;
+    assert!(
+        state
+            .validate_remote_records(&share, &[record.clone()], &[replayed])
+            .is_err()
+    );
+
+    let mut forged_base_tag = record.clone();
+    forged_base_tag.version.base_authenticator = Some("forged".into());
+    assert!(
+        state
+            .validate_remote_records(&share, &[record.clone()], &[forged_base_tag])
+            .is_err()
+    );
+
+    let mut forged = record.clone();
     forged.version.entry = Entry::Tombstone;
-    assert!(state.validate_remote_records(&share, &[forged]).is_err());
+    assert!(
+        state
+            .validate_remote_records(&share, &[record], &[forged])
+            .is_err()
+    );
     Ok(())
 }
 

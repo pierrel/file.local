@@ -247,7 +247,7 @@ fn scan_mode(
                     record.version.merge_base = None;
                 }
             }
-            state.authenticate_version(share, &mut record.version)?;
+            state.authenticate_record(share, record)?;
         }
     }
     records.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));

@@ -1652,8 +1652,7 @@ fn run_sync(
         other => bail!("unexpected handshake response: {other:?}"),
     }
     let remote_records = sync::read_snapshot(&mut remote.output)?;
-    state.validate_remote_records(&share, &remote_records)?;
-    sync::validate_snapshot_pair(&local, &remote_records)?;
+    state.validate_remote_records(&share, &local, &remote_records)?;
     let mut plan = sync::plan(&local, &remote_records);
 
     let root = state.root_for(&share)?;
@@ -2624,9 +2623,7 @@ fn serve_v2_round(
 
     let peer_records = read_v2_snapshot(input, round, &mut budget)?;
     state
-        .validate_remote_records(share, &peer_records)
-        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
-    sync::validate_snapshot_pair(&advertised, &peer_records)
+        .validate_remote_records(share, &advertised, &peer_records)
         .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let plan = read_v2_plan(input, round, &mut budget)?;
     let expected = sync::plan(&advertised, &peer_records);
@@ -2822,8 +2819,7 @@ fn serve_sync(
                 peer_records.extend(records);
             }
             Message::SnapshotEnd if !peer_snapshot_done && !plan_ready => {
-                state.validate_remote_records(share, &peer_records)?;
-                sync::validate_snapshot_pair(advertised, &peer_records)?;
+                state.validate_remote_records(share, advertised, &peer_records)?;
                 peer_snapshot_done = true;
             }
             Message::ApplyChunk {
@@ -3824,8 +3820,7 @@ fn connector_v2_round(
     }
     let remote_records =
         read_connector_snapshot(input, round, &mut budget, pending_remote_generation)?;
-    state.validate_remote_records(share, &remote_records)?;
-    sync::validate_snapshot_pair(&local, &remote_records)?;
+    state.validate_remote_records(share, &local, &remote_records)?;
     let mut plan = sync::plan(&local, &remote_records);
     let required = sync::plan_records_with_inputs(&plan);
     let needs = sync::required_hashes_for_share(state, share, &required)?;

@@ -412,8 +412,9 @@ impl State {
         Ok(key)
     }
 
-    pub fn authenticate_version(&self, share: &ShareId, version: &mut Version) -> Result<()> {
+    pub fn authenticate_record(&self, share: &ShareId, record: &mut Record) -> Result<()> {
         let key = self.authentication_key()?;
+        let version = &mut record.version;
         version.id_authenticator = Some(authenticate(
             &key,
             &serde_json::to_vec(&(
@@ -432,14 +433,34 @@ impl State {
                 &version.entry,
             ))?,
         ));
-        version.version_authenticator = Some(version_tag(&key, share, version)?);
+        version.version_authenticator = Some(version_tag(&key, share, &record.path, version)?);
         Ok(())
     }
 
-    pub fn validate_remote_records(&self, share: &ShareId, records: &[Record]) -> Result<()> {
+    pub fn validate_remote_records<'a>(
+        &self,
+        share: &ShareId,
+        local_records: &'a [Record],
+        remote_records: &'a [Record],
+    ) -> Result<()> {
         let local = self.peer_id()?;
         let key = self.authentication_key()?;
-        for record in records {
+        let mut canonical = std::collections::HashMap::new();
+        for record in local_records {
+            insert_canonical_record(&mut canonical, record)?;
+        }
+        for record in remote_records {
+            let identity = (&record.version.peer, record.version.sequence);
+            let untagged_legacy = record.version.id_authenticator.is_none()
+                && record.version.version_authenticator.is_none()
+                && record.version.base_authenticator.is_none();
+            if untagged_legacy
+                && canonical
+                    .get(&identity)
+                    .is_some_and(|local_record| *local_record == record)
+            {
+                continue;
+            }
             validate_owned_id(&key, share, &local, &record.version.id())?;
             for seen in &record.version.seen {
                 validate_owned_id(&key, share, &local, seen)?;
@@ -462,11 +483,12 @@ impl State {
                 }
             }
             if record.version.peer == local {
-                let expected = version_tag(&key, share, &record.version)?;
+                let expected = version_tag(&key, share, &record.path, &record.version)?;
                 if record.version.version_authenticator.as_deref() != Some(&expected) {
                     bail!("peer supplied invalid metadata for a locally owned version");
                 }
             }
+            insert_canonical_record(&mut canonical, record)?;
         }
         Ok(())
     }
@@ -1836,21 +1858,41 @@ fn authenticate(key: &[u8; 32], bytes: &[u8]) -> String {
     blake3::keyed_hash(key, bytes).to_hex().to_string()
 }
 
-fn version_tag(key: &[u8; 32], share: &ShareId, version: &Version) -> Result<String> {
+fn version_tag(
+    key: &[u8; 32],
+    share: &ShareId,
+    path: &RelativePath,
+    version: &Version,
+) -> Result<String> {
     Ok(authenticate(
         key,
         &serde_json::to_vec(&(
-            "flocal-complete-version-v2",
+            "flocal-complete-record-v3",
             &share.0,
+            path,
             &version.peer.0,
             version.sequence,
             &version.id_authenticator,
             version.timestamp_ns,
             &version.seen,
             &version.merge_base,
+            &version.base_authenticator,
             &version.entry,
         ))?,
     ))
+}
+
+fn insert_canonical_record<'a>(
+    canonical: &mut std::collections::HashMap<(&'a PeerId, u64), &'a Record>,
+    record: &'a Record,
+) -> Result<()> {
+    let identity = (&record.version.peer, record.version.sequence);
+    if let Some(previous) = canonical.insert(identity, record)
+        && previous != record
+    {
+        bail!("the same version identity has contradictory records");
+    }
+    Ok(())
 }
 
 fn validate_owned_id(
@@ -2061,6 +2103,86 @@ mod tests {
     use std::process::Command;
 
     const PERMISSIVE_UMASK_STATE_DIR: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_STATE_DIR";
+
+    #[test]
+    fn canonical_snapshot_rejects_reused_owner_sequence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let original = file_record(
+            RelativePath::from_bytes(b"original".to_vec())?,
+            PeerId("foreign".into()),
+            7,
+            now_ns(),
+            Vec::new(),
+            Entry::Directory,
+        );
+        state.validate_remote_records(
+            &share,
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&original),
+        )?;
+
+        let mut contradictory = original.clone();
+        contradictory.version.id_authenticator = Some("different".into());
+        assert!(
+            state
+                .validate_remote_records(&share, std::slice::from_ref(&original), &[contradictory],)
+                .is_err()
+        );
+        let mut replayed = original.clone();
+        replayed.path = RelativePath::from_bytes(b"replayed".to_vec())?;
+        assert!(
+            state
+                .validate_remote_records(&share, &[], &[original, replayed])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_untagged_legacy_record_is_valid_for_read_only_preview() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let legacy = file_record(
+            RelativePath::from_bytes(b"legacy".to_vec())?,
+            state.peer_id()?,
+            1,
+            now_ns(),
+            Vec::new(),
+            Entry::Directory,
+        );
+
+        state.validate_remote_records(
+            &share,
+            std::slice::from_ref(&legacy),
+            std::slice::from_ref(&legacy),
+        )?;
+        let mut changed = legacy.clone();
+        changed.path = RelativePath::from_bytes(b"changed".to_vec())?;
+        assert!(
+            state
+                .validate_remote_records(&share, std::slice::from_ref(&legacy), &[changed])
+                .is_err()
+        );
+        let mut forged = legacy;
+        forged.version.id_authenticator = Some("forged".into());
+        assert!(
+            state
+                .validate_remote_records(
+                    &share,
+                    std::slice::from_ref(&forged),
+                    std::slice::from_ref(&forged),
+                )
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn private_directory_creation_ignores_a_permissive_umask() -> Result<()> {

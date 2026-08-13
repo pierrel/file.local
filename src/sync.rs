@@ -1452,21 +1452,6 @@ pub fn plan(local: &[Record], remote: &[Record]) -> Plan {
     reconcile(local, remote)
 }
 
-pub fn validate_snapshot_pair(local: &[Record], remote: &[Record]) -> Result<()> {
-    let local: std::collections::HashMap<_, _> = local
-        .iter()
-        .map(|record| (record.version.id(), &record.version))
-        .collect();
-    for record in remote {
-        if let Some(version) = local.get(&record.version.id())
-            && *version != &record.version
-        {
-            bail!("the same version identity has contradictory metadata");
-        }
-    }
-    Ok(())
-}
-
 pub fn materialize_merges(state: &State, share: &ShareId, plan: &mut Plan) -> Result<()> {
     let outcomes = compute_merge_outcomes(state, &plan.merges)?;
     for (candidate, outcome) in plan.merges.clone().into_iter().zip(outcomes) {
@@ -1492,7 +1477,7 @@ pub fn materialize_merges(state: &State, share: &ShareId, plan: &mut Plan) -> Re
                     size: merged.bytes.len() as u64,
                     executable: merged.executable,
                 };
-                state.authenticate_version(share, &mut result.version)?;
+                state.authenticate_record(share, &mut result)?;
                 let mut sink =
                     state.begin_object(merged.hash.clone(), merged.bytes.len() as u64)?;
                 sink.write_chunk(&merged.bytes)?;

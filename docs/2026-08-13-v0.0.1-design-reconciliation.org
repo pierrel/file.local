@@ -248,9 +248,9 @@ though stored JSON remains readable.
 Protocol-created =VersionId= values gain a required =authenticator= for new
 versions. It is a keyed BLAKE3 tag over a protocol domain, share ID, owner peer
 ID, and sequence, using an owner-only random key stored in private installation
-state. The =Version= tag
-separately binds that ID to its timestamp, canonical causal summary, merge
-base, and entry in the same protocol/share domain; the =BaseVersion= tag binds
+state. The complete-record tag separately binds that ID and normalized path to
+its timestamp, canonical causal summary, merge base, and entry in the same
+protocol/share domain; the =BaseVersion= tag binds
 its ID and entry in that domain. This lets an owner
 validate the small ID echoed in =seen= without retaining full history while
 also preventing different full/base metadata from being attached to it. Tags
@@ -534,13 +534,20 @@ duplicate proof, oversized metadata set, wrong phase, or non-deterministic
 result fails the round before visible mutation.
 
 At validated wire decode, each endpoint builds one bounded
-=OwnerSequence -> canonical (VersionId, Version)= map, where =OwnerSequence= is
-the =(peer, sequence)= pair, from full Records in the frozen snapshots,
-conflicts, intents, and proofs, plus a separate =VersionId -> Entry= constraint
-map from =BaseVersion= and shared-head values. Reusing an owner/sequence with a
-different ID tag or complete metadata, or disagreeing with a base-entry
-constraint, is a protocol error. Each endpoint validates every peer-supplied
-locally owned tagged ID through its authenticator, including IDs in =seen=.
+=OwnerSequence -> canonical Record= map, where =OwnerSequence= is the
+=(peer, sequence)= pair, from full Records in the two frozen snapshots. Other
+plan, conflict, intent, base, acknowledgement, and proof structures are checked
+against those frozen Records by their phase-specific exact-shape validators.
+Reusing an owner/sequence with a different path, ID tag, or complete metadata
+is a protocol error. Each endpoint validates every peer-supplied locally owned
+tagged ID through its authenticator, including IDs in =seen=.
+The complete-record authenticator binds the normalized path as well as all
+Version metadata, so a retired authentic version cannot later be replayed at a
+different path.
+Read-only preview may accept an untagged legacy Record only when the peer echoes
+the byte-for-byte identical Record already present in the frozen local
+snapshot. Divergent legacy state uses the ordinary mutating scan, which
+conservatively reissues it before exchange.
 Untagged legacy IDs are removed during conservative scan normalization. These
 checks make identity ownership and crash-safe sequence creation part of plan
 validity, not an assumption of SSH authentication.
@@ -693,8 +700,8 @@ copy or full-history reconstruction.
 - Absent equal base metadata causes recoverable whole-file fallback for ordinary
   legacy/incomplete history. An advertised base that is locally missing or
   corrupt is repaired through authorized transfer; failure to supply it, or
-  contradictory metadata for the same version ID, causes a protocol error, not
-  fallback.
+  contradictory records for the same owner/sequence, causes a protocol error,
+  not fallback.
 - An acknowledgement manifest may contain only the canonical intersection of
   current regular-file records. A peer rejects a head it cannot match to its
   durable current record, and never treats an acknowledgement as an object
