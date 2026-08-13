@@ -799,7 +799,8 @@ pub fn apply_plan_with_root_skipping(
             state.replace_records(share, &recovered)?;
             return Err(error.context("apply stopped; state was recovered from disk"));
         }
-        sync_applied_record(root_dir, record)?;
+        sync_applied_record(root_dir, record)
+            .with_context(|| format!("making applied path durable: {}", record.path.display()))?;
         completed.push(record.clone());
     }
     root.validate(state, share)?;

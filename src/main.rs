@@ -2167,11 +2167,14 @@ fn read_watch_ready(state: &mut State, share: &ShareId, input: &impl AsFd) -> Re
     loop {
         match sync::read_v2_envelope_until(input, budget.frame_deadline()?)? {
             V2Envelope::Session {
-                frame: V2SessionFrame::UnsettledChunk { paths },
+                frame: frame @ V2SessionFrame::UnsettledChunk { .. },
             } => {
                 budget
-                    .add_metadata(serde_json::to_vec(&paths)?.len())
+                    .add_metadata(serde_json::to_vec(&frame)?.len())
                     .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                let V2SessionFrame::UnsettledChunk { paths } = frame else {
+                    unreachable!("matched unsettled chunk")
+                };
                 let count = unsettled
                     .len()
                     .checked_add(paths.len())

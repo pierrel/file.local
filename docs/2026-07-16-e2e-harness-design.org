@@ -296,7 +296,6 @@ name, then =rename= — which stays within the same directory and mount.
 | =a.watch_start() -> Watch= / =watch.stop()= | foreground =flocal watch= held by a guard |
 | =a.watch_start_with_apply_stop() -> Watch= / =watch.wait_stopped()= | E2E-feature watch with a one-shot deterministic pre-apply stop |
 | =p.status() -> Status=                    | parsed =status --json= (=schema=, =entries=, =pending_install=, =tombstones=, and =unsettled=; fields grow with the scenarios that read them) |
-| =p.wait_for_pending_install_clear() -> bool= | bounded status polling; command/parse failures remain errors while timeout returns =false= |
 | =p.conflicts() -> Conflicts=              | either peer's parsed =conflicts list --json=, with =expect_one(path)= |
 | =p.restore_loser(id) -> String=           | either peer's =restore --version loser= to a scratch path outside the share; returns the content |
 | =p.reset_state()=                         | delete the peer's flocal state directory (=~/.local/state/file.local=) inside its container, so it no longer holds the share registration or peer binding, while its share files and the other peer's registration of it survive |
