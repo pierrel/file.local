@@ -322,7 +322,7 @@ differences, CRLF, repeated lines, files above 200 lines, binary rejection,
 per-file limits, and the 64-candidate cumulative boundary.
 
 =make check= passes formatting and Clippy with warnings denied. LLVM line
-coverage is 91.73 percent for the whole project and 91.27 percent for executable
+coverage is 91.77 percent for the whole project and 91.44 percent for executable
 lines changed from the review base, both above the mandatory 90 percent gate.
 
 Local review found and fixed the live pending-root race, absent cumulative
@@ -333,14 +333,17 @@ to a lower probability; each fix narrows the representation or serialized
 state transition that permits it.
 
 The external bridge review also found and fixed duplicate path acceptance in
-chunked head manifests, stale protocol documentation, premature cumulative
-budget accounting, and incomplete canonical identity checks. The last issue
-was closed by requiring one owner/sequence pair to name one complete Record,
-including its path and authentication metadata. This prevents a valid version
-from being replayed under a second path. The incomplete pathless tag existed
-only on this unmerged feature branch, so review removed it instead of shipping
-a permanent compatibility mechanism that could not recover already-forgotten
-historical paths.
+chunked head manifests and peer snapshots, stale protocol documentation,
+premature cumulative budget accounting, incomplete canonical identity checks,
+and quadratic conflict lookup while formatting large plans. A peer snapshot
+now has one current Record per path, with malformed snapshots becoming terminal
+protocol errors instead of endless watch retries. Canonical identity validation
+requires one owner/sequence pair to name one complete Record, including its path
+and authentication metadata. This prevents a valid version from being replayed
+under a second path. The incomplete pathless tag existed only on this unmerged
+feature branch, so review removed it instead of shipping a permanent
+compatibility mechanism that could not recover already-forgotten historical
+paths.
 
 For a first upgraded dry-run, an untagged legacy Record is previewable only if
 it is byte-for-byte identical on both frozen snapshots. This read-only rule

@@ -538,6 +538,9 @@ At validated wire decode, each endpoint builds one bounded
 =(peer, sequence)= pair, from full Records in the two frozen snapshots. Other
 plan, conflict, intent, base, acknowledgement, and proof structures are checked
 against those frozen Records by their phase-specific exact-shape validators.
+Each peer snapshot must also contain exactly one current Record per normalized
+path; a repeated path is a terminal protocol error rather than an
+ordering-dependent reconciliation choice.
 Reusing an owner/sequence with a different path, ID tag, or complete metadata
 is a protocol error. Each endpoint validates every peer-supplied locally owned
 tagged ID through its authenticator, including IDs in =seen=.

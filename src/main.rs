@@ -3820,7 +3820,9 @@ fn connector_v2_round(
     }
     let remote_records =
         read_connector_snapshot(input, round, &mut budget, pending_remote_generation)?;
-    state.validate_remote_records(share, &local, &remote_records)?;
+    state
+        .validate_remote_records(share, &local, &remote_records)
+        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let mut plan = sync::plan(&local, &remote_records);
     let required = sync::plan_records_with_inputs(&plan);
     let needs = sync::required_hashes_for_share(state, share, &required)?;
@@ -5595,6 +5597,59 @@ mod tests {
         let report = String::from_utf8(report)?;
         assert!(report.contains("UPLOAD from-local"), "{report}");
         assert!(report.contains("DOWNLOAD from-remote"), "{report}");
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_connector_rejects_duplicate_snapshot_paths_without_retrying() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("local");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let root = sync::ShareRoot::open(&state, &share)?;
+        let mut first = test_record(b"duplicate", "foreign", Entry::Directory);
+        let mut second = first.clone();
+        first.version.sequence = 8;
+        second.version.sequence = 9;
+
+        let (connector_stream, responder_reader) = UnixStream::pair()?;
+        let (responder_stream, connector_reader) = UnixStream::pair()?;
+        let responder = std::thread::spawn(move || -> Result<()> {
+            let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
+            assert!(matches!(
+                sync::read_v2_envelope_until(&responder_reader, budget.frame_deadline()?)?,
+                V2Envelope::Round {
+                    round: 1,
+                    frame: V2RoundFrame::SyncStart { .. }
+                }
+            ));
+            write_v2_round(&responder_stream, 1, V2RoundFrame::SyncAccepted, &budget)?;
+            write_v2_snapshot(&responder_stream, 1, &[first, second], &budget)
+        });
+
+        let mut pending_remote_generation = 0;
+        let result = connector_v2_round(
+            &mut state,
+            &share,
+            &root,
+            1,
+            0,
+            0,
+            &connector_reader,
+            &connector_stream,
+            &mut pending_remote_generation,
+            &Default::default(),
+        );
+        let error = match result {
+            Ok(_) => bail!("duplicate peer paths must terminate the persistent session"),
+            Err(error) => error,
+        };
+        responder.join().expect("responder joins")?;
+        assert_eq!(error.to_string(), "peer snapshot contains duplicate paths");
+        assert!(is_terminal_watch_error(&error));
         Ok(())
     }
 

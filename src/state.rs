@@ -446,10 +446,14 @@ impl State {
         let local = self.peer_id()?;
         let key = self.authentication_key()?;
         let mut canonical = std::collections::HashMap::new();
+        let mut remote_paths = std::collections::HashSet::new();
         for record in local_records {
             insert_canonical_record(&mut canonical, record)?;
         }
         for record in remote_records {
+            if !remote_paths.insert(record.path.as_bytes()) {
+                bail!("peer snapshot contains duplicate paths");
+            }
             let identity = (&record.version.peer, record.version.sequence);
             let untagged_legacy = record.version.id_authenticator.is_none()
                 && record.version.version_authenticator.is_none()
@@ -2139,6 +2143,31 @@ mod tests {
                 .validate_remote_records(&share, &[], &[original, replayed])
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_snapshot_rejects_duplicate_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let first = file_record(
+            RelativePath::from_bytes(b"duplicate".to_vec())?,
+            PeerId("foreign".into()),
+            8,
+            now_ns(),
+            Vec::new(),
+            Entry::Directory,
+        );
+        let mut second = first.clone();
+        second.version.sequence = 9;
+        let error = state
+            .validate_remote_records(&share, &[], &[first, second])
+            .expect_err("a peer snapshot must contain each path once");
+        assert_eq!(error.to_string(), "peer snapshot contains duplicate paths");
         Ok(())
     }
 
