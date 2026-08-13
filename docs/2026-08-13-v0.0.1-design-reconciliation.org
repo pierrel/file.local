@@ -1,6 +1,6 @@
 #+title: v0.0.1 design reconciliation and three-way merge plan
 #+date: 2026-08-13
-#+status: accepted implementation plan
+#+status: implemented, with final reconciliation below
 
 * 1. Decision
 
@@ -23,6 +23,44 @@ which earlier statements are obsolete, what the three-way feature will change,
 and which other items remain separate alpha-exit work in [[file:../ROADMAP.org][the roadmap]]. It
 supersedes the original detailed design where later implementation evidence or
 platform behavior produced a narrower decision.
+
+** 1.1 Final implementation reconciliation
+
+Implementation and adversarial review produced four smaller decisions than the
+initial plan below. This subsection is normative where the later planning text
+still describes the rejected alternative.
+
+1. The wire and SQLite representation remains the existing top-level =Version=
+   with additive optional authenticators and =merge_base=. New versions always
+   carry all three keyed tags. On the first upgraded scan, unverifiable foreign
+   current versions are reissued by the holder and untagged causal IDs are
+   discarded. This can cause one conservative whole-file recovery decision
+   after upgrade, but it never treats unverifiable legacy metadata as ancestry.
+   The custom nested decoder and permanent legacy-commitment tables proposed in
+   section 5 were not added.
+2. =pending_objects= is share scoped rather than round-ID scoped because every
+   mutating round already holds the installation-wide sync lock. Cleanup occurs
+   only while holding that lock at the beginning or end of a round. Merely
+   opening state never clears pending roots, so a concurrent read-only command
+   cannot collect a live transfer or merge result. Rows abandoned by a crash are
+   cleared by the next serialized round.
+3. The existing install intent keeps records, conflicts, and per-path temporary
+   phases. Recovery replays that idempotent intent. It does not add a second
+   =completed_paths= journal. If an apply is invalidated, an original recovery
+   conflict is retained only when that action completed in the current replay
+   or the recovered filesystem already contains its visible winner. This makes
+   a conflict for an unapplied action unreachable without another checkpoint
+   mechanism.
+4. Dry-run hashes scanned regular files into the private content-addressed
+   cache so it can compute the exact merge, but it reserves no sequence, stores
+   no record, and publishes no generated merge object. The cache entries are
+   pruned on cancellation while the sync lock is held; a crash can leave only
+   unreferenced private cache bytes for the next round to collect.
+
+Merged versions do follow the stronger identity rule from the plan: the
+connector reserves a fresh local sequence after confirmation, retains the
+common base until acknowledgement, authenticates the complete version, and
+sends it for independent byte-level verification by the responder.
 
 * 2. Current implementation baseline
 
@@ -149,15 +187,16 @@ pending)=; committed explicit/watch output replaces =pending= with its recovery
 ID. Whole-file fallback follows the same rule and prints =CONFLICT path (REASON;
 recovery pending|ID)=, using the stable =FallbackReason= spelling. JSON plan
 schema 2 represents the same distinction and uses =recovery_id: null= in a
-preview. It uses a tagged =outcome= for each changed path rather than requiring callers to
-infer it from records. =--dry-run= may fetch and verify bounded candidate bytes
-into owner-only ephemeral files so it can produce the real result, but deletes
-those files when the preview ends. It computes merged bytes in memory and does
-not publish any object or change records, conflicts, install intents, pending
-objects, shared heads, or the synchronized tree. The initial-sync preview uses
-the same ephemeral boundary while confirmation is pending and removes it if
-the user declines. Normal sync publishes the computed result only after
-confirmation; watch logs the outcome only after its complete plan commits.
+preview. Schema 2 keeps the complete =plan= and adds a parallel =recovery=
+array of ={ path, recovery_id }= entries; preview IDs are =null=, so callers do
+not mistake a provisional conflict for durable recovery. =--dry-run= may fetch and verify bounded candidate bytes
+and hashes local files into the owner-only object cache so it can produce the
+real result. It computes merged bytes in memory and does not reserve an ID,
+publish a generated merge object, or change records, conflicts, install
+intents, pending objects, shared heads, or the synchronized tree. Cancellation
+prunes unreferenced cache bytes while holding the sync lock. Normal sync
+publishes the generated result only after confirmation; watch logs the outcome
+only after its complete plan commits.
 
 * 5. Version and shared-base state
 
@@ -171,7 +210,7 @@ pub struct BaseVersion {
     pub id: VersionId,
     pub entry: Entry,
     #[serde(default)]
-    pub base_authenticator: Option<VersionAuthenticator>,
+    pub authenticator: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -179,33 +218,32 @@ pub struct VersionId {
     pub peer: PeerId,
     pub sequence: u64,
     #[serde(default)]
-    pub id_authenticator: Option<VersionAuthenticator>,
+    pub authenticator: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Version {
-    pub id: VersionId,
+    pub peer: PeerId,
+    pub sequence: u64,
+    #[serde(default)]
+    pub id_authenticator: Option<String>,
     pub timestamp_ns: i64,
     #[serde(default)]
     pub seen: Vec<VersionId>,
     #[serde(default)]
     pub merge_base: Option<BaseVersion>,
     #[serde(default)]
-    pub version_authenticator: Option<VersionAuthenticator>,
+    pub version_authenticator: Option<String>,
     #[serde(default)]
-    pub base_authenticator: Option<VersionAuthenticator>,
+    pub base_authenticator: Option<String>,
     pub entry: Entry,
 }
 #+end_src
 
-=Version= has a custom compatibility =Deserialize= implementation backed by an
-untagged =LegacyVersionWire | CurrentVersionWire= helper. The legacy variant
-requires top-level =peer= and =sequence= and maps them to =VersionId { peer,
-sequence, id_authenticator: None }= while defaulting the new base/version tags
-to =None=. The current variant requires nested =id=. Each variant denies
-unknown fields, and validation runs after either representation is decoded.
-This decoder is shared by SQLite state and the bounded wire decoder; migration
-does not depend on serde silently ignoring or inventing a field.
+=Version= deliberately keeps its existing top-level shape. Additive optional
+fields let existing alpha state decode without a second model or table. New
+wire protocol versions make the behavioral incompatibility explicit even
+though stored JSON remains readable.
 
 Protocol-created =VersionId= values gain a required =authenticator= for new
 versions. It is a keyed BLAKE3 tag over a protocol domain, share ID, owner peer
@@ -217,33 +255,24 @@ its ID and entry in that domain. This lets an owner
 validate the small ID echoed in =seen= without retaining full history while
 also preventing different full/base metadata from being attached to it. Tags
 are not content secrets and are never accepted as object capabilities. Their
-inputs use one protocol-fixed length-prefixed binary encoding, not JSON field
-order. A peer can relay an ID but cannot invent a locally owned gap or attach
-different metadata to an old ID. Migration creates bounded identity-only
-commitments for legacy locally owned IDs in every reachable =seen= summary,
-plus full metadata commitments for reachable legacy Versions and bases. An
-untagged ID or Version remains valid only while it matches the corresponding
-commitment; commitments are collected with their last
-causal/current/base/recovery reference. Untagged IDs cannot authorize invented
-causal claims after the protocol upgrade.
+inputs are domain-separated serialized tuples containing the share and owned
+metadata. A peer can relay a tagged ID but cannot invent a locally owned gap or
+attach different metadata to an old ID.
 
-A full =Version= embeds its authenticated =VersionId= and the base-projection
+A full =Version= carries the fields needed to project its authenticated
+=VersionId= and the base-projection
 tag created by the owner. Therefore any endpoint can later project
 =Version::id()= or =Version::as_base()= byte-for-byte without the owner's key;
 it never recomputes or strips an authenticator while relaying ancestry.
 
-Before its first upgraded wire snapshot, each installation normalizes every
-untagged current Version not owned by that installation, regardless of whether
-it has a local full commitment for the foreign legacy metadata. It also
-normalizes an owned Version that fails its own commitment. It issues a fresh
-authenticated version owned by itself, with the same entry and timestamp but
-only locally validated causal IDs; this is a conservative legacy relay, not
-proof of the former owner. Thus an offline peer can preserve bytes from a
-legitimate old version that its owner no longer retains, while it cannot use
-unverifiable ownership to win a causal comparison. If two relays diverge, the
-first upgraded round uses recoverable whole-file ordering; equal entries
-converge without invented ancestry. The acknowledged result then becomes an
-ordinary authenticated shared base.
+Before its first upgraded wire snapshot, each installation reissues an
+untagged foreign current Version under its own identity. When authenticating
+an untagged locally owned current Version, it removes untagged causal IDs and
+an untagged base. This is a conservative legacy relay, not proof of the former
+owner. It preserves current bytes while refusing unverifiable ancestry. If two
+relays diverge, the first upgraded round uses recoverable whole-file ordering;
+equal entries converge without invented ancestry. The acknowledged result then
+becomes an ordinary authenticated shared base.
 
 =BaseVersion= is not recursive. It contains an immutable version identity and
 the entry metadata needed to locate and validate one base object. It is valid
@@ -257,9 +286,9 @@ attaching arbitrary old content to a new version merely because the bytes happen
 to be in the installation object store. The existing snapshot and metadata
 limits bound its wire cost.
 
-The compatibility representation is backward-readable for stored legacy JSON, but the wire
-protocol versions change because an older peer would ignore the behavior the
-field enables.
+The additive representation is backward-readable for stored legacy JSON, but
+the wire protocol versions change because an older peer would ignore the
+behavior the fields enable.
 
 ** 5.2 Local shared-head marker
 
@@ -511,8 +540,8 @@ conflicts, intents, and proofs, plus a separate =VersionId -> Entry= constraint
 map from =BaseVersion= and shared-head values. Reusing an owner/sequence with a
 different ID tag or complete metadata, or disagreeing with a base-entry
 constraint, is a protocol error. Each endpoint validates every peer-supplied
-locally owned ID through its
-authenticator or bounded legacy commitment, including IDs in =seen=. These
+locally owned tagged ID through its authenticator, including IDs in =seen=.
+Untagged legacy IDs are removed during conservative scan normalization. These
 checks make identity ownership and crash-safe sequence creation part of plan
 validity, not an assumption of SSH authentication.
 
@@ -577,14 +606,13 @@ The object collector adds references from:
 3. every conflict base, input, and merged record;
 4. every current record, base, input, and merged result named by a pending
    install intent;
-5. every published object named by =pending_objects=;
-6. every object named by =legacy_orphan=.
+5. every verified or locally generated object named by =pending_objects=.
 
 Replace =apply_plan(records)= plus a later =add_conflicts= with one
 =commit_plan(effective_plan)= operation. It first derives the effective plan
 (including ignore/deferred decisions), validates every conflict reference, and
 ensures every referenced object is durable and rehashed. It then commits an
-=InstallIntent { records, conflicts, temps, completed_paths }= before the first visible
+=InstallIntent { records, conflicts, temps }= before the first visible
 replacement. After all replacements and directory fsyncs, one SQLite
 transaction replaces current records, inserts the intent conflicts, updates any
 eligible local bookkeeping, and deletes the intent. It leaves
@@ -593,28 +621,23 @@ them only after proof that the other endpoint also committed. This closes the
 existing crash window between visible replacement and conflict insertion: a
 loser, base, or merged result is collector-visible before it can be displaced.
 
-Add =pending_objects(share_id, round_id, hash, provenance)= as the one
-publication crash root for
+Add =pending_objects(share_id, hash, provenance)= as the publication crash root for
 *every* incoming or generated plan object not already rooted in durable local
 share state. Before receive/publication, insert and commit the pending
-reference; a crash at that point leaves a harmless reference to a missing
-object. Then publish and fsync the object through the existing owner-only
-object path. Remove all of a plan's pending rows only in the same transaction
-that installs the full-plan intent, whose records and conflicts become their
-replacement GC roots. A cancelled preview never publishes and therefore never
-needs a pending row. This narrow protocol does not hold the object lock across
-protocol work and does not rely on the installation sync lock, because object
-GC uses a different lock. On cancellation or failure before intent adoption,
-the round takes the object lock and for each pending row deletes the object only
-if no record, conflict, shared head, install intent, legacy orphan, or other
-pending row owns it; it then deletes the row before retrying. Before a new round
-for a share, and on process startup, cleanup removes every stale unadopted round
-using the same ownership
-predicate as normal abort, including records, conflicts, shared heads, install
-intents, legacy orphans, and other live pending rows. Protocol
-sessions do not resume across either boundary, so no live owner is discarded.
-A missing object needs only its row removed. Cleanup is idempotent and prevents
-a peer from accumulating pending roots by repeatedly abandoning transfers.
+reference for incoming bytes; a crash at that point leaves a harmless reference
+to a missing object. Generated bytes are published first and rooted before the
+sync lock can be released. Intent insertion then replaces object ownership and
+clears the share's pending rows in the next SQLite statement. A crash between
+those statements leaves only an extra conservative root. A cancelled preview
+creates no generated object and therefore needs no generated pending row.
+
+All mutating rounds hold the installation-wide sync lock before clearing stale
+pending rows and invoking the object collector. State opening does neither.
+Consequently another command cannot erase a live round's roots, while a crash
+leaves rows for the next serialized round to clear. Object publication and
+collection still use the narrower object lock internally. Cleanup is
+idempotent and prevents a peer from accumulating pending roots by repeatedly
+abandoning transfers.
 
 =provenance= is =receiving=, =verified_from_bound_peer=, or =generated_local=.
 All three values are GC ownership, but =receiving= is never outbound authority.
@@ -624,50 +647,25 @@ before changing the row to =verified_from_bound_peer=. Thus knowing a hash and
 adding a pending row cannot expose another share's object. Outbound
 authorization accepts only this share's durable records/bases/recovery/intents,
 =generated_local= results proposed in this round, or prior
-=verified_from_bound_peer= provenance. A =legacy_orphan= is deliberately not a
-protocol recovery root or outbound capability: it is local GC ownership and
-explicit scratch export only.
+=verified_from_bound_peer= provenance.
 
-The full intent stores a bounded =completed_paths= set. After each replacement
-and directory fsync, the applier durably adds that path before moving to the
-next. On restart, a gap between fsync and checkpoint is resolved by
-descriptor-relative inspection: only an exact intended target with no
-unresolved owned displaced temporary is promoted to completed; ambiguity keeps
-the recovery roots. If a later path invalidates, retirement derives a new
-complete recovered plan from that intent and a fresh descriptor-relative scan.
-The committed conflict set is the union of (a) original intent conflicts whose
-winning path is completed or visibly matches its intended target and (b) new
-conflicts derived for invalidated or uncompleted effects. In one transaction it
-replaces current records, inserts that set, records the unsettled path, and
-deletes the original intent. A crash before that transaction leaves the full
-intent as the GC root; a crash after it leaves only the recovered records and
-conflicts.
+The full intent does not add a second completed-path journal. Per-path
+temporary phases plus the descriptor-relative filesystem scan make replay
+idempotent. If a later path invalidates, retirement derives a complete recovered
+plan from the intent and a fresh scan. It retains an original intent conflict
+only when its action completed in the current replay or the recovered file
+already equals its visible winner, then unions newly derived conflicts. One
+transaction replaces current records, inserts that set, records the unsettled
+path, and deletes the intent.
 
-State opening performs an idempotent, version-gated SQLite migration. In one
-transaction it creates the private version-authentication key when absent,
-=shared_heads=, bounded legacy ID/full-version commitments, =pending_objects=, and a
-new conflict table with =conflict_json=. It decodes every legacy conflict row,
-inserts its converted form with the same ID and creation time, then swaps tables
-and advances the schema version.
-A crash rolls back the whole migration, so startup never sees a half-copied
-conflict table. It converts legacy conflicts without reading file contents.
-Existing =version_json= values decode with =merge_base=None=. A legacy pending
-install intent remains explicitly tagged =Legacy= rather than acquiring an
-empty conflict list. Before ordinary upgraded synchronization, startup runs its
-existing filesystem recovery with the legacy current and target records still
-rooted. Under the object lock it first pins every otherwise-unreferenced object
-as a =legacy_orphan(share_id, hash, size)=, because the old intent could have
-lost the path/Version metadata for a fetched loser before =add_conflicts=. It
-also creates an ordinary migration recovery conflict for every differing
-pre-intent regular-file Record that may have been displaced, then atomically
-commits recovered records, those conflicts, and legacy-intent removal.
-=conflicts list/show= labels orphan bytes as upgrade recovery with unknown path
-and provenance, and =restore --object HASH= can copy them to an explicit scratch
-destination; it never installs them into the share automatically. This can
-retain unrelated unreferenced bytes after the rare upgrade with an interrupted
-old install, but it cannot silently collect an available loser the legacy
-intent had no way to name. No current root, available recovery bytes, or user
-file is discarded during migration.
+State opening performs additive idempotent SQLite migrations for the private
+authentication key, =shared_heads=, =pending_objects=, and =conflict_json=.
+Legacy conflict columns remain readable and are decoded as two-input
+whole-file conflicts when =conflict_json= is absent. Existing =version_json=
+and install-intent JSON decode new optional fields as absent. The next scan
+conservatively authenticates or reissues those current versions as described in
+section 5.1. This avoids a parallel legacy state machine and never accepts
+untagged metadata as new merge ancestry.
 
 After upgrade, a fully acknowledged round establishes shared heads only for
 equal regular-file post-commit records. The collector keeps both the current
@@ -747,9 +745,9 @@ path validation or capability-relative apply while those gates are pending.
 5. Migrate conflict storage and extend inspection/restore without removing the
    legacy selector. Test preservation of legacy IDs and winner/loser spelling.
 6. Replace split apply/conflict writes with full-effective-plan intents and one
-   commit transaction. Add recovery checkpoints, =pending_objects= roots for
-   every unrooted received/generated plan object, and crash tests at every
-   publication and intent boundary.
+   commit transaction. Reuse per-path temporary phases for idempotent replay,
+   add =pending_objects= roots for every unrooted received/generated plan
+   object, and test publication and intent crash boundaries.
 7. Bump both wire protocols and add candidate proof, base/result object
    authorization, responder recomputation, phase validation, and the two
    explicit acknowledgement manifests. Reuse the same helpers in one-shot and
@@ -782,19 +780,15 @@ The feature is complete only when all of the following are proven.
    the round without mutation; it never selects an endpoint-local fallback.
 5. Repeated offline edits retain the last shared base, not every intermediate
    save. Garbage collection before and after restart keeps exactly all current,
-   shared-head, base, conflict, full-plan install-intent, pending-object, and
-   legacy-orphan references.
+   shared-head, base, conflict, full-plan install-intent, and pending-object
+   references.
 6. Legacy state opens without invented ancestry. Its first fully acknowledged
    upgraded round establishes a base only for equal regular-file heads, and
-   legacy conflict restore keeps working. An interrupted legacy install is
-   recovered before normal sync and conservatively retains every possibly
-   displaced regular-file version. If one offline peer retains a foreign legacy
-   Version whose owner now retains only its causal ID, the holder relays it as a
-   fresh holder-owned authenticated Version and the owner accepts the upgraded
-   round without trusting the obsolete foreign ownership claim. Real
-   pre-upgrade =version_json=, conflict, and install-intent fixtures decode
-   through the explicit legacy variant before migration; malformed mixed
-   legacy/current shapes are rejected.
+   legacy conflict restore keeps working. Existing additive =version_json=,
+   conflict, and install-intent rows decode with new fields absent. Each holder
+   reissues an untagged foreign current Version under its own authenticated
+   identity and removes unverifiable causal IDs, so the upgraded round preserves
+   current bytes without trusting obsolete foreign ownership claims.
 7. The responder rejects forged merge bytes/hash, wrong base, contradictory
    version metadata, invalid hunk ranges, unauthorized object requests,
    duplicates, wrong phases, and cumulative budget excess before mutation.

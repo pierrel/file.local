@@ -21,11 +21,90 @@ fn record(path: &[u8], peer: &str, sequence: u64, entry: Entry) -> Result<Record
         version: Version {
             peer: PeerId(peer.into()),
             sequence,
+            id_authenticator: None,
             timestamp_ns: sequence as i64,
             seen: Vec::new(),
+            merge_base: None,
+            version_authenticator: None,
+            base_authenticator: None,
             entry,
         },
     })
+}
+
+#[test]
+fn version_authentication_rejects_forged_local_history() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir(&root)?;
+    let state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let local = state.peer_id()?;
+    let mut record = record(b"file", &local.0, 1, Entry::Directory)?;
+    state.authenticate_version(&share, &mut record.version)?;
+    state.validate_remote_records(&share, std::slice::from_ref(&record))?;
+
+    let mut forged = record;
+    forged.version.entry = Entry::Tombstone;
+    assert!(state.validate_remote_records(&share, &[forged]).is_err());
+    Ok(())
+}
+
+#[test]
+fn object_provenance_is_share_scoped_and_round_cleanup_is_serialized() -> Result<()> {
+    let temp = tempdir()?;
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    let state_path = temp.path().join("state");
+    fs::create_dir(&first_root)?;
+    fs::create_dir(&second_root)?;
+    let bytes = b"private to first share";
+    let hash = ObjectHash::from_blake3(blake3::hash(bytes));
+    let second_share;
+    {
+        let mut state = State::open(&state_path)?;
+        let first_share = state.init_share(&first_root)?;
+        second_share = state.init_share(&second_root)?;
+        state.import_object(&hash, bytes)?;
+        let first = record(
+            b"file",
+            "first",
+            1,
+            Entry::File {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+                executable: false,
+            },
+        )?;
+        state.replace_records(&first_share, std::slice::from_ref(&first))?;
+        assert_eq!(
+            flocal::sync::required_hashes_for_share(&state, &second_share, &[first])?,
+            vec![hash.clone()]
+        );
+        state.mark_object_receiving(&second_share, &hash)?;
+    }
+    let state = State::open(&state_path)?;
+    assert!(
+        state.object_path(&hash).exists(),
+        "first share still owns the object"
+    );
+
+    let orphan = ObjectHash::from_blake3(blake3::hash(b"orphan"));
+    state.mark_object_receiving(&second_share, &orphan)?;
+    let mut sink = state.begin_object(orphan.clone(), 6)?;
+    sink.write_chunk(b"orphan")?;
+    sink.finish()?;
+    drop(state);
+    let state = State::open(&state_path)?;
+    assert!(
+        state.object_path(&orphan).exists(),
+        "opening state must not erase another process's live transfer root"
+    );
+    let _global = state.lock_global_sync()?;
+    state.clear_pending_objects(&second_share)?;
+    state.prune_unreferenced_objects()?;
+    assert!(!state.object_path(&orphan).exists());
+    Ok(())
 }
 
 #[test]
@@ -130,11 +209,7 @@ fn registered_share_conflict_and_object_lifecycle() -> Result<()> {
         },
     )?;
     let loser = record(b"file", "loser", 1, Entry::Tombstone)?;
-    let conflict = Conflict {
-        path: winner.path.clone(),
-        winner,
-        loser,
-    };
+    let conflict = Conflict::whole_file(winner, loser, flocal::merge::FallbackReason::AbsentBase);
     state.add_conflicts(&share, std::slice::from_ref(&conflict))?;
     let stored = state.conflicts(&share)?;
     assert_eq!(stored.len(), 1);

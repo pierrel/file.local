@@ -1,0 +1,359 @@
+#+title: Three-way merge implementation report
+#+date: 2026-08-13
+#+status: implementation and local validation complete; external review pending
+
+* What changed for the user
+
+=flocal= now preserves both sides of ordinary concurrent text editing when the
+two peers started from the same acknowledged file. If one machine edits the
+top of a file while the other edits the bottom, the next sync installs one file
+containing both edits. No conflict record is created for that clean merge.
+
+When both sides edit the same region, =flocal= still merges every clean region.
+For the overlap itself it uses the same deterministic last-write-wins order the
+product already used for whole files. It does not put conflict markers into the
+working file. Instead, one recovery record retains the common base, both input
+files, the installed merge, and the overlapping line ranges. Those versions
+are available through =flocal conflicts show= and top-level =flocal restore=.
+
+Files that are binary, too large, too expensive to compare, or missing a proven
+common base continue through recoverable whole-file selection. That behavior
+is deliberate: synchronization continues, both available inputs remain
+recoverable, and the merge engine never consumes unbounded memory or CPU.
+
+* The final design
+
+** A shared file becomes the base only after both peers commit it
+
+A file merely appearing in two snapshots is not enough to call it shared. One
+peer could have crashed before installing it. Each successful round therefore
+ends with both sides exchanging their durable post-commit file heads. The exact
+intersection is recorded in a =shared_heads= table. A later local edit can carry
+that immutable file version as its =merge_base=.
+
+This makes the important state transition explicit:
+
+#+begin_example
+same committed head on both peers
+            |
+            v
+ acknowledged shared base
+       /             \
+offline edit A    offline edit B
+       \             /
+         three-way merge
+#+end_example
+
+The base object is a normal content-addressed BLAKE3 object. Current records,
+shared heads, merge bases, recovery records, install intents, and pending
+objects are all garbage-collection roots. Restarting or pruning state therefore
+cannot remove the one old file needed for the next merge.
+
+** Reconciliation first identifies candidates without reading file contents
+
+The existing causal rules still run first. A known descendant beats an
+ancestor, and equal content converges without a merge. Only two concurrent,
+different regular files with the same authenticated base become a
+=MergeCandidate=. Missing or unequal bases become explicit whole-file recovery
+outcomes.
+
+That split keeps metadata reconciliation pure. It also prevents a peer from
+turning arbitrary bytes in the object cache into merge ancestry. Both child
+versions must name the same base and prove it in their causal summaries before
+the content merge is considered.
+
+** The connector proposes; the responder independently proves
+
+The connector obtains the three bounded objects, runs the merge, reserves a
+fresh locally owned sequence, authenticates the resulting Version, and sends
+the final plan. The responder checks the plan's shape before requesting the
+generated object. It limits proposed merged bytes to the same two-megabyte
+round budget, receives only share-authorized objects, recomputes every merge
+from the base and inputs, and requires the resulting entry and recovery hunks
+to match.
+
+SSH authentication establishes which paired peer is speaking. It does not make
+the peer's protocol values trustworthy. This is why the responder verifies the
+merge instead of accepting a connector-selected hash.
+
+** Resource use is bounded per file and per round
+
+Each input is limited to 256 KiB and 4,096 lines. One comparison is limited to
+8,000,000 estimated work units, 1,024 overlap hunks, and 512 KiB of output. A
+whole round is limited to 64 candidates, 32,000,000 work units, 4,096 hunks,
+and two MiB of merged output. Candidate paths are processed in raw-byte path
+order. Once the remaining round budget cannot admit a candidate, that path and
+all later candidates deterministically use =round_merge_budget= whole-file
+recovery on both peers.
+
+Persistent rounds retain their existing five-minute deadline, frame deadlines,
+metadata limits, transfer limits, and record-count limits. The merge budgets
+bound the synchronous CPU work that happens between those deadline checks.
+
+** Publication and apply remain crash recoverable
+
+Incoming and generated objects receive share-scoped =pending_objects= roots
+before they can be needed by a plan. Cleanup happens only while holding the
+installation-wide sync lock. Opening state no longer clears pending rows. This
+matters because a harmless concurrent command such as =flocal status= must not
+be able to collect an object belonging to a live sync.
+
+The full install intent now includes conflicts as well as records and temporary
+file phases. Records, recovery data, and intent removal commit in one SQLite
+transaction after filesystem replacements are durable. If a path changes
+during apply, an original recovery conflict is retained only when its action
+completed during the current replay or the recovered filesystem already
+contains its visible winner. An action that never became visible cannot create
+a misleading recovery record.
+
+* Code changes, component by component
+
+** The merge engine
+
+The new =src/merge.rs= module is a pure line-oriented merge adapter over the
+=similar= crate's Myers diff. The public boundary accepts three byte slices and
+returns either exact merged bytes and overlap ranges or a stable fallback
+reason:
+
+#+begin_src rust
+pub fn merge(
+    base: &[u8],
+    a: &[u8],
+    b: &[u8],
+    a_wins_overlap: bool,
+) -> Result<MergeResult, FallbackReason> {
+    for input in [base, a, b] {
+        if input.len() > MAX_INPUT_BYTES {
+            return Err(FallbackReason::InputBytes);
+        }
+        if input.contains(&0) {
+            return Err(FallbackReason::ContainsNul);
+        }
+        std::str::from_utf8(input).map_err(|_| FallbackReason::InvalidUtf8)?;
+    }
+    // line and work limits follow before diff and composition
+}
+#+end_src
+
+The adapter does not expose dependency-specific diff operations to protocol or
+state code. It converts them into small base-to-side edits, composes connected
+edit regions, preserves identical changes once, and records only real overlaps.
+Every append uses checked size arithmetic.
+
+** Version and base state
+
+=VersionId= and =BaseVersion= gained optional keyed authenticators, and
+=Version= gained =merge_base= plus tags for its identity, complete metadata,
+and base projection. The installation key is random and private to local state.
+An owner validates any locally owned ID or full Version echoed by its peer.
+
+The scanner chooses a base narrowly:
+
+#+begin_src rust
+let merge_base = previous.get(path.as_bytes()).and_then(|old| {
+    if shared_heads.get(path.as_bytes()) == old.version.as_base().as_ref() {
+        old.version.as_base()
+    } else if old.version.peer == peer
+        && old.version.id_authenticator.is_some()
+        && old.version.version_authenticator.is_some()
+    {
+        old.version.merge_base.clone()
+    } else {
+        None
+    }
+});
+#+end_src
+
+The first branch advances from an acknowledged head. The second lets a locally
+owned chain retain its old base until a later acknowledgement. A foreign,
+unacknowledged record cannot seed ancestry into a new local edit.
+
+Legacy alpha state uses the same additive JSON shape. On its first upgraded
+scan, an untagged foreign current version is conservatively reissued by the
+holder. Untagged causal IDs and bases are not trusted. This may produce one
+whole-file recovery decision after upgrade, but it preserves current bytes and
+does not invent history.
+
+** Merge materialization and identity
+
+=sync::materialize_merges= runs the bounded candidates once. A successful
+result becomes an ordinary connector-owned authenticated Version:
+
+#+begin_src rust
+result.version.peer = state.peer_id()?;
+result.version.sequence = state.next_sequence(share)?;
+result.version.timestamp_ns = candidate
+    .winner.version.timestamp_ns
+    .max(candidate.loser.version.timestamp_ns);
+result.version.seen.clear();
+remember_version(&mut result.version.seen, &candidate.winner.version);
+remember_version(&mut result.version.seen, &candidate.loser.version);
+result.version.merge_base = Some(candidate.base.clone());
+result.version.entry = Entry::File {
+    hash: merged.hash.clone(),
+    size: merged.bytes.len() as u64,
+    executable: merged.executable,
+};
+state.authenticate_version(share, &mut result.version)?;
+#+end_src
+
+The fresh sequence is reserved only for a committed attempt. Dry-run uses
+=preview_merges=, which calculates exact bytes and fallback reasons without
+reserving an identity or publishing a generated object.
+
+The earlier implementation draft used a synthetic =merge-HASH= peer so both
+ends could independently construct identical metadata. Review rejected that:
+the identity had no owner and could later be forged. The final design instead
+separates metadata validation from content verification. The responder accepts
+only a fresh authenticated identity owned by the bound connector, then
+recomputes the bytes and hunks independently.
+
+** Conflict and restore model
+
+=Conflict= now has a typed =resolution=, two canonical complete inputs, an
+optional base, an optional merged record, and overlap hunks. The old
+=winner_json= and =loser_json= columns remain readable while a new
+=conflict_json= stores the complete shape. Conflict IDs hash that canonical
+shape, not local creation time.
+
+JSON conflict output is schema 2. Existing
+=--version winner|loser= restore syntax remains, and the CLI adds =--input
+PEER=, =--base=, and =--merged=. All restored bytes still pass through the
+existing destination-exists, no-follow final-component, atomic replacement,
+and =--force= checks.
+
+Plan JSON schema 2 keeps the complete plan and adds a parallel =recovery=
+array. Each entry names a path and its durable recovery ID; preview entries use
+=null= because their final authenticated merge identity has not been reserved.
+
+** Protocol and acknowledgements
+
+Explicit sync moved from protocol 1 to 2; persistent watch moved from 3 to 4.
+=ApplyChunk= carries merge candidates, and both protocols gained bounded
+post-commit head manifests. Explicit sync closes with =HeadChunk=, =Applied=,
+and =CommitAck=. Persistent sync uses =HeadChunk=, =Applied=, and
+=SyncFinished=. Only exact regular-file records present in both durable
+manifests enter =shared_heads=.
+
+Object authorization remains share scoped. Protocol request gates expose the
+current advertised records and bases plus the current plan's generated results.
+Explicit sync can also serve the stored winner and loser of this share's
+recovery records; persistent watch does not add that broader recovery set.
+Install intents and pending roots keep objects alive locally but do not by
+themselves add them to a session's outbound request set. Merely knowing a
+BLAKE3 hash from another share does not grant access to it.
+
+** User output and documentation
+
+Clean merges print =MERGE path=. Overlap merges include the recovery ID after
+commit. Whole-file fallback prints =CONFLICT= with its stable reason and
+recovery ID. Watch output remains silent for unchanged paths and reports only
+actions that actually committed. The README, roadmap, state-of-the-union, and
+the detailed design reconciliation now describe the shipped protocol and merge
+behavior.
+
+* Rust features used here
+
+=Result<T, E>= makes fallback different from operational failure. The pure
+engine returns =Result<MergeResult, FallbackReason>=: invalid UTF-8 or a budget
+limit is a normal deterministic outcome. The synchronization adapter itself
+returns =anyhow::Result= because a missing object or SQLite failure must abort
+the round. That type distinction prevents an endpoint-local I/O failure from
+silently becoming a merge policy choice.
+
+Enums such as =Entry=, =ConflictResolution=, and =FallbackReason= are closed
+sets. Rust's exhaustive =match= requires code to account for every file kind
+and every outcome. =if let Entry::File { hash, size, executable }= destructures
+only the regular-file case and fails explicitly for an impossible candidate.
+
+Borrowing lets the merge engine work with line slices referencing the original
+input buffers instead of copying every line. Ownership becomes explicit when a
+final =Vec<u8>= is assembled and moved into =ComputedMerge=. The first review
+found that the draft recomputed an overlapping Myers diff up to three times to
+recover its hunks. Returning bytes and hunks together let the final code move
+both from one computation.
+
+=Option<BaseVersion>= represents the real absence of a proven base. It is not
+replaced by a sentinel version. =checked_add= and =saturating_add= make resource
+accounting explicit; a numeric overflow cannot wrap a budget back into an
+allowed range. Serde's tagged enums give protocol frames and conflict
+resolutions stable names while the protocol-version bump prevents an old peer
+from silently ignoring their meaning.
+
+Capability-style filesystem access comes from =cap_std::fs::Dir=. Apply holds
+an already opened root directory and performs descriptor-relative operations,
+so replacing a pathname with a symlink cannot redirect a merge outside the
+share. Rust lifetimes ensure those borrowed directory capabilities cannot
+outlive the owning value.
+
+* What was hard
+
+The hardest question was not how to compute a diff. It was deciding when an old
+file is truly shared. Recording a base at scan time would be easy and wrong:
+one side may not have committed it. The two-phase post-commit head exchange is
+the piece that makes merge ancestry truthful across disconnects.
+
+The second hard part was preserving distrust between paired peers. A merge is
+new content and a new causal identity. Both ends must agree on the content, but
+only one installation can own and authenticate the identity. Separating a
+connector proposal from responder recomputation resolved that tension without
+sharing secret keys or creating an ownerless synthetic peer.
+
+Crash retention crossed SQLite, immutable objects, and visible filesystem
+replacement. An early review found that =State::open= globally deleted pending
+roots. A concurrent read-only command could therefore race a live round and
+collect its just-published object. Moving cleanup under the already mandatory
+global sync lock made that state unreachable and removed the need for a more
+complex round-lease mechanism.
+
+Finally, resource limits had to be deterministic. Per-file limits alone still
+allowed a peer to advertise many legal-but-expensive candidates while holding
+the installation-wide sync lock. Canonical ordering plus one cumulative ledger
+ensures both endpoints choose the same fallback boundary and bounds total work.
+
+* Validation and review
+
+The implementation currently passes all native unit and integration tests,
+including the real SSH process-boundary test. The promoted Docker regression
+proves that concurrent non-overlapping edits preserve both changes. A second
+Docker scenario proves that overlap keeps clean regions and can restore base
+and merged bytes. Unit tests cover inserts, deletes, empty files, final-newline
+differences, CRLF, repeated lines, files above 200 lines, binary rejection,
+per-file limits, and the 64-candidate cumulative boundary.
+
+=make check= passes formatting and Clippy with warnings denied. LLVM line
+coverage is 90.03 percent for the whole project and 90.03 percent for executable
+lines changed from the review base, both above the mandatory 90 percent gate.
+
+Local review found and fixed the live pending-root race, absent cumulative
+budget, repeated diff computation, ownerless merge identity, premature merge
+publication during dry-run, untrusted inherited bases, legacy untagged causal
+IDs, and false recovery conflicts for unapplied actions. No finding was reduced
+to a lower probability; each fix narrows the representation or serialized
+state transition that permits it.
+
+The complete Docker suite passes all 28 product scenarios over real SSH. The
+final local review round, GitHub CI, and Copilot bridge review are recorded in
+the pull request before it is ready for the user's merge. This report is
+reconciled again if those reviews change the implementation.
+
+* Limits and upgrade note
+
+Both peers must run this version. Explicit sync protocol 2 and persistent watch
+protocol 4 intentionally reject older peers; managed watch keeps retrying with
+bounded diagnostics until both sides are upgraded.
+
+Three-way merge applies only to UTF-8 regular files within the fixed limits.
+NUL-containing files, invalid UTF-8, oversized inputs, excessive work, and
+round-budget exhaustion use recoverable whole-file selection. Overlaps choose
+one complete side for the overlapping region rather than inserting markers or
+opening an editor. Conflict pruning is still not implemented, so recovery
+objects remain until that separate roadmap item lands.
+
+This feature does not complete the entire alpha exit. Native macOS/Linux
+dogfooding, conflict lifecycle and recovery-space controls, clean share removal,
+durable last-success/error status, metadata policy, rename UX, target-name
+representability, and broader crash fault injection remain in the roadmap. The
+most useful operational test after installing both peers is to edit separate
+lines of one already synchronized text file while disconnected, reconnect, and
+confirm that =watch= reports =MERGE= and both lines are present.

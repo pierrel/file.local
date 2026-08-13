@@ -8,6 +8,35 @@ use flocal::sync::{ShareRoot, apply_plan, plan, refresh, refresh_with_root};
 use tempfile::tempdir;
 
 #[test]
+fn acknowledged_file_head_survives_restart_as_the_next_merge_base() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let state_path = temp.path().join("state");
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("shared.txt"), "base\n")?;
+
+    let (share, base) = {
+        let mut state = State::open(&state_path)?;
+        let share = state.init_share(&root)?;
+        let records = refresh(&mut state, &share)?;
+        let base = records[0].version.as_base().unwrap();
+        state.acknowledge_shared_heads(&share, &records)?;
+        state.prune_unreferenced_objects()?;
+        (share, base)
+    };
+
+    fs::write(root.join("shared.txt"), "edited after restart\n")?;
+    let mut state = State::open(&state_path)?;
+    let records = refresh(&mut state, &share)?;
+    assert_eq!(records[0].version.merge_base.as_ref(), Some(&base));
+    let Entry::File { hash, .. } = &base.entry else {
+        unreachable!()
+    };
+    assert_eq!(state.read_object(hash)?, b"base\n");
+    Ok(())
+}
+
+#[test]
 fn scan_apply_and_delete_round_trip() -> Result<()> {
     let temp = tempdir()?;
     let source = temp.path().join("source");
@@ -109,8 +138,12 @@ fn ignored_unsynchronized_collision_blocks_apply() -> Result<()> {
         version: flocal::model::Version {
             peer: flocal::model::PeerId("remote".into()),
             sequence: 1,
+            id_authenticator: None,
             timestamp_ns: 1,
             seen: Vec::new(),
+            merge_base: None,
+            version_authenticator: None,
+            base_authenticator: None,
             entry: Entry::Tombstone,
         },
     };
@@ -137,8 +170,12 @@ fn ignored_parent_cannot_be_reincluded_by_nested_rules_during_apply() -> Result<
         version: flocal::model::Version {
             peer: flocal::model::PeerId("remote".into()),
             sequence: 1,
+            id_authenticator: None,
             timestamp_ns: 1,
             seen: Vec::new(),
+            merge_base: None,
+            version_authenticator: None,
+            base_authenticator: None,
             entry: Entry::Tombstone,
         },
     };
@@ -410,8 +447,12 @@ fn foreign_tombstone_for_unknown_path_is_not_persisted_or_applied() -> Result<()
         version: flocal::model::Version {
             peer: flocal::model::PeerId("peer-foreign".into()),
             sequence: 1,
+            id_authenticator: None,
             timestamp_ns: 1,
             seen: Vec::new(),
+            merge_base: None,
+            version_authenticator: None,
+            base_authenticator: None,
             entry: Entry::Tombstone,
         },
     };

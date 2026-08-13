@@ -11,8 +11,7 @@ pub use peer::{
 };
 
 /// Keep the strict expected-failure wrapper's inversion and infrastructure
-/// behavior exercised without Docker. The three-way merge E2E currently uses
-/// it and must delete that wrapper when the implementation lands.
+/// behavior exercised without Docker for future bug-first scenarios.
 #[test]
 fn known_failure_passes_only_when_its_body_fails() {
     assert!(known_failure(|| anyhow::bail!("the pinned bug")).is_ok());

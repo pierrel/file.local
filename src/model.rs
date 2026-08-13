@@ -163,19 +163,37 @@ pub enum Entry {
     Tombstone,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct VersionId {
     pub peer: PeerId,
     pub sequence: u64,
+    #[serde(default)]
+    pub authenticator: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BaseVersion {
+    pub id: VersionId,
+    pub entry: Entry,
+    #[serde(default)]
+    pub authenticator: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Version {
     pub peer: PeerId,
     pub sequence: u64,
+    #[serde(default)]
+    pub id_authenticator: Option<String>,
     pub timestamp_ns: i64,
     #[serde(default)]
     pub seen: Vec<VersionId>,
+    #[serde(default)]
+    pub merge_base: Option<BaseVersion>,
+    #[serde(default)]
+    pub version_authenticator: Option<String>,
+    #[serde(default)]
+    pub base_authenticator: Option<String>,
     pub entry: Entry,
 }
 
@@ -184,7 +202,16 @@ impl Version {
         VersionId {
             peer: self.peer.clone(),
             sequence: self.sequence,
+            authenticator: self.id_authenticator.clone(),
         }
+    }
+
+    pub fn as_base(&self) -> Option<BaseVersion> {
+        matches!(self.entry, Entry::File { .. }).then(|| BaseVersion {
+            id: self.id(),
+            entry: self.entry.clone(),
+            authenticator: self.base_authenticator.clone(),
+        })
     }
 
     pub fn has_seen(&self, other: &VersionId) -> bool {

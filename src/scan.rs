@@ -77,6 +77,7 @@ fn scan_mode(
     advance_sequence: bool,
 ) -> Result<(Vec<Record>, IgnoreMatcher)> {
     let peer = state.peer_id()?;
+    let shared_heads = state.shared_heads(share)?;
     let mut preview_sequence = previous
         .iter()
         .map(|record| record.version.sequence)
@@ -134,12 +135,9 @@ fn scan_mode(
                 Entry::Directory
             } else if metadata.is_file() {
                 let input = open_regular_nofollow(root_dir, &relative)?;
-                let (hash, size) = if advance_sequence {
-                    state.store_object(input)
-                } else {
-                    state.hash_object(input)
-                }
-                .with_context(|| format!("capturing {}", display_root.join(&relative).display()))?;
+                let (hash, size) = state.store_object(input).with_context(|| {
+                    format!("capturing {}", display_root.join(&relative).display())
+                })?;
                 Entry::File {
                     hash,
                     size,
@@ -166,6 +164,18 @@ fn scan_mode(
                 if let Some(old) = previous.get(path.as_bytes()) {
                     remember(&mut causal, old.version.id());
                 }
+                let merge_base = previous.get(path.as_bytes()).and_then(|old| {
+                    if shared_heads.get(path.as_bytes()) == old.version.as_base().as_ref() {
+                        old.version.as_base()
+                    } else if old.version.peer == peer
+                        && old.version.id_authenticator.is_some()
+                        && old.version.version_authenticator.is_some()
+                    {
+                        old.version.merge_base.clone()
+                    } else {
+                        None
+                    }
+                });
                 records.push(file_record(
                     path,
                     peer.clone(),
@@ -174,6 +184,8 @@ fn scan_mode(
                     causal,
                     entry,
                 ));
+                let version = &mut records.last_mut().expect("record was just pushed").version;
+                version.merge_base = merge_base;
             }
         }
     }
@@ -209,6 +221,33 @@ fn scan_mode(
                 },
                 Entry::Tombstone,
             ));
+        }
+    }
+    if advance_sequence {
+        for record in &mut records {
+            if record.version.id_authenticator.is_some() {
+                continue;
+            }
+            if record.version.peer != peer {
+                record.version.peer = peer.clone();
+                record.version.sequence = state.next_sequence(share)?;
+                record.version.seen.clear();
+                record.version.merge_base = None;
+            } else {
+                record
+                    .version
+                    .seen
+                    .retain(|version| version.authenticator.is_some());
+                if record
+                    .version
+                    .merge_base
+                    .as_ref()
+                    .is_some_and(|base| base.authenticator.is_none())
+                {
+                    record.version.merge_base = None;
+                }
+            }
+            state.authenticate_version(share, &mut record.version)?;
         }
     }
     records.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
@@ -285,7 +324,9 @@ fn is_internal_path(relative: &Path) -> bool {
 
 fn remember(seen: &mut Vec<crate::model::VersionId>, version: crate::model::VersionId) {
     if let Some(existing) = seen.iter_mut().find(|item| item.peer == version.peer) {
-        existing.sequence = existing.sequence.max(version.sequence);
+        if version.sequence > existing.sequence {
+            *existing = version;
+        }
     } else {
         seen.push(version);
     }

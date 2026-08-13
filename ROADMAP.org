@@ -19,7 +19,7 @@ model. Remove stale descriptions of already implemented background services and
 recovery behavior, distinguish the current alpha from the intended =v0.0.1=,
 and make the remaining acceptance criteria explicit.
 
-** TODO Deterministic three-way text merge
+** DONE Deterministic three-way text merge
 
 When both peers change a text file from the same retained base, preserve
 identical and non-overlapping edits from both peers. Resolve only overlapping

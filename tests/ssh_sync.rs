@@ -236,6 +236,50 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
         restored.to_str().unwrap(),
         "--force",
     ])?;
+    let restored_base = temp.path().join("restored-base.txt");
+    run(&[
+        "restore",
+        local_root.to_str().unwrap(),
+        &conflict.id,
+        "--base",
+        "--to",
+        restored_base.to_str().unwrap(),
+    ])?;
+    assert_eq!(fs::read_to_string(&restored_base)?, "local");
+    let restored_merged = temp.path().join("restored-merged.txt");
+    run(&[
+        "restore",
+        local_root.to_str().unwrap(),
+        &conflict.id,
+        "--merged",
+        "--to",
+        restored_merged.to_str().unwrap(),
+    ])?;
+    assert_eq!(
+        fs::read_to_string(&restored_merged)?,
+        fs::read_to_string(local_root.join("from-local.txt"))?
+    );
+    let input_peer = conflict.inputs[0].version.peer.0.as_str();
+    let restored_input = temp.path().join("restored-input.txt");
+    run(&[
+        "restore",
+        local_root.to_str().unwrap(),
+        &conflict.id,
+        "--input",
+        input_peer,
+        "--to",
+        restored_input.to_str().unwrap(),
+    ])?;
+    assert!(restored_input.exists());
+    run_fails(&[
+        "restore",
+        local_root.to_str().unwrap(),
+        &conflict.id,
+        "--input",
+        "missing-peer",
+        "--to",
+        temp.path().join("missing-input").to_str().unwrap(),
+    ])?;
 
     fs::write(remote_root.join("boundary-remote-a"), "123")?;
     fs::write(remote_root.join("boundary-remote-b"), "456")?;
