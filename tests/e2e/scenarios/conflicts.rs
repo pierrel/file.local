@@ -1,9 +1,34 @@
-//! Catalog #9 (concurrent-edit conflict with a recoverable loser) and #19
-//! (concurrent deletions and delete-versus-edit convergence).
+//! Catalog #9 (concurrent-edit conflict with a recoverable loser), #19
+//! (concurrent deletions and delete-versus-edit convergence), and the
+//! known-broken three-way merge story from the 2026-08-13 reconciliation.
 
 use anyhow::Result;
 
 use crate::harness as e2e;
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn concurrent_nonoverlapping_edits_preserve_both_changes() -> Result<()> {
+    e2e::known_failure(|| {
+        let (a, b) = e2e::pair()?;
+        a.write("shared.txt", "first: base\nsecond: base\n")?;
+        a.sync()?;
+
+        b.offline()?;
+        a.write("shared.txt", "first: edited on a\nsecond: base\n")?;
+        b.write("shared.txt", "first: base\nsecond: edited on b\n")?;
+        b.online()?;
+        a.sync()?;
+
+        e2e::assert_trees_equal(&a, &b)?;
+        anyhow::ensure!(
+            a.read("shared.txt")? == "first: edited on a\nsecond: edited on b\n",
+            "non-overlapping edits were not both preserved"
+        );
+        a.conflicts()?.expect_none()?;
+        Ok(())
+    })
+}
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]

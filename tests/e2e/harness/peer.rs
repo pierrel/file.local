@@ -111,6 +111,14 @@ pub struct ConflictEntry {
 pub struct Conflicts(Vec<ConflictEntry>);
 
 impl Conflicts {
+    pub fn expect_none(&self) -> Result<()> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            bail!("expected no conflicts, found {}", self.0.len())
+        }
+    }
+
     pub fn expect_one(&self, path: &str) -> Result<&ConflictEntry> {
         let matching: Vec<_> = self.0.iter().filter(|c| c.path == path).collect();
         match matching.as_slice() {
