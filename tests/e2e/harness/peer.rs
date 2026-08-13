@@ -14,13 +14,13 @@ const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 /// command a constant string with nothing interpolated into it.
 const WATCH_PIDFILE: &str = "/tmp/flocal-watch.pid";
 const WATCH_LOG: &str = "/home/peer/.flocal-watch.log";
+const APPLY_STOP_MARKER: &str = "/home/peer/.local/state/file.local/.e2e-stop-before-apply";
 const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
-/// The product's status JSON schema this harness is written against:
-/// schema 2, which the tombstone-retention fix introduced together with
-/// promoting the scenarios that read `tombstones`.
-const STATUS_SCHEMA: u64 = 2;
+/// The product's status JSON schema this harness is written against. Schema 3
+/// adds durable unsettled paths to schema 2's tombstone fields.
+const STATUS_SCHEMA: u64 = 3;
 /// The conflicts listing has its own schema, which stays 1 when the status
-/// schema bumps to 2.
+/// schema bumps to 3.
 const CONFLICTS_SCHEMA: u64 = 1;
 
 /// One running container. Owns its removal; `--rm` plus the in-container
@@ -90,13 +90,14 @@ impl std::ops::Deref for Connector {
     }
 }
 
-/// The parsed `status --json`, pinned to `STATUS_SCHEMA`. `tombstones` is
-/// `Option` so the one struct parses both before and after the schema bump.
-/// Fields grow with the scenarios that read them.
+/// The parsed `status --json`, pinned to `STATUS_SCHEMA`. Fields grow with
+/// the scenarios that read them.
 #[derive(Debug, serde::Deserialize)]
 pub struct Status {
     pub schema: u64,
     pub entries: u64,
+    pub pending_install: bool,
+    pub unsettled: Vec<Vec<u8>>,
     #[serde(default)]
     pub tombstones: Option<u64>,
 }
@@ -213,9 +214,7 @@ pub fn managed_pair() -> Result<(Connector, Peer)> {
     ))
 }
 
-/// The knobs `pair_with` accepts beyond the standard opening. Currently:
-/// the watch rescan interval (design section 14.1), which watch scenarios
-/// set to the one-second floor so a cycle costs a second, not thirty.
+/// The knobs `pair_with` accepts beyond the standard opening.
 pub struct Config {
     pub watch_max_session_bytes: Option<u64>,
 }
@@ -424,38 +423,6 @@ impl Connector {
         Ok(())
     }
 
-    pub fn conflicts(&self) -> Result<Conflicts> {
-        let output = self.flocal_ok(&["conflicts", "list", SHARE, "--json"])?;
-        #[derive(serde::Deserialize)]
-        struct Listing {
-            schema: u64,
-            conflicts: Vec<RawConflict>,
-        }
-        #[derive(serde::Deserialize)]
-        struct RawConflict {
-            id: String,
-            path: Vec<u8>,
-        }
-        let listing: Listing =
-            serde_json::from_slice(&output.stdout).context("parsing conflicts list --json")?;
-        if listing.schema != CONFLICTS_SCHEMA {
-            return Err(self.fail(format!(
-                "conflicts schema {} does not match the pinned {CONFLICTS_SCHEMA}",
-                listing.schema
-            )));
-        }
-        Ok(Conflicts(
-            listing
-                .conflicts
-                .into_iter()
-                .map(|conflict| ConflictEntry {
-                    id: conflict.id,
-                    path: String::from_utf8_lossy(&conflict.path).into_owned(),
-                })
-                .collect(),
-        ))
-    }
-
     /// Starts a foreground `flocal watch` inside the container (detached
     /// from the harness process) and returns the guard holding it. The
     /// start command records the shell's pid before `exec`ing `flocal`, so
@@ -503,30 +470,35 @@ impl Connector {
         })
     }
 
-    /// Restores a conflict's losing input to a scratch path outside the
-    /// share and returns its content.
-    pub fn restore_loser(&self, id: &str) -> Result<String> {
-        validate_component(id)?;
-        let destination = format!("/home/peer/.e2e-restore-{}", unique_token());
-        self.flocal_ok(&[
-            "restore",
-            SHARE,
-            id,
-            "--version",
-            "loser",
-            "--to",
-            &destination,
+    pub fn watch_start_with_apply_stop(&self) -> Result<Watch<'_>> {
+        self.watch_start_with_apply_stops(1)
+    }
+
+    pub fn watch_start_with_apply_stops(&self, count: u8) -> Result<Watch<'_>> {
+        anyhow::ensure!(
+            matches!(count, 1 | 2),
+            "apply stop count must be one or two"
+        );
+        let watch = self.watch_start()?;
+        watch.wait_for_log("Peer connected")?;
+        let count = count.to_string();
+        self.exec_ok(&[
+            "sh",
+            "-c",
+            "printf %s \"$1\" >\"$2\"",
+            "sh",
+            &count,
+            APPLY_STOP_MARKER,
         ])?;
-        let output = self.exec_ok(&["cat", "--", &destination])?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(watch)
     }
 }
 
 /// A running `flocal watch`, held as a guard. `stop(self)` consumes the
 /// guard, so double-stop is unrepresentable; `Drop` is the never-panicking
 /// best-effort backstop. Even SIGKILL is lock-safe by the product's own
-/// construction: `flock` releases on process exit, SQLite WAL recovers,
-/// and `recover_installs` repairs any interrupted install.
+/// construction: `flock` releases on process exit, SQLite WAL recovers, and
+/// the next command attempts durable install-intent recovery automatically.
 pub struct Watch<'a> {
     peer: &'a Peer,
     pid: u32,
@@ -534,6 +506,30 @@ pub struct Watch<'a> {
 }
 
 impl Watch<'_> {
+    pub fn wait_stopped(&self) -> Result<()> {
+        let pid = self.pid;
+        self.peer.poll_until(
+            &format!("flocal watch (pid {pid}) did not stop at the apply boundary"),
+            DEADLINE,
+            move |peer| {
+                if !peer.is_watcher(pid)? {
+                    return Err(peer.fail(format!(
+                        "{}: flocal watch (pid {pid}) exited before the apply boundary",
+                        peer.alias
+                    )));
+                }
+                let output = peer.exec_raw(&["cat", "--", &format!("/proc/{pid}/status")])?;
+                if !output.status.success() {
+                    return Ok(None);
+                }
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.starts_with("State:\tT"))
+                    .then_some(()))
+            },
+        )
+    }
+
     pub fn suspend(&self) -> Result<()> {
         let output = self.peer.signal("STOP", self.pid)?;
         if !output.status.success() {
@@ -548,6 +544,12 @@ impl Watch<'_> {
     }
 
     pub fn resume(&self) -> Result<()> {
+        if !self.peer.is_watcher(self.pid)? {
+            return Err(self.peer.fail(format!(
+                "{}: flocal watch (pid {}) exited before resume",
+                self.peer.alias, self.pid
+            )));
+        }
         let output = self.peer.signal("CONT", self.pid)?;
         if !output.status.success() {
             return Err(self.peer.fail(format!(
@@ -558,6 +560,19 @@ impl Watch<'_> {
             )));
         }
         Ok(())
+    }
+
+    pub fn resume_to_next_apply_stop(&self) -> Result<()> {
+        self.resume()?;
+        self.peer.poll_until(
+            "second E2E apply-stop marker was not consumed",
+            DEADLINE,
+            |peer| {
+                let output = peer.exec_raw(&["test", "!", "-e", APPLY_STOP_MARKER])?;
+                Ok(output.status.success().then_some(()))
+            },
+        )?;
+        self.wait_stopped()
     }
 
     pub fn wait_for_error(&self, needle: &str) -> Result<()> {
@@ -659,6 +674,57 @@ impl Peer {
             },
         )
     }
+
+    pub fn conflicts(&self) -> Result<Conflicts> {
+        let output = self.flocal_ok(&["conflicts", "list", SHARE, "--json"])?;
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            schema: u64,
+            conflicts: Vec<RawConflict>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawConflict {
+            id: String,
+            path: Vec<u8>,
+        }
+        let listing: Listing =
+            serde_json::from_slice(&output.stdout).context("parsing conflicts list --json")?;
+        if listing.schema != CONFLICTS_SCHEMA {
+            return Err(self.fail(format!(
+                "conflicts schema {} does not match the pinned {CONFLICTS_SCHEMA}",
+                listing.schema
+            )));
+        }
+        Ok(Conflicts(
+            listing
+                .conflicts
+                .into_iter()
+                .map(|conflict| ConflictEntry {
+                    id: conflict.id,
+                    path: String::from_utf8_lossy(&conflict.path).into_owned(),
+                })
+                .collect(),
+        ))
+    }
+
+    /// Restores a conflict's losing input to a scratch path outside the
+    /// share and returns its content.
+    pub fn restore_loser(&self, id: &str) -> Result<String> {
+        validate_component(id)?;
+        let destination = format!("/home/peer/.e2e-restore-{}", unique_token());
+        self.flocal_ok(&[
+            "restore",
+            SHARE,
+            id,
+            "--version",
+            "loser",
+            "--to",
+            &destination,
+        ])?;
+        let output = self.exec_ok(&["cat", "--", &destination])?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     // ----- file operations (inside the container, as the peer user) -----
 
     pub fn write(&self, path: &str, content: &str) -> Result<()> {

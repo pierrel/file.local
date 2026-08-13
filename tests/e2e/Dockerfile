@@ -10,12 +10,12 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
     && echo 'fn main() {}' > src/main.rs \
     && touch src/lib.rs \
-    && cargo build --release --locked \
+    && cargo build --release --locked --features e2e-test-hooks \
     && rm -rf src target/release/flocal target/release/deps/flocal*
 COPY src ./src
 # COPY preserves context mtimes, which predate the dummy build above; touch
 # so cargo rebuilds the real sources instead of reusing the dummy library.
-RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked --features e2e-test-hooks
 
 # debian:bookworm-slim
 FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818

@@ -582,9 +582,12 @@ with =make e2e=.  GitHub CI runs Linux, macOS, changed-line coverage, and E2E.
 
 - This is alpha software, not a substitute for backups.
 - It is two peers per share, with SSH as the initial transport.
-- Persistent managed watch requires protocol version 2 on both peers; a rolling
-  upgrade blocks the enabled watch with an upgrade diagnostic until both peers
-  are upgraded and the user starts it again.
+- Persistent managed watch requires protocol version 3 on both peers. During a
+  rolling upgrade the enabled watch remains reconnecting with bounded upgrade
+  diagnostics until both peers are upgraded; no manual restart is required.
+- A scan/install race is recovered automatically in-session. Repeatedly changing
+  paths become durable unsettled state while stable siblings continue, and a
+  later full round clears and reports them as settled.
 - The daemon is supported on Linux user-systemd and macOS graphical sessions.
 - macOS service logs are not yet retained; foreground =flocal watch PATH= is
   the current live diagnostic route.

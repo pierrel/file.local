@@ -1,0 +1,103 @@
+#+title: Stale watch install-intent E2E reproduction
+
+* 1. Story and scope
+
+A persistent watch can scan a path, then lose an apply race when a local
+process changes that path before installation.  The apply correctly preserves
+the local change, but its durable install intent remains.  Later watch sessions
+compute a different plan and repeatedly fail with =a different install is
+already pending for this share=.
+
+This change first pinned the bug as a deterministic expected failure, then
+promoted the same scenario with the automatic-recovery implementation.  It now
+proves that the obsolete intent is retired, both user inputs remain recoverable,
+and watch continues in the existing SSH session.
+
+* 2. Deterministic boundary
+
+Add an =e2e-test-hooks= Cargo feature enabled only by the Docker E2E build's
+=cargo build --release --locked --features e2e-test-hooks=.  Default builds and
+binaries installed by the supported =make install= path contain no gate, and
+the test image needs no new package.
+
+With that feature, =sync::apply_plan_with_root= looks for the fixed
+=.e2e-stop-before-apply= marker under =State::dir=, the already verified
+private state directory outside the synchronized root.  After
+=set_install_intent= has durably recorded the selected records and before the
+first record is applied, the hook atomically renames the marker to a fixed
+claimed name, verifies the claimed entry is a regular non-symlink file, removes
+it, and sends =SIGSTOP= to its own process.  An absent marker is a no-op.
+The atomic rename consumes the trigger, while the private non-symlinked parent
+and fixed claimed path prevent replacement from redirecting validation or
+removal outside the state directory.  A marker containing =2= recreates a
+one-shot marker containing =1=, allowing the continuous-mutation scenario to
+stop two consecutive apply attempts deterministically.  Other contents are
+rejected.  The hook is reached only in the E2E-feature build.
+
+The same feature compiles the watch failure-summary interval as 100
+milliseconds instead of five minutes so the scenario can observe the changed
+follow-on error within its deadline.  This changes reporting cadence only, not
+retry backoff or synchronization behavior; default builds retain five minutes.
+
+* 3. Harness interface and lifecycle
+
+=Connector::watch_start_with_apply_stops= starts watch, waits for the ordinary
+=Peer connected= line, and creates a one- or two-stop marker.  The singular
+helper delegates to it.  Delaying marker creation keeps startup ungated.
+=Watch::wait_stopped= reads the tracked process's =/proc/<pid>/status= and
+requires state =T=.  =resume_to_next_apply_stop= waits for the second marker to
+be consumed before requiring another stopped state, avoiding an impossible
+requirement to observe the process briefly running between two adjacent stops.
+=Watch= cleanup resumes or kills the tracked process, so a failed assertion
+cannot strand it.
+
+* 4. Promoted recovery scenarios
+
+In =tests/e2e/scenarios/watching.rs=:
+
+1. Pair the peers, write =race.txt= as =base=, and synchronize it.
+2. Start connector watch with the apply stop and wait until it is connected.
+3. Change responder =race.txt= to =remote change=.
+4. Wait until the tracked connector watch process is stopped.  The hook's
+   ordering proves its install intent is durable and apply has not begun.
+5. Change connector =race.txt= to =local raced change= and resume the watcher.
+6. Require =UNSETTLED ... recalculating now= followed by =SETTLED=.
+7. Assert the connector's racing bytes win live, the responder's bytes remain
+   recoverable as the conflict loser, =pending_install= is false, and durable
+   =unsettled= state is empty.
+8. Reject the former stale-intent and connection-loss diagnostics and require
+   the same responder SSH-session count.
+
+The second scenario creates =changing.txt= and =stable.txt=, stops two
+consecutive apply attempts, and changes only =changing.txt= at each stop.  It
+requires the changing-path deferral line, convergence and reporting of the
+stable sibling, eventual convergence and =SETTLED= for the noisy path, and no
+new SSH session.
+
+* 5. Failure and security boundaries
+
+The gate carries no synchronized path or content, never enters protocol frames,
+and is absent from production builds.  It uses only the two fixed marker names
+beneath the verified private =State::dir=, atomically claims the marker before
+type validation/removal, and stops only its own process.  The harness's existing
+tracked-PID identity checks and deadlines bound observation and cleanup.  The
+scenario inspects real files, durable status, and a real persistent SSH session
+rather than mocking filesystem or protocol behavior.
+
+The Docker scenario runs on Debian/Linux.  It pins the platform-independent
+watch/install-intent state transition using Linux's real filesystem and
+protocol implementation, but does not by itself reproduce macOS rename
+semantics.  The repair design must retain a real-macOS reproduction or
+acceptance check for the reported platform.
+
+* 6. Acceptance
+
+- The stale intent is retired in the same session and never produces the old
+  =different install= loop.
+- The connector's racing bytes remain live and the responder's bytes remain
+  explicitly recoverable.
+- A twice-invalidated path does not block a stable sibling.
+- Durable status and transition logs expose unsettled then settled state.
+- Both scenarios retain one foreground watcher and one SSH session.
+- Normal unit/check targets and the complete Docker E2E suite still pass.
+- No default-build or installed-binary behavior changes.

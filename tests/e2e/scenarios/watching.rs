@@ -119,6 +119,83 @@ fn watch_reports_only_applied_actions() -> Result<()> {
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
+fn watch_does_not_remain_stuck_on_a_stale_install_intent() -> Result<()> {
+    let (a, b) = e2e::pair_with(e2e::Config {
+        watch_max_session_bytes: None,
+    })?;
+    a.write("race.txt", "base")?;
+    a.sync()?;
+
+    let watch = a.watch_start_with_apply_stop()?;
+    let sessions = b.ssh_session_count()?;
+    b.write("race.txt", "remote change")?;
+    watch.wait_stopped()?;
+    a.write("race.txt", "local raced change")?;
+    watch.resume()?;
+
+    watch.wait_for_log("UNSETTLED race.txt changed while synchronizing; recalculating now")?;
+    a.assert_file("race.txt", "local raced change")?;
+    b.wait_for_file("race.txt", "local raced change")?;
+    watch.wait_for_log("SETTLED race.txt no longer blocks synchronization")?;
+    anyhow::ensure!(
+        !a.status()?.pending_install,
+        "stale install intent remained pending"
+    );
+    anyhow::ensure!(
+        a.status()?.unsettled.is_empty(),
+        "settled path remained in durable status"
+    );
+    let conflicts = b.conflicts()?;
+    let conflict = conflicts.expect_one("race.txt")?;
+    anyhow::ensure!(
+        b.restore_loser(&conflict.id)? == "remote change",
+        "the responder did not retain its remote input as the conflict loser"
+    );
+
+    watch.assert_log_absent("a different install is already pending for this share")?;
+    watch.assert_log_absent("Peer connection lost")?;
+    anyhow::ensure!(
+        b.ssh_session_count()? == sessions,
+        "stale apply recovery opened a new SSH session"
+    );
+    watch.stop()
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn changing_path_does_not_block_a_stable_sibling() -> Result<()> {
+    let (a, b) = e2e::pair_with(e2e::Config {
+        watch_max_session_bytes: None,
+    })?;
+    a.write("changing.txt", "base")?;
+    a.write("stable.txt", "base")?;
+    a.sync()?;
+
+    let watch = a.watch_start_with_apply_stops(2)?;
+    let sessions = b.ssh_session_count()?;
+    b.write("changing.txt", "remote")?;
+    b.write("stable.txt", "stable remote")?;
+    watch.wait_stopped()?;
+    a.write("changing.txt", "local one")?;
+    watch.resume_to_next_apply_stop()?;
+    a.write("changing.txt", "local two")?;
+    watch.resume()?;
+
+    watch.wait_for_log("UNSETTLED changing.txt is still changing; stable paths will continue")?;
+    a.wait_for_file("stable.txt", "stable remote")?;
+    watch.wait_for_log("stable.txt")?;
+    watch.wait_for_log("SETTLED changing.txt no longer blocks synchronization")?;
+    b.wait_for_file("changing.txt", "local two")?;
+    anyhow::ensure!(
+        b.ssh_session_count()? == sessions,
+        "unsettled-path recovery opened a new SSH session"
+    );
+    watch.assert_log_absent("Peer connection lost")?;
+    watch.stop()
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
 fn watch_rescans_both_directions_after_process_suspension() -> Result<()> {
     let (a, b) = e2e::pair_with(e2e::Config {
         watch_max_session_bytes: None,

@@ -243,6 +243,11 @@ impl State {
                 share_id TEXT PRIMARY KEY,
                 records_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS unsettled_paths (
+                share_id TEXT NOT NULL,
+                path BLOB NOT NULL,
+                PRIMARY KEY (share_id, path)
+            );
             ",
         )?;
         let columns: Vec<String> = {
@@ -392,6 +397,92 @@ impl State {
     pub fn clear_install_intent(&self, share: &ShareId) -> Result<()> {
         self.conn
             .execute("DELETE FROM install_intents WHERE share_id=?1", [&share.0])?;
+        Ok(())
+    }
+
+    pub fn unsettled_paths(&self, share: &ShareId) -> Result<Vec<RelativePath>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM unsettled_paths WHERE share_id=?1 ORDER BY path")?;
+        statement
+            .query_map([&share.0], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| RelativePath::from_bytes(row?))
+            .collect()
+    }
+
+    pub fn remember_unsettled_path(&mut self, share: &ShareId, path: &RelativePath) -> Result<()> {
+        self.remember_unsettled_paths(share, std::slice::from_ref(path))
+    }
+
+    pub fn remember_unsettled_paths(
+        &mut self,
+        share: &ShareId,
+        paths: &[RelativePath],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for path in paths {
+            tx.execute(
+                "INSERT OR IGNORE INTO unsettled_paths(share_id,path) VALUES(?1,?2)",
+                params![share.0, path.as_bytes()],
+            )?;
+        }
+        ensure_unsettled_limit(&tx, share)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_unsettled_paths(&self, share: &ShareId) -> Result<Vec<RelativePath>> {
+        let paths = self.unsettled_paths(share)?;
+        self.conn
+            .execute("DELETE FROM unsettled_paths WHERE share_id=?1", [&share.0])?;
+        Ok(paths)
+    }
+
+    pub fn retire_invalidated_install(
+        &mut self,
+        share: &ShareId,
+        expected: &InstallIntent,
+        records: &[Record],
+        conflicts: &[Conflict],
+        unsettled: &RelativePath,
+    ) -> Result<()> {
+        let current = self
+            .install_intent(share)?
+            .context("install intent disappeared before invalidation recovery")?;
+        if current.records != expected.records
+            || current.temps.len() != expected.temps.len()
+            || current
+                .temps
+                .iter()
+                .zip(&expected.temps)
+                .any(|(current, expected)| {
+                    current.path != expected.path || current.token != expected.token
+                })
+        {
+            bail!("install intent changed before invalidation recovery");
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
+        for record in records {
+            tx.execute(
+                "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
+                params![
+                    share.0,
+                    record.path.as_bytes(),
+                    serde_json::to_string(&record.version)?
+                ],
+            )?;
+        }
+        for conflict in conflicts {
+            insert_conflict(&tx, share, conflict)?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO unsettled_paths(share_id,path) VALUES(?1,?2)",
+            params![share.0, unsettled.as_bytes()],
+        )?;
+        ensure_unsettled_limit(&tx, share)?;
+        tx.execute("DELETE FROM install_intents WHERE share_id=?1", [&share.0])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -796,24 +887,7 @@ impl State {
 
     pub fn add_conflicts(&self, share: &ShareId, conflicts: &[Conflict]) -> Result<()> {
         for conflict in conflicts {
-            let digest = blake3::hash(&serde_json::to_vec(&(
-                conflict.path.as_bytes(),
-                &conflict.winner.version,
-                &conflict.loser.version,
-            ))?);
-            let id = format!("c-{}", &digest.to_hex()[..12]);
-            self.conn.execute(
-                "INSERT OR IGNORE INTO conflicts(id,share_id,path,winner_json,loser_json,created_ns)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    id,
-                    share.0,
-                    conflict.path.as_bytes(),
-                    serde_json::to_string(&conflict.winner)?,
-                    serde_json::to_string(&conflict.loser)?,
-                    now_ns().to_string(),
-                ],
-            )?;
+            insert_conflict(&self.conn, share, conflict)?;
         }
         Ok(())
     }
@@ -1496,6 +1570,51 @@ fn set_private_file(path: &Path) -> Result<()> {
 
 fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn insert_conflict(connection: &Connection, share: &ShareId, conflict: &Conflict) -> Result<()> {
+    let digest = blake3::hash(&serde_json::to_vec(&(
+        conflict.path.as_bytes(),
+        &conflict.winner.version,
+        &conflict.loser.version,
+    ))?);
+    let id = format!("c-{}", &digest.to_hex()[..12]);
+    connection.execute(
+        "INSERT OR IGNORE INTO conflicts(id,share_id,path,winner_json,loser_json,created_ns)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            id,
+            share.0,
+            conflict.path.as_bytes(),
+            serde_json::to_string(&conflict.winner)?,
+            serde_json::to_string(&conflict.loser)?,
+            now_ns().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_unsettled_limit(connection: &Connection, share: &ShareId) -> Result<()> {
+    let (count, bytes): (i64, i64) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(LENGTH(path)),0) FROM unsettled_paths WHERE share_id=?1",
+        [&share.0],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if count > crate::sync::MAX_RECORDS_PER_SESSION as i64 {
+        bail!("persistent watch readiness has too many unsettled paths");
+    }
+    // RelativePath JSON is an array of decimal bytes. Four encoded bytes per
+    // raw byte plus 64 bytes of per-path frame/delimiter overhead is a
+    // conservative upper bound used so every durable union is guaranteed to
+    // fit the wire's metadata budget, even when each path needs its own frame.
+    if bytes
+        .saturating_mul(4)
+        .saturating_add(count.saturating_mul(64))
+        > crate::sync::MAX_METADATA_BYTES_PER_SESSION as i64
+    {
+        bail!("persistent watch readiness exceeds its cumulative metadata limit");
+    }
     Ok(())
 }
 

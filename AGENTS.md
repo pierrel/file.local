@@ -34,18 +34,31 @@ Every non-trivial feature follows this sequence:
    cross-platform filesystem behavior; and adversarial security. Add a
    dedicated documentation-alignment pass. Fix every blocker and important
    finding, rerun validation, and repeat the affected reviews until clean.
-4. **Review.** Run the complete local review loop to convergence. Reconcile the
+4. **Final report.** Before final review of a non-trivial implementation, write
+   a dated, reader-first report in `docs/` that explains what actually shipped.
+   It is distinct from the implementation contract: write naturally for a
+   technically curious reader and make it self-contained. Include the intended
+   user experience and full final design, a component-by-component explanation
+   of the code changes with representative excerpts from the real
+   implementation, explanations of language-specific features used in those
+   excerpts, the difficult parts and why they were difficult, validation and
+   review results, remaining limits, and an operational upgrade or testing note
+   when applicable. Scale each section to the change, but do not omit it merely
+   because the answer can be brief. Deliver the reviewed report in the medium
+   the user asks for, such as Kindle, but do not infer an external destination.
+5. **Review.** Run the complete local review loop to convergence. Reconcile the
    design document and `README.org` against the actual diff, run the complete
-   local test and lint suite, and record any changed decision and why. Then push
-   the feature branch and open a draft pull request. Address review feedback by
-   rerunning the affected local-review lenses before pushing. After the fix is
-   pushed, resolve each GitHub thread that it fully addresses. If a thread needs
-   a user decision or clarification, reply in that thread instead of resolving
-   it and sign the reply `— Codex` so automated comments are distinguishable
-   from the user's own comments. Once local review is clean and current feedback
-   is addressed, mark the pull request ready for review and enter the Copilot
-   review stage below. Continue Copilot rounds until it converges with no new
-   actionable comments or seven submitted rounds have passed. The user merges.
+   local test and lint suite, reconcile the final report against the reviewed
+   head, and record any changed decision and why. Then push the feature branch
+   and open a draft pull request. Address review feedback by rerunning the
+   affected local-review lenses before pushing. After the fix is pushed, resolve
+   each GitHub thread that it fully addresses. If a thread needs a user decision
+   or clarification, reply in that thread instead of resolving it and sign the
+   reply `— Codex` so automated comments are distinguishable from the user's
+   own comments. Once local review is clean and current feedback is addressed,
+   mark the pull request ready for review and enter the Copilot review stage
+   below. Continue Copilot rounds until it converges with no new actionable
+   comments or seven submitted rounds have passed. The user merges.
 
 Branch from `main`, never from another feature branch. Use one feature per
 branch. Commit and push freely on feature branches, but never merge or commit

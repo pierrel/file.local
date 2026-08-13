@@ -1,0 +1,360 @@
+#+title: Automatic recovery from a stale watch install
+
+* 1. Accepted user experience
+
+Pierre reviewed the decision packet in Etherpad revision 131 on 2026-08-12
+(SHA-256 =0aa5fb9a59aa3f1cb80de17c37ff050509b0ce4b8d15fb8136527e5707cab7d5=)
+and accepted both recommendations, with one additional latency requirement:
+
+1. A path that changes between scan and installation remains local input.
+   =watch= retires the obsolete attempt, recalculates immediately in the same
+   synchronization session, and continues without a command, daemon restart,
+   reconnect backoff, or another filesystem-watch cycle.  Ordinary conflict
+   selection retains both meaningful file versions.
+2. A path that continues changing cannot indefinitely prevent unrelated stable
+   paths from synchronizing.  =watch= identifies the path as unsettled, commits
+   work outside its filesystem dependency closure, and later reports when the
+   path settles.
+
+No user data is discarded.  A plan is a disposable calculation; an install
+intent is the durable journal for one attempt to apply it.  The implementation
+may abandon a plan only after it has accounted for that intent's filesystem
+effects and made the recovered state durable.
+
+* 2. Observed failure and scope
+
+The E2E scenario in =watch_does_not_remain_stuck_on_a_stale_install_intent=
+stops connector watch after =set_install_intent= and before apply, changes the
+destination, and resumes it.  The atomic installer exchanges the entries,
+detects that the displaced entry differs from the scan, and restores it.  The
+subsequent scan records the local edit, but the old intent remains; the next
+plan then fails forever with =a different install is already pending for this
+share=.
+
+This change fixes that state transition for foreground and daemon-managed
+persistent watch.  It also makes one-shot/startup recovery retire the same safe
+invalidation instead of leaving a poisoned intent, but one-shot protocol v1
+does not gain an in-session recalculation loop.  General I/O, corruption,
+ownership, root-identity, ignored-path, and protocol errors remain errors and
+must not clear an intent.
+
+* 3. Typed invalidation and rollback boundary
+
+Introduce a narrow typed =ApplyInvalidated { path: RelativePath }= error.  It
+is produced only when an install precondition changed and the installer has
+already restored the live entry:
+
+- an exchange displaced something other than the expected old entry;
+- a no-replace install finds a concurrently created destination; or
+- the tombstone exchange finds a different entry than the expected deletion.
+
+=apply_record= removes a staged entry that it can prove belongs to the current
+intent after rollback.  For a tombstone mismatch this adds deletion of the
+owned marker after swapping the live entry back.  It never removes a
+=Pending= token or a =Creating= token whose contents do not prove ownership.
+All other failures retain their existing error type and durable intent.
+
+Every successful record apply makes the final inode durable after all content,
+permission, and executable-bit changes, then makes its containing directory
+durable before the record enters the completed set.  This includes fsync of
+each newly created directory and its parent, from the changed leaf back through
+the existing ancestor chain.  An invalidation similarly fsyncs the containing
+directory after rollback and owned-temp removal.
+
+Linux uses =rustix::fs::fsync= for the final regular-file inode and directory
+handles.  On macOS regular files use the existing =rustix= dependency's
+=rustix::fs::fcntl_fullfsync= (=F_FULLFSYNC=) after final metadata changes;
+directories use =rustix::fs::fsync=.  If =F_FULLFSYNC= is unsupported or any sync
+fails, apply returns an actionable durability error and retains the intent; it
+does not weaken the gate to an ordinary successful apply.  No dependency is
+added.  The retirement transaction cannot run until these syncs succeed:
+deleting the only ownership journal while an exchange, metadata change, or
+removal remained merely in cache would make a post-power-loss filesystem state
+unrecoverable.
+
+The typed value, rather than error text, is the only route into automatic
+abandonment.  This prevents an unrelated error containing words such as “path
+changed” from erasing crash-recovery state.
+
+* 4. Recovering a partially applied plan
+
+An install intent covers a whole plan, so invalidation can occur after earlier
+records were installed.  =apply_plan_with_root= therefore tracks each ordered
+record whose =apply_record= completed.  On typed invalidation it builds a
+recovery baseline from the pre-apply records, replacing only those completed
+paths with their intended records.  It scans the real tree against that
+baseline through the already-held =ShareRoot= capability.
+
+This preserves the peer/version identity of entries that really completed,
+while the invalidated path becomes a new local version causally descended from
+the pre-apply record.  Records not yet attempted remain based on the old
+state.  Scanning only against the old state would incorrectly relabel already
+installed remote versions as new local edits; scanning against the complete
+target would incorrectly claim unattempted paths had committed.
+
+Reconcile the recovered records with the abandoned target solely to derive
+recovery conflicts.  The invalidated local file and the downloaded peer file
+then remain referenced even if the process dies before the next round.  This
+does not splice the old and new plans: no reconciled target from this step is
+installed or accepted as current state.
+
+Add one narrow =State::retire_invalidated_install= transaction which:
+
+1. reads and verifies that the current intent is the same attempt being
+   retired, including records and token identities (phases may have advanced
+   normally during that attempt);
+2. replaces the share records with the recovered scan;
+3. inserts the deterministic recovery conflicts; and
+4. inserts the invalidated path as a durable unsettled seed; and
+5. deletes that install intent.
+
+Root identity is revalidated after the scan and before the transaction.  A
+crash before commit leaves the original intent, so recovery reaches the same
+idempotent rollback/invalidation path.  A crash after commit sees recovered
+records and conflicts with no obsolete intent.  Object pruning occurs only
+after a later successful round.
+
+* 5. Persistent protocol state transition
+
+Persistent watch protocol version 3 adds:
+
+#+begin_src rust
+RoundInvalidated { path: RelativePath }
+#+end_src
+
+The new frame is valid only where its sender was applying the agreed plan:
+
+- If the responder invalidates before =Applied=, it sends
+  =RoundInvalidated= and returns to the session loop.
+- If the connector invalidates after receiving =Applied=, it sends
+  =RoundInvalidated= instead of =SyncFinished=; the responder accepts it and
+  returns to the session loop.
+
+Both receivers require the path to be present in that round's validated plan.
+An unknown, wrong-phase, duplicate, or wrong-round invalidation is a terminal
+protocol error.  Both endpoints append the valid path to identical
+session-local invalidation history and idempotently persist it before logging
+or beginning another round; =SyncStart= does not transmit a second copy of
+derived deferred state.  During the version-3 handshake, each side sends its
+sorted durable unsettled seeds in =UnsettledChunk= frames under one absolute
+time and cumulative metadata budget, followed by one phase-closing =Ready=.
+The persisted union enforces the same record and path-byte bounds.  After
+peer/share authentication and before the
+startup round, both sides validate and persist the union.  This
+closes the crash window in which a =RoundInvalidated= sender committed its
+seed but the receiving process died before recording it.  A new connection
+still starts unfiltered: durable seeds drive status and settlement reporting,
+not apply filtering without fresh same-session invalidations.
+
+Version 2 peers receive an explicit upgrade diagnostic rather than
+interpreting the changed state machine.  A mixed-version managed watch stays
+=reconnecting= with ordinary bounded retry/backoff until both peers run
+version 3; it never silently falls back to polling.  Explicit authentication,
+peer-identity, root-identity, and malformed-frame failures remain terminal.
+
+=connector_v2_round= becomes a version-3 round returning either a committed
+report or an invalidated path.  The session coordinator does not complete the
+frozen watcher generations, emit actions, increment the failure counter, apply
+retry backoff, or close SSH for an invalidated round.  It logs the local-state
+transition and starts the next numbered round directly.  Both peers refresh
+and reconcile again; downloaded verified objects remain reusable.
+
+Version 3 retains the existing half-duplex ordering.  Before the connector
+sends its snapshot, it requests only hashes required by its derived effective
+target; every such remotely sourced hash must be in the responder's just
+advertised share snapshot.  After receiving the connector snapshot and validating
+the ordinary full plan, the responder derives its effective target and requests
+its missing hashes.  The connector authorizes those requests against its own
+advertised share snapshot plus retained conflict inputs.  As in protocol v2,
+an authenticated bound peer is authorized for object content advertised within
+that share, including content a conforming receiver does not currently need;
+deferred filtering is a bandwidth behavior, not a peer confidentiality
+boundary.  This preserves exact per-share authorization without another protocol
+reordering, reader, or concurrency path.
+
+* 6. Bounded progress when a path keeps changing
+
+The first invalidation in a synchronization cycle triggers one immediate,
+unfiltered recalculation.  If the recalculation succeeds, the path settles in
+that same immediate round.  Action output from any abandoned round remains
+suppressed, even if another record had already been installed and durably
+accounted for before the invalidation.
+
+If any path invalidates that recalculation, the coordinator adds its closure to
+=deferred= and immediately runs a filtered round.  In the observed continuous-
+mutation case this is the same path; a different racing path is isolated
+without spending another full-plan retry.  Both peers first derive and validate
+the ordinary full plan.  They then independently form their apply target:
+
+- outside the deferred closure, use the newly reconciled records;
+- inside the closure, retain that peer's refreshed records; and
+- omit conflicts whose path is inside the closure.
+
+The filtered round therefore has side-specific retained records only inside a
+derived closure, while its synchronized target remains identical everywhere
+else.  The connector transmits the ordinary full plan.  The responder validates
+that plan exactly as today, and both endpoints derive both effective targets
+from the full plan, the two transmitted snapshots, and the shared
+session-local invalidation history.  Each conforming side requests objects
+needed by its own effective target and non-deferred conflicts, so no object
+needed only by a deferred action is transferred in normal operation.  The
+sender retains the established security boundary: any requested hash must
+occur in that sender's authenticated share snapshot or retained conflict
+inputs.
+
+The successful filtered round reports only actions outside the closure.  It
+does not unconditionally schedule another full-tree scan.  A real newer local
+or remote watcher generation schedules the ordinary debounced unfiltered
+round; the existing bounded safety audit remains the no-event backstop.  A
+later unfiltered success removes the closure from durable unsettled state.  A
+hot path can therefore produce work only at the existing event debounce and
+maximum-burst rate, not an internal immediate loop after it has been isolated.
+Retained records inside a deferred closure are explicit no-ops at the apply
+boundary.  Records outside it, including apparent KEEP records in an
+unfiltered round, still verify their filesystem preconditions so a scan/apply
+race cannot produce a false success or false =SETTLED=.
+
+The first immediate invalidation consumes the cycle's one unfiltered retry;
+each later invalidation adds at least one planned path to the bounded deferred
+set.  Once no
+non-deferred planned path remains, the filtered round completes.  Continuous
+mutation therefore cannot create an unbounded immediate CPU/protocol loop or
+starve independent paths.
+
+* 7. Filesystem dependency closure
+
+Closure is calculated from validated =RelativePath= components and the two
+fresh snapshots plus the full plan; byte-prefix tests are forbidden.
+
+1. Include the invalidated path and every planned descendant.
+2. Walk proper ancestors.  An ancestor that remains a directory on both peers
+   and in the target contributes no siblings.
+3. If either peer or the target requires a directory/non-directory/missing
+   structural transition at an ancestor, include that ancestor and every
+   planned descendant.  Repeat upward because that transition can itself
+   depend on its parent.
+
+Both sides derive the same closure from phase-valid invalidations and require
+every seed to have belonged to the validated plan where it arose.  The
+session-local seed set is sorted, unique, and bounded by the session record
+limit.  Once a seed is deferred, further invalidations inside its closure do
+not trigger another immediate retry; they leave work to watcher generations or
+the safety audit.
+
+* 8. Watch output and status meaning
+
+The first invalidation of a path writes one bounded, timestamped, escaped line:
+
+#+begin_example
+UNSETTLED notes/today.org changed while synchronizing; recalculating now
+#+end_example
+
+When a filtered round becomes necessary, the next transition is:
+
+#+begin_example
+UNSETTLED notes/today.org is still changing; stable paths will continue
+#+end_example
+
+An eventual unfiltered committed round writes:
+
+#+begin_example
+SETTLED notes/today.org no longer blocks synchronization
+#+end_example
+
+These are local convergence events, not connection failures.  They do not
+produce =Peer connection lost=, =synchronization failed=, or recovery-attempt
+counts.  Abandoned-round action lines remain suppressed.  A successful
+filtered round reports only actions it actually commits.  Paths use the same
+non-UTF-8-safe escaping as existing plan output, and every line uses the
+existing UTC watch timestamp.
+
+Unsettled seeds are durable state, inserted by the same transaction that
+retires the invalidated intent or idempotently upon receiving an authenticated
+invalidation or handshake seed.  Any successful unfiltered full round clears
+all of the share's seeds before reporting =SyncFinished=: success proves that
+every fresh synchronized target applied or that a seed now has no action
+because its path was deleted, renamed, or became ignored.  Record finalization
+and seed clearing are separate durable transactions.  A crash between them may
+conservatively leave settled seeds for the next startup to clear.  A filtered
+round never clears them.  Add an =unsettled_paths(share_id, path)= table with
+that composite primary key.
+
+Status JSON schema 3 exposes sorted raw path bytes as =unsettled=; text
+=flocal status PATH= lists their escaped forms.  Text =sync list= appends =N
+unsettled paths= to an otherwise =watching= or =reconnecting= share and directs
+the user to =flocal status PATH= for names.  The state is therefore visible
+after a daemon crash and on macOS, where LaunchAgent output is not retained.
+A restarted watch emits =SETTLED <path> no longer blocks synchronization= for
+durable seeds cleared by its successful unfiltered startup round even if the
+earlier =UNSETTLED= line was in a prior process.
+
+* 9. Interfaces and implementation sequence
+
+1. Add typed invalidation at the atomic install boundary and safe tombstone
+   marker cleanup.
+2. Track completed records, durably sync changed parent directories, construct
+   the recovery baseline, and add the exact transactional =State= retirement
+   operation plus durable unsettled seeds.  Refactor record/conflict SQL
+   insertion only as needed to share it with that transaction.
+3. Promote startup =recover_installs= handling of a retired invalidation to
+   success while preserving generic failures.
+4. Bump persistent watch to version 3 and implement the two phase-valid
+   =RoundInvalidated= paths plus the same-session immediate round loop.
+5. Add pure dependency-closure and side-specific effective-target/object-
+   authorization functions; then add the bounded one-retry/defer coordinator
+   state derived solely from phase-valid invalidation history.
+6. Add =UNSETTLED=/=SETTLED= transition output and reconcile =README.org=,
+   persistent-watch design, state-of-the-union, E2E harness design, and this
+   state document with the shipped behavior.
+
+No new dependency, background thread, public repair command, or per-record
+durable intent is introduced.  The only schema addition is durable unsettled
+paths and the corresponding status schema 3 field.
+
+* 10. Validation and acceptance
+
+- Promote =watch_does_not_remain_stuck_on_a_stale_install_intent= from
+  =known_failure= to passing.  It requires the racing local bytes, peer bytes
+  recoverable as a conflict input, =pending_install: false=, =UNSETTLED= then
+  =SETTLED=, no =different install= or connection-loss diagnostic, and no new
+  SSH session.
+- Add a deterministic E2E scenario that invalidates the same path twice while
+  another path needs synchronization.  The stable path must converge and be
+  reported during the filtered round while the noisy path remains unsettled;
+  after mutation stops, the same session must converge it and print =SETTLED=.
+- Add core tests for exact-attempt retirement, recovered records, durable
+  unsettled state, and generic apply failures retaining their intents.  The
+  deterministic E2E race covers the real rollback boundary and preservation of
+  both versions.
+- Unit-test closure construction and side-specific effective targets; the
+  two-path E2E covers an unchanged-directory sibling end to end.
+- Protocol/session tests cover typed invalidation framing, authenticated
+  chunked readiness union, phase rejection, and same-session convergence.
+- The double-invalidation E2E plus retained-path unit tests prove that a
+  deferred closure is not reapplied while its stable sibling converges.  The
+  in-process restart handshake test proves durable unsettled seeds are united
+  and cleared by a successful unfiltered startup round.
+- Status/state tests cover byte-preserving JSON, escaped text paths,
+  receiver-side and handshake-union persistence, and clearing seeds whose path
+  was deleted, renamed, or newly ignored before the successful full round.
+- Run =make check= with whole-project and changed-line coverage at least 90%,
+  the complete =make e2e= Docker suite, and CI's native macOS suite.  The Docker
+  hook proves the state machine on Linux; Pierre's original foreground-watch
+  workflow or an equivalent native test remains the final macOS filesystem
+  acceptance because Docker cannot exercise =renameatx_np= and FSEvents.
+
+* 11. Alternatives rejected
+
+- Clearing every failed intent can delete the only durable ownership record
+  for a temporary or displaced entry.
+- Waiting for notify/debounce, reconnecting SSH, or applying retry backoff does
+  not meet the accepted immediate-recalculation experience.
+- Retrying the complete plan without a bound allows one hot path to starve the
+  share.
+- Deferring only the exact pathname is unsafe across parent/child structural
+  transitions; deferring every ancestor subtree blocks unrelated siblings.
+- Splicing actions from the old plan into the new one reuses stale
+  preconditions.  The recovery baseline records completed facts, but every new
+  action comes from fresh reconciliation.
+- Per-record intents make partial progress easier to represent but add durable
+  schema and recovery states not required to fix this observed failure.

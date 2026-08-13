@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::model::{Entry, ObjectHash, PeerId, Record, ShareId};
+use crate::model::{Entry, ObjectHash, PeerId, Record, RelativePath, ShareId};
 use crate::reconcile::{Plan, reconcile};
 use crate::scan::{IgnoreMatcher, preview_cap_with_ignores, scan_cap, scan_cap_with_ignores};
 pub use crate::state::RootIdentityChanged;
@@ -14,7 +14,7 @@ use crate::state::{InstallTempPhase, RootIdentity, State};
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
 pub const SYNC_PROTOCOL_VERSION: u32 = 1;
-pub const WATCH_PROTOCOL_VERSION: u32 = 2;
+pub const WATCH_PROTOCOL_VERSION: u32 = 3;
 /// Compatibility name for the existing one-shot synchronization protocol.
 pub const PROTOCOL_VERSION: u32 = SYNC_PROTOCOL_VERSION;
 pub const MAX_RECORDS_PER_SESSION: usize = 1_000_000;
@@ -71,6 +71,34 @@ impl RoundBudget {
     }
 }
 const CHUNK: usize = 256 * 1024;
+
+#[derive(Debug)]
+pub struct ApplyInvalidated {
+    pub path: RelativePath,
+}
+
+impl std::fmt::Display for ApplyInvalidated {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "path changed while applying: {}",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for ApplyInvalidated {}
+
+#[derive(Debug)]
+struct InstallPreconditionChanged;
+
+impl std::fmt::Display for InstallPreconditionChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("install precondition changed")
+    }
+}
+
+impl std::error::Error for InstallPreconditionChanged {}
 
 pub struct ShareRoot {
     path: std::path::PathBuf,
@@ -219,6 +247,9 @@ pub enum V2SessionFrame {
     Ready {
         generation: u64,
     },
+    UnsettledChunk {
+        paths: Vec<RelativePath>,
+    },
     Changed {
         generation: u64,
     },
@@ -263,6 +294,9 @@ pub enum V2RoundFrame {
     },
     ApplyEnd,
     Applied,
+    RoundInvalidated {
+        path: RelativePath,
+    },
     Done,
     SyncFinished,
     SyncFailed {
@@ -606,6 +640,22 @@ pub fn apply_plan_with_root(
     root: &ShareRoot,
     records: &[Record],
 ) -> Result<()> {
+    apply_plan_with_root_skipping(
+        state,
+        share,
+        root,
+        records,
+        &std::collections::HashSet::new(),
+    )
+}
+
+pub fn apply_plan_with_root_skipping(
+    state: &mut State,
+    share: &ShareId,
+    root: &ShareRoot,
+    records: &[Record],
+    retained_paths: &std::collections::HashSet<Vec<u8>>,
+) -> Result<()> {
     validate_unique_paths(records)?;
     validate_declared_sizes(records)?;
     root.validate(state, share)?;
@@ -626,6 +676,8 @@ pub fn apply_plan_with_root(
         }
     }
     let (intent, _) = state.set_install_intent(share, records)?;
+    #[cfg(feature = "e2e-test-hooks")]
+    e2e_stop_before_apply(state)?;
     let install_temps: std::collections::HashMap<&[u8], _> = intent
         .temps
         .iter()
@@ -662,7 +714,9 @@ pub fn apply_plan_with_root(
     }
     let mut ordered = Vec::new();
     for record in &accepted {
-        if !ignored_cached(&matcher, record, &mut ignore_cache) {
+        if !ignored_cached(&matcher, record, &mut ignore_cache)
+            && !retained_paths.contains(record.path.as_bytes())
+        {
             ordered.push(record.clone());
         }
     }
@@ -674,6 +728,7 @@ pub fn apply_plan_with_root(
             Entry::File { .. } | Entry::Symlink { .. } => (2, depth),
         }
     });
+    let mut completed: Vec<Record> = Vec::new();
     for record in &ordered {
         let expected = prior
             .get(record.path.as_bytes())
@@ -700,16 +755,89 @@ pub fn apply_plan_with_root(
             phase = InstallTempPhase::Creating;
         }
         if let Err(error) = apply_record(state, share, root_dir, record, expected, &token, phase) {
+            if let Some(invalidated) = error.downcast_ref::<ApplyInvalidated>() {
+                let parent = record
+                    .path
+                    .to_path_buf()
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_path_buf();
+                sync_directory_chain(root_dir, &parent)?;
+                let mut baseline: std::collections::HashMap<_, _> = state
+                    .records(share)?
+                    .into_iter()
+                    .map(|record| (record.path.as_bytes().to_vec(), record))
+                    .collect();
+                for applied in &completed {
+                    baseline.insert(applied.path.as_bytes().to_vec(), applied.clone());
+                }
+                let mut baseline: Vec<_> = baseline.into_values().collect();
+                baseline.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+                let recovered = scan_cap(state, share, &root.path, root_dir, &baseline)?;
+                root.validate(state, share)?;
+                let conflicts = reconcile(&recovered, records).conflicts;
+                let current_intent = state
+                    .install_intent(share)?
+                    .context("install intent disappeared before invalidation recovery")?;
+                if current_intent.records != intent.records {
+                    bail!("install intent changed before invalidation recovery");
+                }
+                state.retire_invalidated_install(
+                    share,
+                    &current_intent,
+                    &recovered,
+                    &conflicts,
+                    &invalidated.path,
+                )?;
+                return Err(ApplyInvalidated {
+                    path: invalidated.path.clone(),
+                }
+                .into());
+            }
             let recovered = scan_cap(state, share, &root.path, root_dir, &state.records(share)?)?;
             root.validate(state, share)?;
             state.replace_records(share, &recovered)?;
             return Err(error.context("apply stopped; state was recovered from disk"));
         }
+        sync_applied_record(root_dir, record)
+            .with_context(|| format!("making applied path durable: {}", record.path.display()))?;
+        completed.push(record.clone());
     }
     root.validate(state, share)?;
     state.replace_records(share, &accepted)?;
     state.clear_install_intent(share)?;
     Ok(())
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_stop_before_apply(state: &State) -> Result<()> {
+    if e2e_claim_apply_stop(state)? {
+        signal_hook::low_level::raise(signal_hook::consts::SIGSTOP)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_claim_apply_stop(state: &State) -> Result<bool> {
+    let marker = state.dir.join(".e2e-stop-before-apply");
+    let claimed = state.dir.join(".e2e-stop-before-apply-claimed");
+    match std::fs::rename(&marker, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("claiming E2E pre-apply stop marker"),
+    }
+    let metadata = std::fs::symlink_metadata(&claimed)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("E2E pre-apply stop marker is not a regular file");
+    }
+    let repeats = std::fs::read(&claimed)?;
+    match repeats.as_slice() {
+        b"" | b"1" => {}
+        b"2" => std::fs::write(&marker, b"1")?,
+        _ => bail!("E2E pre-apply stop marker has an invalid repeat count"),
+    }
+    std::fs::remove_file(&claimed)?;
+    Ok(true)
 }
 
 fn install_temp_exists(root: &cap_std::fs::Dir, record: &Record, token: &str) -> Result<bool> {
@@ -782,6 +910,19 @@ fn apply_record(
         && !matches!(record.version.entry, Entry::Tombstone)
         && !disk_matches_cap(&parent_dir, temp, &record.version.entry)?
     {
+        if temp_phase == InstallTempPhase::Owned
+            && expected
+                .map(|expected| disk_matches_cap(&parent_dir, temp, expected))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            remove_entry(&parent_dir, temp)?;
+            sync_directory_chain(&parent_dir, Path::new(""))?;
+            return Err(ApplyInvalidated {
+                path: record.path.clone(),
+            }
+            .into());
+        }
         bail!("owned install temporary does not match its intended entry");
     }
     match &record.version.entry {
@@ -790,7 +931,8 @@ fn apply_record(
                 parent_dir.create_dir(temp)?;
                 state.mark_install_temp_owned(share, &record.path)?;
             }
-            atomic_install(&parent_dir, temp, name, expected)?;
+            atomic_install(&parent_dir, temp, name, expected, None)
+                .map_err(|error| map_precondition(error, &record.path))?;
         }
         Entry::File {
             hash,
@@ -814,15 +956,8 @@ fn apply_record(
                 }))?;
                 state.mark_install_temp_owned(share, &record.path)?;
             }
-            let old_mode = atomic_install(&parent_dir, temp, name, expected)?;
-            if let Some(mut mode) = old_mode {
-                if *executable {
-                    mode |= 0o111;
-                } else {
-                    mode &= !0o111;
-                }
-                parent_dir.set_permissions(name, Permissions::from_mode(mode))?;
-            }
+            atomic_install(&parent_dir, temp, name, expected, Some(*executable))
+                .map_err(|error| map_precondition(error, &record.path))?;
         }
         Entry::Symlink {
             target: link_target,
@@ -831,7 +966,8 @@ fn apply_record(
                 parent_dir.symlink_contents(bytes_path(link_target), temp)?;
                 state.mark_install_temp_owned(share, &record.path)?;
             }
-            atomic_install(&parent_dir, temp, name, expected)?;
+            atomic_install(&parent_dir, temp, name, expected, None)
+                .map_err(|error| map_precondition(error, &record.path))?;
         }
         Entry::Tombstone => {
             if !temp_exists {
@@ -847,7 +983,12 @@ fn apply_record(
                 expected.expect("tombstones with nothing to delete are skipped before apply");
             if !disk_matches_cap(&parent_dir, temp, expected)? {
                 exchange(&parent_dir, temp, name)?;
-                bail!("path changed while applying: {}", record.path.display());
+                parent_dir.remove_file(temp)?;
+                sync_directory_chain(&parent_dir, Path::new(""))?;
+                return Err(ApplyInvalidated {
+                    path: record.path.clone(),
+                }
+                .into());
             }
             if let Err(error) = remove_entry(&parent_dir, temp) {
                 exchange(&parent_dir, temp, name)?;
@@ -950,26 +1091,145 @@ fn atomic_install(
     temp: &Path,
     target: &Path,
     expected: Option<&Entry>,
-) -> Result<Option<u32>> {
+    executable: Option<bool>,
+) -> Result<()> {
     use cap_std::fs::PermissionsExt;
     if matches!(expected, None | Some(Entry::Tombstone)) {
-        rename_noreplace(root, temp, target)?;
-        return Ok(None);
+        match rename_noreplace(root, temp, target) {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<rustix::io::Errno>()
+                    .is_some_and(|error| *error == rustix::io::Errno::EXIST)
+                    || error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                remove_entry(root, temp)?;
+                sync_directory_chain(root, Path::new(""))?;
+                return Err(InstallPreconditionChanged.into());
+            }
+            Err(error) => return Err(error),
+        }
+        return Ok(());
+    }
+    if let Some(executable) = executable {
+        let mut mode = root.symlink_metadata(target)?.permissions().mode();
+        if executable {
+            mode |= 0o111;
+        } else {
+            mode &= !0o111;
+        }
+        root.set_permissions(temp, cap_std::fs::Permissions::from_mode(mode))?;
+        sync_regular_file(root.as_fd(), temp)?;
     }
     exchange(root, temp, target)?;
     let expected = expected.expect("checked above");
     if !disk_matches_cap(root, temp, expected)? {
         exchange(root, temp, target)?;
         remove_entry(root, temp)?;
-        bail!("path changed while applying");
+        sync_directory_chain(root, Path::new(""))?;
+        return Err(InstallPreconditionChanged.into());
     }
-    let old_mode = root.symlink_metadata(temp)?.permissions().mode();
     if let Err(error) = remove_entry(root, temp) {
         exchange(root, temp, target)?;
         remove_entry(root, temp)?;
         return Err(error.context("displaced entry could not be removed; replacement rolled back"));
     }
-    Ok(Some(old_mode))
+    Ok(())
+}
+
+fn map_precondition(error: anyhow::Error, path: &RelativePath) -> anyhow::Error {
+    if error.downcast_ref::<InstallPreconditionChanged>().is_some() {
+        ApplyInvalidated { path: path.clone() }.into()
+    } else {
+        error
+    }
+}
+
+fn sync_applied_record(root: &cap_std::fs::Dir, record: &Record) -> Result<()> {
+    let path = record.path.to_path_buf();
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let (directories, parent_fd) = open_directory_chain(root, parent)?;
+    if matches!(record.version.entry, Entry::File { .. }) {
+        sync_regular_file(
+            parent_fd.as_fd(),
+            Path::new(path.file_name().context("entry has no basename")?),
+        )?;
+    }
+    let mut directories = directories;
+    if matches!(record.version.entry, Entry::Directory) {
+        directories.push(rustix::fs::openat(
+            parent_fd.as_fd(),
+            Path::new(path.file_name().context("entry has no basename")?),
+            directory_open_flags(),
+            rustix::fs::Mode::empty(),
+        )?);
+    }
+    sync_open_directories(&directories)
+}
+
+fn sync_regular_file(directory: impl AsFd, path: &Path) -> Result<()> {
+    let fd = rustix::fs::openat(
+        directory,
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    #[cfg(target_os = "macos")]
+    rustix::fs::fcntl_fullfsync(&fd)?;
+    #[cfg(not(target_os = "macos"))]
+    rustix::fs::fsync(&fd)?;
+    Ok(())
+}
+
+fn sync_directory_chain(root: &cap_std::fs::Dir, relative: &Path) -> Result<()> {
+    let (directories, _) = open_directory_chain(root, relative)?;
+    sync_open_directories(&directories)
+}
+
+fn directory_open_flags() -> rustix::fs::OFlags {
+    rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC
+}
+
+fn open_directory_chain(
+    root: &cap_std::fs::Dir,
+    relative: &Path,
+) -> Result<(Vec<rustix::fd::OwnedFd>, rustix::fd::OwnedFd)> {
+    let flags = directory_open_flags();
+    let mut directories = vec![rustix::fs::openat(
+        root.as_fd(),
+        Path::new("."),
+        flags,
+        rustix::fs::Mode::empty(),
+    )?];
+    for component in relative.components() {
+        let directory = rustix::fs::openat(
+            directories
+                .last()
+                .context("directory chain is empty")?
+                .as_fd(),
+            Path::new(component.as_os_str()),
+            flags,
+            rustix::fs::Mode::empty(),
+        )?;
+        directories.push(directory);
+    }
+    let leaf = directories
+        .last()
+        .context("directory chain is empty")?
+        .try_clone()?;
+    Ok((directories, leaf))
+}
+
+fn sync_open_directories(directories: &[rustix::fd::OwnedFd]) -> Result<()> {
+    for directory in directories.iter().rev() {
+        rustix::fs::fsync(directory)?;
+    }
+    Ok(())
 }
 
 fn disk_matches_cap(root: &cap_std::fs::Dir, path: &Path, expected: &Entry) -> Result<bool> {
@@ -1196,9 +1456,73 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn install_precondition_errors_become_path_specific_invalidations() -> Result<()> {
+        let path = RelativePath::from_bytes(b"changing/path".to_vec())?;
+        assert_eq!(
+            InstallPreconditionChanged.to_string(),
+            "install precondition changed"
+        );
+        let error = map_precondition(InstallPreconditionChanged.into(), &path);
+        let invalidated = error
+            .downcast_ref::<ApplyInvalidated>()
+            .expect("install preconditions have a typed public result");
+        assert_eq!(invalidated.path, path);
+        assert_eq!(
+            invalidated.to_string(),
+            "path changed while applying: changing/path"
+        );
+
+        let ordinary = map_precondition(anyhow::anyhow!("ordinary failure"), &path);
+        assert_eq!(ordinary.to_string(), "ordinary failure");
+        Ok(())
+    }
+
+    #[test]
     fn rejects_oversized_frame_before_allocation() {
         let bytes = ((MAX_FRAME as u32) + 1).to_be_bytes().to_vec();
         assert!(read_message(&mut bytes.as_slice()).is_err());
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn e2e_apply_stop_marker_is_regular_and_one_shot() -> Result<()> {
+        let temp = tempdir()?;
+        let state = State::open(temp.path().join("state"))?;
+        assert!(!e2e_claim_apply_stop(&state)?);
+
+        let marker = state.dir.join(".e2e-stop-before-apply");
+        fs::write(&marker, b"")?;
+        assert!(e2e_claim_apply_stop(&state)?);
+        assert!(!e2e_claim_apply_stop(&state)?);
+
+        fs::write(&marker, b"2")?;
+        assert!(e2e_claim_apply_stop(&state)?);
+        assert!(e2e_claim_apply_stop(&state)?);
+        assert!(!e2e_claim_apply_stop(&state)?);
+
+        fs::write(&marker, b"3")?;
+        assert!(e2e_claim_apply_stop(&state).is_err());
+        fs::remove_file(state.dir.join(".e2e-stop-before-apply-claimed"))?;
+
+        fs::create_dir(&marker)?;
+        assert!(e2e_claim_apply_stop(&state).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn no_replace_race_removes_the_owned_staged_entry() -> Result<()> {
+        let temp = tempdir()?;
+        fs::create_dir(temp.path().join("staged"))?;
+        fs::write(temp.path().join("target"), b"concurrent")?;
+        let root = cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())?;
+
+        let error = atomic_install(&root, Path::new("staged"), Path::new("target"), None, None)
+            .expect_err("the concurrent target must invalidate the no-replace install");
+
+        assert!(error.downcast_ref::<InstallPreconditionChanged>().is_some());
+        assert!(!temp.path().join("staged").exists());
+        assert_eq!(fs::read(temp.path().join("target"))?, b"concurrent");
+        Ok(())
     }
 
     #[test]

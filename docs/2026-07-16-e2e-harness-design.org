@@ -286,7 +286,7 @@ name, then =rename= — which stays within the same directory and mount.
 
 | =e2e::containers() -> (PeerBox, PeerBox)= | started, unpaired containers — for pairing/rejection scenarios |
 | =e2e::pair() -> (Connector, Peer)=        | the standard opening: init, peer add, confirmed initial sync |
-| =e2e::pair_with(Config)=                  | same, with knobs (currently: watch rescan seconds) |
+| =e2e::pair_with(Config)=                  | same, with knobs (currently: watch session byte limit) |
 | =a.init()= / =a.peer_add(b) -> (Connector, Peer)= | explicit pairing steps; =peer_add= is a =PeerBox= method consuming both boxes |
 | =a.sync()=                                | =flocal sync --yes=; fails the scenario on nonzero exit |
 | =a.sync_dry_run()=                        | =flocal sync --dry-run=; asserts the connector's tree is unchanged by the preview |
@@ -294,9 +294,10 @@ name, then =rename= — which stays within the same directory and mount.
 | =a.sync_expect_offline()=                 | asserts nonzero exit and that the connector's tree is unchanged |
 | =a.sync_expect_err(needle)=               | asserts nonzero exit and a substring of stderr |
 | =a.watch_start() -> Watch= / =watch.stop()= | foreground =flocal watch= held by a guard |
-| =p.status() -> Status=                    | parsed =status --json= (=schema=, =entries=, and =tombstones= as =Option=; fields grow with the scenarios that read them) |
-| =a.conflicts() -> Conflicts=              | parsed =conflicts list --json=, with =expect_one(path)= |
-| =a.restore_loser(id) -> String=           | =restore --version loser= to a scratch path outside the share; returns the content |
+| =a.watch_start_with_apply_stop() -> Watch= / =watch.wait_stopped()= | E2E-feature watch with a one-shot deterministic pre-apply stop |
+| =p.status() -> Status=                    | parsed =status --json= (=schema=, =entries=, =pending_install=, =tombstones=, and =unsettled=; fields grow with the scenarios that read them) |
+| =p.conflicts() -> Conflicts=              | either peer's parsed =conflicts list --json=, with =expect_one(path)= |
+| =p.restore_loser(id) -> String=           | either peer's =restore --version loser= to a scratch path outside the share; returns the content |
 | =p.reset_state()=                         | delete the peer's flocal state directory (=~/.local/state/file.local=) inside its container, so it no longer holds the share registration or peer binding, while its share files and the other peer's registration of it survive |
 | =e2e::known_failure(body)=                | strict expected-failure wrapper for scenarios pinning known-broken behavior on =main= (section 2.4) |
 
@@ -331,8 +332,11 @@ catalog #2 does with =b.assert_absent=).
   killing the =docker exec= client does not kill the exec'd process, and a
   surviving watcher would keep holding the share and global locks. Even
   SIGKILL is lock-safe by the product's own construction: =flock= releases
-  on process exit, SQLite WAL recovers, and =recover_installs= repairs any
-  interrupted install on the next command. =stop(self)= consumes the guard,
+  on process exit, SQLite WAL recovers, and =recover_installs= attempts to
+  repair an interrupted install on the next command.  The stale-intent bug
+  originally pinned by =watch_does_not_remain_stuck_on_a_stale_install_intent=
+  is now repaired and that scenario passes; see the 2026-08-12 update below.
+  =stop(self)= consumes the guard,
   so double-stop is unrepresentable; the guard's =Drop= is the
   never-panicking best-effort backstop.
 
@@ -341,7 +345,7 @@ assert that the embedded =schema= field equals a constant pinned in the
 harness, failing with the actual version on mismatch, so a schema bump
 breaks scenarios mechanically and visibly rather than silently misparsing.
 The conflicts listing has its own pinned constant (=CONFLICTS_SCHEMA=,
-currently 1), independent of the status pin, so the status bump to 2 does
+currently 1), independent of the status pin, so the status bump to 3 does
 not disturb conflicts parsing.
 The pinned constant tracks /=main= at harness landing/: status schema 1,
 which has no =tombstones= field. So that one =Status= struct is final form
@@ -1197,6 +1201,14 @@ pin remains in the catalog. The wrapper itself stays as standing
 vocabulary — the AGENTS.md bug workflow pins newly reported bugs with it
 where possible — and its semantics are exercised by a Docker-free self-test in the
 harness.
+
+* Update 2026-08-12: stale-install recovery and status schema 3
+
+The deterministic pre-apply stop hook now accepts a bounded repeat count of
+one or two.  Two passing watch scenarios use it to prove automatic recovery
+from one scan/install race and isolation of a path that races twice while a
+stable sibling converges.  Status schema 3 adds the byte-preserving
+=unsettled= path list; the conflicts schema remains 1.
 
 * Update 2026-07-22: the watch slice and the section 14.1 hook
 

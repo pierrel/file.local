@@ -155,3 +155,15 @@ rejection described by the detailed design was unreachable for that case.
 the responder answers with the graceful rejection. The end-to-end
 peer-identity scenario was promoted from a known failure, so all sixteen
 end-to-end scenarios now pass against this tree.
+
+* Update 2026-08-12: automatic scan/install-race recovery
+
+Persistent watch protocol version 3 treats a safely rolled-back install
+precondition change as local synchronization state, not a connection failure.
+The obsolete install attempt is retired transactionally with the recovered
+records, retained conflict input, and durable unsettled path.  Watch
+recalculates immediately in the same SSH session.  If that path invalidates
+again, stable work outside its filesystem dependency closure continues; a
+later successful full round clears the status and reports =SETTLED=.  Status
+JSON schema 3 adds the raw-byte =unsettled= list.  The deterministic two-host
+Docker scenarios pass; native macOS filesystem acceptance remains required.

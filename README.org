@@ -175,13 +175,19 @@ failures are summarized every five minutes without log flooding, and recovery
 reports how many attempts failed. Explicit =flocal sync= output remains a
 proposed plan because it may precede initial confirmation.
 
-Persistent watch uses protocol version 2, so install or upgrade =flocal= on both
+If a file changes after a round scans it but before installation, watch keeps
+that local change, records the path as =UNSETTLED=, and recalculates immediately
+without reconnecting. A path that changes again is isolated so stable sibling
+paths can finish. A later full round reports =SETTLED=. =flocal status= and
+=sync list= expose durable unsettled state across daemon restarts.
+
+Persistent watch uses protocol version 3, so install or upgrade =flocal= on both
 peers before adding a managed sync. During a rolling upgrade, the first sync
 can still run through protocol version 1. The daemon keeps retrying with bounded
-failure reports until both peers support version 2; it never silently falls back
+failure reports until both peers support version 3; it never silently falls back
 to polling. Downgrading
 does not change synchronized state, though persistent watch remains unavailable
-until both peers support version 2.
+until both peers support version 3.
 
 See [[file:docs/2026-07-14-v0.0.1-design.org][the proposed detailed design]] for the CLI, wire behavior, recovery commands,
 security model, platform constraints, and acceptance criteria. The README is
