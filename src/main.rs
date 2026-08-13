@@ -4206,6 +4206,11 @@ fn write_plan_report(
         local.iter().map(|r| (r.path.as_bytes(), r)).collect();
     let remote_by_path: std::collections::HashMap<_, _> =
         remote.iter().map(|r| (r.path.as_bytes(), r)).collect();
+    let conflicts_by_path: std::collections::HashMap<_, _> = plan
+        .conflicts
+        .iter()
+        .map(|conflict| (conflict.path.as_bytes(), conflict))
+        .collect();
     // `watch`'s repeating background sync timestamps every printed line and
     // omits KEEP: on an idle share almost every path matches on both peers,
     // and a KEEP line per path per rescan cycle would drown out the
@@ -4217,11 +4222,7 @@ fn write_plan_report(
     for record in &plan.records {
         let local_record = local_by_path.get(record.path.as_bytes());
         let remote_record = remote_by_path.get(record.path.as_bytes());
-        if let Some(conflict) = plan
-            .conflicts
-            .iter()
-            .find(|conflict| conflict.path == record.path)
-        {
+        if let Some(conflict) = conflicts_by_path.get(record.path.as_bytes()) {
             let recovery = if report == PlanReport::Preview {
                 "pending".to_owned()
             } else {

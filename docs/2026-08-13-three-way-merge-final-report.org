@@ -322,7 +322,7 @@ differences, CRLF, repeated lines, files above 200 lines, binary rejection,
 per-file limits, and the 64-candidate cumulative boundary.
 
 =make check= passes formatting and Clippy with warnings denied. LLVM line
-coverage is 91.73 percent for the whole project and 91.57 percent for executable
+coverage is 91.73 percent for the whole project and 91.27 percent for executable
 lines changed from the review base, both above the mandatory 90 percent gate.
 
 Local review found and fixed the live pending-root race, absent cumulative
