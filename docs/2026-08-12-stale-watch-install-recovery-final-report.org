@@ -1,0 +1,845 @@
+#+title: How file.local now recovers when a file changes during synchronization
+#+subtitle: Final design and implementation report
+#+author: file.local project
+#+date: 2026-08-12
+
+* 1. What changed
+
+This work fixes the failure Pierre saw on macOS where =flocal watch .= could
+enter a permanent retry loop after a file changed at exactly the wrong moment.
+The log would repeat messages such as:
+
+#+begin_example
+synchronization failed; retrying in background: apply stopped: path changed while applying
+synchronization still failing: a different install is already pending for this share
+#+end_example
+
+The retry loop was not primarily a connection problem. The connection was
+being torn down because a local filesystem race left an obsolete install
+intent in durable state. Every later attempt found that intent and refused to
+start another installation.
+
+The shipped behavior is now:
+
+1. Preserve the local change that invalidated the old calculation.
+2. Roll back and durably account for anything the abandoned attempt already
+   changed.
+3. Retire only the exact obsolete install intent.
+4. Recalculate immediately over the same peer connection.
+5. If the same path keeps changing, isolate its filesystem dependency closure
+   and synchronize unrelated stable paths.
+6. Remember the unsettled path across crashes and show it in =watch=, =status=,
+   and =sync list=.
+7. Report =SETTLED= when a later complete round proves that the path no longer
+   blocks synchronization.
+
+No repair command, daemon restart, or manual deletion of state is required.
+No meaningful local or remote file version is discarded.
+
+* 2. The mental model
+
+Three concepts matter: a snapshot, a plan, and an install intent.
+
+*A snapshot* describes what one peer believes exists at a point in time. It
+contains paths, version identities, and entry kinds such as file, directory,
+symlink, or tombstone.
+
+*A plan* is a disposable calculation made by reconciling the two snapshots.
+It says what the synchronized tree should become. A plan can become obsolete
+the instant a person or editor changes a file. Throwing away a plan means only
+discarding that calculation. It does not mean throwing away a file or a
+version.
+
+*An install intent* is different. It is the durable journal for one attempt
+to apply a plan. It records the intended records and the temporary names owned
+by that attempt. It exists so a process crash or power loss can be recovered
+without guessing which temporary files belong to file.local.
+
+The *connector* is the peer that opens the SSH watch session and coordinates
+rounds. The *responder* is the remote peer serving that session. The
+*coordinator* is the connector-side loop that decides whether a completed
+round settles work, recalculates immediately, or defers an unsettled closure.
+
+The original implementation correctly treated an install intent as precious,
+but it did not have a safe transition for this case:
+
+#+begin_example
+scan -> record intent -> local file changes -> apply detects mismatch -> rollback
+#+end_example
+
+It restored the local file, but retained the intent. The next attempt then saw
+the old journal and stopped. The fix is not “clear pending state on error.”
+That would be unsafe because many errors occur before rollback is proven. The
+fix is a narrow state transition that can retire an intent only after a typed
+invalidation and durable recovery.
+
+* 3. Intended user experience
+
+The accepted experience has two rules.
+
+First, a file changed between scan and installation remains local input. The
+system recalculates in the same watch session. The user does not run another
+command, restart the daemon, wait for reconnect backoff, or understand an
+install journal.
+
+Second, one continuously changing path must not starve unrelated work. The
+first invalidation gets one immediate full retry. If recalculation is also
+invalidated, the changing path becomes unsettled and stable paths continue.
+
+The visible transitions look like this:
+
+#+begin_example
+2026-08-12T17:00:00Z UNSETTLED notes/today.org changed while synchronizing; recalculating now
+2026-08-12T17:00:01Z UNSETTLED notes/today.org is still changing; stable paths will continue
+2026-08-12T17:00:02Z DOWNLOAD notes/stable.org
+2026-08-12T17:00:09Z SETTLED notes/today.org no longer blocks synchronization
+#+end_example
+
+These are convergence events, not transport failures. They do not increment
+the connection failure counter or print =Peer connection lost=. A real broken
+pipe, timeout, or failed SSH process still uses the existing connection-loss
+and recovery messages.
+
+* 4. The complete recovery design
+
+** 4.1 Detect only a proven install race
+
+The atomic installer already knew when its precondition was false. For an
+existing destination it temporarily exchanges the staged entry with the live
+entry, inspects the displaced entry, and swaps back if the displaced entry is
+not what the plan expected. For a new destination it uses a no-replace rename
+and treats “already exists” as a concurrent creation.
+
+Those narrow cases now become a typed =ApplyInvalidated= result only after the
+live entry has been restored and an owned staging entry has been removed. An
+ordinary I/O error, corrupt object, changed root identity, ignored-path
+collision, or protocol error is not converted into invalidation and cannot
+retire the intent.
+
+This distinction is the main safety boundary. Error text is never parsed.
+
+** 4.2 Make the rollback durable
+
+Restoring a pathname is not enough. Filesystems and storage devices may still
+hold namespace changes in volatile caches. Before the code retires the journal,
+it syncs the directory chain that records the rollback and owned-temporary
+removal. It deliberately does not flush the restored file's contents: those
+bytes may belong to the editor or other local process that won the race, not to
+file.local.
+
+For records that completed successfully before the invalidation, the affected
+directory chain is made durable before the record enters the recovery baseline;
+final regular-file inodes are flushed as well. On Linux, regular files and
+directories use =fsync=. On macOS, regular files use =F_FULLFSYNC= through
+=rustix::fs::fcntl_fullfsync=; directories use =fsync=. A durability failure is
+a real failure. The intent remains available for recovery rather than
+pretending the apply completed.
+
+All directory traversal is descriptor-relative and uses =NOFOLLOW=. A path
+component cannot be swapped for a symlink and redirect durability operations
+outside the held share root.
+
+** 4.3 Recover partial progress accurately
+
+One install intent covers a plan with many records. The race may happen after
+earlier records have already been installed. Recovery therefore cannot scan
+against only the old snapshot or against the complete target plan.
+
+Scanning against only the old snapshot would relabel completed remote versions
+as new local edits. Scanning against the full target would claim that records
+not yet attempted had been installed.
+
+The apply loop records each successfully finalized record in =completed=. On
+invalidation it creates a baseline from the old records, replacing only the
+completed paths with their intended records. It then scans the real tree
+against that baseline. The result says exactly what became true before the
+race, while the invalidated path becomes a fresh local version.
+
+The abandoned target is reconciled with this recovered snapshot only to retain
+conflict inputs. No action from the obsolete plan is spliced into the next
+plan.
+
+** 4.4 Retire the old attempt in one database transaction
+
+The state layer verifies that the current intent is the same attempt being
+retired. It compares the record set and each temporary path/token identity.
+Normal phase advancement is allowed, but a different attempt is rejected.
+
+One SQLite transaction then:
+
+1. replaces persisted records with the recovered snapshot;
+2. inserts recovery conflicts;
+3. records the invalidated path as unsettled;
+4. deletes the exact install intent.
+
+A crash before commit leaves the original intent. Startup recovery can repeat
+the same idempotent rollback. A crash after commit sees recovered state,
+preserved conflicts, and no obsolete intent.
+
+** 4.5 Recalculate without reconnecting
+
+Persistent watch protocol version 3 adds a round result:
+
+#+begin_src rust
+RoundInvalidated { path: RelativePath }
+#+end_src
+
+Either peer can send it only at the point where that peer was applying the
+validated plan. The receiver accepts it only if the path belongs to the
+effective plan and was not a retained no-op. A wrong path, round, phase, or
+duplicate terminal result is a protocol error.
+
+The coordinator does not treat this result as session failure. It does not
+close SSH, apply retry backoff, print actions from the abandoned round, or mark
+watcher generations complete. It records the invalidation and starts the next
+numbered round immediately over the same connection.
+
+Version 2 peers receive an explicit unsupported-protocol-version diagnostic.
+Silent fallback would be dangerous because version 2 does not understand the
+new round state; the operational answer is to upgrade both peers.
+
+** 4.6 Bound a continuously changing path
+
+An =InvalidationCycle= gives the whole plan one immediate unfiltered retry. If
+that retry is invalidated, its path enters a bounded deferred set. A filtered
+round then keeps each peer's own fresh record inside the deferred closure while
+using the reconciled target everywhere else.
+
+The closure is structural, not a byte-prefix match:
+
+1. include the invalidated path and planned descendants;
+2. walk proper ancestors;
+3. if an ancestor changes between directory, non-directory, or missing on
+   either peer or in the target, include that ancestor and all planned
+   descendants;
+4. repeat upward because a structural transition can depend on its parent.
+
+This matters for cases such as replacing =notes= from a directory with a file.
+Deferring only =notes/today.org= would be nonsensical because the parent
+transition controls the child. Deferring every ancestor subtree would be too
+broad and could block unrelated siblings.
+
+The filtered round is still based on two fresh snapshots and one validated
+full plan. Each peer independently derives its side-specific effective target.
+Retained paths are explicit no-ops at the apply boundary. Stable paths use the
+normal apply and verification path.
+
+There is no internal busy loop after isolation. New filesystem generations use
+the existing debounce and maximum-burst behavior; the periodic safety audit is
+the no-event fallback.
+
+** 4.7 Make unsettled state durable and shared
+
+An =unsettled_paths(share_id, path)= table stores byte-preserving relative
+paths. The set is sorted, unique, count-bounded, and conservatively bounded by
+its worst-case JSON encoding size.
+
+During a version 3 watch handshake, each side sends its durable set in bounded
+=UnsettledChunk= frames, then one =Ready=. For each one-way readiness transfer,
+the receiver accumulates chunks in memory and atomically unions the received
+set into its already durable local set only after =Ready=. If that chunk
+sequence ends early, none of its partial set is persisted. The opposite
+direction is a separate transfer: one side may have completed its durable union
+before the reverse transfer finishes.
+
+Each one-way transfer has its own absolute deadline and cumulative metadata
+budget. Both its sender and receiver charge the serialized frame, not merely
+the path array. This last detail came from Copilot review and prevents an
+asymmetric wire limit.
+
+A successful unfiltered round clears the durable seeds before reporting
+=SyncFinished=. Record finalization and seed clearing are separate durable
+transactions. A crash between them may conservatively leave a settled seed,
+which the next successful startup round clears and reports.
+
+** 4.8 Status and compatibility
+
+=flocal status --json= schema 3 includes raw path bytes in =unsettled=. Text
+status prints escaped names. =flocal sync list= appends the number of unsettled
+paths to the daemon state and directs the user to status for names.
+
+The schema and protocol changes are intentional. Both peers must run protocol
+version 3 for persistent watch. A mixed-version daemon keeps reconnecting with
+an explicit unsupported-version error rather than running a subtly
+incompatible state machine. The user must upgrade file.local on both peers.
+
+* 5. How the code implements the design
+
+This section uses representative excerpts from the shipped code. Some are
+shortened, requalified, or given placeholder comments so the relevant Rust fits
+on a Kindle page; each excerpt identifies the real implementation it explains.
+
+** 5.1 A typed result instead of matching prose
+
+From =src/sync.rs=:
+
+#+begin_src rust
+#[derive(Debug)]
+pub struct ApplyInvalidated {
+    pub path: RelativePath,
+}
+
+impl std::fmt::Display for ApplyInvalidated {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "path changed while applying: {}", self.path.display())
+    }
+}
+
+impl std::error::Error for ApplyInvalidated {}
+#+end_src
+
+=ApplyInvalidated= carries a validated =RelativePath=. The display string is
+for a person; the Rust type is for control flow. Callers use
+=error.downcast_ref::<ApplyInvalidated>()=, so another error that happens to say
+“path changed” cannot enter the retirement path.
+
+There is an even narrower private =InstallPreconditionChanged= inside the
+atomic rename code. =map_precondition= attaches the affected path and promotes
+it to =ApplyInvalidated= only at the synchronization boundary:
+
+#+begin_src rust
+fn map_precondition(error: anyhow::Error, path: &RelativePath) -> anyhow::Error {
+    if error.downcast_ref::<InstallPreconditionChanged>().is_some() {
+        ApplyInvalidated { path: path.clone() }.into()
+    } else {
+        error
+    }
+}
+#+end_src
+
+** 5.2 The atomic rollback
+
+The existing-target branch exchanges staged and live entries. If the displaced
+entry is not the expected old version, it swaps back, removes the owned staged
+entry, syncs the directory, and returns the narrow precondition error:
+
+#+begin_src rust
+exchange(root, temp, target)?;
+let expected = expected.expect("checked above");
+if !disk_matches_cap(root, temp, expected)? {
+    exchange(root, temp, target)?;
+    remove_entry(root, temp)?;
+    sync_directory_chain(root, Path::new(""))?;
+    return Err(InstallPreconditionChanged.into());
+}
+#+end_src
+
+For a destination expected not to exist, =rename_noreplace= is used. An
+=AlreadyExists= result means another actor created the destination. The code
+removes only its own staged entry, syncs the directory, and invalidates.
+
+** 5.3 Partial-apply recovery
+
+The apply loop tracks completed records. On the typed error, it overlays those
+records onto the prior baseline and scans the actual tree:
+
+#+begin_src rust
+let mut baseline: HashMap<_, _> = state
+    .records(share)?
+    .into_iter()
+    .map(|record| (record.path.as_bytes().to_vec(), record))
+    .collect();
+
+for applied in &completed {
+    baseline.insert(applied.path.as_bytes().to_vec(), applied.clone());
+}
+
+let mut baseline: Vec<_> = baseline.into_values().collect();
+baseline.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+let recovered = scan_cap(state, share, &root.path, root_dir, &baseline)?;
+#+end_src
+
+The map makes “one record per path” explicit and avoids repeatedly searching a
+vector. Sorting restores deterministic state and wire order.
+
+After root identity is revalidated, the state transaction retires the exact
+attempt. A different intent produces an error rather than deleting somebody
+else's recovery journal.
+
+** 5.4 The retirement transaction
+
+From =src/state.rs=:
+
+#+begin_src rust
+let tx = self.conn.transaction()?;
+tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
+for record in records {
+    tx.execute(
+        "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
+        params![share.0, record.path.as_bytes(), serde_json::to_string(&record.version)?],
+    )?;
+}
+for conflict in conflicts {
+    insert_conflict(&tx, share, conflict)?;
+}
+tx.execute(
+    "INSERT OR IGNORE INTO unsettled_paths(share_id,path) VALUES(?1,?2)",
+    params![share.0, unsettled.as_bytes()],
+)?;
+ensure_unsettled_limit(&tx, share)?;
+tx.execute("DELETE FROM install_intents WHERE share_id=?1", [&share.0])?;
+tx.commit()?;
+#+end_src
+
+Nothing becomes visible halfway through this sequence. SQLite exposes either
+the old intent and old records or the complete recovered state.
+
+** 5.5 Platform-specific durability without path traversal
+
+The final file is opened relative to an already opened directory, with symlink
+following disabled:
+
+#+begin_src rust
+let fd = rustix::fs::openat(
+    directory,
+    path,
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    Mode::empty(),
+)?;
+
+#[cfg(target_os = "macos")]
+rustix::fs::fcntl_fullfsync(&fd)?;
+#[cfg(not(target_os = "macos"))]
+rustix::fs::fsync(&fd)?;
+#+end_src
+
+Before this code runs, every synchronized path has been constructed as a
+=RelativePath=. That type accepts only a nonempty, NUL-free canonical sequence
+of normal relative components; it rejects absolute paths, =.=, =..=, duplicate
+separators, trailing separators, =.git=, and file.local's reserved temporary
+names. The directory chain is then opened one validated component at a time
+with =DIRECTORY=, =NOFOLLOW=, and =CLOEXEC=. The descriptors are synced from
+leaf back toward the root. The validated path type plus descriptor-relative
+traversal tie every operation to the held share capability instead of
+re-resolving an attacker-controlled ambient pathname.
+
+** 5.6 A closed protocol state
+
+The wire frames are Rust enums:
+
+#+begin_src rust
+pub enum V2SessionFrame {
+    // existing variants
+    UnsettledChunk { paths: Vec<RelativePath> },
+    Ready { generation: u64 },
+}
+
+pub enum V2RoundFrame {
+    // existing variants
+    RoundInvalidated { path: RelativePath },
+}
+#+end_src
+
+Despite the historical =V2= type names, =WATCH_PROTOCOL_VERSION= is now 3.
+Keeping the framing types avoided a wide rename with no behavioral value; the
+version number and accepted variants define compatibility.
+
+Pattern matching makes phase handling exhaustive. For example, the connector
+accepts an invalidation reported by the responder only when the path belongs to
+the connector's effective view of the responder plan:
+
+#+begin_src rust
+V2RoundFrame::RoundInvalidated { path }
+    if accepts_invalidation(&responder_plan, &path) =>
+{
+    state.remember_unsettled_path(share, &path)?;
+    return Ok(ConnectorRound::Invalidated(path));
+}
+#+end_src
+
+An unmatched frame falls into the existing protocol-error path. There is no
+boolean combination such as =is_done && is_invalidated= that could represent
+an impossible state.
+
+** 5.7 Atomic readiness union
+
+The receiver holds chunks locally until the phase-closing frame:
+
+#+begin_src rust
+let mut unsettled = Vec::new();
+loop {
+    match read_v2_envelope_until(input, budget.frame_deadline()?)? {
+        V2Envelope::Session {
+            frame: frame @ V2SessionFrame::UnsettledChunk { .. },
+        } => {
+            budget.add_metadata(serde_json::to_vec(&frame)?.len())?;
+            let V2SessionFrame::UnsettledChunk { paths } = frame else {
+                unreachable!("matched unsettled chunk")
+            };
+            unsettled.extend(paths);
+        }
+        V2Envelope::Session { frame: V2SessionFrame::Ready { .. } } => {
+            unsettled.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            unsettled.dedup();
+            state.remember_unsettled_paths(share, &unsettled)?;
+            return Ok(());
+        }
+        other => return Err(watch_protocol_error(format!(
+            "unexpected persistent readiness frame: {other:?}"
+        ))),
+    }
+}
+#+end_src
+
+The real function also enforces the cumulative byte and record-count limits.
+The important shape is that database mutation occurs only in the =Ready=
+branch.
+
+** 5.8 One retry, then isolation
+
+The coordinator owns an =InvalidationCycle=. Its first observed path returns
+=Recalculate=. Later invalidations return =Deferred= and enter a set. That set
+feeds =effective_plan=, which keeps each side's own records inside the closure
+and the reconciled records outside it.
+
+The apply API receives =retained_paths= explicitly:
+
+#+begin_src rust
+for record in &accepted {
+    if !ignored_cached(&matcher, record, &mut ignore_cache)
+        && !retained_paths.contains(record.path.as_bytes())
+    {
+        ordered.push(record.clone());
+    }
+}
+#+end_src
+
+This is intentionally a no-op list at the final apply boundary. It prevents a
+future refactor from accidentally “applying” the retained local version while
+still allowing all non-retained paths to use the ordinary verification path.
+
+* 6. Rust features used here
+
+This section explains the language features in the examples without assuming
+prior Rust experience.
+
+** 6.1 =Result=, the =?= operator, and error context
+
+Most fallible functions return =Result<T>=. =?= means: if this operation
+succeeded, unwrap its value; if it failed, return the error immediately.
+
+#+begin_src rust
+sync_directory_chain(root_dir, &parent)?;
+#+end_src
+
+The code uses =anyhow::Context= when a low-level error needs operator meaning:
+
+#+begin_src rust
+sync_applied_record(root_dir, record)
+    .with_context(|| format!(
+        "making applied path durable: {}",
+        record.path.display()
+    ))?;
+#+end_src
+
+The original OS error remains in the error chain, while the message now names
+the affected path. This path context was another Copilot round 1 finding.
+
+** 6.2 Typed errors and downcasting
+
+=anyhow::Error= can carry any error implementing Rust's =Error= trait. Most
+callers can propagate it without knowing its concrete type. A boundary that
+must make a state-machine decision can inspect it safely:
+
+#+begin_src rust
+if let Some(invalidated) = error.downcast_ref::<ApplyInvalidated>() {
+    // exact recovery transition
+}
+#+end_src
+
+=downcast_ref= borrows the embedded value; it does not consume the error. This
+gives the convenience of a general application error while retaining one
+machine-readable exceptional condition.
+
+** 6.3 Enums and exhaustive pattern matching
+
+A Rust =enum= is a tagged union. Each variant can carry different data. A
+=match= must cover all possibilities unless it has a catch-all arm. This makes
+protocol phases and round outcomes much harder to represent incorrectly than a
+collection of loosely related flags.
+
+A match guard adds a condition to one pattern:
+
+#+begin_src rust
+V2RoundFrame::RoundInvalidated { path }
+    if accepts_invalidation(&plan, &path) => { /* accept */ }
+#+end_src
+
+The same variant with an unrecognized path does not enter that arm.
+
+** 6.4 Ownership, borrowing, and cloning
+
+Rust gives every value one owner. Passing =&path= borrows it temporarily;
+passing =path= moves ownership; =path.clone()= creates another owned value.
+
+The recovery code borrows large shared structures where possible and clones a
+=RelativePath= or =Record= when the value must outlive the current borrow or be
+stored in another collection. These clones copy metadata and path bytes, not
+file contents.
+
+=std::slice::from_ref(path)= creates a borrowed one-item slice without cloning:
+
+#+begin_src rust
+self.remember_unsettled_paths(share, std::slice::from_ref(path))
+#+end_src
+
+That lets the one-path API reuse the transactional many-path implementation.
+
+** 6.5 The =let ... else= pattern
+
+This form destructures a value and requires a diverging fallback:
+
+#+begin_src rust
+let V2SessionFrame::UnsettledChunk { paths } = frame else {
+    unreachable!("matched unsettled chunk")
+};
+#+end_src
+
+The surrounding match has already proven the variant. The statement moves
+=paths= out after the complete frame has been serialized for budget accounting.
+The =else= documents the invariant to the compiler and reader.
+
+** 6.6 Traits such as =AsFd= and =Error=
+
+A trait describes shared behavior. Implementing =std::error::Error= makes a
+type usable in Rust's error ecosystem. Accepting =impl AsFd= lets a function
+work with any object that can lend a file descriptor without taking ownership
+of it.
+
+=OwnedFd= closes its descriptor automatically when dropped. The directory
+chain therefore has explicit lifetime ownership without manual close calls.
+
+** 6.7 Conditional compilation
+
+=#[cfg(target_os = "macos")]= includes code only in a macOS build.
+=#[cfg(feature = "e2e-test-hooks")]= includes the deterministic pause hook only
+in the Docker E2E binary. Production builds do not contain the hook.
+
+This is compile-time selection, not a runtime branch. Native macOS CI proved
+that the =F_FULLFSYNC= code compiled and the platform suite passed.
+
+** 6.8 Capability-oriented filesystem access
+
+=cap_std::fs::Dir= represents an already opened directory. Operations are
+relative to that capability. Combined with =openat= and =NOFOLLOW=, this avoids
+repeated ambient path resolution and constrains work to the share root.
+
+This is not a special Rust language feature, but Rust's ownership of the
+directory and file descriptors makes the capability lifetime clear and closes
+descriptors automatically.
+
+* 7. What changed by component
+
+** =src/sync.rs=
+
+- Added the typed invalidation errors.
+- Added safe rollback classification for exchange, no-replace, and tombstone
+  races.
+- Added partial-progress tracking and recovery baseline construction.
+- Added retained-path skipping at the final apply boundary.
+- Added descriptor-relative file and directory durability.
+- Added protocol version 3 frame variants.
+- Added the feature-gated deterministic pre-apply pause hook.
+
+** =src/state.rs=
+
+- Added the =unsettled_paths= table and sorted byte-preserving accessors.
+- Added bounded union persistence.
+- Added the exact-attempt =retire_invalidated_install= transaction.
+- Shared conflict insertion inside ordinary and recovery transactions.
+
+** =src/main.rs=
+
+- Added handshake chunking and atomic readiness union.
+- Added responder and connector invalidation paths.
+- Added the one-retry/defer coordinator state machine.
+- Added dependency-closure and side-specific effective-plan derivation.
+- Added =UNSETTLED= and =SETTLED= output.
+- Added unsettled information to status and daemon sync listings.
+- Changed startup recovery to treat a safely retired invalidation as recovered,
+  while preserving ordinary failures.
+- Added explicit mixed-version behavior.
+
+** E2E harness and tests
+
+- The Docker E2E build enables =e2e-test-hooks=.
+- The harness can create a counted pause marker, wait for watch to stop at the
+  exact boundary, mutate a file, and resume the process.
+- The original failure scenario is now a normal passing test.
+- A second scenario invalidates a hot path twice and proves a stable sibling
+  synchronizes before the hot path settles.
+- Core tests cover exact intent identity, recovered state, durable unsettled
+  paths, and an interrupted exchange followed by a local edit.
+- Protocol tests cover the new closed frame variants and version rejection.
+- Unit and in-process tests cover closure behavior, phase validation, readiness
+  atomicity, bounded logging, and session reuse.
+
+** Documentation
+
+=README.org=, the alpha implementation record, persistent-watch design, E2E
+harness design, project state-of-the-union, detailed recovery design, and E2E
+design were reconciled with the shipped behavior. Status JSON is documented as
+schema 3 and persistent watch as protocol 3.
+
+* 8. What was hard
+
+** 8.1 Knowing when it is safe to forget durable state
+
+The obvious fix was to clear the pending intent when apply said the path had
+changed. That is unsafe. The same broad failure path can include I/O failure,
+corrupt content, ambiguous temporary ownership, or failure during rollback.
+Deleting the intent in those cases removes the only durable explanation of
+filesystem debris.
+
+The solution required a proof chain: recognize one exact precondition race,
+restore the live entry, remove only a proven-owned temporary, make those facts
+durable, recover partial progress, verify intent identity, then retire in one
+transaction.
+
+** 8.2 Representing partial truth
+
+After three records apply and the fourth invalidates, neither the old snapshot
+nor the target plan describes reality. The difficult part was constructing a
+baseline that says “these exact records completed; the rest did not.” That
+preserves remote version identities instead of inventing local edits and avoids
+claiming unattempted work succeeded.
+
+** 8.3 Letting peers disagree locally while agreeing globally
+
+For a deferred path, each peer must retain its own local version. Therefore the
+two effective apply targets differ inside the closure, yet they must agree on
+the synchronized target everywhere else and validate the same full plan.
+
+The clean separation is:
+
+- one shared, validated full plan;
+- one shared invalidation history and derived closure;
+- two deterministic effective plans, each retaining its own snapshot only
+  inside that closure.
+
+This avoided adding a second ad hoc plan protocol or trusting one peer's
+filtered calculation.
+
+** 8.4 Progress without an unbounded retry loop
+
+Immediate retry gives the desired fast recovery for ordinary editor saves, but
+unbounded immediate retries turn a hot file into a CPU and network loop. A
+fixed retry count alone would still block stable paths. The one-retry-then-
+isolate state machine provides fast common-case recovery and a construction
+that guarantees stable work can proceed.
+
+** 8.5 Filesystem durability across Linux and macOS
+
+Atomic rename protects namespace consistency, not persistence across power
+loss. Before the journal can be retired, completed file.local records must pass
+their applicable inode and directory durability gates, and the invalidated
+rollback and owned-temporary removal must be durable in the affected directory
+chain. The concurrently edited winning file remains owned by its local writer.
+Linux and macOS expose different strongest operations, and directory traversal
+itself must resist symlink races. Native macOS CI was essential because Docker
+on Linux cannot compile or exercise the macOS branch.
+
+** 8.6 Reproducing a race deterministically
+
+The production bug depended on timing between setting the intent and applying
+the first record. A test based on sleeps would be slow and flaky. The E2E-only
+marker makes the process stop at the exact boundary using =SIGSTOP=. The test
+changes the live file and resumes with =SIGCONT=. A counted marker repeats the
+same boundary for the stable-sibling scenario.
+
+The hook is deliberately absent from production builds.
+
+** 8.7 Keeping protocol input bounded and transactional
+
+Durable unsettled state must survive reconnects, so both peers exchange it at
+startup. That introduces an untrusted variable-length input before normal
+rounds. The design needed a count limit, cumulative encoded-byte limit,
+absolute deadline, frame-size limit, authenticated share binding, and an atomic
+phase close so a disconnect cannot persist half a union.
+
+Review found one subtle asymmetry: the sender charged the complete enum frame,
+while the receiver initially charged only the contained path vector. Charging
+the same serialized unit on both sides fixed the actual boundary rather than
+adding more slack.
+
+* 9. Validation and review evidence
+
+Local validation on the final implementation head:
+
+- =make check= passed.
+- Whole-project line coverage exceeded 90 percent.
+- Changed executable lines were 90.06 percent covered on final head =83a8956=.
+- Formatting passed.
+- Clippy passed for all targets and features with warnings denied.
+- All 26 Docker E2E scenarios passed.
+- The exact stale-intent reproduction passed.
+- The continuously changing path and stable sibling scenario passed.
+- The locally installed release daemon was active and running.
+
+Hosted validation on GitHub:
+
+- Ubuntu tests passed.
+- Native macOS tests passed.
+- Coverage passed.
+- All Docker E2E scenarios passed.
+
+The local review loop covered correctness, concurrency and liveness, error
+handling and edge cases, adversarial security, simplicity and duplication,
+design adherence, cross-platform filesystem behavior, and dedicated comment
+and documentation alignment. The final local passes were clear.
+
+Copilot round 1 found three real issues:
+
+1. receive-side readiness accounting omitted the enum wrapper;
+2. the E2E design listed a helper that no longer existed;
+3. durability failures lacked affected-path context.
+
+All three were fixed, locally reviewed, retested, redeployed, replied to, and
+resolved. Copilot round 2 produced no formal comments. It offered two
+suppressed suggestions about cleaning deliberately malformed E2E marker state.
+Those were declined because the feature exists only in disposable test
+containers, malformed markers are fatal harness misuse, and adding recovery
+from an invalid directory marker would support an unobserved state.
+
+The final reviewed implementation is commit =83a8956= in pull request 10.
+
+* 10. Remaining limits and operational notes
+
+- Both peers must be upgraded together for persistent watch protocol 3.
+- One-shot protocol v1 gains safe retirement during startup recovery, but it
+  does not gain same-session recalculation.
+- An actually broken connection still reconnects with bounded retry. This work
+  separates local invalidation from connection failure; it does not hide
+  transport failures.
+- A path can remain visibly unsettled while it continues changing. That is an
+  accurate state, not a stuck install. Stable paths continue.
+- Durable seeds can conservatively survive a crash after a successful round
+  but before seed clearing. The next full successful round clears them.
+- Docker proves the state machine on Linux. Native macOS CI covers compilation
+  and the platform suite. The original foreground workflow on a real Mac
+  remains useful final acceptance for FSEvents and the native filesystem.
+
+For manual testing, install the same reviewed version on both peers, start the
+managed sync or =flocal watch .=, edit a synchronized file repeatedly while a
+separate stable file changes on the other peer, and observe:
+
+1. no recurring =a different install is already pending=;
+2. no connection-loss message for the local race;
+3. =UNSETTLED= followed by stable sibling progress;
+4. =SETTLED= after editing stops;
+5. =pending_install: false= in status;
+6. an empty =unsettled= array after the final full round.
+
+* 11. Why this design fits file.local
+
+The final design adds one durable table, one typed state transition, and two
+protocol variants. It does not add a repair command, background worker,
+per-record journal, second connection, or dependency.
+
+It keeps the central local-first promise: a concurrent local edit is input, not
+an error to overwrite. It keeps crash recovery conservative: durable ownership
+state is forgotten only after the filesystem and recovered database state make
+that safe. It keeps one noisy file from controlling the whole share. Finally,
+it exposes the important distinction to the user: connection trouble is
+connection trouble; a changing local path is an unsettled convergence state;
+and neither should masquerade as the other.
