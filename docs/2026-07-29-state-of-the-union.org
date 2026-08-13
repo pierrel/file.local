@@ -421,8 +421,9 @@ to inspect or restore a winner/loser version.
 
 [[file:src/sync.rs][src/sync.rs]] owns the SSH protocol types and the mechanics
 of turning a plan into durable filesystem changes.  It has a v1 one-shot
-protocol and a v2 persistent-watch protocol.  Both use typed serde messages,
-explicit phases, and bounded framing.
+protocol and a version-3 persistent-watch protocol.  Both use typed serde
+messages, explicit phases, and bounded framing. Version 3 adds same-session
+scan/install-race recovery and durable unsettled-state exchange.
 
 The protocol has non-negotiable resource limits:
 
@@ -630,6 +631,8 @@ or a half-applied transfer.
 - For protocol and recovery design decisions: [[file:docs/2026-07-24-persistent-watch-protocol-design.org][persistent watch design]] and
   [[file:docs/2026-07-25-daemon-managed-sync-design.org][daemon-managed sync design]].
 - For the original product constraints and explicit gaps: [[file:docs/2026-07-14-alpha-implementation.org][alpha implementation state]].
+- For the reconciled current baseline and accepted three-way implementation:
+  [[file:docs/2026-08-13-v0.0.1-design-reconciliation.org][v0.0.1 design reconciliation]].
 - For an approachable code exercise, read a test in
   [[file:tests/e2e/scenarios/watching.rs][tests/e2e/scenarios/watching.rs]], then follow the called behavior into
   =src/main.rs=.  Rust tests are ordinary functions marked =#[test]=; the

@@ -12,7 +12,7 @@ whole-file conflict recovery, and automatic stale-install recovery are the
 foundation. Leaving alpha requires one substantial synchronization feature and
 the lifecycle and safety work that makes it trustworthy.
 
-** TODO Reconcile the durable design with the implementation
+** DONE Reconcile the durable design with the implementation
 
 Update the dated design and implementation state before changing the merge
 model. Remove stale descriptions of already implemented background services and

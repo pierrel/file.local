@@ -167,3 +167,32 @@ again, stable work outside its filesystem dependency closure continues; a
 later successful full round clears the status and reports =SETTLED=.  Status
 JSON schema 3 adds the raw-byte =unsettled= list.  The deterministic two-host
 Docker scenarios pass; native macOS filesystem acceptance remains required.
+
+* Update 2026-08-13: reconciled current baseline
+
+The historical lists above are no longer a complete description of =main=.
+The reader-first current baseline and accepted next implementation are now in
+[[file:2026-08-13-v0.0.1-design-reconciliation.org][the v0.0.1 design reconciliation]], while [[file:../ROADMAP.org][the roadmap]] defines the alpha exit.
+
+In particular, the earlier statement that background services were deferred is
+obsolete. =make install= now installs one per-user daemon through systemd on
+Linux or a LaunchAgent in a macOS graphical session. The daemon owns enabled
+connector watches, restores them after restart, and exposes private local
+=list=, =start=, and =stop= control. Each worker keeps a version-3 SSH session,
+uses native events as scan hints, heartbeats while idle, performs periodic full
+audits, reconnects with bounded backoff, and reports connection and local
+unsettled-state transitions.
+
+Root device/inode identity is durable, missing or replaced roots block rather
+than being scanned as empty, and scan/install precondition changes now roll back
+and recalculate within the same session. Directory durability coverage was
+expanded as part of that recovery work. Full crash-boundary fault injection,
+native macOS filesystem acceptance, destination-local ACL/xattr preservation,
+and adversarial concurrent-symlink stress remain release gates.
+
+All current Docker E2E scenarios pass. Whole-file file/file conflicts still use
+recoverable last-write-wins with =winner=/=loser= restoration. Three-way merge,
+common-base retention, richer conflict recovery, pruning, clean relationship
+removal, durable operational timestamps/errors, filename representability, and
+rename correlation beyond unambiguous events remain work for the focused
+=v0.0.1= exit defined by the roadmap.
