@@ -1,0 +1,148 @@
+#+title: file.local roadmap
+
+This roadmap records the minimum product work needed to move beyond the alpha,
+followed by deliberately deferred work. The alpha exit is a focused =v0.0.1=:
+two peers should support Pierre's everyday macOS/Linux editor-and-agent workflow
+without data loss or manual repair of synchronization state.
+
+* Exit alpha: =v0.0.1=
+
+The existing two-peer synchronization, managed daemon, offline catch-up,
+whole-file conflict recovery, and automatic stale-install recovery are the
+foundation. Leaving alpha requires one substantial synchronization feature and
+the lifecycle and safety work that makes it trustworthy.
+
+** TODO Reconcile the durable design with the implementation
+
+Update the dated design and implementation state before changing the merge
+model. Remove stale descriptions of already implemented background services and
+recovery behavior, distinguish the current alpha from the intended =v0.0.1=,
+and make the remaining acceptance criteria explicit.
+
+** TODO Deterministic three-way text merge
+
+When both peers change a text file from the same retained base, preserve
+identical and non-overlapping edits from both peers. Resolve only overlapping
+hunks by the existing deterministic last-write-wins ordering, without placing
+conflict markers in the working file.
+
+This includes the state model needed to make merging and recovery real:
+
+1. Retain and identify a common base until it is no longer needed.
+2. Produce one merged operation that causally descends from both inputs.
+3. When overlap or fallback creates a recovery conflict, store the base when
+   available, both inputs, merged result when available, ordering, and any
+   overlapping hunks.
+4. Restore any version retained by that recovery conflict.
+5. Fall back to whole-file last-write-wins for binary, oversized, or baseless
+   files while retaining both available inputs.
+6. Retain the recoverable input for destructive delete-versus-edit and
+   incompatible path-kind conflicts.
+
+Text classification and merging must use bounded memory and CPU. Any spill
+storage is owner-only and counts toward the existing state budget; a hostile or
+pathological peer input must not turn merging into unbounded work.
+
+Live collaborative editing, CRDTs, and semantic language-aware merging are out
+of scope.
+
+** TODO Bound recovery storage
+
+Add explicit conflict pruning with a preview. Never prune a base still required
+for a future merge. Report recovery-object disk usage in status so a user can
+act before the configured state budget safely stops synchronization. Add a
+durable per-share command to raise that budget locally or on the peer. Budget
+exhaustion and =ENOSPC= must stop before changing the visible file and clean up
+any partial unreferenced object.
+
+Automatic acknowledged-tombstone collection is not required to leave alpha;
+tombstones may remain indefinitely in =v0.0.1= because that behavior is safe and
+visible. It is required before a broader stable release.
+
+** TODO Remove a synchronization relationship cleanly
+
+Provide a confirmed removal command that stops the managed worker and removes
+both registrations when the peer is reachable. Preserve synchronized files and
+document the retained recovery state. Provide an explicit local-only escape
+hatch for a permanently unavailable peer.
+
+Uninstalling the global per-user daemon is not an alpha-exit requirement; it may
+remain installed and idle when no sync is enabled.
+
+** TODO Make operational state durable and visible
+
+Persist and report the last successful synchronization, last connection
+attempt, last complete scan, current retry state, last actionable connection
+error, pending work, and whether remote state is unknown while offline. A stale
+or unknown snapshot must never look like an authoritative zero-pending state.
+This must remain useful when a managed macOS worker failed outside a foreground
+=flocal watch= session and complement the recovery usage reported by status.
+
+** TODO Preserve destination-local filesystem metadata
+
+Continue synchronizing only the executable bit, but preserve the existing
+destination file's owner, ordinary permission bits, ACLs, and extended
+attributes across replacement. If the target cannot preserve its local
+metadata, block the replacement instead of silently discarding it.
+
+** TODO Give observed renames deterministic semantics
+
+Capture a rename as one operation when the watcher supplies an unambiguous pair
+or file identity, so concurrent rename, edit, or delete resolves by the same
+deterministic ordering. Report any ambiguous rename, including an unpaired macOS
+filesystem event or a later scan discovery, and fall back visibly to path-wise
+delete plus create rather than guessing. An unobserved rename-and-edit remains
+ambiguous in =v0.0.1= and does not require hidden identity metadata in user
+files.
+
+** TODO Complete the cross-platform safety gates
+
+Before tagging =v0.0.1=:
+
+1. Exercise native macOS-to-Linux synchronization over SSH through sleep/wake,
+   network loss, offline edits on both peers, atomic editor saves, daemon
+   restart, and upgrade.
+2. Verify that every exact filename can round-trip on the target filesystem and
+   detect case-folding and Unicode-normalization collisions before applying a
+   tree that the target cannot represent safely.
+3. Inject interruption at every durable install transition and prove restart
+   yields the complete old file, the complete new file, or a recoverable
+   recorded intent, never mixed or unexplained state.
+4. Stress concurrent symlink replacement at filesystem boundaries.
+5. Dogfood the native macOS/Linux workflow through repeated reconnects,
+   conflicts, and upgrades with no manual metadata repair or lost recoverable
+   version.
+
+* After =v0.0.1=
+
+These are intentionally not requirements for leaving alpha unless real usage
+shows that one blocks the two-peer workflow.
+
+** TODO Collect acknowledged tombstones
+
+Remove a tombstone only after both peers have durably acknowledged it and no
+retained merge base refers to the deleted version.
+
+** TODO Replace full scans where measurement justifies it
+
+The full scanner is the correctness backstop. Add incremental filesystem event
+handling or transfer deltas only when measured tree size or transfer cost makes
+the current behavior inadequate.
+
+** TODO Make the peer-side =flocal= executable more discoverable
+
+It currently:
+
+1. Tries =command -v flocal=.
+2. Falls back to =$HOME/.local/bin/flocal=.
+3. Validates and stores the resulting absolute path.
+
+Revisit this when supporting more installation layouts or more than two peers.
+
+** TODO Broader product surface
+
+More than two peers, invitations and discovery, guaranteed inference of
+unobserved rename-and-edit operations, resumable chunk transfer, synchronization
+of ACLs and extended attributes between peers, a GUI, and packaged installers
+remain outside the =v0.0.1= exit bar. Destination-local ACLs and extended
+attributes are nevertheless preserved during replacement.
