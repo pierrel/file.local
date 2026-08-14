@@ -1,6 +1,6 @@
 #+title: Bounded recovery storage: final implementation report
 #+date: 2026-08-14
-#+status: locally validated
+#+status: reviewed
 
 * What changed for the user
 
@@ -335,11 +335,11 @@ budget control, dry-run over an already-full recovery allowance, and managed
 watch blocking on byte, count, and metadata limits then resuming automatically
 after the applicable remediation.
 
-The final =make check= passed with 92.11% whole-project line coverage and
-91.74% changed-line coverage.  Rust formatting and Clippy with warnings denied
+The final =make check= passed with 92.15% whole-project line coverage and
+91.80% changed-line coverage.  Rust formatting and Clippy with warnings denied
 were clean.  The complete Docker suite passed all 33 scenarios.
 
-Four local review rounds covered correctness, error handling, concurrency and
+Five local review rounds covered correctness, error handling, concurrency and
 liveness, adversarial security, simplicity and duplication, design adherence,
 and documentation alignment.  No blocker was found.  Important findings were
 fixed around pre-mutation admission, invalidation recovery, typed terminal
@@ -348,6 +348,13 @@ restart after remediation, protocol-upgrade liveness, and truthful partial
 success.  Smaller findings fixed stale documentation, unsafe command examples,
 duplicate walkers, inconsistent snapshots, child cleanup, and preview-output
 bounds.  No concrete finding was rejected.  The final round was clear.
+
+The first Copilot bridge review found one real issue that the local loop had
+missed: SQLite's =LENGTH(TEXT)= counts Unicode characters, while the recovery
+allowance is defined in stored UTF-8 bytes.  The accounting queries now use
+=LENGTH(CAST(field AS BLOB))= for every text field, and a regression test with
+non-ASCII peer IDs compares SQLite's total with the canonical Rust byte count.
+The post-fix local review and all checks were clear.
 
 There is no deploy target for this standalone CLI repository.  Linux-native
 and Docker validation ran locally; macOS remains covered by CI and Pierre's

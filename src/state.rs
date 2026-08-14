@@ -1788,7 +1788,7 @@ impl State {
         #[cfg(feature = "e2e-test-hooks")]
         let fail_after = self.recovery_test_limit(".e2e-recovery-temp-fail-after")?;
         let (summaries, summary_bytes): (i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(6*LENGTH(id)+16*LENGTH(path)+128),0)
+            "SELECT COUNT(*),COALESCE(SUM(6*LENGTH(CAST(id AS BLOB))+16*LENGTH(path)+128),0)
              FROM conflicts WHERE share_id=?1",
             [&share.0],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2725,8 +2725,10 @@ fn sync_dir(path: &Path) -> Result<()> {
 
 fn recovery_row_totals(connection: &Connection, share: &ShareId) -> Result<(u64, u64)> {
     let mut statement = connection.prepare(
-        "SELECT LENGTH(id),LENGTH(path),LENGTH(winner_json),LENGTH(loser_json),
-                LENGTH(created_ns),COALESCE(LENGTH(conflict_json),0)
+        "SELECT LENGTH(CAST(id AS BLOB)),LENGTH(path),
+                LENGTH(CAST(winner_json AS BLOB)),LENGTH(CAST(loser_json AS BLOB)),
+                LENGTH(CAST(created_ns AS BLOB)),
+                COALESCE(LENGTH(CAST(conflict_json AS BLOB)),0)
          FROM conflicts WHERE share_id=?1",
     )?;
     let rows = statement.query_map([&share.0], |row| {
@@ -3187,6 +3189,40 @@ mod tests {
         let actual = serde_json::to_string_pretty(&summary).unwrap().len() as u64;
         let conservative = 6 * id.len() as u64 + 16 * 4096 + 128;
         assert!(actual <= conservative);
+    }
+
+    #[test]
+    fn recovery_metadata_counts_utf8_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let conflict = Conflict::whole_file(
+            file_record(
+                RelativePath::from_bytes(b"unicode".to_vec())?,
+                PeerId("peer-snow-雪".into()),
+                2,
+                2,
+                Vec::new(),
+                Entry::Directory,
+            ),
+            file_record(
+                RelativePath::from_bytes(b"unicode".to_vec())?,
+                PeerId("peer-cafe-é".into()),
+                1,
+                1,
+                Vec::new(),
+                Entry::Tombstone,
+            ),
+            crate::merge::FallbackReason::AbsentBase,
+        );
+        state.add_conflicts(&share, std::slice::from_ref(&conflict))?;
+        let id = crate::reconcile::conflict_id(&conflict);
+        let rows = state.raw_conflicts_for_prune(&share, &[id])?;
+        let expected = raw_conflict_metadata_bytes(&rows[0])?;
+        assert_eq!(recovery_row_totals(&state.conn, &share)?, (1, expected));
+        Ok(())
     }
 
     #[test]
