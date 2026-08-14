@@ -354,7 +354,8 @@ missed: SQLite's =LENGTH(TEXT)= counts Unicode characters, while the recovery
 allowance is defined in stored UTF-8 bytes.  The accounting queries now use
 =LENGTH(CAST(field AS BLOB))= for every text field, and a regression test with
 non-ASCII peer IDs compares SQLite's total with the canonical Rust byte count.
-The post-fix local review and all checks were clear.
+The post-fix local review and all checks were clear.  Copilot's second review
+covered the final code head and produced no new comments.
 
 There is no deploy target for this standalone CLI repository.  Linux-native
 and Docker validation ran locally; macOS remains covered by CI and Pierre's
