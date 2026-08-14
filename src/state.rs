@@ -1748,7 +1748,9 @@ impl State {
         let _object_lock = self.lock_objects()?;
         let plan = self.recovery_prune_plan_locked(share, conflict_ids)?;
         if plan.selection_token != expected_token {
-            bail!("recovery conflicts changed since preview; preview pruning again");
+            bail!(
+                "recovery conflicts changed since preview; rerun the prune preview and apply with the new selection token"
+            );
         }
         let transaction = self.conn.transaction()?;
         for conflict in &plan.conflicts {

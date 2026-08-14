@@ -219,7 +219,9 @@ let _global_lock = self.lock_global_sync()?;
 let _object_lock = self.lock_objects()?;
 let plan = self.recovery_prune_plan_locked(share, conflict_ids)?;
 if plan.selection_token != expected_token {
-    bail!("recovery conflicts changed since preview; preview pruning again");
+    bail!(
+        "recovery conflicts changed since preview; rerun the prune preview and apply with the new selection token"
+    );
 }
 let transaction = self.conn.transaction()?;
 for conflict in &plan.conflicts {
@@ -336,10 +338,10 @@ watch blocking on byte, count, and metadata limits then resuming automatically
 after the applicable remediation.
 
 The final =make check= passed with 92.15% whole-project line coverage and
-91.80% changed-line coverage.  Rust formatting and Clippy with warnings denied
+91.85% changed-line coverage.  Rust formatting and Clippy with warnings denied
 were clean.  The complete Docker suite passed all 33 scenarios.
 
-Five local review rounds covered correctness, error handling, concurrency and
+Six local review rounds covered correctness, error handling, concurrency and
 liveness, adversarial security, simplicity and duplication, design adherence,
 and documentation alignment.  No blocker was found.  Important findings were
 fixed around pre-mutation admission, invalidation recovery, typed terminal
@@ -356,6 +358,12 @@ allowance is defined in stored UTF-8 bytes.  The accounting queries now use
 non-ASCII peer IDs compares SQLite's total with the canonical Rust byte count.
 The post-fix local review and all checks were clear.  Copilot's second review
 covered the final code head and produced no new comments.
+
+The final-report review found one smaller user-facing defect: the stale
+selection-token error said only “preview pruning again.”  It now tells the user
+to rerun the prune preview and apply with the newly issued token.  The runtime
+message and the code example above are identical, and the post-fix local loop
+was clear.
 
 There is no deploy target for this standalone CLI repository.  Linux-native
 and Docker validation ran locally; macOS remains covered by CI and Pierre's
