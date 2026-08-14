@@ -29,6 +29,9 @@ case "$last" in
   printf '%s\n' "$FLOCAL_BIN"
   exit 0
   ;;
+*" conflicts budget --share "*)
+  exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" sh -c "$last"
+  ;;
 esac
 exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_REMOTE_MAX_SESSION_BYTES" "$FLOCAL_BIN" protocol serve
 "#,
@@ -132,6 +135,32 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
     ])?;
     run(&["peer", "list", local_root.to_str().unwrap()])?;
     run(&["peer", "list", local_root.to_str().unwrap(), "--json"])?;
+    run(&[
+        "conflicts",
+        "budget",
+        local_root.to_str().unwrap(),
+        "11GiB",
+        "--peer",
+        "--json",
+    ])?;
+    run(&[
+        "conflicts",
+        "budget",
+        local_root.to_str().unwrap(),
+        "12GiB",
+        "--peer",
+    ])?;
+    let local_database = State::open(&local_state)?;
+    let (share, _) = local_database.find_share(&local_root)?;
+    assert_eq!(
+        local_database.recovery_budget(&share)?,
+        10 * 1024 * 1024 * 1024
+    );
+    assert_eq!(
+        State::open(&remote_state)?.recovery_budget(&share)?,
+        12 * 1024 * 1024 * 1024
+    );
+    drop(local_database);
     run(&["status", local_root.to_str().unwrap()])?;
     run(&["status", local_root.to_str().unwrap(), "--json"])?;
     run(&["conflicts", "list", local_root.to_str().unwrap()])?;
@@ -139,7 +168,6 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
     fs::write(local_root.join("from-local.txt"), "local")?;
     run(&["sync", local_root.to_str().unwrap(), "--dry-run", "--yes"])?;
     let local_database = State::open(&local_state)?;
-    let (share, _) = local_database.find_share(&local_root)?;
     assert!(local_database.records(&share)?.is_empty());
     let remote_database = State::open(&remote_state)?;
     assert!(remote_database.records(&share)?.is_empty());

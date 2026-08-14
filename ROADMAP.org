@@ -46,7 +46,7 @@ pathological peer input must not turn merging into unbounded work.
 Live collaborative editing, CRDTs, and semantic language-aware merging are out
 of scope.
 
-** TODO Bound recovery storage
+** DONE Bound recovery storage
 
 Add explicit conflict pruning with a preview. Never prune a base still required
 for a future merge. Report recovery-object disk usage in status so a user can

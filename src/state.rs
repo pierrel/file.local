@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -15,6 +15,98 @@ use crate::model::{
     Entry, ObjectHash, PeerConfig, PeerId, Record, RelativePath, ShareId, Version, VersionId,
 };
 use crate::reconcile::{Conflict, ConflictResolution};
+
+pub const DEFAULT_RECOVERY_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const RECOVERY_ROW_OVERHEAD_BYTES: u64 = 256;
+const MAX_ALL_PRUNE_SUMMARIES: u64 = 10_000;
+const MAX_ALL_PRUNE_SUMMARY_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RecoveryUsage {
+    pub conflicts: u64,
+    pub conflict_limit: u64,
+    pub conflicts_remaining: u64,
+    pub object_bytes: u64,
+    pub metadata_bytes: u64,
+    pub metadata_limit_bytes: u64,
+    pub metadata_remaining_bytes: u64,
+    pub used_bytes: u64,
+    pub budget_bytes: u64,
+    pub remaining_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub over_budget: bool,
+    pub over_conflict_limit: bool,
+    pub over_metadata_limit: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RecoveryPruneConflict {
+    pub id: String,
+    pub path: RelativePath,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RecoveryPrunePlan {
+    pub conflicts: Vec<RecoveryPruneConflict>,
+    pub selection_token: String,
+    pub released_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RecoveryPruneOutcome {
+    pub plan: RecoveryPrunePlan,
+    pub collection_pending: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct RawConflictRow {
+    id: String,
+    path: Vec<u8>,
+    winner: String,
+    loser: String,
+    created_ns: String,
+    document: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryLimitKind {
+    BudgetBytes,
+    ConflictCount,
+    MetadataBytes,
+}
+
+#[derive(Debug)]
+pub struct RecoveryLimitExceeded {
+    pub kind: RecoveryLimitKind,
+    pub current: u64,
+    pub projected: u64,
+    pub limit: u64,
+}
+
+impl std::fmt::Display for RecoveryLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, remediation) = match self.kind {
+            RecoveryLimitKind::BudgetBytes => (
+                "recovery storage budget",
+                "prune conflicts or raise the recovery budget",
+            ),
+            RecoveryLimitKind::ConflictCount => {
+                ("recovery conflict count", "prune recovery conflicts")
+            }
+            RecoveryLimitKind::MetadataBytes => {
+                ("recovery metadata limit", "prune recovery conflicts")
+            }
+        };
+        write!(
+            formatter,
+            "{name} exceeded: current {}, projected {}, limit {}; {remediation}",
+            self.current, self.projected, self.limit
+        )
+    }
+}
+
+impl std::error::Error for RecoveryLimitExceeded {}
 
 #[derive(Debug)]
 pub struct RootIdentityChanged(String);
@@ -92,8 +184,8 @@ pub enum InstallTempPhase {
 
 pub struct ObjectSink {
     _budget_lock: File,
-    file: File,
-    temp_path: PathBuf,
+    file: Option<File>,
+    temp_path: Option<PathBuf>,
     final_path: PathBuf,
     expected_hash: ObjectHash,
     expected_size: u64,
@@ -102,11 +194,27 @@ pub struct ObjectSink {
 }
 
 impl ObjectSink {
+    pub fn already_present(&self) -> bool {
+        self.file.is_none()
+    }
+
     pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
         if self.written.saturating_add(bytes.len() as u64) > self.expected_size {
             bail!("object exceeds declared size");
         }
-        self.file.write_all(bytes)?;
+        #[cfg(feature = "e2e-test-hooks")]
+        if self
+            .temp_path
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .is_some_and(|state| state.join(".e2e-object-enospc").exists())
+        {
+            return Err(std::io::Error::from_raw_os_error(28).into());
+        }
+        if let Some(file) = &mut self.file {
+            file.write_all(bytes)?;
+        }
         self.hasher.update(bytes);
         self.written += bytes.len() as u64;
         Ok(())
@@ -120,10 +228,14 @@ impl ObjectSink {
         if actual != self.expected_hash {
             bail!("received object hash mismatch");
         }
-        self.file.sync_all()?;
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+        file.sync_all()?;
+        let temp_path = self.temp_path.as_ref().expect("writer has a temporary");
         match fs::symlink_metadata(&self.final_path) {
             Ok(_) if object_path_matches(&self.final_path, &self.expected_hash)? => {
-                fs::remove_file(&self.temp_path)?;
+                fs::remove_file(temp_path)?;
             }
             Ok(metadata) => {
                 if metadata.is_dir() {
@@ -131,11 +243,11 @@ impl ObjectSink {
                 } else {
                     fs::remove_file(&self.final_path)?;
                 }
-                fs::rename(&self.temp_path, &self.final_path)?;
+                fs::rename(temp_path, &self.final_path)?;
                 sync_dir(self.final_path.parent().expect("object parent"))?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::rename(&self.temp_path, &self.final_path)?;
+                fs::rename(temp_path, &self.final_path)?;
                 sync_dir(self.final_path.parent().expect("object parent"))?;
             }
             Err(error) => return Err(error.into()),
@@ -146,7 +258,9 @@ impl ObjectSink {
 
 impl Drop for ObjectSink {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.temp_path);
+        if let Some(temp_path) = &self.temp_path {
+            let _ = fs::remove_file(temp_path);
+        }
     }
 }
 
@@ -232,7 +346,8 @@ impl State {
                 root_inode TEXT,
                 watch_enabled INTEGER NOT NULL DEFAULT 0,
                 blocked_diagnostic TEXT,
-                intent_generation INTEGER NOT NULL DEFAULT 0
+                intent_generation INTEGER NOT NULL DEFAULT 0,
+                recovery_budget_bytes INTEGER NOT NULL DEFAULT 10737418240
             );
             CREATE TABLE IF NOT EXISTS records (
                 share_id TEXT NOT NULL,
@@ -315,6 +430,12 @@ impl State {
         if !columns.iter().any(|name| name == "intent_generation") {
             transaction.execute(
                 "ALTER TABLE shares ADD COLUMN intent_generation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|name| name == "recovery_budget_bytes") {
+            transaction.execute(
+                "ALTER TABLE shares ADD COLUMN recovery_budget_bytes INTEGER NOT NULL DEFAULT 10737418240",
                 [],
             )?;
         }
@@ -588,41 +709,45 @@ impl State {
         Ok(())
     }
 
-    pub fn share_authorized_objects(&self, share: &ShareId) -> Result<HashSet<ObjectHash>> {
+    pub fn share_authorized_objects(
+        &self,
+        share: &ShareId,
+        candidates: &HashSet<ObjectHash>,
+    ) -> Result<HashSet<ObjectHash>> {
         let mut authorized = HashSet::new();
         for record in self.records(share)? {
-            remember_entry_hash(&mut authorized, &record.version.entry);
+            remember_candidate_entry_hash(&mut authorized, candidates, &record.version.entry);
             if let Some(base) = record.version.merge_base {
-                remember_entry_hash(&mut authorized, &base.entry);
+                remember_candidate_entry_hash(&mut authorized, candidates, &base.entry);
             }
         }
         for base in self.shared_heads(share)?.into_values() {
-            remember_entry_hash(&mut authorized, &base.entry);
+            remember_candidate_entry_hash(&mut authorized, candidates, &base.entry);
         }
-        for conflict in self.conflicts(share)? {
-            for record in conflict.inputs {
-                remember_entry_hash(&mut authorized, &record.version.entry);
-            }
-            if let Some(base) = conflict.base {
-                remember_entry_hash(&mut authorized, &base.entry);
-            }
-            if let Some(record) = conflict.merged {
-                remember_entry_hash(&mut authorized, &record.version.entry);
+        let mut statement = self.conn.prepare(
+            "SELECT winner_json,loser_json,conflict_json FROM conflicts WHERE share_id=?1",
+        )?;
+        let rows = statement.query_map([&share.0], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (winner, loser, document) = row?;
+            let conflict = decode_conflict(&winner, &loser, document.as_deref())?;
+            for entry in conflict_entries(&conflict) {
+                remember_candidate_entry_hash(&mut authorized, candidates, entry);
             }
         }
         if let Some(intent) = self.install_intent(share)? {
             for record in intent.records {
-                remember_entry_hash(&mut authorized, &record.version.entry);
+                remember_candidate_entry_hash(&mut authorized, candidates, &record.version.entry);
             }
             for conflict in intent.conflicts {
-                for record in conflict.inputs {
-                    remember_entry_hash(&mut authorized, &record.version.entry);
-                }
-                if let Some(base) = conflict.base {
-                    remember_entry_hash(&mut authorized, &base.entry);
-                }
-                if let Some(record) = conflict.merged {
-                    remember_entry_hash(&mut authorized, &record.version.entry);
+                for entry in conflict_entries(&conflict) {
+                    remember_candidate_entry_hash(&mut authorized, candidates, entry);
                 }
             }
         }
@@ -631,7 +756,10 @@ impl State {
              WHERE share_id=?1 AND provenance!='receiving'",
         )?;
         for row in statement.query_map([&share.0], |row| row.get::<_, String>(0))? {
-            authorized.insert(ObjectHash::parse(row?)?);
+            let hash = ObjectHash::parse(row?)?;
+            if candidates.contains(&hash) {
+                authorized.insert(hash);
+            }
         }
         Ok(authorized)
     }
@@ -656,6 +784,7 @@ impl State {
         {
             bail!("install intent changed before commit");
         }
+        self.ensure_recovery_limits(share, &current.conflicts)?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
         for record in records {
@@ -743,6 +872,7 @@ impl State {
         {
             bail!("install intent changed before invalidation recovery");
         }
+        self.ensure_recovery_limits(share, conflicts)?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
         for record in records {
@@ -874,7 +1004,7 @@ impl State {
         Ok(file)
     }
 
-    fn lock_objects(&self) -> Result<File> {
+    pub fn lock_objects(&self) -> Result<File> {
         let path = self.dir.join("objects.lock");
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         set_private_file(&path)?;
@@ -1216,11 +1346,649 @@ impl State {
         Ok(())
     }
 
-    pub fn add_conflicts(&self, share: &ShareId, conflicts: &[Conflict]) -> Result<()> {
+    pub fn add_conflicts(&mut self, share: &ShareId, conflicts: &[Conflict]) -> Result<()> {
+        let _global_lock = self.lock_global_sync()?;
+        self.ensure_recovery_limits(share, conflicts)?;
+        let transaction = self.conn.transaction()?;
         for conflict in conflicts {
-            insert_conflict(&self.conn, share, conflict)?;
+            insert_conflict(&transaction, share, conflict)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn recovery_budget(&self, share: &ShareId) -> Result<u64> {
+        #[cfg(feature = "e2e-test-hooks")]
+        {
+            let marker = self.dir.join(".e2e-recovery-budget-bytes");
+            if marker.exists() {
+                let value = fs::read_to_string(marker)?;
+                return value
+                    .trim()
+                    .parse::<u64>()
+                    .context("invalid E2E recovery budget marker");
+            }
+        }
+        let value: i64 = self.conn.query_row(
+            "SELECT recovery_budget_bytes FROM shares WHERE share_id=?1",
+            [&share.0],
+            |row| row.get(0),
+        )?;
+        u64::try_from(value).context("recovery budget is negative")
+    }
+
+    fn recovery_conflict_limit(&self) -> Result<u64> {
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(limit) = self.recovery_test_limit(".e2e-recovery-conflict-limit")? {
+            return Ok(limit);
+        }
+        Ok(crate::sync::MAX_RECORDS_PER_SESSION as u64)
+    }
+
+    fn recovery_metadata_limit(&self) -> Result<u64> {
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(limit) = self.recovery_test_limit(".e2e-recovery-metadata-limit")? {
+            return Ok(limit);
+        }
+        Ok(crate::sync::MAX_METADATA_BYTES_PER_SESSION as u64)
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    fn recovery_test_limit(&self, name: &str) -> Result<Option<u64>> {
+        let marker = self.dir.join(name);
+        if !marker.exists() {
+            return Ok(None);
+        }
+        Ok(Some(
+            fs::read_to_string(marker)?
+                .trim()
+                .parse::<u64>()
+                .context("invalid E2E recovery limit marker")?,
+        ))
+    }
+
+    pub fn raise_recovery_budget(&mut self, share: &ShareId, budget: u64) -> Result<u64> {
+        let budget = i64::try_from(budget).context("recovery budget exceeds SQLite limit")?;
+        let transaction = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous: i64 = transaction.query_row(
+            "SELECT recovery_budget_bytes FROM shares WHERE share_id=?1",
+            [&share.0],
+            |row| row.get(0),
+        )?;
+        if budget <= previous {
+            bail!("new recovery budget must be greater than the current {previous} bytes");
+        }
+        let changed = transaction.execute(
+            "UPDATE shares SET recovery_budget_bytes=?2 WHERE share_id=?1",
+            params![share.0, budget],
+        )?;
+        if changed != 1 {
+            bail!("share not found");
+        }
+        transaction.commit()?;
+        u64::try_from(previous).context("recovery budget is negative")
+    }
+
+    pub fn recovery_usage(&self, share: &ShareId) -> Result<RecoveryUsage> {
+        let _object_lock = self.lock_objects()?;
+        let transaction = self.conn.unchecked_transaction()?;
+        self.prepare_recovery_objects(share, &[])?;
+        let result = (|| {
+            let (conflicts, metadata_bytes) = recovery_row_totals(&self.conn, share)?;
+            let object_bytes = temp_object_bytes(&self.conn, "recovery_objects")?;
+            let budget_bytes = self.recovery_budget(share)?;
+            let reclaimable_bytes = self.recovery_reclaimable_all(share)?;
+            let used_bytes = object_bytes
+                .checked_add(metadata_bytes)
+                .context("recovery usage exceeds supported byte range")?;
+            let conflict_limit = self.recovery_conflict_limit()?;
+            let metadata_limit_bytes = self.recovery_metadata_limit()?;
+            Ok(RecoveryUsage {
+                conflicts,
+                conflict_limit,
+                conflicts_remaining: conflict_limit.saturating_sub(conflicts),
+                object_bytes,
+                metadata_bytes,
+                metadata_limit_bytes,
+                metadata_remaining_bytes: metadata_limit_bytes.saturating_sub(metadata_bytes),
+                used_bytes,
+                budget_bytes,
+                remaining_bytes: budget_bytes.saturating_sub(used_bytes),
+                reclaimable_bytes,
+                over_budget: used_bytes > budget_bytes,
+                over_conflict_limit: conflicts > conflict_limit,
+                over_metadata_limit: metadata_bytes > metadata_limit_bytes,
+            })
+        })();
+        let cleanup = self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.recovery_objects; DROP TABLE IF EXISTS temp.recovery_refs;",
+        );
+        let result = result.and_then(|usage| {
+            cleanup?;
+            Ok(usage)
+        });
+        match result {
+            Ok(usage) => {
+                transaction.commit()?;
+                Ok(usage)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn ensure_recovery_limits(&self, share: &ShareId, planned: &[Conflict]) -> Result<()> {
+        let _object_lock = self.lock_objects()?;
+        self.prepare_recovery_objects(share, planned)?;
+        let result = (|| {
+            let (current_count, current_metadata) = recovery_row_totals(&self.conn, share)?;
+            let mut projected_count = current_count;
+            let mut projected_metadata = current_metadata;
+            let mut planned_documents = HashMap::new();
+            for conflict in planned {
+                let id = crate::reconcile::conflict_id(conflict);
+                let document = serde_json::to_string(conflict)?;
+                if !remember_planned_document(&mut planned_documents, &id, &document)? {
+                    continue;
+                }
+                match self.stored_conflict_document(&id)? {
+                    Some((stored_share, stored))
+                        if stored_share == *share && stored == document => {}
+                    Some(_) => bail!("conflict ID collision for {id}"),
+                    None => {
+                        projected_count = projected_count
+                            .checked_add(1)
+                            .context("recovery conflict count overflow")?;
+                        projected_metadata = projected_metadata
+                            .checked_add(conflict_metadata_bytes(&id, conflict, &document)?)
+                            .context("recovery metadata byte overflow")?;
+                    }
+                }
+            }
+            enforce_recovery_limit(
+                RecoveryLimitKind::ConflictCount,
+                current_count,
+                projected_count,
+                self.recovery_conflict_limit()?,
+            )?;
+            enforce_recovery_limit(
+                RecoveryLimitKind::MetadataBytes,
+                current_metadata,
+                projected_metadata,
+                self.recovery_metadata_limit()?,
+            )?;
+            let object_bytes = temp_object_bytes(&self.conn, "recovery_objects")?;
+            let current = self.recovery_usage_charge(share)?;
+            let projected = object_bytes
+                .checked_add(projected_metadata)
+                .context("recovery usage exceeds supported byte range")?;
+            enforce_recovery_limit(
+                RecoveryLimitKind::BudgetBytes,
+                current,
+                projected,
+                self.recovery_budget(share)?,
+            )
+        })();
+        let cleanup = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS temp.recovery_objects;");
+        result.and_then(|()| {
+            cleanup?;
+            Ok(())
+        })
+    }
+
+    fn recovery_usage_charge(&self, share: &ShareId) -> Result<u64> {
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.current_recovery_objects;
+             CREATE TEMP TABLE current_recovery_objects(
+                 hash TEXT PRIMARY KEY,
+                 size INTEGER NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
+        let result = (|| {
+            self.stream_conflict_objects(share, "current_recovery_objects")?;
+            let (_, metadata) = recovery_row_totals(&self.conn, share)?;
+            temp_object_bytes(&self.conn, "current_recovery_objects")?
+                .checked_add(metadata)
+                .context("recovery usage exceeds supported byte range")
+        })();
+        let cleanup = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS temp.current_recovery_objects;");
+        result.and_then(|value| {
+            cleanup?;
+            Ok(value)
+        })
+    }
+
+    fn stored_conflict_document(&self, id: &str) -> Result<Option<(ShareId, String)>> {
+        self.conn
+            .query_row(
+                "SELECT share_id,conflict_json FROM conflicts WHERE id=?1",
+                [id],
+                |row| Ok((ShareId(row.get(0)?), row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .map(|(share, document)| {
+                document
+                    .context("legacy conflict has no canonical document")
+                    .map(|document| (share, document))
+            })
+            .transpose()
+    }
+
+    fn prepare_recovery_objects(&self, share: &ShareId, planned: &[Conflict]) -> Result<()> {
+        #[cfg(feature = "e2e-test-hooks")]
+        if self.dir.join(".e2e-recovery-temp-fail").exists() {
+            bail!("injected recovery temporary-table failure");
+        }
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.recovery_objects;
+             CREATE TEMP TABLE recovery_objects(
+                 hash TEXT PRIMARY KEY,
+                 size INTEGER NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
+        self.stream_conflict_objects(share, "recovery_objects")?;
+        for conflict in planned {
+            insert_conflict_objects(&self.conn, "recovery_objects", conflict)?;
         }
         Ok(())
+    }
+
+    fn stream_conflict_objects(&self, share: &ShareId, table: &str) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT winner_json,loser_json,conflict_json FROM conflicts WHERE share_id=?1",
+        )?;
+        let rows = statement.query_map([&share.0], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (winner, loser, document) = row?;
+            let conflict = decode_conflict(&winner, &loser, document.as_deref())?;
+            insert_conflict_objects(&self.conn, table, &conflict)?;
+        }
+        Ok(())
+    }
+
+    fn recovery_reclaimable_all(&self, share: &ShareId) -> Result<u64> {
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.recovery_refs;
+             CREATE TEMP TABLE recovery_refs(hash TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )?;
+        self.stream_global_object_refs(Some(share), None, "recovery_refs")?;
+        let mut statement = self.conn.prepare(
+            "SELECT objects.hash FROM recovery_objects AS objects
+             LEFT JOIN recovery_refs AS refs ON refs.hash=objects.hash
+             WHERE refs.hash IS NULL",
+        )?;
+        let mut total = 0u64;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let hash = ObjectHash::parse(row?)?;
+            let path = self.object_path(&hash);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    metadata
+                }
+                Ok(_) => bail!("stored object is not a regular file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            total = total
+                .checked_add(metadata.len())
+                .context("reclaimable object size overflow")?;
+        }
+        Ok(total)
+    }
+
+    fn stream_global_object_refs(
+        &self,
+        excluded_conflict_share: Option<&ShareId>,
+        excluded_conflict_ids: Option<(&ShareId, &HashSet<String>)>,
+        table: &str,
+    ) -> Result<()> {
+        self.visit_global_object_refs(excluded_conflict_share, excluded_conflict_ids, |hash| {
+            insert_temp_hash(&self.conn, table, hash)
+        })
+    }
+
+    fn visit_global_object_refs(
+        &self,
+        excluded_conflict_share: Option<&ShareId>,
+        excluded_conflict_ids: Option<(&ShareId, &HashSet<String>)>,
+        mut visit: impl FnMut(&ObjectHash) -> Result<()>,
+    ) -> Result<()> {
+        {
+            let mut statement = self.conn.prepare("SELECT version_json FROM records")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let version: Version = serde_json::from_str(&row?)?;
+                visit_entry_object(&version.entry, &mut visit)?;
+                if let Some(base) = version.merge_base {
+                    visit_entry_object(&base.entry, &mut visit)?;
+                }
+            }
+        }
+        {
+            let mut statement = self.conn.prepare("SELECT base_json FROM shared_heads")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let base: crate::model::BaseVersion = serde_json::from_str(&row?)?;
+                visit_entry_object(&base.entry, &mut visit)?;
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT id,share_id,winner_json,loser_json,conflict_json FROM conflicts",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ShareId(row.get(1)?),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, share, winner, loser, document) = row?;
+                if excluded_conflict_share == Some(&share) {
+                    continue;
+                }
+                if excluded_conflict_ids.is_some_and(|(excluded_share, ids)| {
+                    excluded_share == &share && ids.contains(&id)
+                }) {
+                    continue;
+                }
+                let conflict = decode_conflict(&winner, &loser, document.as_deref())?;
+                for entry in conflict_entries(&conflict) {
+                    visit_entry_object(entry, &mut visit)?;
+                }
+            }
+        }
+        for (_, intent) in self.install_intents()? {
+            for record in intent.records {
+                visit_entry_object(&record.version.entry, &mut visit)?;
+            }
+            for conflict in intent.conflicts {
+                for entry in conflict_entries(&conflict) {
+                    visit_entry_object(entry, &mut visit)?;
+                }
+            }
+        }
+        let mut statement = self.conn.prepare("SELECT hash FROM pending_objects")?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let hash = ObjectHash::parse(row?)?;
+            visit(&hash)?;
+        }
+        Ok(())
+    }
+
+    pub fn recovery_prune_plan(
+        &self,
+        share: &ShareId,
+        conflict_ids: &[String],
+    ) -> Result<RecoveryPrunePlan> {
+        let _global_lock = self.lock_global_sync()?;
+        let _object_lock = self.lock_objects()?;
+        self.recovery_prune_plan_locked(share, conflict_ids)
+    }
+
+    pub fn prune_recovery(
+        &mut self,
+        share: &ShareId,
+        conflict_ids: &[String],
+        expected_token: &str,
+    ) -> Result<RecoveryPruneOutcome> {
+        let _global_lock = self.lock_global_sync()?;
+        let _object_lock = self.lock_objects()?;
+        let plan = self.recovery_prune_plan_locked(share, conflict_ids)?;
+        if plan.selection_token != expected_token {
+            bail!(
+                "recovery conflicts changed since preview; rerun the prune preview and apply with the new selection token"
+            );
+        }
+        let transaction = self.conn.transaction()?;
+        for conflict in &plan.conflicts {
+            let changed = transaction.execute(
+                "DELETE FROM conflicts WHERE share_id=?1 AND id=?2",
+                params![share.0, conflict.id],
+            )?;
+            if changed != 1 {
+                bail!("recovery conflicts changed while pruning");
+            }
+        }
+        transaction.commit()?;
+        let collection_pending = self.prune_unreferenced_objects_locked().is_err();
+        Ok(RecoveryPruneOutcome {
+            plan,
+            collection_pending,
+        })
+    }
+
+    fn recovery_prune_plan_locked(
+        &self,
+        share: &ShareId,
+        conflict_ids: &[String],
+    ) -> Result<RecoveryPrunePlan> {
+        if !conflict_ids.is_empty() {
+            let selected = self.raw_conflicts_for_prune(share, conflict_ids)?;
+            return self.recovery_prune_plan_selected(share, selected);
+        }
+        self.recovery_prune_plan_all(share)
+    }
+
+    fn recovery_prune_plan_all(&self, share: &ShareId) -> Result<RecoveryPrunePlan> {
+        #[cfg(feature = "e2e-test-hooks")]
+        if self.dir.join(".e2e-recovery-temp-fail").exists() {
+            bail!("injected recovery temporary-table failure");
+        }
+        #[cfg(feature = "e2e-test-hooks")]
+        let fail_after = self.recovery_test_limit(".e2e-recovery-temp-fail-after")?;
+        let (summaries, summary_bytes): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(6*LENGTH(CAST(id AS BLOB))+16*LENGTH(path)+128),0)
+             FROM conflicts WHERE share_id=?1",
+            [&share.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        #[cfg(feature = "e2e-test-hooks")]
+        let maximum_summaries = self
+            .recovery_test_limit(".e2e-recovery-preview-summary-limit")?
+            .unwrap_or(MAX_ALL_PRUNE_SUMMARIES);
+        #[cfg(not(feature = "e2e-test-hooks"))]
+        let maximum_summaries = MAX_ALL_PRUNE_SUMMARIES;
+        enforce_all_prune_summary_bounds(
+            u64::try_from(summaries)?,
+            u64::try_from(summary_bytes)?,
+            maximum_summaries,
+            MAX_ALL_PRUNE_SUMMARY_BYTES,
+        )?;
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.prune_selected_objects;
+             DROP TABLE IF EXISTS temp.prune_refs;
+             CREATE TEMP TABLE prune_selected_objects(
+                 hash TEXT PRIMARY KEY,
+                 size INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE prune_refs(hash TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )?;
+        let result = (|| {
+            let mut released_metadata = 0u64;
+            let mut selection_hasher = prune_selection_hasher(share, true);
+            let mut conflicts = Vec::new();
+            let mut statement = self.conn.prepare(
+                "SELECT id,path,winner_json,loser_json,created_ns,conflict_json
+                 FROM conflicts WHERE share_id=?1 ORDER BY id",
+            )?;
+            let rows = statement.query_map([&share.0], raw_conflict_from_row)?;
+            for row in rows {
+                #[cfg(feature = "e2e-test-hooks")]
+                if fail_after == Some(conflicts.len() as u64) {
+                    bail!("injected recovery temporary-table extension failure");
+                }
+                let row = row?;
+                released_metadata = released_metadata
+                    .checked_add(raw_conflict_metadata_bytes(&row)?)
+                    .context("released recovery metadata overflow")?;
+                let conflict = decode_conflict(&row.winner, &row.loser, row.document.as_deref())?;
+                insert_conflict_objects(&self.conn, "prune_selected_objects", &conflict)?;
+                hash_token_field(&mut selection_hasher, &serde_json::to_vec(&row)?);
+                conflicts.push(RecoveryPruneConflict {
+                    id: row.id,
+                    path: RelativePath::from_bytes(row.path)?,
+                });
+            }
+            let released_objects = temp_object_bytes(&self.conn, "prune_selected_objects")?;
+            self.stream_global_object_refs(Some(share), None, "prune_refs")?;
+            let mut reclaimable = 0u64;
+            let mut statement = self.conn.prepare(
+                "SELECT selected.hash FROM prune_selected_objects AS selected
+                 LEFT JOIN prune_refs AS refs ON refs.hash=selected.hash
+                 WHERE refs.hash IS NULL",
+            )?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let hash = ObjectHash::parse(row?)?;
+                match fs::symlink_metadata(self.object_path(&hash)) {
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                        reclaimable = reclaimable
+                            .checked_add(metadata.len())
+                            .context("reclaimable object size overflow")?;
+                    }
+                    Ok(_) => bail!("stored object is not a regular file"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(RecoveryPrunePlan {
+                conflicts,
+                selection_token: selection_hasher.finalize().to_hex().to_string(),
+                released_bytes: released_objects
+                    .checked_add(released_metadata)
+                    .context("released recovery size overflow")?,
+                reclaimable_bytes: reclaimable,
+            })
+        })();
+        let cleanup = self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.prune_selected_objects;
+             DROP TABLE IF EXISTS temp.prune_refs;",
+        );
+        result.and_then(|plan| {
+            cleanup?;
+            Ok(plan)
+        })
+    }
+
+    fn recovery_prune_plan_selected(
+        &self,
+        share: &ShareId,
+        selected: Vec<RawConflictRow>,
+    ) -> Result<RecoveryPrunePlan> {
+        let selected_ids: HashSet<String> = selected.iter().map(|row| row.id.clone()).collect();
+        let mut selected_objects = HashMap::new();
+        let mut released_metadata = 0u64;
+        for row in &selected {
+            released_metadata = released_metadata
+                .checked_add(raw_conflict_metadata_bytes(row)?)
+                .context("released recovery metadata overflow")?;
+            let conflict = decode_conflict(&row.winner, &row.loser, row.document.as_deref())?;
+            remember_conflict_object_sizes(&mut selected_objects, &conflict)?;
+        }
+
+        let mut released_objects = selected_objects.clone();
+        let mut statement = self.conn.prepare(
+            "SELECT id,winner_json,loser_json,conflict_json FROM conflicts WHERE share_id=?1",
+        )?;
+        let rows = statement.query_map([&share.0], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, winner, loser, document) = row?;
+            if selected_ids.contains(&id) {
+                continue;
+            }
+            let conflict = decode_conflict(&winner, &loser, document.as_deref())?;
+            forget_conflict_objects(&mut released_objects, &conflict);
+        }
+        let released_object_bytes = checked_object_size_sum(&released_objects)?;
+
+        let mut reclaimable = selected_objects;
+        self.eliminate_global_object_refs(&mut reclaimable, share, &selected_ids)?;
+        let mut reclaimable_bytes = 0u64;
+        for hash in reclaimable.keys() {
+            match fs::symlink_metadata(self.object_path(hash)) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    reclaimable_bytes = reclaimable_bytes
+                        .checked_add(metadata.len())
+                        .context("reclaimable object size overflow")?;
+                }
+                Ok(_) => bail!("stored object is not a regular file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(RecoveryPrunePlan {
+            conflicts: selected
+                .iter()
+                .map(|row| {
+                    Ok(RecoveryPruneConflict {
+                        id: row.id.clone(),
+                        path: RelativePath::from_bytes(row.path.clone())?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            selection_token: prune_selection_token(share, false, &selected)?,
+            released_bytes: released_object_bytes
+                .checked_add(released_metadata)
+                .context("released recovery size overflow")?,
+            reclaimable_bytes,
+        })
+    }
+
+    fn eliminate_global_object_refs(
+        &self,
+        candidates: &mut HashMap<ObjectHash, u64>,
+        selected_share: &ShareId,
+        selected_ids: &HashSet<String>,
+    ) -> Result<()> {
+        self.visit_global_object_refs(None, Some((selected_share, selected_ids)), |hash| {
+            candidates.remove(hash);
+            Ok(())
+        })
+    }
+
+    fn raw_conflicts_for_prune(
+        &self,
+        share: &ShareId,
+        conflict_ids: &[String],
+    ) -> Result<Vec<RawConflictRow>> {
+        debug_assert!(!conflict_ids.is_empty());
+        let mut ids = conflict_ids.to_vec();
+        ids.sort();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("duplicate conflict IDs are not allowed");
+        }
+        ids.into_iter()
+            .map(|id| {
+                self.conn
+                    .query_row(
+                        "SELECT id,path,winner_json,loser_json,created_ns,conflict_json
+                         FROM conflicts WHERE share_id=?1 AND id=?2",
+                        params![share.0, id],
+                        raw_conflict_from_row,
+                    )
+                    .optional()?
+                    .context(format!("conflict {id} not found in this share"))
+            })
+            .collect()
     }
 
     pub fn conflicts(&self, share: &ShareId) -> Result<Vec<StoredConflict>> {
@@ -1238,41 +2006,58 @@ impl State {
                 r.get::<_, Option<String>>(5)?,
             ))
         })?;
-        rows.map(|row| {
-            let (id, path, winner, loser, created, conflict) = row?;
-            let legacy_winner: Record = serde_json::from_str(&winner)?;
-            let legacy_loser: Record = serde_json::from_str(&loser)?;
-            let conflict: Conflict = conflict
-                .map(|json| serde_json::from_str(&json))
-                .transpose()?
-                .unwrap_or_else(|| {
-                    Conflict::whole_file(
-                        legacy_winner.clone(),
-                        legacy_loser.clone(),
-                        crate::merge::FallbackReason::Legacy,
-                    )
-                });
-            Ok(StoredConflict {
-                id,
-                path: RelativePath::from_bytes(path)?,
-                winner: conflict.winner().clone(),
-                loser: conflict.loser().clone(),
-                resolution: conflict.resolution,
-                base: conflict.base,
-                inputs: conflict.inputs,
-                merged: conflict.merged,
-                hunks: conflict.hunks,
-                created_ns: created.parse()?,
+        rows.map(|row| stored_conflict_from_parts(row?)).collect()
+    }
+
+    pub fn conflict_ids_page(
+        &self,
+        share: &ShareId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RecoveryPruneConflict>> {
+        if limit == 0 || limit > 1000 {
+            bail!("conflict ID page limit must be between 1 and 1000");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id,path FROM conflicts
+             WHERE share_id=?1 AND (?2 IS NULL OR id>?2)
+             ORDER BY id LIMIT ?3",
+        )?;
+        statement
+            .query_map(params![share.0, after, i64::try_from(limit + 1)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .map(|row| {
+                let (id, path) = row?;
+                Ok(RecoveryPruneConflict {
+                    id,
+                    path: RelativePath::from_bytes(path)?,
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 
     pub fn conflict(&self, share: &ShareId, id: &str) -> Result<StoredConflict> {
-        self.conflicts(share)?
-            .into_iter()
-            .find(|conflict| conflict.id == id)
-            .context("conflict not found")
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id,path,winner_json,loser_json,created_ns,conflict_json
+                 FROM conflicts WHERE share_id=?1 AND id=?2",
+                params![share.0, id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("conflict not found")?;
+        stored_conflict_from_parts(row)
     }
 
     pub fn initial_complete(&self, id: &ShareId) -> Result<bool> {
@@ -1415,56 +2200,27 @@ impl State {
     }
 
     pub fn store_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {
-        let _budget_lock = self.lock_objects()?;
         let metadata_before = input.metadata()?;
         let (probe_hash, probe_size) = self.hash_object(input.try_clone()?)?;
         input.rewind()?;
-        let probe_path = self.object_path(&probe_hash);
-        if probe_path.exists() && object_path_matches(&probe_path, &probe_hash)? {
+        let mut sink = self.begin_object(probe_hash.clone(), probe_size)?;
+        if sink.already_present() {
             return Ok((probe_hash, probe_size));
         }
-        let available = self.available_object_bytes()?;
-        if metadata_before.len() > available {
-            bail!("captured object exceeds remaining state storage budget");
-        }
-        let temp_name = format!(".tmp-{}", ShareId::generate().0);
-        let temp_path = self.dir.join("objects").join(temp_name);
-        let mut temp = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)?;
-        set_private_file(&temp_path)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut size = 0u64;
         let mut buffer = vec![0u8; 1024 * 1024];
         loop {
             let read = input.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
-            hasher.update(&buffer[..read]);
-            temp.write_all(&buffer[..read])?;
-            size += read as u64;
-            if size > available {
-                fs::remove_file(temp_path)?;
-                bail!("growing object exceeds remaining state storage budget");
-            }
+            sink.write_chunk(&buffer[..read])?;
         }
-        temp.sync_all()?;
         let metadata_after = input.metadata()?;
         if !same_file_snapshot(&metadata_before, &metadata_after)? {
-            fs::remove_file(temp_path)?;
             bail!("file changed while it was being captured");
         }
-        let hash = ObjectHash::from_blake3(hasher.finalize());
-        let final_path = self.object_path(&hash);
-        if final_path.exists() && object_path_matches(&final_path, &hash)? {
-            fs::remove_file(temp_path)?;
-        } else {
-            fs::rename(temp_path, &final_path)?;
-            sync_dir(final_path.parent().expect("object parent"))?;
-        }
-        Ok((hash, size))
+        sink.finish()?;
+        Ok((probe_hash, probe_size))
     }
 
     pub fn hash_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {
@@ -1510,37 +2266,9 @@ impl State {
     }
 
     pub fn import_object(&self, expected: &ObjectHash, bytes: &[u8]) -> Result<()> {
-        let _budget_lock = self.lock_objects()?;
-        let actual = ObjectHash::from_blake3(blake3::hash(bytes));
-        if &actual != expected {
-            bail!("received object hash mismatch");
-        }
-        let final_path = self.object_path(expected);
-        if final_path.exists() && object_path_matches(&final_path, expected)? {
-            return Ok(());
-        }
-        if bytes.len() as u64 > self.available_object_bytes()? {
-            bail!("object exceeds remaining state storage budget");
-        }
-        let temp_path = self
-            .dir
-            .join("objects")
-            .join(format!(".tmp-{}", ShareId::generate().0));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)?;
-        set_private_file(&temp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        match fs::rename(&temp_path, &final_path) {
-            Ok(()) => sync_dir(final_path.parent().expect("object parent"))?,
-            Err(_error) if final_path.exists() => {
-                fs::remove_file(temp_path)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
+        let mut sink = self.begin_object(expected.clone(), bytes.len() as u64)?;
+        sink.write_chunk(bytes)?;
+        sink.finish()
     }
 
     pub fn begin_object(
@@ -1551,11 +2279,19 @@ impl State {
         let budget_lock = self.lock_objects()?;
         let final_path = self.object_path(&expected_hash);
         let reclaimable = match fs::symlink_metadata(&final_path) {
-            Ok(metadata)
-                if metadata.is_file()
-                    && !metadata.file_type().is_symlink()
-                    && !object_path_matches(&final_path, &expected_hash)? =>
-            {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                if object_path_matches(&final_path, &expected_hash)? {
+                    return Ok(ObjectSink {
+                        _budget_lock: budget_lock,
+                        file: None,
+                        temp_path: None,
+                        final_path,
+                        expected_hash,
+                        expected_size,
+                        written: 0,
+                        hasher: blake3::Hasher::new(),
+                    });
+                }
                 metadata.len()
             }
             Ok(_) | Err(_) => 0,
@@ -1578,8 +2314,8 @@ impl State {
         set_private_file(&temp_path)?;
         Ok(ObjectSink {
             _budget_lock: budget_lock,
-            file,
-            temp_path,
+            file: Some(file),
+            temp_path: Some(temp_path),
             final_path,
             expected_hash,
             expected_size,
@@ -1621,108 +2357,63 @@ impl State {
 
     pub fn prune_unreferenced_objects(&self) -> Result<()> {
         let _lock = self.lock_objects()?;
-        let mut referenced = std::collections::HashSet::new();
-        {
-            let mut statement = self.conn.prepare("SELECT version_json FROM records")?;
-            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-                let version = serde_json::from_str::<Version>(&row?)?;
-                remember_entry_hash(&mut referenced, &version.entry);
-                if let Some(base) = version.merge_base {
-                    remember_entry_hash(&mut referenced, &base.entry);
-                }
-            }
+        self.prune_unreferenced_objects_locked()
+    }
+
+    fn prune_unreferenced_objects_locked(&self) -> Result<()> {
+        #[cfg(feature = "e2e-test-hooks")]
+        if self.dir.join(".e2e-collector-fail").exists() {
+            bail!("injected object collection failure");
         }
-        {
-            let mut statement = self.conn.prepare("SELECT base_json FROM shared_heads")?;
-            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-                remember_entry_hash(
-                    &mut referenced,
-                    &serde_json::from_str::<crate::model::BaseVersion>(&row?)?.entry,
-                );
-            }
-        }
-        {
-            let mut statement = self
-                .conn
-                .prepare("SELECT winner_json, loser_json, conflict_json FROM conflicts")?;
-            for row in statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })? {
-                let (winner, loser, conflict) = row?;
-                let conflict = conflict
-                    .map(|json| serde_json::from_str::<Conflict>(&json))
-                    .transpose()?;
-                if let Some(conflict) = conflict {
-                    for input in &conflict.inputs {
-                        remember_entry_hash(&mut referenced, &input.version.entry);
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.collector_refs;
+             CREATE TEMP TABLE collector_refs(hash TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )?;
+        let result = (|| {
+            self.stream_global_object_refs(None, None, "collector_refs")?;
+            let mut removed = false;
+            for entry in fs::read_dir(self.dir.join("objects"))? {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name.starts_with(".tmp-") {
+                    let metadata = fs::symlink_metadata(entry.path())?;
+                    if metadata.is_file() && !metadata.file_type().is_symlink() {
+                        fs::remove_file(entry.path())?;
+                        removed = true;
                     }
-                    if let Some(base) = &conflict.base {
-                        remember_entry_hash(&mut referenced, &base.entry);
+                    continue;
+                }
+                let Ok(hash) = ObjectHash::parse(name) else {
+                    continue;
+                };
+                let referenced = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM collector_refs WHERE hash=?1",
+                        [hash.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !referenced {
+                    let metadata = fs::symlink_metadata(entry.path())?;
+                    if metadata.is_file() && !metadata.file_type().is_symlink() {
+                        fs::remove_file(entry.path())?;
+                        removed = true;
                     }
-                    if let Some(merged) = &conflict.merged {
-                        remember_entry_hash(&mut referenced, &merged.version.entry);
-                    }
-                } else {
-                    remember_entry_hash(
-                        &mut referenced,
-                        &serde_json::from_str::<Record>(&winner)?.version.entry,
-                    );
-                    remember_entry_hash(
-                        &mut referenced,
-                        &serde_json::from_str::<Record>(&loser)?.version.entry,
-                    );
                 }
             }
-        }
-        for (_, intent) in self.install_intents()? {
-            for record in intent.records {
-                remember_entry_hash(&mut referenced, &record.version.entry);
+            if removed {
+                sync_dir(&self.dir.join("objects"))?;
             }
-            for conflict in intent.conflicts {
-                for input in conflict.inputs {
-                    remember_entry_hash(&mut referenced, &input.version.entry);
-                }
-                if let Some(base) = conflict.base {
-                    remember_entry_hash(&mut referenced, &base.entry);
-                }
-                if let Some(merged) = conflict.merged {
-                    remember_entry_hash(&mut referenced, &merged.version.entry);
-                }
-            }
-        }
-        {
-            let mut statement = self.conn.prepare("SELECT hash FROM pending_objects")?;
-            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-                referenced.insert(ObjectHash::parse(row?)?);
-            }
-        }
-        for entry in fs::read_dir(self.dir.join("objects"))? {
-            let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if name.starts_with(".tmp-") {
-                let metadata = fs::symlink_metadata(entry.path())?;
-                if metadata.is_file() && !metadata.file_type().is_symlink() {
-                    fs::remove_file(entry.path())?;
-                }
-                continue;
-            }
-            let Ok(hash) = ObjectHash::parse(name) else {
-                continue;
-            };
-            if !referenced.contains(&hash) {
-                let metadata = fs::symlink_metadata(entry.path())?;
-                if metadata.is_file() && !metadata.file_type().is_symlink() {
-                    fs::remove_file(entry.path())?;
-                }
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        let cleanup = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS temp.collector_refs;");
+        result.and_then(|()| cleanup.map_err(Into::into))
     }
 }
 
@@ -1852,8 +2543,14 @@ fn private_directory_walk_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn remember_entry_hash(hashes: &mut std::collections::HashSet<ObjectHash>, entry: &Entry) {
-    if let Entry::File { hash, .. } = entry {
+fn remember_candidate_entry_hash(
+    hashes: &mut HashSet<ObjectHash>,
+    candidates: &HashSet<ObjectHash>,
+    entry: &Entry,
+) {
+    if let Entry::File { hash, .. } = entry
+        && candidates.contains(hash)
+    {
         hashes.insert(hash.clone());
     }
 }
@@ -2028,10 +2725,329 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn recovery_row_totals(connection: &Connection, share: &ShareId) -> Result<(u64, u64)> {
+    let mut statement = connection.prepare(
+        "SELECT LENGTH(CAST(id AS BLOB)),LENGTH(path),
+                LENGTH(CAST(winner_json AS BLOB)),LENGTH(CAST(loser_json AS BLOB)),
+                LENGTH(CAST(created_ns AS BLOB)),
+                COALESCE(LENGTH(CAST(conflict_json AS BLOB)),0)
+         FROM conflicts WHERE share_id=?1",
+    )?;
+    let rows = statement.query_map([&share.0], |row| {
+        Ok([
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        ])
+    })?;
+    let mut count = 0u64;
+    let mut metadata = 0u64;
+    for row in rows {
+        count = count
+            .checked_add(1)
+            .context("recovery conflict count overflow")?;
+        metadata = row?.into_iter().try_fold(
+            metadata
+                .checked_add(RECOVERY_ROW_OVERHEAD_BYTES)
+                .context("recovery metadata byte overflow")?,
+            |total, bytes| {
+                total
+                    .checked_add(u64::try_from(bytes).context("negative recovery field size")?)
+                    .context("recovery metadata byte overflow")
+            },
+        )?;
+    }
+    Ok((count, metadata))
+}
+
+fn raw_conflict_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawConflictRow> {
+    Ok(RawConflictRow {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        winner: row.get(2)?,
+        loser: row.get(3)?,
+        created_ns: row.get(4)?,
+        document: row.get(5)?,
+    })
+}
+
+fn stored_conflict_from_parts(
+    (id, path, winner, loser, created, document): (
+        String,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        Option<String>,
+    ),
+) -> Result<StoredConflict> {
+    let legacy_winner: Record = serde_json::from_str(&winner)?;
+    let legacy_loser: Record = serde_json::from_str(&loser)?;
+    let conflict: Conflict = document
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?
+        .unwrap_or_else(|| {
+            Conflict::whole_file(
+                legacy_winner,
+                legacy_loser,
+                crate::merge::FallbackReason::Legacy,
+            )
+        });
+    Ok(StoredConflict {
+        id,
+        path: RelativePath::from_bytes(path)?,
+        winner: conflict.winner().clone(),
+        loser: conflict.loser().clone(),
+        resolution: conflict.resolution,
+        base: conflict.base,
+        inputs: conflict.inputs,
+        merged: conflict.merged,
+        hunks: conflict.hunks,
+        created_ns: created.parse()?,
+    })
+}
+
+fn raw_conflict_metadata_bytes(row: &RawConflictRow) -> Result<u64> {
+    [
+        row.id.len(),
+        row.path.len(),
+        row.winner.len(),
+        row.loser.len(),
+        row.created_ns.len(),
+        row.document.as_ref().map_or(0, String::len),
+        RECOVERY_ROW_OVERHEAD_BYTES as usize,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, bytes| {
+        total
+            .checked_add(bytes as u64)
+            .context("recovery metadata byte overflow")
+    })
+}
+
+fn prune_selection_token(
+    share: &ShareId,
+    all: bool,
+    conflicts: &[RawConflictRow],
+) -> Result<String> {
+    let mut hasher = prune_selection_hasher(share, all);
+    for conflict in conflicts {
+        hash_token_field(&mut hasher, &serde_json::to_vec(conflict)?);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn prune_selection_hasher(share: &ShareId, all: bool) -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"flocal-prune-selection-v1\0");
+    hash_token_field(&mut hasher, share.0.as_bytes());
+    hash_token_field(&mut hasher, if all { b"all" } else { b"selected" });
+    hasher
+}
+
+fn hash_token_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn conflict_metadata_bytes(id: &str, conflict: &Conflict, document: &str) -> Result<u64> {
+    let winner = serde_json::to_string(conflict.winner())?;
+    let loser = serde_json::to_string(conflict.loser())?;
+    [
+        id.len(),
+        conflict.path.as_bytes().len(),
+        winner.len(),
+        loser.len(),
+        now_ns().to_string().len(),
+        document.len(),
+        RECOVERY_ROW_OVERHEAD_BYTES as usize,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, bytes| {
+        total
+            .checked_add(bytes as u64)
+            .context("recovery metadata byte overflow")
+    })
+}
+
+fn decode_conflict(winner: &str, loser: &str, document: Option<&str>) -> Result<Conflict> {
+    if let Some(document) = document {
+        return Ok(serde_json::from_str(document)?);
+    }
+    Ok(Conflict::whole_file(
+        serde_json::from_str(winner)?,
+        serde_json::from_str(loser)?,
+        crate::merge::FallbackReason::Legacy,
+    ))
+}
+
+fn conflict_entries(conflict: &Conflict) -> impl Iterator<Item = &Entry> {
+    conflict
+        .inputs
+        .iter()
+        .map(|record| &record.version.entry)
+        .chain(conflict.base.iter().map(|base| &base.entry))
+        .chain(conflict.merged.iter().map(|record| &record.version.entry))
+}
+
+fn visit_entry_object(
+    entry: &Entry,
+    visit: &mut impl FnMut(&ObjectHash) -> Result<()>,
+) -> Result<()> {
+    if let Entry::File { hash, .. } = entry {
+        visit(hash)?;
+    }
+    Ok(())
+}
+
+fn remember_conflict_object_sizes(
+    objects: &mut HashMap<ObjectHash, u64>,
+    conflict: &Conflict,
+) -> Result<()> {
+    for entry in conflict_entries(conflict) {
+        if let Entry::File { hash, size, .. } = entry
+            && let Some(previous) = objects.insert(hash.clone(), *size)
+            && previous != *size
+        {
+            bail!("object {} has contradictory declared sizes", hash.as_str());
+        }
+    }
+    Ok(())
+}
+
+fn forget_conflict_objects(objects: &mut HashMap<ObjectHash, u64>, conflict: &Conflict) {
+    for entry in conflict_entries(conflict) {
+        forget_entry_object(objects, entry);
+    }
+}
+
+fn forget_entry_object(objects: &mut HashMap<ObjectHash, u64>, entry: &Entry) {
+    if let Entry::File { hash, .. } = entry {
+        objects.remove(hash);
+    }
+}
+
+fn checked_object_size_sum(objects: &HashMap<ObjectHash, u64>) -> Result<u64> {
+    objects.values().try_fold(0u64, |total, size| {
+        total
+            .checked_add(*size)
+            .context("recovery object size overflow")
+    })
+}
+
+fn insert_conflict_objects(
+    connection: &Connection,
+    table: &str,
+    conflict: &Conflict,
+) -> Result<()> {
+    for entry in conflict_entries(conflict) {
+        if let Entry::File { hash, size, .. } = entry {
+            let size = i64::try_from(*size).context("object size exceeds SQLite limit")?;
+            connection.execute(
+                &format!("INSERT OR IGNORE INTO {table}(hash,size) VALUES(?1,?2)"),
+                params![hash.as_str(), size],
+            )?;
+            let stored: i64 = connection.query_row(
+                &format!("SELECT size FROM {table} WHERE hash=?1"),
+                [hash.as_str()],
+                |row| row.get(0),
+            )?;
+            if stored != size {
+                bail!("object {} has contradictory declared sizes", hash.as_str());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_temp_hash(connection: &Connection, table: &str, hash: &ObjectHash) -> Result<()> {
+    connection.execute(
+        &format!("INSERT OR IGNORE INTO {table}(hash) VALUES(?1)"),
+        [hash.as_str()],
+    )?;
+    Ok(())
+}
+
+fn enforce_all_prune_summary_bounds(
+    conflicts: u64,
+    summary_bytes: u64,
+    maximum_conflicts: u64,
+    maximum_summary_bytes: u64,
+) -> Result<()> {
+    if conflicts > maximum_conflicts || summary_bytes > maximum_summary_bytes {
+        bail!(
+            "all-conflict preview is too large; run `flocal conflicts list PATH --ids` and prune selected conflict IDs"
+        );
+    }
+    Ok(())
+}
+
+fn temp_object_bytes(connection: &Connection, table: &str) -> Result<u64> {
+    let mut statement = connection.prepare(&format!("SELECT size FROM {table}"))?;
+    statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .try_fold(0u64, |total, size| {
+            total
+                .checked_add(u64::try_from(size?).context("negative recovery object size")?)
+                .context("recovery object size overflow")
+        })
+}
+
+fn enforce_recovery_limit(
+    kind: RecoveryLimitKind,
+    current: u64,
+    projected: u64,
+    limit: u64,
+) -> Result<()> {
+    if projected > limit {
+        return Err(RecoveryLimitExceeded {
+            kind,
+            current,
+            projected,
+            limit,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn remember_planned_document(
+    documents: &mut HashMap<String, String>,
+    id: &str,
+    document: &str,
+) -> Result<bool> {
+    match documents.get(id) {
+        Some(previous) if previous == document => Ok(false),
+        Some(_) => bail!("conflict ID collision for {id}"),
+        None => {
+            documents.insert(id.to_owned(), document.to_owned());
+            Ok(true)
+        }
+    }
+}
+
 fn insert_conflict(connection: &Connection, share: &ShareId, conflict: &Conflict) -> Result<()> {
     let id = crate::reconcile::conflict_id(conflict);
+    let document = serde_json::to_string(conflict)?;
+    let existing: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT share_id,conflict_json FROM conflicts WHERE id=?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match existing {
+        Some((stored_share, Some(stored))) if stored_share == share.0 && stored == document => {
+            return Ok(());
+        }
+        Some(_) => bail!("conflict ID collision for {id}"),
+        None => {}
+    }
     connection.execute(
-        "INSERT OR IGNORE INTO conflicts(id,share_id,path,winner_json,loser_json,created_ns,conflict_json)
+        "INSERT INTO conflicts(id,share_id,path,winner_json,loser_json,created_ns,conflict_json)
          VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
             id,
@@ -2040,7 +3056,7 @@ fn insert_conflict(connection: &Connection, share: &ShareId, conflict: &Conflict
             serde_json::to_string(conflict.winner())?,
             serde_json::to_string(conflict.loser())?,
             now_ns().to_string(),
-            serde_json::to_string(conflict)?,
+            document,
         ],
     )?;
     Ok(())
@@ -2107,6 +3123,160 @@ mod tests {
     use std::process::Command;
 
     const PERMISSIVE_UMASK_STATE_DIR: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_STATE_DIR";
+
+    #[test]
+    fn planned_conflict_ids_are_exactly_idempotent() -> Result<()> {
+        let mut documents = HashMap::new();
+        assert!(remember_planned_document(&mut documents, "short", "first")?);
+        assert!(!remember_planned_document(
+            &mut documents,
+            "short",
+            "first"
+        )?);
+        assert!(remember_planned_document(&mut documents, "short", "second").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn every_recovery_limit_kind_is_typed() {
+        for kind in [
+            RecoveryLimitKind::BudgetBytes,
+            RecoveryLimitKind::ConflictCount,
+            RecoveryLimitKind::MetadataBytes,
+        ] {
+            let error = enforce_recovery_limit(kind, 1, 2, 1).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RecoveryLimitExceeded>().unwrap().kind,
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn full_prune_summary_bounds_are_exact() {
+        assert!(
+            enforce_all_prune_summary_bounds(
+                MAX_ALL_PRUNE_SUMMARIES,
+                MAX_ALL_PRUNE_SUMMARY_BYTES,
+                MAX_ALL_PRUNE_SUMMARIES,
+                MAX_ALL_PRUNE_SUMMARY_BYTES,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_all_prune_summary_bounds(
+                MAX_ALL_PRUNE_SUMMARIES + 1,
+                0,
+                MAX_ALL_PRUNE_SUMMARIES,
+                MAX_ALL_PRUNE_SUMMARY_BYTES,
+            )
+            .is_err()
+        );
+        assert!(
+            enforce_all_prune_summary_bounds(
+                0,
+                MAX_ALL_PRUNE_SUMMARY_BYTES + 1,
+                MAX_ALL_PRUNE_SUMMARIES,
+                MAX_ALL_PRUNE_SUMMARY_BYTES,
+            )
+            .is_err()
+        );
+
+        let id = "\"\n\\".repeat(128);
+        let path = RelativePath::from_bytes(vec![0xff; 4096]).unwrap();
+        let summary = RecoveryPruneConflict {
+            id: id.clone(),
+            path,
+        };
+        let actual = serde_json::to_string_pretty(&summary).unwrap().len() as u64;
+        let conservative = 6 * id.len() as u64 + 16 * 4096 + 128;
+        assert!(actual <= conservative);
+    }
+
+    #[test]
+    fn recovery_metadata_counts_utf8_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let conflict = Conflict::whole_file(
+            file_record(
+                RelativePath::from_bytes(b"unicode".to_vec())?,
+                PeerId("peer-snow-雪".into()),
+                2,
+                2,
+                Vec::new(),
+                Entry::Directory,
+            ),
+            file_record(
+                RelativePath::from_bytes(b"unicode".to_vec())?,
+                PeerId("peer-cafe-é".into()),
+                1,
+                1,
+                Vec::new(),
+                Entry::Tombstone,
+            ),
+            crate::merge::FallbackReason::AbsentBase,
+        );
+        state.add_conflicts(&share, std::slice::from_ref(&conflict))?;
+        let id = crate::reconcile::conflict_id(&conflict);
+        let rows = state.raw_conflicts_for_prune(&share, &[id])?;
+        let expected = raw_conflict_metadata_bytes(&rows[0])?;
+        assert_eq!(recovery_row_totals(&state.conn, &share)?, (1, expected));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_conflict_rows_remain_inspectable_and_prunable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let winner = file_record(
+            RelativePath::from_bytes(b"legacy-conflict".to_vec())?,
+            PeerId("winner".into()),
+            2,
+            2,
+            Vec::new(),
+            Entry::Directory,
+        );
+        let loser = file_record(
+            RelativePath::from_bytes(b"legacy-conflict".to_vec())?,
+            PeerId("loser".into()),
+            1,
+            1,
+            Vec::new(),
+            Entry::Tombstone,
+        );
+        state.conn.execute(
+            "INSERT INTO conflicts(id,share_id,path,winner_json,loser_json,created_ns,conflict_json)
+             VALUES('legacy-id',?1,?2,?3,?4,'1',NULL)",
+            params![
+                share.0,
+                b"legacy-conflict".as_slice(),
+                serde_json::to_string(&winner)?,
+                serde_json::to_string(&loser)?
+            ],
+        )?;
+        let stored = state.conflict(&share, "legacy-id")?;
+        assert_eq!(stored.winner, winner);
+        assert_eq!(stored.loser, loser);
+        #[cfg(feature = "e2e-test-hooks")]
+        {
+            fs::write(state.dir.join(".e2e-recovery-conflict-limit"), b"0")?;
+            fs::write(state.dir.join(".e2e-recovery-metadata-limit"), b"0")?;
+            let usage = state.recovery_usage(&share)?;
+            assert!(usage.over_conflict_limit);
+            assert!(usage.over_metadata_limit);
+        }
+        let plan = state.recovery_prune_plan(&share, &[])?;
+        assert_eq!(plan.conflicts.len(), 1);
+        state.prune_recovery(&share, &[], &plan.selection_token)?;
+        assert!(state.conflicts(&share)?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn canonical_snapshot_rejects_reused_owner_sequence() -> Result<()> {

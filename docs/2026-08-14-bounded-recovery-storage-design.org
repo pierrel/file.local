@@ -1,0 +1,463 @@
+#+title: Bounded recovery storage design
+#+date: 2026-08-14
+#+status: implemented and locally validated
+
+* 1. User story and boundary
+
+Three-way merge and whole-file conflict recovery deliberately keep every file
+version a user may need.  Today those recovery records cannot be removed, their
+object cost is invisible, and the only storage limit is the installation-wide
+=FLOCAL_MAX_STATE_BYTES= object-store cap.  A long-running share can therefore
+reach that cap without a useful warning or a safe way to recover space.
+
+This feature makes recovery retention finite and operable without weakening the
+rule that visible files never change unless all recovery material for the plan
+is already durable.  It provides:
+
+1. per-share recovery usage and budget in =flocal status=;
+2. preview-first deletion of selected or all recovery conflicts;
+3. a durable command that can only raise the local or paired peer's per-share
+   recovery budget;
+4. a projected-budget gate before a plan with new recovery records can mutate
+   the working tree; and
+5. deterministic cleanup when an object write hits the budget or =ENOSPC=.
+
+This is not automatic age-based deletion.  The user chooses which recovery
+records cease to exist.  Acknowledged tombstone collection, history policies,
+and background pruning remain separate roadmap work.
+
+* 2. Terms and accounting
+
+The object directory is installation-wide and content-addressed.  One physical
+object may be named by several conflicts, by current records, by shared merge
+heads, or by several shares.  A per-share budget therefore cannot honestly be
+presented as exclusive physical allocation.
+
+For one share, the *recovery object set* is the union of regular-file object
+hashes in its durable conflict rows: both inputs, the base when present, and the
+merged result when present.  A repeated hash is counted once.  The canonical
+declared size for a hash must agree everywhere it appears; disagreement is
+corrupt state or a malformed plan and is rejected.
+
+=object_bytes= is the checked sum of canonical sizes in that object set.  It
+intentionally counts an object even when a current record or another share also
+names the same physical bytes.  =metadata_bytes= charges the exact encoded
+durable fields of every conflict row plus a fixed 256-byte row/index allowance.
+=used_bytes = object_bytes + metadata_bytes= is the stable per-share budget
+charge.  Including metadata means tiny and zero-byte conflicts cannot grow the
+SQLite database without consuming the budget.
+
+Independently of the configurable budget, one share may retain at most the
+existing =MAX_RECORDS_PER_SESSION= conflict count and
+=MAX_METADATA_BYTES_PER_SESSION= charged conflict metadata bytes.  Every
+insertion and projected plan enforces these cumulative durable caps
+transactionally.  Usage, all-conflict pruning, and global reference walks
+stream full conflict documents and hash/size indexes through SQLite instead of
+retaining a population-sized document or hash set in Rust.  All-conflict output
+retains only the ID/path summaries it must return, capped at 10,000 summaries
+and a conservative 8 MiB encoded-output bound.  Above that output cap,
+paginated ID listing and selected pruning are the bounded recovery path.
+Failure to create or extend a temporary table
+leaves durable state unchanged and reports the local storage error.  Selected
+mode retains only the hashes and documents named by the bounded command line,
+then streams every durable global root and removes referenced hashes from that
+candidate set.  It therefore computes the same exact token and physical
+reclaimability without the population-sized temporary index used by status and
+all-conflict preview.
+
+=reclaimable_bytes= is different: it is the physical size of objects that the
+global collector would delete if the selected conflicts disappeared now.  The
+calculation considers every remaining record, merge base, shared head,
+conflict, install intent, and pending object in every share.  It may be zero
+even when pruning releases a large per-share budget charge.  The CLI names both
+values and never calls the logical charge reclaimed disk space.
+
+The default per-share recovery budget is 10 GiB, matching the existing default
+installation object-store budget.  The installation-wide cap remains an
+independent hard limit.  All byte totals use checked =u64= arithmetic and
+SQLite values are restricted to =0..=i64::MAX=.
+
+* 3. User interface
+
+** 3.1 Status
+
+Human =flocal status PATH= gains:
+
+#+begin_example
+Recovery: 3 conflicts, 18.4 MiB / 10.0 GiB
+Reclaimable now: 7.1 MiB
+#+end_example
+
+When usage reaches or exceeds the budget it prints an actionable warning with
+the two relevant commands.  =over_budget= means =used_bytes > budget_bytes=;
+equality gets the warning but is not over budget.  =remaining_bytes= is
+=budget_bytes.saturating_sub(used_bytes)=.  Existing status language continues
+to say that its file view is the last persisted scan.
+
+=status --json= advances from schema 3 to schema 4 and adds:
+
+#+begin_src json
+"recovery": {
+  "conflicts": 3,
+  "conflict_limit": 1000000,
+  "conflicts_remaining": 999997,
+  "object_bytes": 19290000,
+  "metadata_bytes": 3798,
+  "metadata_limit_bytes": 268435456,
+  "metadata_remaining_bytes": 268431658,
+  "used_bytes": 19293798,
+  "budget_bytes": 10737418240,
+  "remaining_bytes": 10718124442,
+  "reclaimable_bytes": 7444889,
+  "over_budget": false,
+  "over_conflict_limit": false,
+  "over_metadata_limit": false
+}
+#+end_src
+
+All fields describe this installation only.  A user runs status on both peers
+when their budgets differ.  The remaining fields saturate at zero.  Reaching a
+fixed count or metadata cap prints prune-only guidance because raising the byte
+budget cannot change those safety bounds.
+
+** 3.2 Preview-first pruning
+
+#+begin_example
+flocal conflicts list PATH --ids [--limit N] [--after ID] [--json]
+flocal conflicts prune PATH [CONFLICT_ID ...] [--json]
+flocal conflicts prune PATH [CONFLICT_ID ...] --selection TOKEN --yes [--json]
+#+end_example
+
+With IDs, every named ID must exist in that share and duplicate IDs are
+rejected.  With no IDs, the selection is every current recovery conflict.
+Without =--yes= the command only previews.  It prints each selected conflict's
+ID and raw-byte-safe displayed path, the number of records selected,
+=released_bytes= from the per-share recovery charge, and the exact
+=reclaimable_bytes= in the global store.  Valid UTF-8 names retain the existing
+escaped display; invalid UTF-8 escapes every original non-ASCII byte as
+=\xNN=, so two distinct names cannot render identically.
+
+An all-conflict preview refuses above 10,000 ID/path summaries or 8 MiB of
+summary output.  =conflicts list --ids= returns at most 1,000 summaries per
+page, with a continuation ID.  The user can feed IDs from those pages to
+selected preview and prune, so even a legacy share already above a fixed cap
+has a bounded remediation path.
+
+The preview also emits a full 64-hex BLAKE3 =selection_token= over the canonical
+tuple =("flocal-prune-selection-v1", ShareId, selection mode, sorted selected
+IDs and their complete stored conflict documents)=.  It prints the exact apply
+token and tells the user to rerun the same preview command with
+=--selection TOKEN --yes=.  For an all-conflict preview, the empty ID list and
+=all= mode name the complete set observed by preview.  =--yes= without
+=--selection= is rejected.
+
+With =--yes=, the selection and token are recomputed while serialization locks
+are held.  A missing, changed, or newly included conflict aborts without
+deleting anything; the user previews again.  An empty selection succeeds and
+changes nothing.  JSON schema 1 is:
+
+#+begin_src json
+{
+  "schema": 1,
+  "applied": false,
+  "selection_token": "0123...cdef",
+  "conflicts": [{"id":"c-...", "path":[102,111,111]}],
+  "released_bytes": 1048576,
+  "reclaimable_bytes": 524288
+}
+#+end_src
+
+The applied form reports the recomputed committed plan.  Prune is explicitly
+local to this installation: IDs, usage, and retained records may differ on the
+peer, so human output tells the user to preview and prune separately there.
+
+Deleting conflict rows is the committed action; physical collection follows.
+If collection fails after commit, the command truthfully emits =applied: true=
+and =collection_pending: true= with the committed result, then exits nonzero
+with instructions to rerun pruning or synchronization.  It never reports the
+operation as unapplied.
+
+** 3.3 Raising the budget
+
+#+begin_example
+flocal conflicts budget PATH SIZE [--peer] [--json]
+flocal conflicts budget --share SHARE_ID SIZE [--json]
+#+end_example
+
+=SIZE= accepts an integer byte count or an integer followed by =KiB=, =MiB=,
+or =GiB=.  Zero, fractional values, whitespace, unknown suffixes, overflow,
+and values above =i64::MAX= are rejected.  The new value must be strictly
+greater than the current value.  The command never lowers a budget and never
+deletes recovery data.
+
+The selector is exactly one of =PATH= or =--share SHARE_ID=, matching =sync
+start=.  Normal local use names =PATH=.  =--share= exists so a fixed remote
+command never serializes a possibly non-UTF-8 remote root.
+
+Without =--peer= the command updates the selected local share.  With =--peer=
+it resolves =PATH= locally, then invokes this fixed remote grammar:
+
+#+begin_example
+ABSOLUTE_FLOCAL conflicts budget --share VALIDATED_SHARE_ID DECIMAL_BYTES --json
+#+end_example
+
+=--peer= and =--share= cannot be combined by the caller.  The executable keeps
+the existing absolute safe-character validation.  =VALIDATED_SHARE_ID= must be
+1--128 ASCII alphanumeric, hyphen, or underscore bytes and must name the local
+paired share.  The byte count is emitted as canonical decimal.  No other user
+text reaches OpenSSH's shell-parsed command string.
+
+A small administrative SSH runner uses the existing connect/server-alive
+options, kills and waits for the child after a 30-second absolute deadline,
+and caps each of stdout and stderr at 64 KiB before parsing one schema-1 JSON
+response.  Overflow, timeout, malformed output, or a nonzero exit is an error.
+No new sync-protocol capability lets an ordinary peer frame raise the other
+side's disk allowance.
+
+JSON schema 1 reports =target= (=local= or =peer=), =previous_bytes=, and
+=budget_bytes=.  A peer raise changes only the peer; local status remains
+unchanged.
+
+* 4. Durable state and migration
+
+Add one column to =shares=:
+
+#+begin_src sql
+recovery_budget_bytes INTEGER NOT NULL DEFAULT 10737418240
+#+end_src
+
+=State::open= adds the column transactionally for existing installations.
+Existing conflict documents and object paths do not migrate.  An existing
+share whose recovery set is already above the default opens normally and
+status reports =over_budget: true=; a mutating synchronization is blocked until
+the user prunes recovery or raises the budget.  Read-only status, conflict
+inspection, restore, prune preview, actual prune, and budget raise remain
+available while over budget.
+
+The same rule handles a legacy share already beyond a fixed count or metadata
+cap: opening, status, direct conflict inspection, restore, paginated ID
+listing, selected pruning, and budget administration work.  Mutating sync
+remains blocked until explicit pruning brings the share under both fixed caps.
+An all-conflict preview may refuse at its output-memory bound.  Raising the
+byte budget cannot bypass the fixed caps.
+
+The state layer exposes typed values rather than loose tuples:
+
+- =RecoveryUsage { conflicts, object_bytes, metadata_bytes, used_bytes,
+  budget_bytes, remaining_bytes, reclaimable_bytes, over_budget }=;
+- =RecoveryPrunePlan { conflicts, released_bytes, reclaimable_bytes }=; and
+- a typed =RecoveryLimitExceeded= error whose variant identifies byte budget,
+  conflict count, or metadata bytes and carries current, projected, and limit
+  values.
+
+The same canonical conflict-entry walker supplies usage, projected usage,
+prune planning, object authorization, and collector references.  The
+surrounding root walks differ by purpose, but inputs, base, and merged output
+cannot drift between them.
+
+* 5. Pruning transaction and protected bases
+
+Actual pruning acquires the installation synchronization lock and the global
+object lock.  It recomputes the selection token and reference graph after
+acquiring the locks.  The SQLite transaction deletes only the selected
+conflict rows and commits before physical collection begins.  The collector has
+an internal already-locked entry point, so pruning never recursively acquires
+the object lock.
+
+After commit, the existing global collector removes only hashes absent from
+all remaining roots.  In particular it retains:
+
+1. every current record and its =merge_base=;
+2. every =shared_heads= base needed by the next concurrent merge;
+3. every unselected conflict in every share;
+4. every complete install intent; and
+5. every pending verified, generated, or receiving object.
+
+Thus pruning a conflict cannot prune a base still required for a future merge.
+It can remove the conflict's copy of that logical charge, while physical
+=reclaimable_bytes= correctly remains zero for the protected object.
+
+A crash after the row commit but before file collection leaves harmless
+unreferenced objects; the next serialized sync or prune collects them.  A crash
+before commit leaves all recovery records and objects intact.  There is no
+state in which a conflict row survives after its only object was intentionally
+deleted.
+
+=restore= takes the same object lock before reading the conflict row and holds
+it through verified open and copy.  A concurrent prune therefore runs wholly
+before or after restore; it cannot remove a selected row/object between lookup
+and use.
+
+* 6. Budget enforcement in synchronization
+
+For a mutating plan, each endpoint computes the union of its existing durable
+conflicts and the conflicts in its endpoint-specific effective apply plan.
+Deferred or retained paths that will not insert a local conflict are not
+charged to that endpoint in the round.  Object hashes are deduplicated only by
+the full 256-bit =ObjectHash=.
+
+Conflict display IDs remain short and are never an accounting identity.  If a
+planned conflict ID already exists, the complete canonical conflict document
+must be identical for it to be an idempotent insertion; a different document
+with the same ID is a hard collision error.  The projection rejects a byte
+budget, cumulative count, or cumulative metadata excess with the corresponding
+=RecoveryLimitExceeded= variant.
+
+The connector may need bounded candidate bytes to determine whether a
+three-way merge is clean or creates a conflict.  Those bytes are temporary
+plan inputs, not yet durable recovery, so the exact recovery check runs after
+merge materialization.  On failure their pending roots are cleared and the
+global collector removes newly unreferenced objects.
+
+The connector checks its effective plan before publishing the materialized
+plan.  The responder checks its effective plan before requesting any plan
+objects.  The shared apply boundary checks the same conflict set again before
+writing an install intent or touching the working tree.  The last check makes
+missed call sites and state changes fail closed.
+
+Dry-run remains available while over any recovery limit and may produce a
+recovery preview; it never inserts a conflict.  Every =RecoveryLimitExceeded=
+variant is terminal for persistent watch, so the daemon records a durable
+blocked diagnostic instead of retrying a local policy violation forever.
+Explicit sync returns the same actionable error with matching remediation.
+
+Explicit sync advances from protocol 2 to 3 and persistent watch from 4 to 5.
+The wire shape is unchanged, but the exact-version handshake makes
+mixed-version mutation fail with upgrade guidance instead of letting an old
+endpoint accept recovery beyond its promised local bound.  A mismatch is an
+upgrade condition rather than a local safety-policy violation, so managed
+watch stays reconnecting with bounded failure reports and resumes without a
+manual command once both binaries are compatible.
+
+When any recovery-limit error blocks an enabled managed connector, a successful
+local prune sends the existing daemon =Start= request for that share.  A budget
+raise does the same for byte-budget blocks.  This clears the diagnostic and
+restarts its worker.  Responder-only shares have no local worker to restart.
+Output says whether restart was requested, and failure gives the exact =flocal
+sync start PATH= recovery step.  When remediation runs on a responder-only
+share, output explicitly says to run =flocal sync start PATH= on the connector
+because this installation cannot restart the remote worker.
+
+* 7. =ENOSPC= and partial-object cleanup
+
+All recovery objects are received or generated in the private object directory
+before =apply_complete_plan= begins visible mutation.  Budget projection cannot
+reserve physical filesystem space, so a real =ENOSPC= may still occur during
+that object write.  It must nevertheless leave the working tree untouched.
+
+=store_object=, =import_object=, received objects, and generated merge objects
+all use the existing =ObjectSink= ownership shape.  Its temporary file is
+owner-only, its expected size and BLAKE3 hash are verified, and =Drop= removes
+the temporary on write, sync, hash, rename, budget, or =ENOSPC= failure.  A
+successful rename is made durable before the object becomes available.
+
+A process crash or power loss does not run =Drop= and may leave an owner-only
+=.tmp-*= file.  The next serialized sync or prune collector removes such
+temporary files before accepting new recovery state.  Opening control state
+does not scan the object directory.  A temporary is never treated as a
+published object or recovery root.
+
+This guarantee is scoped to recovery/object preparation, the storage boundary
+changed here.  Existing atomic per-path install recovery remains responsible
+for destination-filesystem failures during the later apply phase.
+
+* 8. Concurrency and security
+
+- Sync and prune share the installation synchronization lock.  Prune cannot
+  race conflict insertion or plan projection.
+- Object accounting, publication, and collection share the blocking object
+  lock.  The reference graph and object directory cannot change underneath an
+  applied prune plan.
+- Budget raises are monotonic SQLite updates and may race safely with a check:
+  a round either observes the old stricter value or the new larger one.
+- Paths and conflict documents remain untrusted.  The existing =RelativePath=,
+  =ObjectHash=, record-authentication, canonical-owner, metadata, record-count,
+  and frame-size validation runs before accounting.
+- A hostile peer cannot make arithmetic wrap, charge one hash at conflicting
+  sizes, use a conflict from another share, select an arbitrary filesystem
+  path, or raise a budget through protocol input.
+- Cumulative durable conflict count and metadata bytes are enforced across
+  sessions.  Each walk is streaming and uses SQLite-backed temporary indexes,
+  so legacy state above those caps cannot force an in-memory population-sized
+  document or hash set.  Full-preview summaries are explicitly bounded; paged
+  ID discovery and selected pruning remain available.  The design adds no
+  file-content reads to status or pruning preview.
+- Linux and macOS use the same SQLite and ordinary private-file operations; no
+  platform-specific quota API is introduced.
+
+* 9. Implementation sequence
+
+1. Add the schema column, typed recovery accounting and all-limit error,
+   cumulative count/metadata caps, SQLite-backed canonical conflict-object
+   walker, full-document ID collision check, and state-level
+   migration/accounting tests.
+2. Refactor remaining direct object writers through =ObjectSink= and test
+   injected write failure cleans its temporary file.
+3. Add status schema 4 and human reporting.
+4. Add token-bound prune planning/application, truthful committed-collection
+   outcomes, restore serialization, and =conflicts prune= output schemas.
+5. Add strict size parsing, monotonic budget updates, and the bounded local and
+   peer budget command.
+6. Enforce projected effective-plan usage at connector, responder, and shared
+   apply boundaries; bump protocol versions and make persistent budget failure
+   terminal with automatic managed-worker restart after remediation.
+7. Add product E2E scenarios, reconcile README/roadmap/design docs, and write
+   the final reader-facing implementation report.
+
+* 10. Acceptance evidence
+
+The feature is complete only when tests prove:
+
+1. status reports object and metadata charges, their exact per-share total,
+   budget, count and metadata caps, every saturated remainder and over-limit
+   state, and physical reclaimability, including migrated state materially
+   above the in-memory caps with bounded-memory prune-only recovery guidance;
+2. preview changes nothing, token-bound selected prune deletes only named
+   conflicts, empty selection is harmless, bounded all-conflict prune works,
+   oversized preview directs the user through paged IDs, and a
+   conflict arriving between preview/apply makes apply abort; injected SQLite
+   temporary-table creation and extension failures leave status/all-prune
+   durable state unchanged while selected preview and apply still reduce a
+   legacy-over-cap share with exact reclaimability;
+3. an object shared by another conflict/share/current record/shared head or
+   merge base is never physically removed and preview does not call it
+   reclaimable;
+4. pruning the last root removes the object and survives restart;
+5. budget updates survive restart, cannot lower, parse strictly, and =--peer=
+   changes only the paired installation; hostile remote timeout/output and
+   shell metacharacters are rejected within fixed bounds;
+6. both explicit sync and persistent watch stop before visible mutation when a
+   new effective recovery conflict would exceed either endpoint's budget;
+7. injected object-store =ENOSPC= removes the partial temporary, records no
+   conflict, and leaves both visible trees unchanged; crash after temporary
+   creation is collected by the next serialized collector without treating it
+   as published;
+8. a dry-run still previews while over budget;
+9. cumulative tiny or zero-byte conflicts stop at count, metadata, or byte
+   bounds across sessions, and short conflict-ID collisions never under-account
+   or discard a different document;
+10. concurrent restore/prune is serialized on Linux and macOS, post-commit
+    collector failure is reported as applied with collection pending, a
+    managed connector blocked by byte, count, or metadata recovery limits
+    resumes after the applicable remediation, and responder-only output names
+    the connector-side restart step;
+11. legacy state migrates without rewriting conflicts or losing restore; and
+12. native tests, Clippy, formatting, whole and changed-line coverage, Linux,
+    macOS, and the complete Docker E2E suite pass.
+
+* 11. Rejected alternatives
+
+- Automatic oldest-first deletion is rejected because age is not evidence that
+  a recovery version is valueless.
+- Counting physical bytes exclusively to one share is rejected because global
+  content deduplication gives no stable owner.
+- Treating a statvfs free-space check as an =ENOSPC= guarantee is rejected; it
+  only changes probability.  Owned temporary cleanup plus pre-apply object
+  preparation gives the required construction.
+- Lowering a budget is rejected in this feature because it silently creates an
+  immediately blocked share without releasing data.
+- A peer protocol message that raises the receiver's allowance is rejected;
+  administrative SSH invocation uses the user's remote account authority and
+  fixed validated arguments instead.
+- A new recovery database or per-share copy of shared objects is rejected as
+  duplicated state and disk usage.

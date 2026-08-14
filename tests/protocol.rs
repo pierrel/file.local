@@ -25,7 +25,7 @@ fn record(path: &[u8], entry: Entry) -> Result<Record> {
 }
 
 #[test]
-fn explicit_v2_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
+fn explicit_v3_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
     let message = Message::Sync {
         protocol: sync::SYNC_PROTOCOL_VERSION,
         share: flocal::model::ShareId("share".into()),
@@ -36,11 +36,11 @@ fn explicit_v2_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
     sync::write_message(&mut wire, &message)?;
     assert_eq!(
         &wire[4..],
-        br#"{"type":"sync","protocol":2,"share":"share","peer":"peer","dry_run":false}"#
+        br#"{"type":"sync","protocol":3,"share":"share","peer":"peer","dry_run":false}"#
     );
     assert!(matches!(
         sync::read_message(&mut wire.as_slice())?,
-        Message::Sync { protocol: 2, .. }
+        Message::Sync { protocol: 3, .. }
     ));
 
     let initial = InitialMessage::Sync {

@@ -72,9 +72,18 @@ impl RelativePath {
     }
 
     pub fn display(&self) -> String {
-        String::from_utf8_lossy(&self.0)
-            .escape_default()
-            .to_string()
+        match std::str::from_utf8(&self.0) {
+            Ok(path) => path.escape_default().to_string(),
+            Err(_) => self
+                .0
+                .iter()
+                .map(|byte| match byte {
+                    b' '..=b'~' if *byte != b'\\' => (*byte as char).to_string(),
+                    b'\\' => "\\\\".to_owned(),
+                    _ => format!("\\x{byte:02x}"),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -258,6 +267,19 @@ mod tests {
         assert!(RelativePath::from_bytes(b"src//main.rs".to_vec()).is_err());
         assert!(RelativePath::from_bytes(b"src/./main.rs".to_vec()).is_err());
         assert!(RelativePath::from_bytes(b"src/main.rs/".to_vec()).is_err());
+        assert_eq!(
+            RelativePath::from_bytes(b"invalid-\xff".to_vec())
+                .unwrap()
+                .display(),
+            "invalid-\\xff"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            RelativePath::from_bytes(b"back\\slash-\xff".to_vec())
+                .unwrap()
+                .display(),
+            "back\\\\slash-\\xff"
+        );
     }
 
     #[test]

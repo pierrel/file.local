@@ -13,8 +13,8 @@ pub use crate::state::RootIdentityChanged;
 use crate::state::{InstallTempPhase, RootIdentity, State};
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
-pub const SYNC_PROTOCOL_VERSION: u32 = 2;
-pub const WATCH_PROTOCOL_VERSION: u32 = 4;
+pub const SYNC_PROTOCOL_VERSION: u32 = 3;
+pub const WATCH_PROTOCOL_VERSION: u32 = 5;
 /// Compatibility name for the existing one-shot synchronization protocol.
 pub const PROTOCOL_VERSION: u32 = SYNC_PROTOCOL_VERSION;
 pub const MAX_RECORDS_PER_SESSION: usize = 1_000_000;
@@ -789,6 +789,7 @@ pub fn apply_complete_plan_with_root_skipping(
     validate_unique_paths(records)?;
     validate_declared_sizes(records)?;
     root.validate(state, share)?;
+    state.ensure_recovery_limits(share, &plan.conflicts)?;
     let prior = state.records(share)?;
     let prior: std::collections::HashMap<_, _> = prior
         .iter()
@@ -2036,7 +2037,15 @@ pub fn required_hashes_for_share(
     validate_declared_sizes(records)?;
     let root = state.root_for(share)?;
     let matcher = IgnoreMatcher::new(&root)?;
-    let authorized = state.share_authorized_objects(share)?;
+    let candidates = records
+        .iter()
+        .filter(|record| !matcher.is_record_ignored(record))
+        .filter_map(|record| match &record.version.entry {
+            Entry::File { hash, .. } => Some(hash.clone()),
+            _ => None,
+        })
+        .collect();
+    let authorized = state.share_authorized_objects(share, &candidates)?;
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for record in records {
