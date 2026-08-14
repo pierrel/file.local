@@ -15,10 +15,17 @@ const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 const WATCH_PIDFILE: &str = "/tmp/flocal-watch.pid";
 const WATCH_LOG: &str = "/home/peer/.flocal-watch.log";
 const APPLY_STOP_MARKER: &str = "/home/peer/.local/state/file.local/.e2e-stop-before-apply";
+const OBJECT_ENOSPC_MARKER: &str = "/home/peer/.local/state/file.local/.e2e-object-enospc";
+const RECOVERY_BUDGET_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-recovery-budget-bytes";
+const RECOVERY_CONFLICT_LIMIT_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-recovery-conflict-limit";
+const RECOVERY_METADATA_LIMIT_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-recovery-metadata-limit";
 const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
-/// The product's status JSON schema this harness is written against. Schema 3
-/// adds durable unsettled paths to schema 2's tombstone fields.
-const STATUS_SCHEMA: u64 = 3;
+/// The product's status JSON schema this harness is written against. Schema 4
+/// adds bounded recovery usage to schema 3's durable unsettled paths.
+const STATUS_SCHEMA: u64 = 4;
 /// Recovery records use the versioned three-way merge shape.
 const CONFLICTS_SCHEMA: u64 = 2;
 
@@ -99,6 +106,17 @@ pub struct Status {
     pub unsettled: Vec<Vec<u8>>,
     #[serde(default)]
     pub tombstones: Option<u64>,
+    pub recovery: RecoveryStatus,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RecoveryStatus {
+    pub conflicts: u64,
+    pub used_bytes: u64,
+    pub metadata_bytes: u64,
+    pub budget_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub over_budget: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -366,6 +384,29 @@ impl Connector {
 
     pub fn restart_daemon(&self) -> Result<()> {
         self.peer.restart_daemon()
+    }
+
+    pub fn wait_for_sync_diagnostic(&self, needle: &str) -> Result<()> {
+        self.poll_until(
+            &format!("managed sync did not report {needle:?}"),
+            DEADLINE,
+            |peer| {
+                let output = peer.flocal_raw(&["sync", "list", "--json"])?;
+                Ok((output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(needle))
+                .then_some(()))
+            },
+        )
+    }
+
+    pub fn raise_recovery_budget(&self, size: &str) -> Result<()> {
+        self.flocal_ok(&["conflicts", "budget", SHARE, size])?;
+        Ok(())
+    }
+
+    pub fn raise_peer_recovery_budget(&self, size: &str) -> Result<()> {
+        self.flocal_ok(&["conflicts", "budget", SHARE, size, "--peer"])?;
+        Ok(())
     }
 
     /// `flocal sync --dry-run`; asserts the connector's tree is unchanged by
@@ -714,6 +755,96 @@ impl Peer {
         ))
     }
 
+    pub fn prune_conflict(&self, id: &str) -> Result<()> {
+        validate_component(id)?;
+        #[derive(serde::Deserialize)]
+        struct Preview {
+            schema: u64,
+            applied: bool,
+            selection_token: String,
+        }
+        let preview = self.flocal_ok(&["conflicts", "prune", SHARE, id, "--json"])?;
+        let preview: Preview =
+            serde_json::from_slice(&preview.stdout).context("parsing conflict prune preview")?;
+        if preview.schema != 1 || preview.applied {
+            bail!("invalid conflict prune preview response");
+        }
+        self.flocal_ok(&[
+            "conflicts",
+            "prune",
+            SHARE,
+            id,
+            "--selection",
+            &preview.selection_token,
+            "--yes",
+            "--json",
+        ])?;
+        Ok(())
+    }
+
+    pub fn object_enospc(&self, enabled: bool) -> Result<()> {
+        if enabled {
+            self.exec_ok(&["touch", OBJECT_ENOSPC_MARKER])?;
+        } else {
+            self.exec_ok(&["rm", "-f", OBJECT_ENOSPC_MARKER])?;
+        }
+        Ok(())
+    }
+
+    pub fn assert_no_object_temporaries(&self) -> Result<()> {
+        let output = self.exec_ok(&[
+            "find",
+            "/home/peer/.local/state/file.local/objects",
+            "-maxdepth",
+            "1",
+            "-name",
+            ".tmp-*",
+            "-print",
+        ])?;
+        if !output.stdout.is_empty() {
+            bail!(
+                "partial object temporaries remained: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        Ok(())
+    }
+
+    pub fn recovery_budget_limit(&self, bytes: Option<u64>) -> Result<()> {
+        match bytes {
+            Some(bytes) => {
+                self.exec_with_stdin_ok(
+                    &["tee", RECOVERY_BUDGET_MARKER],
+                    bytes.to_string().as_bytes(),
+                )?;
+            }
+            None => {
+                self.exec_ok(&["rm", "-f", RECOVERY_BUDGET_MARKER])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn recovery_conflict_limit(&self, limit: Option<u64>) -> Result<()> {
+        self.recovery_limit_marker(RECOVERY_CONFLICT_LIMIT_MARKER, limit)
+    }
+
+    pub fn recovery_metadata_limit(&self, bytes: Option<u64>) -> Result<()> {
+        self.recovery_limit_marker(RECOVERY_METADATA_LIMIT_MARKER, bytes)
+    }
+
+    fn recovery_limit_marker(&self, marker: &str, limit: Option<u64>) -> Result<()> {
+        match limit {
+            Some(limit) => {
+                self.exec_with_stdin_ok(&["tee", marker], limit.to_string().as_bytes())?;
+            }
+            None => {
+                self.exec_ok(&["rm", "-f", marker])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Restores a conflict's losing input to a scratch path outside the
     /// share and returns its content.
     pub fn restore_loser(&self, id: &str) -> Result<String> {
@@ -898,6 +1029,10 @@ impl Peer {
 
     pub fn assert_status(&self, predicate: impl Fn(&Status) -> bool + 'static) -> Result<()> {
         self.check(Self::status_condition(predicate), Duration::ZERO)
+    }
+
+    pub fn wait_for_status(&self, predicate: impl Fn(&Status) -> bool + 'static) -> Result<()> {
+        self.check(Self::status_condition(predicate), DEADLINE)
     }
 
     pub fn assert_dir(&self, path: &str) -> Result<()> {

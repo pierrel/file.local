@@ -140,8 +140,11 @@ Concurrent text edits use a three-way merge from the last shared version.
 Non-overlapping line changes merge automatically. When both sides change the
 same hunk, the later change wins that hunk. When an overlap or fallback creates
 a recovery conflict, both peer inputs, plus the base and merged result when they
-exist, are retained. Explicit recovery pruning remains required before the
-=v0.0.1= alpha exit; the current command does not discard them.
+exist, are retained. =flocal status= reports the per-share recovery charge and
+physical bytes reclaimable now. =flocal conflicts prune= previews a token-bound
+selection before deleting local recovery records, and =flocal conflicts budget=
+can only raise the durable local or peer allowance. A sync that would exceed a
+recovery limit stops before visible mutation instead of retrying forever.
 Binary files and files without a common base use the same last-write-wins rule
 for the whole file. Deletes and unambiguously paired observed renames
 participate in the same ordering. An ambiguous rename event, including one that
@@ -182,13 +185,13 @@ without reconnecting. A path that changes again is isolated so stable sibling
 paths can finish. A later full round reports =SETTLED=. =flocal status= and
 =sync list= expose durable unsettled state across daemon restarts.
 
-Persistent watch uses protocol version 4, so install or upgrade =flocal= on both
+Persistent watch uses protocol version 5, so install or upgrade =flocal= on both
 peers before adding a managed sync. During a rolling upgrade, the first sync
-uses explicit protocol version 2. The daemon keeps retrying with bounded
-failure reports until both peers support version 4; it never silently falls back
-to polling. Downgrading
-does not change synchronized state, though persistent watch remains unavailable
-until both peers support version 4.
+uses explicit protocol version 3. A persistent protocol mismatch keeps the
+worker reconnecting with bounded upgrade reports until both peers support
+version 5; it never silently falls back to polling. Downgrading does not change
+synchronized state, though persistent watch remains unavailable until both
+peers support version 5.
 
 See [[file:docs/2026-08-13-v0.0.1-design-reconciliation.org][the current design reconciliation]] for the implemented three-way merge and
 its safety boundaries, [[file:docs/2026-07-14-v0.0.1-design.org][the original detailed design]] for the broader

@@ -476,10 +476,13 @@ manager with a duplicate child.
 1. Network, SSH, remote process, and transient local watcher errors leave the
    watch enabled and the worker in =reconnecting=.  The existing bounded
    backoff and recovery scans continue unattended.
-2. A root identity mismatch, peer identity mismatch, unsupported persistent
-   protocol, unsafe stored executable, or unrepairable local watcher setup
-   moves the worker to =blocked= and persists its bounded diagnostic.  It
-   remains enabled so =list= exposes the user's requested configuration, but
+2. A root identity mismatch, peer identity mismatch, unsafe stored executable,
+   or unrepairable local watcher setup moves the worker to =blocked= and
+   persists its bounded diagnostic.  A persistent protocol mismatch remains
+   reconnecting with bounded upgrade reports because installing the compatible
+   peer is an external condition that should resume without =sync start=.  A
+   terminal block remains enabled so =list= exposes the user's requested
+   configuration, but
    restart does not retry it until =sync start= explicitly revalidates and
    clears the marker.  A missing/replaced root can be stopped or retried by =--share=;
    path canonicalization is never required to control it.  It never treats a

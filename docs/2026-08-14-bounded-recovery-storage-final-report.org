@@ -1,0 +1,380 @@
+#+title: Bounded recovery storage: final implementation report
+#+date: 2026-08-14
+#+status: locally validated
+
+* What changed for the user
+
+Recovery data is now finite, visible, and deliberately manageable.  A sync
+still keeps every input needed to recover from an automatic merge or a
+whole-file winner, but it cannot let that history grow invisibly until the
+installation becomes unusable.
+
+Every share begins with a 10 GiB recovery allowance.  =flocal status PATH=
+shows the current logical recovery charge and the physical object bytes that a
+prune could actually reclaim:
+
+#+begin_example
+Recovery: 3 conflicts, 18.4 MiB / 10.0 GiB
+Reclaimable now: 7.1 MiB
+#+end_example
+
+The two numbers are intentionally different.  A conflict may refer to an
+object that is also a current file, a merge base, another share's recovery
+record, an unfinished install, or an in-flight transfer.  Removing the
+conflict releases its share allowance, but the object is not physically
+collectable while any such reference remains.
+
+Pruning is preview-first and local:
+
+#+begin_src sh
+flocal conflicts prune PATH [CONFLICT_ID ...]
+flocal conflicts prune PATH [CONFLICT_ID ...] --selection TOKEN --yes
+#+end_src
+
+The preview prints exactly which recovery records would disappear, the share
+allowance released, the bytes physically reclaimable now, and a selection
+token.  The apply command succeeds only if the selected rows are still exactly
+the rows that produced that token.  A peer must be previewed and pruned
+separately, so one endpoint never silently destroys the other's recovery copy.
+
+When keeping the history is the right choice, the allowance can only move up:
+
+#+begin_src sh
+flocal conflicts budget PATH 20GiB
+flocal conflicts budget PATH 20GiB --peer
+#+end_src
+
+The peer form runs one fixed, validated administrative command over SSH.  It
+does not grant a general remote-command surface.  If a recovery limit had
+blocked an enabled managed connector, successful remediation restarts that
+share automatically.  A responder explains that the connector is the side
+that must initiate synchronization.
+
+Most importantly, a plan that would exceed the byte, conflict-count, or
+metadata limit is rejected before either visible tree changes.  Foreground
+sync reports the cause.  Managed watch enters a durable =blocked= state instead
+of retrying forever, then resumes after pruning or a sufficient budget raise.
+
+* Final design
+
+** Accounting
+
+The recovery charge belongs to a share, while object files belong to the whole
+installation.  For one share the implementation gathers every regular-file
+hash referenced by the conflict inputs, optional base, and optional merged
+result.  Each hash is charged once at its declared size.  Each durable
+conflict row also contributes the exact encoded lengths of its fields plus a
+256-byte row and index allowance.  Therefore:
+
+#+begin_example
+used_bytes = unique recovery object sizes + conflict metadata bytes
+#+end_example
+
+The configurable budget defaults to 10 GiB.  Independently, the existing
+session limits are reused as cumulative per-share caps: 1,000,000 conflicts
+and 256 MiB of conflict metadata.  Checked arithmetic is used throughout, and
+values stored in SQLite must fit its signed 64-bit integer range.
+
+Hash and reference sets used for usage, full pruning, and collection live in
+indexed SQLite temporary tables.  Full conflict documents are decoded one row
+at a time; only the ID/path summaries required by preview output are retained.
+Those summaries are capped at 10,000 records or a conservative 8 MiB bound on
+their encoded output.  A larger legacy share uses =flocal conflicts list PATH
+--ids --limit N --after ID= to discover IDs in bounded pages, then previews and
+prunes selected IDs.  Selected mode's in-memory work is bounded by the command
+line itself.
+
+** Admission and atomicity
+
+The recovery check is part of both protocol roles and the common durable apply
+path.  It runs after a complete candidate plan is known and before that plan
+can mutate the working tree.  It distinguishes byte budget, record count, and
+metadata failures with a typed error.  The persistent watch protocol marks
+these errors terminal, which is what converts an endless retry loop into an
+actionable blocked share.
+
+Conflict insertion is transactional and idempotent only when the existing row
+has the same share and the same canonical conflict document.  A short conflict
+ID collision with different content is rejected rather than silently treated
+as a duplicate.
+
+** Safe pruning and collection
+
+A prune preview hashes the share, selection mode, and complete canonical rows
+with BLAKE3.  Apply recomputes that plan while holding the global sync lock and
+the object-store lock.  A stale token changes no durable state.
+
+After the conflict rows commit, object collection walks every durable object
+root in every share: current entries, retained merge bases, acknowledged
+shared heads, remaining conflicts, install intents, and pending objects.  Only
+an object absent from that complete root set is removed.  If collection fails
+after the conflict transaction commits, output says =applied: true= and
+=collection_pending: true=; it never claims the deletion was rolled back.
+
+Restore now takes the same object lock, so it cannot race a successful prune
+between conflict lookup and opening the retained object.
+
+** Crash-safe object writes
+
+All object producers now use one =ObjectSink=.  It creates an owner-only
+temporary file in the object directory, streams and hashes the expected byte
+count, syncs the file, publishes it with an atomic rename, and syncs the
+directory.  Dropping an unfinished sink removes its temporary.  The global
+collector removes abandoned =.tmp-*= regular files left by a killed process.
+State opening does not scan the object directory; the next serialized sync or
+prune collector performs cleanup.  A failed write, including =ENOSPC=,
+therefore cannot publish a partial object or change either visible tree.
+
+** Protocol and status compatibility
+
+Explicit synchronization is protocol version 3 and persistent watch is
+version 5.  Both endpoints must be upgraded because older binaries do not
+promise the new admission check.  Status JSON is schema 4 and adds a =recovery=
+object with charge, cap, remaining, over-limit, and reclaimability fields.
+A persistent version mismatch remains reconnecting with bounded upgrade
+reports.  It cannot mutate either tree and resumes without a manual command
+once both binaries are compatible.
+
+* Code tour
+
+** The typed limit
+
+The state layer returns a concrete error that higher layers can classify:
+
+#+begin_src rust
+pub struct RecoveryLimitExceeded {
+    pub kind: RecoveryLimitKind,
+    pub current: u64,
+    pub projected: u64,
+    pub limit: u64,
+}
+
+fn enforce_recovery_limit(
+    kind: RecoveryLimitKind,
+    current: u64,
+    projected: u64,
+    limit: u64,
+) -> Result<()> {
+    if projected > limit {
+        return Err(RecoveryLimitExceeded {
+            kind,
+            current,
+            projected,
+            limit,
+        }
+        .into());
+    }
+    Ok(())
+}
+#+end_src
+
+=RecoveryLimitKind= is a Rust =enum=: one value must be exactly
+=BudgetBytes=, =ConflictCount=, or =MetadataBytes=.  That is safer than parsing
+an error string to decide whether watch should retry.  =Result<()>= means the
+function either returns no value on success or an error.  =anyhow= stores the
+concrete error inside its general error type; =downcast_ref= later recovers the
+type without losing the human explanation.
+
+** Projecting before mutation
+
+The state layer deduplicates planned conflicts against canonical durable rows,
+adds their metadata with checked arithmetic, and applies all three limits:
+
+#+begin_src rust
+let mut planned_documents = HashMap::new();
+for conflict in planned {
+    let id = crate::reconcile::conflict_id(conflict);
+    let document = serde_json::to_string(conflict)?;
+    if !remember_planned_document(&mut planned_documents, &id, &document)? {
+        continue;
+    }
+    match self.stored_conflict_document(&id)? {
+        Some((stored_share, stored))
+            if stored_share == *share && stored == document => {}
+        Some(_) => bail!("conflict ID collision for {id}"),
+        None => {
+            projected_count = projected_count.checked_add(1)
+                .context("recovery conflict count overflow")?;
+            projected_metadata = projected_metadata
+                .checked_add(conflict_metadata_bytes(&id, conflict, &document)?)
+                .context("recovery metadata byte overflow")?;
+        }
+    }
+}
+#+end_src
+
+The =?= operator returns immediately when an operation fails and otherwise
+unwraps its success value.  =checked_add= returns an =Option= instead of
+wrapping on overflow; =context= turns =None= into an explanatory error.  The
+=remember_planned_document= rejects one short ID naming two different
+documents within the same plan and skips an exact repeat.  The match guard
+makes exact idempotence against a durable row the only accepted duplicate.
+
+** Token-bound pruning
+
+Pruning is serialized and rechecks the preview:
+
+#+begin_src rust
+let _global_lock = self.lock_global_sync()?;
+let _object_lock = self.lock_objects()?;
+let plan = self.recovery_prune_plan_locked(share, conflict_ids)?;
+if plan.selection_token != expected_token {
+    bail!("recovery conflicts changed since preview; preview pruning again");
+}
+let transaction = self.conn.transaction()?;
+for conflict in &plan.conflicts {
+    let changed = transaction.execute(
+        "DELETE FROM conflicts WHERE share_id=?1 AND id=?2",
+        params![share.0, conflict.id],
+    )?;
+    if changed != 1 {
+        bail!("recovery conflicts changed while pruning");
+    }
+}
+transaction.commit()?;
+#+end_src
+
+The leading underscores on the lock variables are intentional: their values
+are never read, but Rust keeps them alive until the function scope ends.  Their
+=Drop= implementations release the operating-system file locks.  The SQLite
+transaction rolls back automatically if the function exits before =commit=.
+
+** ObjectSink and RAII
+
+Object publication uses Rust's resource-acquisition-is-initialization pattern:
+
+#+begin_src rust
+impl Drop for ObjectSink {
+    fn drop(&mut self) {
+        if let Some(temp_path) = &self.temp_path {
+            let _ = fs::remove_file(temp_path);
+        }
+    }
+}
+#+end_src
+
+Rust calls =Drop::drop= on normal return and error unwinding.  =finish(self)=
+consumes the sink, verifies and syncs its contents, then renames the temporary
+to the final hash path.  =Option<PathBuf>= represents whether this sink owns a
+temporary at all: when a verified object already exists, the sink validates
+incoming bytes without writing a duplicate.  =Drop= cleans only a present
+temporary path; after a successful rename that removal harmlessly returns “not
+found.”
+
+** Terminal watch behavior
+
+The responder classifies the concrete limit error as non-retryable:
+
+#+begin_src rust
+let retryable = error.downcast_ref::<WatchProtocolError>().is_none()
+    && error.downcast_ref::<sync::RootIdentityChanged>().is_none()
+    && error
+        .downcast_ref::<flocal::state::RecoveryLimitExceeded>()
+        .is_none();
+#+end_src
+
+That bit crosses the persistent protocol.  The connector stores the diagnostic
+and stops only that managed worker.  This is the direct correction to the
+observed endless sequence of “already pending” and retry messages.
+
+** Peer budget administration
+
+The peer command validates the stored SSH host, executable, and share ID, then
+constructs only this command:
+
+#+begin_src rust
+let command = format!(
+    "{} conflicts budget --share {} {} --json",
+    peer.executable, share.0, budget
+);
+#+end_src
+
+SSH has a connection timeout and keepalive bounds; the entire operation has a
+30-second deadline; stdout and stderr readers retain at most 64 KiB while still
+draining the pipes; and the JSON response must report schema 1, target =local=,
+and the requested exact budget.  This prevents a stalled or noisy peer from
+hanging or exhausting the local command.
+
+* What was difficult
+
+The hardest issue was that “used by this share” and “safe to delete from disk”
+are different questions.  Charging only exclusive physical bytes would make a
+share's budget change when an unrelated share appeared or disappeared.
+Deleting based only on the selected share would lose data still needed by a
+current record, merge base, install recovery, or transfer.  The implementation
+therefore has one stable logical charge and one exact installation-wide
+reclaimability calculation.
+
+The second hard boundary was ordering.  Checking after installation would be
+too late; checking only the connector would let the responder accept an unsafe
+plan; and deleting conflict rows and objects without common locking would race
+restore or another synchronization.  The shared state admission method and
+the global/object lock order make those bad states unreachable rather than
+merely unlikely.
+
+The third was truthful failure after a partial success.  SQLite can commit the
+chosen conflict deletion before the filesystem collector fails.  Pretending
+the command was wholly rolled back would be dangerous.  The explicit
+=collection_pending= result makes the durable truth visible and leaves a safe,
+repeatable collector retry.
+
+Finally, making =ENOSPC= safe exposed that every object writer needed the same
+publication primitive.  Centralizing them behind =ObjectSink= removed the
+possibility that one transfer path would publish a partial object with subtly
+different cleanup rules.
+
+* Validation and review
+
+Native tests cover accounting, deduplication, token changes, local and peer
+budget commands, every durable object-reference root, temporary-table failure,
+post-commit collector failure, abandoned object temporaries, strict command
+grammar, and process-boundary SSH behavior.  Docker end-to-end scenarios cover
+both endpoints rejecting an over-budget plan before visible mutation, injected
+=ENOSPC= preserving both trees and recovery state, local-only pruning and peer
+budget control, dry-run over an already-full recovery allowance, and managed
+watch blocking on byte, count, and metadata limits then resuming automatically
+after the applicable remediation.
+
+The final =make check= passed with 92.11% whole-project line coverage and
+91.74% changed-line coverage.  Rust formatting and Clippy with warnings denied
+were clean.  The complete Docker suite passed all 33 scenarios.
+
+Four local review rounds covered correctness, error handling, concurrency and
+liveness, adversarial security, simplicity and duplication, design adherence,
+and documentation alignment.  No blocker was found.  Important findings were
+fixed around pre-mutation admission, invalidation recovery, typed terminal
+errors, bounded legacy-state walks, dry-run availability, object publication,
+restart after remediation, protocol-upgrade liveness, and truthful partial
+success.  Smaller findings fixed stale documentation, unsafe command examples,
+duplicate walkers, inconsistent snapshots, child cleanup, and preview-output
+bounds.  No concrete finding was rejected.  The final round was clear.
+
+There is no deploy target for this standalone CLI repository.  Linux-native
+and Docker validation ran locally; macOS remains covered by CI and Pierre's
+dogfood run after merge.
+
+* Remaining limits
+
+Pruning is deliberately manual.  There is no retention age, “keep the last N,”
+or automatic peer-to-peer deletion policy.  The installation-wide object-store
+budget remains separate from the per-share recovery allowance.  Automatic
+acknowledged-tombstone collection is still deferred.
+
+The peer budget command raises only the paired endpoint and cannot lower either
+side.  Pruning remains independently local.  These constraints favor an extra
+operator step over silent loss of the last recoverable version.
+
+* Upgrade and testing note
+
+Install this build on both peers before testing.  The protocol versions changed
+to explicit 3 and persistent watch 5; a mixed-version pair refuses the session
+instead of silently accepting recovery without the new admission guarantee.
+Existing shares migrate in place and receive the 10 GiB default without
+rewriting their conflict rows.
+
+For dogfooding, start with =flocal status PATH= on both endpoints.  Exercise a
+real overlapping edit, inspect =flocal conflicts list PATH=, preview a selected
+prune, and confirm the apply with its printed token.  Also raise the responder's
+allowance with =--peer= and verify that =flocal sync list= returns from
+=blocked= to the normal managed state.  Keep the normal backup of irreplaceable
+data while the project remains alpha.

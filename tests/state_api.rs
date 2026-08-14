@@ -1,12 +1,15 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use flocal::model::{
     Entry, ObjectHash, PeerConfig, PeerId, Record, RelativePath, ShareId, Version,
 };
 use flocal::reconcile::Conflict;
-use flocal::state::{InstallTempPhase, State};
+use flocal::state::{
+    DEFAULT_RECOVERY_BUDGET_BYTES, InstallTempPhase, RecoveryLimitExceeded, RecoveryLimitKind,
+    State,
+};
 use tempfile::tempdir;
 
 #[cfg(unix)]
@@ -247,6 +250,334 @@ fn registered_share_conflict_and_object_lifecycle() -> Result<()> {
     assert_eq!(state.read_object(&other)?, b"other");
     state.prune_unreferenced_objects()?;
     assert!(!state.object_path(&other).exists());
+    Ok(())
+}
+
+#[test]
+fn recovery_usage_prune_and_budget_are_durable_and_reference_safe() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&root)?;
+    let mut state = State::open(&state_dir)?;
+    let share = state.init_share(&root)?;
+    let bytes = b"recover me";
+    let hash = ObjectHash::from_blake3(blake3::hash(bytes));
+    state.import_object(&hash, bytes)?;
+    let first = Conflict::whole_file(
+        record(
+            b"first",
+            "one",
+            2,
+            Entry::File {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+                executable: false,
+            },
+        )?,
+        record(b"first", "two", 1, Entry::Tombstone)?,
+        flocal::merge::FallbackReason::AbsentBase,
+    );
+    state.add_conflicts(&share, std::slice::from_ref(&first))?;
+    let usage = state.recovery_usage(&share)?;
+    assert_eq!(usage.conflicts, 1);
+    assert_eq!(usage.object_bytes, bytes.len() as u64);
+    assert!(usage.metadata_bytes > 256);
+    assert_eq!(usage.used_bytes, usage.object_bytes + usage.metadata_bytes);
+    assert_eq!(usage.reclaimable_bytes, bytes.len() as u64);
+
+    let all_preview = state.recovery_prune_plan(&share, &[])?;
+    let second = Conflict::whole_file(
+        record(
+            b"second",
+            "one",
+            4,
+            Entry::File {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+                executable: false,
+            },
+        )?,
+        record(b"second", "two", 3, Entry::Tombstone)?,
+        flocal::merge::FallbackReason::AbsentBase,
+    );
+    state.add_conflicts(&share, std::slice::from_ref(&second))?;
+    #[cfg(feature = "e2e-test-hooks")]
+    {
+        fs::write(state_dir.join(".e2e-recovery-temp-fail-after"), b"1")?;
+        assert!(state.recovery_prune_plan(&share, &[]).is_err());
+        fs::remove_file(state_dir.join(".e2e-recovery-temp-fail-after"))?;
+        assert_eq!(state.conflicts(&share)?.len(), 2);
+    }
+    assert!(
+        state
+            .prune_recovery(&share, &[], &all_preview.selection_token)
+            .is_err()
+    );
+
+    let first_id = flocal::reconcile::conflict_id(&first);
+    let selected = state.recovery_prune_plan(&share, std::slice::from_ref(&first_id))?;
+    assert_eq!(selected.reclaimable_bytes, 0);
+    state.prune_recovery(
+        &share,
+        std::slice::from_ref(&first_id),
+        &selected.selection_token,
+    )?;
+    assert!(state.object_path(&hash).exists());
+    assert_eq!(state.recovery_usage(&share)?.conflicts, 1);
+
+    let remaining = state.recovery_prune_plan(&share, &[])?;
+    assert_eq!(remaining.reclaimable_bytes, bytes.len() as u64);
+    state.prune_recovery(&share, &[], &remaining.selection_token)?;
+    assert!(!state.object_path(&hash).exists());
+    assert_eq!(state.recovery_usage(&share)?.conflicts, 0);
+
+    let raised = DEFAULT_RECOVERY_BUDGET_BYTES + 1024;
+    assert_eq!(
+        state.raise_recovery_budget(&share, raised)?,
+        DEFAULT_RECOVERY_BUDGET_BYTES
+    );
+    assert!(state.raise_recovery_budget(&share, raised).is_err());
+    drop(state);
+    assert_eq!(State::open(&state_dir)?.recovery_budget(&share)?, raised);
+    Ok(())
+}
+
+#[test]
+fn recovery_reclaimability_respects_every_durable_object_root() -> Result<()> {
+    let temp = tempdir()?;
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    fs::create_dir_all(&first_root)?;
+    fs::create_dir_all(&second_root)?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let first_share = state.init_share(&first_root)?;
+    let second_share = state.init_share(&second_root)?;
+    let bytes = b"shared recovery object";
+    let hash = ObjectHash::from_blake3(blake3::hash(bytes));
+    state.import_object(&hash, bytes)?;
+    let file = |path: &[u8], peer: &str, sequence: u64| {
+        record(
+            path,
+            peer,
+            sequence,
+            Entry::File {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+                executable: false,
+            },
+        )
+    };
+    let conflict = Conflict::whole_file(
+        file(b"conflict", "winner", 2)?,
+        record(b"conflict", "loser", 1, Entry::Tombstone)?,
+        flocal::merge::FallbackReason::AbsentBase,
+    );
+    state.add_conflicts(&first_share, std::slice::from_ref(&conflict))?;
+    let id = flocal::reconcile::conflict_id(&conflict);
+    let reclaimable = |state: &State| -> Result<(u64, u64)> {
+        Ok((
+            state.recovery_usage(&first_share)?.reclaimable_bytes,
+            state
+                .recovery_prune_plan(&first_share, std::slice::from_ref(&id))?
+                .reclaimable_bytes,
+        ))
+    };
+
+    let current = file(b"current", "current", 3)?;
+    state.replace_records(&second_share, std::slice::from_ref(&current))?;
+    assert_eq!(reclaimable(&state)?, (0, 0));
+
+    let mut with_base = record(b"with-base", "current", 4, Entry::Tombstone)?;
+    with_base.version.merge_base = current.version.as_base();
+    state.replace_records(&second_share, std::slice::from_ref(&with_base))?;
+    assert_eq!(reclaimable(&state)?, (0, 0));
+
+    state.replace_records(&second_share, std::slice::from_ref(&current))?;
+    state.acknowledge_shared_heads(&second_share, std::slice::from_ref(&current))?;
+    state.replace_records(&second_share, &[])?;
+    assert_eq!(reclaimable(&state)?, (0, 0));
+    state.acknowledge_shared_heads(&second_share, &[])?;
+
+    state.set_plan_install_intent(
+        &second_share,
+        std::slice::from_ref(&current),
+        std::slice::from_ref(&conflict),
+    )?;
+    assert_eq!(reclaimable(&state)?, (0, 0));
+    state.clear_install_intent(&second_share)?;
+
+    state.mark_object_receiving(&second_share, &hash)?;
+    assert_eq!(reclaimable(&state)?, (0, 0));
+    state.clear_pending_objects(&second_share)?;
+    assert_eq!(
+        reclaimable(&state)?,
+        (bytes.len() as u64, bytes.len() as u64)
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_projection_rejects_oversized_conflicts_before_insertion() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root)?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let hash = ObjectHash::from_blake3(blake3::hash(b"declared"));
+    let conflict = Conflict::whole_file(
+        record(
+            b"large",
+            "one",
+            2,
+            Entry::File {
+                hash,
+                size: DEFAULT_RECOVERY_BUDGET_BYTES,
+                executable: false,
+            },
+        )?,
+        record(b"large", "two", 1, Entry::Tombstone)?,
+        flocal::merge::FallbackReason::AbsentBase,
+    );
+    let error = state
+        .add_conflicts(&share, &[conflict])
+        .expect_err("metadata must put the projected charge over budget");
+    assert!(error.downcast_ref::<RecoveryLimitExceeded>().is_some());
+    assert!(state.conflicts(&share)?.is_empty());
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "e2e-test-hooks")]
+fn cumulative_count_and_metadata_limits_survive_restart() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let state_dir = temp.path().join("state");
+    fs::create_dir(&root)?;
+    let mut state = State::open(&state_dir)?;
+    let share = state.init_share(&root)?;
+    let make_conflict = |path: &[u8], sequence: u64| -> Result<Conflict> {
+        Ok(Conflict::whole_file(
+            record(path, "winner", sequence, Entry::Directory)?,
+            record(path, "loser", sequence - 1, Entry::Tombstone)?,
+            flocal::merge::FallbackReason::AbsentBase,
+        ))
+    };
+    let first = make_conflict(b"first", 2)?;
+    let second = make_conflict(b"second", 4)?;
+    fs::write(state_dir.join(".e2e-recovery-conflict-limit"), b"1")?;
+    state.add_conflicts(&share, std::slice::from_ref(&first))?;
+    drop(state);
+
+    let mut state = State::open(&state_dir)?;
+    let count_error = state
+        .add_conflicts(&share, std::slice::from_ref(&second))
+        .expect_err("the cumulative conflict cap must survive restart");
+    assert_eq!(
+        count_error
+            .downcast_ref::<RecoveryLimitExceeded>()
+            .unwrap()
+            .kind,
+        RecoveryLimitKind::ConflictCount
+    );
+
+    fs::remove_file(state_dir.join(".e2e-recovery-conflict-limit"))?;
+    let current_metadata = state.recovery_usage(&share)?.metadata_bytes;
+    fs::write(
+        state_dir.join(".e2e-recovery-metadata-limit"),
+        (current_metadata + 1).to_string(),
+    )?;
+    let metadata_error = state
+        .add_conflicts(&share, &[second])
+        .expect_err("the cumulative metadata cap must reject the next row");
+    assert_eq!(
+        metadata_error
+            .downcast_ref::<RecoveryLimitExceeded>()
+            .unwrap()
+            .kind,
+        RecoveryLimitKind::MetadataBytes
+    );
+    assert_eq!(state.conflicts(&share)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn object_sink_and_collector_remove_unpublished_temporaries() -> Result<()> {
+    let temp = tempdir()?;
+    let state_dir = temp.path().join("state");
+    let state = State::open(&state_dir)?;
+    let expected = ObjectHash::from_blake3(blake3::hash(b"expected"));
+    assert!(state.import_object(&expected, b"different").is_err());
+    state.import_object(&expected, b"expected")?;
+    #[cfg(feature = "e2e-test-hooks")]
+    {
+        fs::write(state_dir.join(".e2e-object-enospc"), b"1")?;
+        state.import_object(&expected, b"expected")?;
+        let source = state_dir.join("source");
+        fs::write(&source, b"expected")?;
+        assert_eq!(state.store_object(fs::File::open(source)?)?.0, expected);
+        fs::remove_file(state_dir.join(".e2e-object-enospc"))?;
+    }
+    for entry in fs::read_dir(state_dir.join("objects"))? {
+        assert!(!entry?.file_name().to_string_lossy().starts_with(".tmp-"));
+    }
+
+    let held_hash = ObjectHash::from_blake3(blake3::hash(b"held"));
+    let held = state.begin_object(held_hash, 4)?;
+    let open_path = state_dir.clone();
+    let (opened, result) = std::sync::mpsc::channel();
+    let opener = std::thread::spawn(move || {
+        opened.send(State::open(open_path).map(|_| ())).ok();
+    });
+    let opened = result
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .context("State::open blocked behind a live object transfer")?;
+    opened?;
+    drop(held);
+    opener.join().expect("state opener joins");
+
+    drop(state);
+    fs::write(state_dir.join("objects/.tmp-crash"), b"partial")?;
+    let state = State::open(&state_dir)?;
+    assert!(state_dir.join("objects/.tmp-crash").exists());
+    state.prune_unreferenced_objects()?;
+    assert!(!state_dir.join("objects/.tmp-crash").exists());
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "e2e-test-hooks")]
+fn invalidation_recovery_obeys_recovery_admission() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let state_dir = temp.path().join("state");
+    fs::create_dir(&root)?;
+    let mut state = State::open(&state_dir)?;
+    let share = state.init_share(&root)?;
+    let (intent, _) = state.set_install_intent(&share, &[])?;
+    let hash = ObjectHash::from_blake3(blake3::hash(b"large"));
+    let conflict = Conflict::whole_file(
+        record(
+            b"race",
+            "winner",
+            2,
+            Entry::File {
+                hash,
+                size: DEFAULT_RECOVERY_BUDGET_BYTES,
+                executable: false,
+            },
+        )?,
+        record(b"race", "loser", 1, Entry::Tombstone)?,
+        flocal::merge::FallbackReason::AbsentBase,
+    );
+    fs::write(state_dir.join(".e2e-recovery-budget-bytes"), b"1")?;
+    let unsettled = RelativePath::from_bytes(b"race".to_vec())?;
+    let error = state
+        .retire_invalidated_install(&share, &intent, &[], &[conflict], &unsettled)
+        .expect_err("invalidation recovery must obey the same admission gate");
+    assert!(error.downcast_ref::<RecoveryLimitExceeded>().is_some());
+    assert!(state.install_intent(&share)?.is_some());
+    assert!(state.conflicts(&share)?.is_empty());
     Ok(())
 }
 

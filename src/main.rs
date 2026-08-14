@@ -198,10 +198,36 @@ enum ConflictCommand {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        ids: bool,
+        #[arg(long, requires = "ids")]
+        limit: Option<usize>,
+        #[arg(long, requires = "ids")]
+        after: Option<String>,
     },
     Show {
         path: PathBuf,
         conflict_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Prune {
+        path: PathBuf,
+        conflict_ids: Vec<String>,
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Budget {
+        path_or_size: String,
+        size: Option<String>,
+        #[arg(long)]
+        share: Option<String>,
+        #[arg(long)]
+        peer: bool,
         #[arg(long)]
         json: bool,
     },
@@ -255,7 +281,7 @@ fn run() -> Result<()> {
             }
         },
         Commands::Status { path, json } => status(&state, &path, json)?,
-        Commands::Conflicts { command } => conflicts(&state, command)?,
+        Commands::Conflicts { command } => conflicts(&mut state, command)?,
         Commands::Restore {
             path,
             conflict_id,
@@ -1654,6 +1680,9 @@ fn run_sync(
     let remote_records = sync::read_snapshot(&mut remote.output)?;
     state.validate_remote_records(&share, &local, &remote_records)?;
     let mut plan = sync::plan(&local, &remote_records);
+    if !dry_run {
+        ensure_connector_recovery_limits(state, &share, &[])?;
+    }
 
     let root = state.root_for(&share)?;
     let matcher = flocal::scan::IgnoreMatcher::new(&root)?;
@@ -1731,6 +1760,7 @@ fn run_sync(
         return Ok(SyncCompletion::default());
     }
     sync::materialize_merges(state, &share, &mut plan)?;
+    ensure_connector_recovery_limits(state, &share, &plan.conflicts)?;
     if report == PlanReport::Full && !needs_confirmation {
         print_plan(&local, &remote_records, &plan, json, report)?;
     }
@@ -1743,6 +1773,9 @@ fn run_sync(
     };
     let remote_needs = match response {
         Message::Need { hashes } => hashes,
+        Message::Error { message } => {
+            bail!("remote rejected recovery plan: {}", escaped(&message))
+        }
         other => bail!("expected remote object request, got {other:?}"),
     };
     let unique: std::collections::HashSet<_> = remote_needs.iter().collect();
@@ -1950,6 +1983,8 @@ fn serve_initial(
                 )?;
                 return Ok(());
             }
+            state.clear_pending_objects(&share)?;
+            state.prune_unreferenced_objects()?;
             sync::write_message(
                 &mut output,
                 &Message::Accepted {
@@ -1985,7 +2020,9 @@ fn serve_watch_open(
             output,
             V2SessionFrame::Error {
                 retryable: true,
-                message: format!("unsupported persistent watch protocol version {protocol}"),
+                message: format!(
+                    "unsupported persistent watch protocol version {protocol}; upgrade flocal on both peers"
+                ),
             },
         );
     }
@@ -2133,7 +2170,10 @@ fn serve_watch_open(
                 );
                 if let Err(error) = served {
                     let retryable = error.downcast_ref::<WatchProtocolError>().is_none()
-                        && error.downcast_ref::<sync::RootIdentityChanged>().is_none();
+                        && error.downcast_ref::<sync::RootIdentityChanged>().is_none()
+                        && error
+                            .downcast_ref::<flocal::state::RecoveryLimitExceeded>()
+                            .is_none();
                     write_v2_session(
                         output,
                         V2SessionFrame::Error {
@@ -2631,6 +2671,7 @@ fn serve_v2_round(
         .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let applied_plan = effective_plan(&advertised, &peer_records, &plan, deferred);
     let connector_plan = effective_plan(&peer_records, &advertised, &plan, deferred);
+    state.ensure_recovery_limits(share, &applied_plan.plan.conflicts)?;
     let mut required = sync::plan_records_with_inputs(&expected);
     required.extend(plan.records.clone());
     let needs = sync::required_hashes_for_share(state, share, &required)?;
@@ -2739,8 +2780,6 @@ fn serve_sync(
     input: &mut impl io::Read,
     output: &mut impl Write,
 ) -> Result<()> {
-    state.clear_pending_objects(share)?;
-    state.prune_unreferenced_objects()?;
     let mut pending = flocal::reconcile::Plan {
         records: Vec::new(),
         conflicts: Vec::new(),
@@ -2860,6 +2899,15 @@ fn serve_sync(
                 }
                 let expected = sync::plan(advertised, &peer_records);
                 sync::validate_materialized_plan_shape(&pending, &expected, connector)?;
+                if let Err(error) = state.ensure_recovery_limits(share, &pending.conflicts) {
+                    sync::write_message(
+                        output,
+                        &Message::Error {
+                            message: format!("{error:#}"),
+                        },
+                    )?;
+                    return Ok(());
+                }
                 plan_ready = true;
                 let mut required_records = sync::plan_records_with_inputs(&expected);
                 required_records.extend(pending.records.clone());
@@ -2926,6 +2974,29 @@ fn serve_sync(
     Ok(())
 }
 
+fn ensure_connector_recovery_limits(
+    state: &State,
+    share: &ShareId,
+    conflicts: &[flocal::reconcile::Conflict],
+) -> Result<()> {
+    match state.ensure_recovery_limits(share, conflicts) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let cleanup = state.clear_pending_objects(share).and_then(|()| {
+                state
+                    .prune_unreferenced_objects()
+                    .context("collecting candidate objects after recovery limit failure")
+            });
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("candidate-object cleanup also failed: {cleanup:#}")))
+                }
+            }
+        }
+    }
+}
+
 fn status(state: &State, path: &Path, json: bool) -> Result<()> {
     let (share, root) = state.find_share(path)?;
     let peer = state.peer(&share)?;
@@ -2940,10 +3011,11 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         .iter()
         .any(|(pending, _)| pending == &share);
     let unsettled = state.unsettled_paths(&share)?;
+    let recovery = state.recovery_usage(&share)?;
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":3,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install,"unsettled":unsettled})
+            serde_json::json!({"schema":4,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install,"unsettled":unsettled,"recovery":recovery})
         );
     } else {
         println!("Share: {}", share.0);
@@ -2957,8 +3029,27 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         println!("Entries: {entries}");
         println!("Tombstones: {tombstones}");
         println!(
-            "View:  last persisted scan (run `flocal sync {} --dry-run` to preview changes)",
-            root.display()
+            "Recovery: {} conflicts, {} / {}",
+            recovery.conflicts,
+            format_bytes(recovery.used_bytes),
+            format_bytes(recovery.budget_bytes)
+        );
+        println!(
+            "Reclaimable now: {}",
+            format_bytes(recovery.reclaimable_bytes)
+        );
+        if recovery.used_bytes >= recovery.budget_bytes {
+            println!(
+                "Warning: recovery storage is at its limit; use `flocal conflicts prune PATH` or `flocal conflicts budget PATH SIZE` for the root shown above"
+            );
+        }
+        if recovery.over_conflict_limit || recovery.over_metadata_limit {
+            println!(
+                "Warning: fixed recovery record limits are exceeded; use `flocal conflicts prune PATH` for the root shown above"
+            );
+        }
+        println!(
+            "View:  last persisted scan (use `flocal sync PATH --dry-run` to preview this root)"
         );
         if pending_install {
             println!("Warning: an interrupted install will be recovered by the next sync/watch");
@@ -2973,10 +3064,64 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn conflicts(state: &State, command: ConflictCommand) -> Result<()> {
+fn format_bytes(bytes: u64) -> String {
+    if bytes == 0 {
+        return "0 bytes".into();
+    }
+    const UNITS: [(&str, u64); 4] = [
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
+        ("bytes", 1),
+    ];
+    let (unit, divisor) = UNITS
+        .into_iter()
+        .find(|(_, divisor)| bytes >= *divisor)
+        .expect("bytes unit always matches");
+    if divisor == 1 {
+        format!("{bytes} {unit}")
+    } else {
+        format!("{:.1} {unit}", bytes as f64 / divisor as f64)
+    }
+}
+
+fn conflicts(state: &mut State, command: ConflictCommand) -> Result<()> {
     match command {
-        ConflictCommand::List { path, json } => {
+        ConflictCommand::List {
+            path,
+            json,
+            ids,
+            limit,
+            after,
+        } => {
             let (share, _) = state.find_share(&path)?;
+            if ids {
+                let limit = limit.unwrap_or(100);
+                let mut conflicts = state.conflict_ids_page(&share, after.as_deref(), limit)?;
+                let next_after = (conflicts.len() > limit).then(|| conflicts[limit - 1].id.clone());
+                conflicts.truncate(limit);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema": 1,
+                            "conflicts": conflicts,
+                            "next_after": next_after,
+                        }))?
+                    );
+                } else {
+                    for conflict in conflicts {
+                        println!("{}  {}", conflict.id, conflict.path.display());
+                    }
+                    if let Some(next_after) = next_after {
+                        println!(
+                            "More conflicts remain. Rerun with `--ids --after {} --limit {}`.",
+                            next_after, limit
+                        );
+                    }
+                }
+                return Ok(());
+            }
             let conflicts = state.conflicts(&share)?;
             if json {
                 println!(
@@ -3028,8 +3173,336 @@ fn conflicts(state: &State, command: ConflictCommand) -> Result<()> {
                 }
             }
         }
+        ConflictCommand::Prune {
+            path,
+            conflict_ids,
+            selection,
+            yes,
+            json,
+        } => {
+            let (share, root) = state.find_share(&path)?;
+            if yes && selection.is_none() {
+                bail!("--yes requires the --selection token from a prune preview");
+            }
+            if !yes && selection.is_some() {
+                bail!("--selection is only valid with --yes");
+            }
+            if yes {
+                let outcome = state.prune_recovery(
+                    &share,
+                    &conflict_ids,
+                    selection.as_deref().expect("checked above"),
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema": 1,
+                            "applied": true,
+                            "selection_token": outcome.plan.selection_token,
+                            "conflicts": outcome.plan.conflicts,
+                            "released_bytes": outcome.plan.released_bytes,
+                            "reclaimable_bytes": outcome.plan.reclaimable_bytes,
+                            "collection_pending": outcome.collection_pending,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Pruned {} recovery conflicts; released {} of this share's recovery allowance.",
+                        outcome.plan.conflicts.len(),
+                        format_bytes(outcome.plan.released_bytes)
+                    );
+                    println!(
+                        "Physical objects reclaimable now: {}",
+                        format_bytes(outcome.plan.reclaimable_bytes)
+                    );
+                    println!("Pruning is local; preview and prune separately on the peer.");
+                }
+                restart_after_recovery(state, &share, &root, true)?;
+                if outcome.collection_pending {
+                    bail!(
+                        "conflicts were pruned, but object collection is pending; rerun pruning or synchronization"
+                    );
+                }
+            } else {
+                let plan = state.recovery_prune_plan(&share, &conflict_ids)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema": 1,
+                            "applied": false,
+                            "selection_token": plan.selection_token,
+                            "conflicts": plan.conflicts,
+                            "released_bytes": plan.released_bytes,
+                            "reclaimable_bytes": plan.reclaimable_bytes,
+                        }))?
+                    );
+                } else {
+                    println!("Recovery conflicts selected for pruning:");
+                    for conflict in &plan.conflicts {
+                        println!("  {}  {}", conflict.id, conflict.path.display());
+                    }
+                    println!(
+                        "Share allowance released: {}",
+                        format_bytes(plan.released_bytes)
+                    );
+                    println!(
+                        "Physical objects reclaimable now: {}",
+                        format_bytes(plan.reclaimable_bytes)
+                    );
+                    println!("Selection token: {}", plan.selection_token);
+                    println!(
+                        "Apply by rerunning this preview command with `--selection {} --yes`.",
+                        plan.selection_token
+                    );
+                    println!("Pruning is local; preview and prune separately on the peer.");
+                }
+            }
+        }
+        ConflictCommand::Budget {
+            path_or_size,
+            size,
+            share,
+            peer,
+            json,
+        } => {
+            let (share_id, root, size_text) = match share {
+                Some(share) => {
+                    if peer || size.is_some() {
+                        bail!("--share cannot be combined with --peer or a PATH");
+                    }
+                    validate_share_id(&share)?;
+                    let share_id = ShareId(share);
+                    let root = state.managed_share(&share_id)?.root;
+                    (share_id, root, path_or_size)
+                }
+                None => {
+                    let size = size.context("budget requires PATH SIZE")?;
+                    let (share, root) = state.find_share(Path::new(&path_or_size))?;
+                    (share, root, size)
+                }
+            };
+            let budget = parse_recovery_size(&size_text)?;
+            if peer {
+                let previous = raise_peer_recovery_budget(state, &share_id, budget)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema":1,"target":"peer","previous_bytes":previous,"budget_bytes":budget})
+                    );
+                } else {
+                    println!(
+                        "Raised peer recovery budget from {} to {}.",
+                        format_bytes(previous),
+                        format_bytes(budget)
+                    );
+                }
+                restart_after_recovery(state, &share_id, &root, false)?;
+            } else {
+                let previous = state.raise_recovery_budget(&share_id, budget)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema":1,"target":"local","previous_bytes":previous,"budget_bytes":budget})
+                    );
+                } else {
+                    println!(
+                        "Raised local recovery budget from {} to {}.",
+                        format_bytes(previous),
+                        format_bytes(budget)
+                    );
+                }
+                restart_after_recovery(state, &share_id, &root, false)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn parse_recovery_size(value: &str) -> Result<u64> {
+    let (digits, multiplier) = [
+        ("KiB", 1024u64),
+        ("MiB", 1024 * 1024),
+        ("GiB", 1024 * 1024 * 1024),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        value
+            .strip_suffix(suffix)
+            .map(|digits| (digits, multiplier))
+    })
+    .unwrap_or((value, 1));
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("SIZE must be an integer byte count or use KiB, MiB, or GiB");
+    }
+    let amount = digits.parse::<u64>()?;
+    let bytes = amount.checked_mul(multiplier).context("SIZE overflows")?;
+    if bytes == 0 || bytes > i64::MAX as u64 {
+        bail!("SIZE must be between 1 and {} bytes", i64::MAX);
+    }
+    Ok(bytes)
+}
+
+fn validate_share_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("share ID contains unsafe characters");
+    }
+    Ok(())
+}
+
+fn restart_after_recovery(
+    state: &State,
+    share: &ShareId,
+    root: &Path,
+    any_recovery_limit: bool,
+) -> Result<()> {
+    let managed = state.managed_share(share)?;
+    let blocked = managed
+        .blocked_diagnostic
+        .as_deref()
+        .is_some_and(|diagnostic| {
+            diagnostic.contains("recovery storage budget exceeded")
+                || (any_recovery_limit
+                    && (diagnostic.contains("recovery conflict count exceeded")
+                        || diagnostic.contains("recovery metadata limit exceeded")))
+        });
+    if !blocked {
+        return Ok(());
+    }
+    if managed.watch_enabled && managed.peer.is_some() {
+        let restart = || -> Result<()> {
+            ensure_daemon(state)?;
+            daemon_request(
+                state,
+                DaemonRequest::Start {
+                    share: share.0.clone(),
+                    generation: None,
+                },
+            )?;
+            Ok(())
+        };
+        restart().with_context(|| {
+            format!(
+                "automatic restart failed for {}; run `flocal sync start PATH` with that root path",
+                root.display()
+            )
+        })?;
+        eprintln!("flocal: restarted the managed synchronization worker");
+    } else if managed.peer.is_none() {
+        eprintln!(
+            "flocal: this installation is the responder; on the connector, run `flocal sync start PATH` with root {}",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct AdminBudgetResponse {
+    schema: u32,
+    target: String,
+    previous_bytes: u64,
+    budget_bytes: u64,
+}
+
+struct AdminChild(std::process::Child);
+
+impl Drop for AdminChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn raise_peer_recovery_budget(state: &State, share: &ShareId, budget: u64) -> Result<u64> {
+    validate_share_id(&share.0)?;
+    let peer = state
+        .peer(share)?
+        .context("share has no configured connector peer")?;
+    validate_host(&peer.host)?;
+    validate_executable(&peer.executable)?;
+    let command = format!(
+        "{} conflicts budget --share {} {} --json",
+        peer.executable, share.0, budget
+    );
+    let mut child = AdminChild(
+        Command::new("ssh")
+            .args([
+                "-T",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                &peer.host,
+                &command,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let stdout = child.0.stdout.take().context("ssh stdout unavailable")?;
+    let stderr = child.0.stderr.take().context("ssh stderr unavailable")?;
+    let stdout = std::thread::spawn(move || read_bounded_admin_output(stdout));
+    let stderr = std::thread::spawn(move || read_bounded_admin_output(stderr));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.0.kill()?;
+            let _ = child.0.wait();
+            let _ = stdout.join();
+            let _ = stderr.join();
+            bail!("peer recovery budget command exceeded its 30 second deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let (stdout, stdout_overflow) = stdout
+        .join()
+        .map_err(|_| anyhow::anyhow!("peer stdout reader panicked"))??;
+    let (stderr, stderr_overflow) = stderr
+        .join()
+        .map_err(|_| anyhow::anyhow!("peer stderr reader panicked"))??;
+    if stdout_overflow || stderr_overflow {
+        bail!("peer recovery budget command exceeded its 64 KiB output limit");
+    }
+    if !status.success() {
+        bail!(
+            "peer recovery budget command failed: {}",
+            escaped(&String::from_utf8_lossy(&stderr))
+        );
+    }
+    let response: AdminBudgetResponse = serde_json::from_slice(&stdout)
+        .context("peer recovery budget command returned invalid JSON")?;
+    if response.schema != 1 || response.target != "local" || response.budget_bytes != budget {
+        bail!("peer recovery budget command returned an invalid response");
+    }
+    Ok(response.previous_bytes)
+}
+
+fn read_bounded_admin_output(mut reader: impl Read) -> io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut overflow = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok((kept, overflow));
+        }
+        let remaining = (64 * 1024usize).saturating_sub(kept.len());
+        kept.extend_from_slice(&buffer[..count.min(remaining)]);
+        overflow |= count > remaining;
+    }
 }
 
 enum RestoreSelector {
@@ -3065,6 +3538,7 @@ fn restore(
     force: bool,
 ) -> Result<()> {
     let (share, _) = state.find_share(path)?;
+    let _object_lock = state.lock_objects()?;
     let conflict = state.conflict(&share, id)?;
     let base_record;
     let record = match selector {
@@ -3334,6 +3808,12 @@ fn is_terminal_watch_error(error: &anyhow::Error) -> bool {
     if error.downcast_ref::<sync::RootIdentityChanged>().is_some() {
         return true;
     }
+    if error
+        .downcast_ref::<flocal::state::RecoveryLimitExceeded>()
+        .is_some()
+    {
+        return true;
+    }
     let message = format!("{error:#}");
     message.contains("root identity changed")
 }
@@ -3431,8 +3911,6 @@ fn persistent_watch_session_io(
         V2Envelope::Session {
             frame: V2SessionFrame::Error { retryable, message },
         } => {
-            let retryable =
-                retryable || message.starts_with("unsupported persistent watch protocol version ");
             return Err(RemoteWatchError { retryable, message }.into());
         }
         other => {
@@ -3824,6 +4302,7 @@ fn connector_v2_round(
         .validate_remote_records(share, &local, &remote_records)
         .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let mut plan = sync::plan(&local, &remote_records);
+    ensure_connector_recovery_limits(state, share, &[])?;
     let required = sync::plan_records_with_inputs(&plan);
     let needs = sync::required_hashes_for_share(state, share, &required)?;
     let mut expected_sizes = std::collections::HashMap::new();
@@ -3871,6 +4350,7 @@ fn connector_v2_round(
     sync::materialize_merges(state, share, &mut plan)?;
     let applied_plan = effective_plan(&local, &remote_records, &plan, deferred);
     let responder_plan = effective_plan(&remote_records, &local, &plan, deferred);
+    ensure_connector_recovery_limits(state, share, &applied_plan.plan.conflicts)?;
 
     write_v2_snapshot(output, round, &local, &budget)?;
     write_v2_plan(output, round, &plan, &budget)?;
@@ -5094,6 +5574,53 @@ mod tests {
     }
 
     #[test]
+    fn recovery_size_and_command_grammar_are_strict() -> Result<()> {
+        assert_eq!(format_bytes(0), "0 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(parse_recovery_size("1KiB")?, 1024);
+        assert_eq!(parse_recovery_size("2MiB")?, 2 * 1024 * 1024);
+        assert_eq!(parse_recovery_size("3GiB")?, 3 * 1024 * 1024 * 1024);
+        assert_eq!(parse_recovery_size("42")?, 42);
+        for invalid in ["", "0", "1KB", "1.5GiB", " 1", "1 ", "-1"] {
+            assert!(
+                parse_recovery_size(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        assert!(validate_share_id("share-safe_1").is_ok());
+        assert!(validate_share_id("bad;command").is_err());
+        assert!(
+            Cli::try_parse_from(["flocal", "conflicts", "budget", "/tmp/root", "11GiB"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "flocal",
+                "conflicts",
+                "budget",
+                "--share",
+                "share-safe",
+                "11GiB",
+                "--json"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "flocal",
+                "conflicts",
+                "prune",
+                "/tmp/root",
+                "c-123",
+                "--selection",
+                "abc",
+                "--yes"
+            ])
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn utc_timestamp_matches_known_instants() {
         let format = |epoch_seconds: u64| {
             format_utc_timestamp(
@@ -5181,6 +5708,15 @@ mod tests {
             }
             .into()
         ));
+        assert!(is_terminal_watch_error(
+            &flocal::state::RecoveryLimitExceeded {
+                kind: flocal::state::RecoveryLimitKind::BudgetBytes,
+                current: 0,
+                projected: 2,
+                limit: 1,
+            }
+            .into()
+        ));
         assert!(!is_terminal_watch_error(
             &RemoteWatchError {
                 retryable: true,
@@ -5213,6 +5749,42 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "e2e-test-hooks")]
+    fn recovery_cleanup_failure_preserves_the_terminal_limit_type() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let hash = flocal::model::ObjectHash::from_blake3(blake3::hash(b"large"));
+        let conflict = flocal::reconcile::Conflict::whole_file(
+            test_record(
+                b"large",
+                "winner",
+                Entry::File {
+                    hash,
+                    size: flocal::state::DEFAULT_RECOVERY_BUDGET_BYTES,
+                    executable: false,
+                },
+            ),
+            test_record(b"large", "loser", Entry::Tombstone),
+            flocal::merge::FallbackReason::AbsentBase,
+        );
+        std::fs::write(state_dir.join(".e2e-collector-fail"), b"1")?;
+        let error = ensure_connector_recovery_limits(&state, &share, &[conflict])
+            .expect_err("recovery admission must fail");
+        assert!(is_terminal_watch_error(&error));
+        assert!(
+            error
+                .downcast_ref::<flocal::state::RecoveryLimitExceeded>()
+                .is_some()
+        );
+        assert!(error.to_string().contains("cleanup also failed"));
+        Ok(())
     }
 
     #[test]

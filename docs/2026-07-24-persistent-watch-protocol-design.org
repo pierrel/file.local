@@ -253,8 +253,9 @@ remain the synchronization state and repair boundary.
    Local events while offline merely ensure the reconnect scan has work; they
    do not create concurrent SSH attempts.
 6. Reachability, timeout, EOF, remote-busy, and temporary watcher-capacity/setup
-   errors retry. Authentication, bound-peer mismatch, incompatible protocol,
-   unsafe path, persisted root-identity mismatch/missing root, and invalid peer
+   errors retry. A recognized persistent-version mismatch also retries with
+   bounded upgrade guidance. Authentication, bound-peer mismatch, unsafe path,
+   persisted root-identity mismatch/missing root, and malformed or invalid peer
    frames stop =watch= as actionable configuration/security errors.
 7. The existing first/five-minute/recovered error reporter remains the single
    rate limit even when error text changes. Recovery says synchronization
@@ -417,7 +418,8 @@ and the permanent post-migration identity requirement.
   generation is marked reconciled and no uncommitted path action is printed;
   existing durable recovery runs before the next scan.
 - *Peer stalls or violates framing:* finite read/round deadlines end the child;
-  invalid identity/protocol is non-retryable.
+  invalid identity or malformed protocol frames are non-retryable, while a
+  recognized version mismatch remains in bounded upgrade retry.
 - *Event storm:* constant-memory coalescing and maximum-burst deadline produce
   serialized rounds, never concurrent scans.
 - *Root disappears:* stop the session without manufacturing tombstones for the
@@ -722,3 +724,14 @@ explicit one-shot sync advances to protocol version 2. Older peers are rejected
 rather than silently ignoring merge ancestry or acknowledgement semantics. See
 [[file:2026-08-13-v0.0.1-design-reconciliation.org][the current design reconciliation]] for the implemented wire, security, and
 upgrade contract.
+
+* Update 2026-08-14: protocol version 5
+
+Bounded recovery storage makes each endpoint reject an effective apply plan
+that would exceed its local byte, conflict-count, or metadata allowance before
+visible mutation. Persistent watch therefore advances to protocol version 5
+and explicit one-shot sync advances to protocol version 3. The wire shape is
+unchanged; exact-version rejection prevents an older endpoint from accepting
+recovery beyond the new local boundary. See
+[[file:2026-08-14-bounded-recovery-storage-design.org][the bounded recovery storage design]] for the accounting, pruning, and upgrade
+contract.
