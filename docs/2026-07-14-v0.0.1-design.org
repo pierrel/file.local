@@ -2,6 +2,11 @@
 #+date: 2026-07-14
 #+status: proposed
 
+The original proposal is retained below. Its current implementation baseline
+and the accepted plan for the next three-way merge slice are reconciled in
+[[file:2026-08-13-v0.0.1-design-reconciliation.org][the 2026-08-13 design reconciliation]]. That document supersedes this one where
+later implementation evidence or platform behavior changed a decision.
+
 * Summary
 
 =file.local=, invoked as =flocal=, synchronizes one ordinary directory between

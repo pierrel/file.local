@@ -99,7 +99,8 @@ after both peers apply them. When asking for help, include =flocal sync list=
 and the recent Linux journal or macOS foreground-watch lines from both peers.
 
 The current code is proof-stage alpha software: review the explicit implementation gaps in
-[[file:docs/2026-07-14-alpha-implementation.org][the alpha implementation state]] before using it on irreplaceable data.
+[[file:docs/2026-08-13-v0.0.1-design-reconciliation.org][the current design reconciliation]] before using it on irreplaceable data. The
+dated [[file:docs/2026-07-14-alpha-implementation.org][alpha implementation state]] preserves the implementation history.
 
 It follows the local-first principle that the copy on your device is primary:
 files remain ordinary local files, every peer can read and change them without
@@ -137,18 +138,18 @@ is outside v0.0.1; =flocal= never reads or runs Git commands implicitly.
 
 Concurrent text edits use a three-way merge from the last shared version.
 Non-overlapping line changes merge automatically. When both sides change the
-same hunk, the later change wins that hunk. Both peer inputs, plus the base and
-merged result when they exist, are retained for explicit recovery until the
-user prunes them.
+same hunk, the later change wins that hunk. When an overlap or fallback creates
+a recovery conflict, both peer inputs, plus the base and merged result when they
+exist, are retained. Explicit recovery pruning remains required before the
+=v0.0.1= alpha exit; the current command does not discard them.
 Binary files and files without a common base use the same last-write-wins rule
-for the whole file. Deletes and observed renames participate in the same
-ordering. An ambiguous rename discovered only by a later scan falls back to
-path-wise delete-plus-create and is reported rather than guessed.
-Ordinary transfers stream files larger than memory; conflicts additionally
-require enough configured recovery space on both peers and stop safely if it is
-unavailable.
-The alpha proves the same flow with recoverable whole-file last-write-wins
-before three-way text merging is implemented.
+for the whole file. Deletes and unambiguously paired observed renames
+participate in the same ordering. An ambiguous rename event, including one that
+macOS reports without an old/new pair or one discovered only by a later scan,
+falls back to path-wise delete-plus-create and is reported rather than guessed.
+Ordinary transfers stream files larger than memory. Text merging is bounded to
+256 KiB and 4,096 lines per input; larger or non-text files still synchronize
+through recoverable whole-file selection.
 
 =flocal-daemon= keeps one SSH protocol session open for every enabled connector
 share and observes both peers. =make install= installs the normal =flocal=
@@ -181,18 +182,20 @@ without reconnecting. A path that changes again is isolated so stable sibling
 paths can finish. A later full round reports =SETTLED=. =flocal status= and
 =sync list= expose durable unsettled state across daemon restarts.
 
-Persistent watch uses protocol version 3, so install or upgrade =flocal= on both
+Persistent watch uses protocol version 4, so install or upgrade =flocal= on both
 peers before adding a managed sync. During a rolling upgrade, the first sync
-can still run through protocol version 1. The daemon keeps retrying with bounded
-failure reports until both peers support version 3; it never silently falls back
+uses explicit protocol version 2. The daemon keeps retrying with bounded
+failure reports until both peers support version 4; it never silently falls back
 to polling. Downgrading
 does not change synchronized state, though persistent watch remains unavailable
-until both peers support version 3.
+until both peers support version 4.
 
-See [[file:docs/2026-07-14-v0.0.1-design.org][the proposed detailed design]] for the CLI, wire behavior, recovery commands,
-security model, platform constraints, and acceptance criteria. The README is
-the durable high-level contract. Any implementation or design change that no
-longer matches it must update this file in the same pull request.
+See [[file:docs/2026-08-13-v0.0.1-design-reconciliation.org][the current design reconciliation]] for the implemented three-way merge and
+its safety boundaries, [[file:docs/2026-07-14-v0.0.1-design.org][the original detailed design]] for the broader
+CLI, security, platform, and acceptance decisions, and [[file:ROADMAP.org][the roadmap]] for the
+alpha exit bar. The README is the durable high-level contract. Any
+implementation or design change that no longer matches it must update this file
+in the same pull request.
 
 * Stories
 
@@ -203,7 +206,8 @@ longer matches it must update this file in the same pull request.
 - Initial scan, filesystem watching, dry-run, status, ignore rules, atomic
   writes, tombstones, and recoverable last-write-wins conflicts work.
 - The connector runs an enabled sync through one per-user =flocal-daemon=.
-- Whole-file conflict selection is acceptable while the core is being proven.
+- Concurrent text edits with a shared base use deterministic three-way merge;
+  other conflicts retain recoverable whole-file inputs.
 
 ** v0.0.1 - works for me
 

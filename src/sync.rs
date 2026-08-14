@@ -7,18 +7,22 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::model::{Entry, ObjectHash, PeerId, Record, RelativePath, ShareId};
-use crate::reconcile::{Plan, reconcile};
+use crate::reconcile::{MergeCandidate, Plan, reconcile};
 use crate::scan::{IgnoreMatcher, preview_cap_with_ignores, scan_cap, scan_cap_with_ignores};
 pub use crate::state::RootIdentityChanged;
 use crate::state::{InstallTempPhase, RootIdentity, State};
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
-pub const SYNC_PROTOCOL_VERSION: u32 = 1;
-pub const WATCH_PROTOCOL_VERSION: u32 = 3;
+pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+pub const WATCH_PROTOCOL_VERSION: u32 = 4;
 /// Compatibility name for the existing one-shot synchronization protocol.
 pub const PROTOCOL_VERSION: u32 = SYNC_PROTOCOL_VERSION;
 pub const MAX_RECORDS_PER_SESSION: usize = 1_000_000;
 pub const MAX_METADATA_BYTES_PER_SESSION: usize = 256 * 1024 * 1024;
+pub const MAX_MERGE_CANDIDATES_PER_ROUND: usize = 64;
+pub const MAX_MERGE_WORK_PER_ROUND: usize = 32_000_000;
+pub const MAX_MERGE_HUNKS_PER_ROUND: usize = 4_096;
+pub const MAX_MERGED_BYTES_PER_ROUND: usize = 2 * 1024 * 1024;
 pub fn max_transfer_bytes_per_session() -> u64 {
     std::env::var("FLOCAL_MAX_SESSION_BYTES")
         .ok()
@@ -190,9 +194,14 @@ pub enum V1Message {
     ApplyChunk {
         records: Vec<Record>,
         conflicts: Vec<crate::reconcile::Conflict>,
+        merges: Vec<crate::reconcile::MergeCandidate>,
     },
     ApplyEnd,
     Applied,
+    HeadChunk {
+        records: Vec<Record>,
+    },
+    CommitAck,
     Cancel,
     Done,
     Error {
@@ -291,9 +300,13 @@ pub enum V2RoundFrame {
     ApplyChunk {
         records: Vec<Record>,
         conflicts: Vec<crate::reconcile::Conflict>,
+        merges: Vec<crate::reconcile::MergeCandidate>,
     },
     ApplyEnd,
     Applied,
+    HeadChunk {
+        records: Vec<Record>,
+    },
     RoundInvalidated {
         path: RelativePath,
     },
@@ -516,13 +529,72 @@ pub fn read_snapshot(reader: &mut impl Read) -> Result<Vec<Record>> {
 pub fn write_plan(writer: &mut impl Write, plan: &Plan) -> Result<()> {
     write_record_chunks(writer, &plan.records)?;
     write_conflict_chunks(writer, &plan.conflicts)?;
+    write_merge_chunks(writer, &plan.merges)?;
     write_message(writer, &Message::ApplyEnd)
+}
+
+pub fn write_heads(writer: &mut impl Write, records: &[Record]) -> Result<()> {
+    let envelope = serde_json::to_vec(&Message::HeadChunk {
+        records: Vec::new(),
+    })?
+    .len();
+    for chunk in bounded_chunks(records, envelope, "acknowledged head")? {
+        write_message(
+            writer,
+            &Message::HeadChunk {
+                records: chunk.to_vec(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+pub fn regular_file_heads(records: &[Record]) -> Vec<Record> {
+    let mut heads: Vec<_> = records
+        .iter()
+        .filter(|record| matches!(record.version.entry, Entry::File { .. }))
+        .cloned()
+        .collect();
+    heads.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    heads
+}
+
+pub fn intersect_heads(local: &[Record], remote: &[Record]) -> Result<Vec<Record>> {
+    validate_unique_paths(local)?;
+    validate_unique_paths(remote)?;
+    let remote: std::collections::HashMap<_, _> = remote
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
+        .collect();
+    Ok(regular_file_heads(local)
+        .into_iter()
+        .filter(|record| remote.get(record.path.as_bytes()) == Some(&record))
+        .collect())
+}
+
+pub fn validate_ack_heads(current: &[Record], proposed: &[Record]) -> Result<()> {
+    let canonical = regular_file_heads(proposed);
+    if canonical != proposed || proposed.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        bail!("acknowledged heads are not sorted unique regular-file records");
+    }
+    let current: std::collections::HashMap<_, _> = current
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
+        .collect();
+    if proposed
+        .iter()
+        .any(|record| current.get(record.path.as_bytes()) != Some(&record))
+    {
+        bail!("acknowledged head does not match durable current state");
+    }
+    Ok(())
 }
 
 fn write_record_chunks(writer: &mut impl Write, records: &[Record]) -> Result<()> {
     let envelope = serde_json::to_vec(&Message::ApplyChunk {
         records: Vec::new(),
         conflicts: Vec::new(),
+        merges: Vec::new(),
     })?
     .len();
     for chunk in bounded_chunks(records, envelope, "plan record")? {
@@ -531,6 +603,7 @@ fn write_record_chunks(writer: &mut impl Write, records: &[Record]) -> Result<()
             &Message::ApplyChunk {
                 records: chunk.to_vec(),
                 conflicts: Vec::new(),
+                merges: Vec::new(),
             },
         )?;
     }
@@ -544,6 +617,7 @@ fn write_conflict_chunks(
     let envelope = serde_json::to_vec(&Message::ApplyChunk {
         records: Vec::new(),
         conflicts: Vec::new(),
+        merges: Vec::new(),
     })?
     .len();
     for chunk in bounded_chunks(conflicts, envelope, "plan conflict")? {
@@ -552,6 +626,30 @@ fn write_conflict_chunks(
             &Message::ApplyChunk {
                 records: Vec::new(),
                 conflicts: chunk.to_vec(),
+                merges: Vec::new(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn write_merge_chunks(
+    writer: &mut impl Write,
+    merges: &[crate::reconcile::MergeCandidate],
+) -> Result<()> {
+    let envelope = serde_json::to_vec(&Message::ApplyChunk {
+        records: Vec::new(),
+        conflicts: Vec::new(),
+        merges: Vec::new(),
+    })?
+    .len();
+    for chunk in bounded_chunks(merges, envelope, "merge candidate")? {
+        write_message(
+            writer,
+            &Message::ApplyChunk {
+                records: Vec::new(),
+                conflicts: Vec::new(),
+                merges: chunk.to_vec(),
             },
         )?;
     }
@@ -634,6 +732,17 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
     apply_plan_with_root(state, share, &root, records)
 }
 
+pub fn apply_complete_plan(state: &mut State, share: &ShareId, plan: &Plan) -> Result<()> {
+    let root = ShareRoot::open(state, share)?;
+    apply_complete_plan_with_root_skipping(
+        state,
+        share,
+        &root,
+        plan,
+        &std::collections::HashSet::new(),
+    )
+}
+
 pub fn apply_plan_with_root(
     state: &mut State,
     share: &ShareId,
@@ -656,6 +765,27 @@ pub fn apply_plan_with_root_skipping(
     records: &[Record],
     retained_paths: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<()> {
+    apply_complete_plan_with_root_skipping(
+        state,
+        share,
+        root,
+        &Plan {
+            records: records.to_vec(),
+            conflicts: Vec::new(),
+            merges: Vec::new(),
+        },
+        retained_paths,
+    )
+}
+
+pub fn apply_complete_plan_with_root_skipping(
+    state: &mut State,
+    share: &ShareId,
+    root: &ShareRoot,
+    plan: &Plan,
+    retained_paths: &std::collections::HashSet<Vec<u8>>,
+) -> Result<()> {
+    let records = &plan.records;
     validate_unique_paths(records)?;
     validate_declared_sizes(records)?;
     root.validate(state, share)?;
@@ -675,7 +805,7 @@ pub fn apply_plan_with_root_skipping(
             }
         }
     }
-    let (intent, _) = state.set_install_intent(share, records)?;
+    let (intent, _) = state.set_plan_install_intent(share, records, &plan.conflicts)?;
     #[cfg(feature = "e2e-test-hooks")]
     e2e_stop_before_apply(state)?;
     let install_temps: std::collections::HashMap<&[u8], _> = intent
@@ -775,7 +905,25 @@ pub fn apply_plan_with_root_skipping(
                 baseline.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
                 let recovered = scan_cap(state, share, &root.path, root_dir, &baseline)?;
                 root.validate(state, share)?;
-                let conflicts = reconcile(&recovered, records).conflicts;
+                let completed_paths: std::collections::HashSet<_> = completed
+                    .iter()
+                    .map(|record| record.path.as_bytes())
+                    .collect();
+                let recovered_by_path: std::collections::HashMap<_, _> = recovered
+                    .iter()
+                    .map(|record| (record.path.as_bytes(), record))
+                    .collect();
+                let mut conflicts: Vec<_> = intent
+                    .conflicts
+                    .iter()
+                    .filter(|conflict| {
+                        completed_paths.contains(conflict.path.as_bytes())
+                            || recovered_by_path.get(conflict.path.as_bytes())
+                                == Some(&conflict.winner())
+                    })
+                    .cloned()
+                    .collect();
+                conflicts.extend(reconcile(&recovered, records).conflicts);
                 let current_intent = state
                     .install_intent(share)?
                     .context("install intent disappeared before invalidation recovery")?;
@@ -804,8 +952,7 @@ pub fn apply_plan_with_root_skipping(
         completed.push(record.clone());
     }
     root.validate(state, share)?;
-    state.replace_records(share, &accepted)?;
-    state.clear_install_intent(share)?;
+    state.finish_install(share, &intent, &accepted)?;
     Ok(())
 }
 
@@ -1305,6 +1452,510 @@ pub fn plan(local: &[Record], remote: &[Record]) -> Plan {
     reconcile(local, remote)
 }
 
+pub fn materialize_merges(state: &State, share: &ShareId, plan: &mut Plan) -> Result<()> {
+    let outcomes = compute_merge_outcomes(state, &plan.merges)?;
+    for (candidate, outcome) in plan.merges.clone().into_iter().zip(outcomes) {
+        match outcome {
+            Ok(merged) => {
+                let mut result = candidate.winner.clone();
+                result.version.peer = state.peer_id()?;
+                result.version.sequence = state.next_sequence(share)?;
+                result.version.id_authenticator = None;
+                result.version.timestamp_ns = candidate
+                    .winner
+                    .version
+                    .timestamp_ns
+                    .max(candidate.loser.version.timestamp_ns);
+                result.version.seen.clear();
+                remember_version(&mut result.version.seen, &candidate.winner.version);
+                remember_version(&mut result.version.seen, &candidate.loser.version);
+                result.version.merge_base = Some(candidate.base.clone());
+                result.version.version_authenticator = None;
+                result.version.base_authenticator = None;
+                result.version.entry = Entry::File {
+                    hash: merged.hash.clone(),
+                    size: merged.bytes.len() as u64,
+                    executable: merged.executable,
+                };
+                state.authenticate_record(share, &mut result)?;
+                let mut sink =
+                    state.begin_object(merged.hash.clone(), merged.bytes.len() as u64)?;
+                sink.write_chunk(&merged.bytes)?;
+                sink.finish()?;
+                state.mark_object_generated(share, &merged.hash)?;
+                replace_candidate_result(plan, &candidate, result, merged.hunks)?;
+            }
+            Err(reason) => replace_candidate_fallback(plan, &candidate, reason),
+        }
+    }
+    sort_conflicts(plan);
+    Ok(())
+}
+
+/// Computes the exact dry-run result without reserving a Version ID or
+/// publishing a generated object.
+pub fn preview_merges(state: &State, plan: &mut Plan) -> Result<()> {
+    let outcomes = compute_merge_outcomes(state, &plan.merges)?;
+    for (candidate, outcome) in plan.merges.clone().into_iter().zip(outcomes) {
+        match outcome {
+            Ok(merged) => {
+                let mut result = candidate.winner.clone();
+                result.version.entry = Entry::File {
+                    hash: merged.hash,
+                    size: merged.bytes.len() as u64,
+                    executable: merged.executable,
+                };
+                replace_candidate_result(plan, &candidate, result, merged.hunks)?;
+            }
+            Err(reason) => replace_candidate_fallback(plan, &candidate, reason),
+        }
+    }
+    sort_conflicts(plan);
+    Ok(())
+}
+
+pub fn validate_materialized_plan_shape(
+    proposed: &Plan,
+    expected: &Plan,
+    connector: &PeerId,
+) -> Result<()> {
+    if proposed.merges != expected.merges {
+        bail!("merge candidates differ from deterministic reconciliation");
+    }
+    let candidate_paths: std::collections::HashSet<_> = expected
+        .merges
+        .iter()
+        .map(|candidate| candidate.path.as_bytes())
+        .collect();
+    let proposed_by_path: std::collections::HashMap<_, _> = proposed
+        .records
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
+        .collect();
+    let greatest_connector_sequence = expected
+        .records
+        .iter()
+        .chain(
+            expected
+                .merges
+                .iter()
+                .flat_map(|candidate| [&candidate.winner, &candidate.loser]),
+        )
+        .filter(|record| record.version.peer == *connector)
+        .map(|record| record.version.sequence)
+        .max()
+        .unwrap_or(0);
+    let mut merge_sequences = std::collections::HashSet::new();
+    let mut merged_bytes = 0u64;
+    for record in &expected.records {
+        let proposed_record = proposed_by_path
+            .get(record.path.as_bytes())
+            .context("materialized plan is missing a reconciled path")?;
+        if !candidate_paths.contains(record.path.as_bytes()) {
+            if *proposed_record != record {
+                bail!("materialized plan changed a non-merge record");
+            }
+            continue;
+        }
+        let candidate = expected
+            .merges
+            .iter()
+            .find(|candidate| candidate.path == record.path)
+            .expect("candidate path came from this plan");
+        if proposed.conflicts.iter().any(|conflict| {
+            conflict.path == record.path
+                && matches!(
+                    conflict.resolution,
+                    crate::reconcile::ConflictResolution::WholeFile { .. }
+                )
+        }) {
+            if **proposed_record != candidate.winner {
+                bail!("fallback changed the deterministic whole-file winner");
+            }
+            continue;
+        }
+        let Entry::File {
+            hash: _,
+            size: proposed_size,
+            executable: proposed_executable,
+        } = &proposed_record.version.entry
+        else {
+            bail!("materialized merge result is not a file")
+        };
+        let Entry::File {
+            executable: winner_executable,
+            ..
+        } = &candidate.winner.version.entry
+        else {
+            bail!("merge winner is not a file")
+        };
+        if proposed_executable != winner_executable {
+            bail!("materialized merge changed executable metadata");
+        }
+        let mut permitted = candidate.winner.clone();
+        permitted.version.peer = connector.clone();
+        permitted.version.sequence = proposed_record.version.sequence;
+        permitted.version.id_authenticator = proposed_record.version.id_authenticator.clone();
+        permitted.version.timestamp_ns = candidate
+            .winner
+            .version
+            .timestamp_ns
+            .max(candidate.loser.version.timestamp_ns);
+        permitted.version.seen.clear();
+        remember_version(&mut permitted.version.seen, &candidate.winner.version);
+        remember_version(&mut permitted.version.seen, &candidate.loser.version);
+        permitted.version.merge_base = Some(candidate.base.clone());
+        permitted.version.version_authenticator =
+            proposed_record.version.version_authenticator.clone();
+        permitted.version.base_authenticator = proposed_record.version.base_authenticator.clone();
+        permitted.version.entry = proposed_record.version.entry.clone();
+        if **proposed_record != permitted {
+            bail!("materialized merge changed version metadata");
+        }
+        merged_bytes = merged_bytes.saturating_add(*proposed_size);
+        if proposed_record.version.sequence <= greatest_connector_sequence
+            || !merge_sequences.insert(proposed_record.version.sequence)
+            || proposed_record.version.id_authenticator.is_none()
+            || proposed_record.version.version_authenticator.is_none()
+            || proposed_record.version.base_authenticator.is_none()
+            || *proposed_size > crate::merge::MAX_OUTPUT_BYTES as u64
+            || merged_bytes > MAX_MERGED_BYTES_PER_ROUND as u64
+        {
+            bail!("materialized merge lacks a fresh authenticated connector identity");
+        }
+    }
+    if proposed.records.len() != expected.records.len() {
+        bail!("materialized plan has an unexpected record count");
+    }
+    let expected_ordinary: Vec<_> = expected
+        .conflicts
+        .iter()
+        .filter(|conflict| !candidate_paths.contains(conflict.path.as_bytes()))
+        .collect();
+    let proposed_ordinary: Vec<_> = proposed
+        .conflicts
+        .iter()
+        .filter(|conflict| !candidate_paths.contains(conflict.path.as_bytes()))
+        .collect();
+    if proposed_ordinary != expected_ordinary {
+        bail!("materialized plan changed an unrelated conflict");
+    }
+    for candidate in &expected.merges {
+        let outcomes: Vec<_> = proposed
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.path == candidate.path)
+            .collect();
+        if outcomes.len() > 1 {
+            bail!("materialized plan has duplicate candidate outcomes");
+        }
+        if let Some(outcome) = outcomes.first()
+            && (outcome.base.as_ref() != Some(&candidate.base)
+                || !outcome.inputs.contains(&candidate.winner)
+                || !outcome.inputs.contains(&candidate.loser))
+        {
+            bail!("materialized conflict does not match its merge candidate");
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_materialized_plan(state: &State, proposed: &Plan, metadata: &Plan) -> Result<()> {
+    let outcomes = compute_merge_outcomes(state, &metadata.merges)?;
+    for (candidate, outcome) in metadata.merges.iter().zip(outcomes) {
+        let proposed_record = proposed
+            .records
+            .iter()
+            .find(|record| record.path == candidate.path)
+            .context("materialized plan is missing a merge result")?;
+        let proposed_conflicts: Vec<_> = proposed
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.path == candidate.path)
+            .collect();
+        match outcome {
+            Ok(merged) => {
+                let expected_entry = Entry::File {
+                    hash: merged.hash,
+                    size: merged.bytes.len() as u64,
+                    executable: merged.executable,
+                };
+                if proposed_record.version.entry != expected_entry {
+                    bail!("peer merge bytes differ from deterministic reconciliation");
+                }
+                if merged.hunks.is_empty() {
+                    if !proposed_conflicts.is_empty() {
+                        bail!("clean merge unexpectedly carries a recovery conflict");
+                    }
+                } else {
+                    let expected_conflict = crate::reconcile::Conflict::merged(
+                        candidate.base.clone(),
+                        candidate.winner.clone(),
+                        candidate.loser.clone(),
+                        proposed_record.clone(),
+                        merged.hunks,
+                    );
+                    if proposed_conflicts != vec![&expected_conflict] {
+                        bail!("peer overlap recovery differs from deterministic reconciliation");
+                    }
+                }
+            }
+            Err(reason) => {
+                let mut expected_conflict = crate::reconcile::Conflict::whole_file(
+                    candidate.winner.clone(),
+                    candidate.loser.clone(),
+                    reason,
+                );
+                expected_conflict.base = Some(candidate.base.clone());
+                if proposed_record != &candidate.winner
+                    || proposed_conflicts != vec![&expected_conflict]
+                {
+                    bail!("peer merge fallback differs from deterministic reconciliation");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ComputedMerge {
+    bytes: Vec<u8>,
+    hash: ObjectHash,
+    executable: bool,
+    hunks: Vec<crate::merge::ConflictHunk>,
+}
+
+struct MergeInput {
+    base: Vec<u8>,
+    winner: Vec<u8>,
+    loser: Vec<u8>,
+    executable: bool,
+}
+
+fn compute_merge_outcomes(
+    state: &State,
+    candidates: &[MergeCandidate],
+) -> Result<Vec<std::result::Result<ComputedMerge, crate::merge::FallbackReason>>> {
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].path.as_bytes() >= pair[1].path.as_bytes())
+    {
+        bail!("merge candidates are not in canonical path order");
+    }
+    let mut work = 0usize;
+    let mut hunks = 0usize;
+    let mut output = 0usize;
+    let mut exhausted = false;
+    let mut outcomes = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        if exhausted || index >= MAX_MERGE_CANDIDATES_PER_ROUND {
+            exhausted = true;
+            outcomes.push(Err(crate::merge::FallbackReason::RoundMergeBudget));
+            continue;
+        }
+        if candidate_file_sizes(candidate)?
+            .into_iter()
+            .any(|size| size > crate::merge::MAX_INPUT_BYTES as u64)
+        {
+            outcomes.push(Err(crate::merge::FallbackReason::InputBytes));
+            continue;
+        }
+        let input = read_candidate(state, candidate)?;
+        let candidate_work =
+            match crate::merge::comparison_work(&input.base, &input.winner, &input.loser) {
+                Ok(work) if work <= crate::merge::MAX_WORK => work,
+                Ok(_) => {
+                    outcomes.push(Err(crate::merge::FallbackReason::ComparisonWork));
+                    continue;
+                }
+                Err(reason) => {
+                    outcomes.push(Err(reason));
+                    continue;
+                }
+            };
+        if work
+            .checked_add(candidate_work)
+            .is_none_or(|total| total > MAX_MERGE_WORK_PER_ROUND)
+        {
+            exhausted = true;
+            outcomes.push(Err(crate::merge::FallbackReason::RoundMergeBudget));
+            continue;
+        }
+        work += candidate_work;
+        match crate::merge::merge(&input.base, &input.winner, &input.loser, true) {
+            Ok(merged) => {
+                if hunks
+                    .checked_add(merged.hunks.len())
+                    .is_none_or(|total| total > MAX_MERGE_HUNKS_PER_ROUND)
+                    || output
+                        .checked_add(merged.bytes.len())
+                        .is_none_or(|total| total > MAX_MERGED_BYTES_PER_ROUND)
+                {
+                    exhausted = true;
+                    outcomes.push(Err(crate::merge::FallbackReason::RoundMergeBudget));
+                    continue;
+                }
+                hunks += merged.hunks.len();
+                output += merged.bytes.len();
+                let hash = ObjectHash::from_blake3(blake3::hash(&merged.bytes));
+                outcomes.push(Ok(ComputedMerge {
+                    bytes: merged.bytes,
+                    hash,
+                    executable: input.executable,
+                    hunks: merged.hunks,
+                }));
+            }
+            Err(reason) => outcomes.push(Err(reason)),
+        }
+    }
+    Ok(outcomes)
+}
+
+fn candidate_file_sizes(candidate: &MergeCandidate) -> Result<[u64; 3]> {
+    let Entry::File { size: base, .. } = candidate.base.entry else {
+        bail!("merge base is not a file")
+    };
+    let Entry::File { size: winner, .. } = candidate.winner.version.entry else {
+        bail!("merge winner is not a file")
+    };
+    let Entry::File { size: loser, .. } = candidate.loser.version.entry else {
+        bail!("merge loser is not a file")
+    };
+    Ok([base, winner, loser])
+}
+
+fn read_candidate(state: &State, candidate: &MergeCandidate) -> Result<MergeInput> {
+    let Entry::File {
+        hash: base_hash, ..
+    } = &candidate.base.entry
+    else {
+        bail!("merge base is not a file")
+    };
+    let Entry::File {
+        hash: winner_hash,
+        executable,
+        ..
+    } = &candidate.winner.version.entry
+    else {
+        bail!("merge winner is not a file")
+    };
+    let Entry::File {
+        hash: loser_hash, ..
+    } = &candidate.loser.version.entry
+    else {
+        bail!("merge loser is not a file")
+    };
+    Ok(MergeInput {
+        base: state.read_object(base_hash)?,
+        winner: state.read_object(winner_hash)?,
+        loser: state.read_object(loser_hash)?,
+        executable: *executable,
+    })
+}
+
+fn replace_candidate_result(
+    plan: &mut Plan,
+    candidate: &MergeCandidate,
+    result: Record,
+    hunks: Vec<crate::merge::ConflictHunk>,
+) -> Result<()> {
+    let record = plan
+        .records
+        .iter_mut()
+        .find(|record| record.path == candidate.path)
+        .context("merge candidate is missing its result record")?;
+    *record = result;
+    plan.conflicts
+        .retain(|conflict| conflict.path != candidate.path);
+    if !hunks.is_empty() {
+        plan.conflicts.push(crate::reconcile::Conflict::merged(
+            candidate.base.clone(),
+            candidate.winner.clone(),
+            candidate.loser.clone(),
+            record.clone(),
+            hunks,
+        ));
+    }
+    Ok(())
+}
+
+fn replace_candidate_fallback(
+    plan: &mut Plan,
+    candidate: &MergeCandidate,
+    reason: crate::merge::FallbackReason,
+) {
+    let mut conflict = crate::reconcile::Conflict::whole_file(
+        candidate.winner.clone(),
+        candidate.loser.clone(),
+        reason,
+    );
+    conflict.base = Some(candidate.base.clone());
+    plan.conflicts
+        .retain(|conflict| conflict.path != candidate.path);
+    plan.conflicts.push(conflict);
+}
+
+fn sort_conflicts(plan: &mut Plan) {
+    plan.conflicts
+        .sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+}
+
+fn remember_version(seen: &mut Vec<crate::model::VersionId>, version: &crate::model::Version) {
+    for item in version
+        .seen
+        .iter()
+        .cloned()
+        .chain(std::iter::once(version.id()))
+    {
+        if let Some(existing) = seen.iter_mut().find(|known| known.peer == item.peer) {
+            if item.sequence > existing.sequence {
+                *existing = item;
+            }
+        } else {
+            seen.push(item);
+        }
+    }
+    seen.sort_by(|left, right| left.peer.0.cmp(&right.peer.0));
+}
+
+pub fn plan_records_with_inputs(plan: &Plan) -> Vec<Record> {
+    let mut records = plan.records.clone();
+    for conflict in &plan.conflicts {
+        records.extend(conflict.inputs.clone());
+        if let Some(base) = &conflict.base {
+            let mut record = conflict.inputs[0].clone();
+            record.version.entry = base.entry.clone();
+            records.push(record);
+        }
+        if let Some(merged) = &conflict.merged {
+            records.push(merged.clone());
+        }
+    }
+    for candidate in &plan.merges {
+        records.push(candidate.winner.clone());
+        records.push(candidate.loser.clone());
+        let mut base = candidate.winner.clone();
+        base.version.entry = candidate.base.entry.clone();
+        records.push(base);
+    }
+    records
+}
+
+pub fn authorized_hashes(records: &[Record]) -> std::collections::HashSet<ObjectHash> {
+    let mut hashes = std::collections::HashSet::new();
+    for record in records {
+        if let Entry::File { hash, .. } = &record.version.entry {
+            hashes.insert(hash.clone());
+        }
+        if let Some(base) = &record.version.merge_base
+            && let Entry::File { hash, .. } = &base.entry
+        {
+            hashes.insert(hash.clone());
+        }
+    }
+    hashes
+}
+
 pub fn send_object(state: &State, hash: &ObjectHash, writer: &mut impl Write) -> Result<()> {
     let mut file = state.open_verified_object(hash)?;
     let size = file.metadata()?.len();
@@ -1350,6 +2001,18 @@ pub fn receive_object(
     sink.finish()
 }
 
+pub fn receive_object_for_share(
+    state: &State,
+    share: &ShareId,
+    hash: ObjectHash,
+    size: u64,
+    reader: &mut impl Read,
+) -> Result<()> {
+    state.mark_object_receiving(share, &hash)?;
+    receive_object(state, hash.clone(), size, reader)?;
+    state.mark_object_verified(share, &hash)
+}
+
 pub fn required_hashes(state: &State, records: &[Record]) -> Vec<ObjectHash> {
     let mut seen = std::collections::HashSet::new();
     records
@@ -1373,6 +2036,7 @@ pub fn required_hashes_for_share(
     validate_declared_sizes(records)?;
     let root = state.root_for(share)?;
     let matcher = IgnoreMatcher::new(&root)?;
+    let authorized = state.share_authorized_objects(share)?;
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for record in records {
@@ -1386,7 +2050,8 @@ pub fn required_hashes_for_share(
                 Ok(file) if file.metadata()?.len() != *size => {
                     bail!("stored verified object size differs from the validated record")
                 }
-                Ok(_) => {}
+                Ok(_) if authorized.contains(hash) => {}
+                Ok(_) => hashes.push(hash.clone()),
                 Err(_) => hashes.push(hash.clone()),
             }
         }
@@ -1454,6 +2119,199 @@ mod tests {
     use crate::model::{PeerId, RelativePath, Version};
     use std::fs;
     use tempfile::tempdir;
+
+    fn merge_record(
+        peer: &str,
+        sequence: u64,
+        bytes: &[u8],
+        base: Option<crate::model::BaseVersion>,
+    ) -> Record {
+        let mut seen = Vec::new();
+        if let Some(base) = &base {
+            seen.push(base.id.clone());
+        }
+        Record {
+            path: RelativePath::from_bytes(b"shared.txt".to_vec()).unwrap(),
+            version: Version {
+                peer: PeerId(peer.into()),
+                sequence,
+                id_authenticator: None,
+                timestamp_ns: sequence as i64,
+                seen,
+                merge_base: base,
+                version_authenticator: None,
+                base_authenticator: None,
+                entry: Entry::File {
+                    hash: ObjectHash::from_blake3(blake3::hash(bytes)),
+                    size: bytes.len() as u64,
+                    executable: false,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn materializes_and_verifies_clean_overlap_and_fallback_outcomes() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let base_bytes = b"top\nmiddle\nbottom\n";
+        let base_record = merge_record("base", 1, base_bytes, None);
+        let base = base_record.version.as_base().unwrap();
+        let a_bytes = b"TOP\nmiddle\nbottom\n";
+        let b_bytes = b"top\nmiddle\nBOTTOM\n";
+        for bytes in [
+            base_bytes.as_slice(),
+            a_bytes.as_slice(),
+            b_bytes.as_slice(),
+        ] {
+            let hash = ObjectHash::from_blake3(blake3::hash(bytes));
+            state.import_object(&hash, bytes)?;
+        }
+        let a = merge_record("a", 2, a_bytes, Some(base.clone()));
+        let b = merge_record("b", 2, b_bytes, Some(base.clone()));
+        assert!(validate_ack_heads(std::slice::from_ref(&a), &[a.clone(), a.clone()]).is_err());
+        let metadata = plan(std::slice::from_ref(&a), std::slice::from_ref(&b));
+        assert_eq!(metadata.merges.len(), 1);
+        let mut preview = metadata.clone();
+        preview_merges(&state, &mut preview)?;
+        assert!(preview.conflicts.is_empty());
+        let mut clean = metadata.clone();
+        materialize_merges(&state, &share, &mut clean)?;
+        assert!(clean.conflicts.is_empty());
+        validate_materialized_plan_shape(&clean, &metadata, &state.peer_id()?)?;
+        verify_materialized_plan(&state, &clean, &metadata)?;
+        let Entry::File { hash, .. } = &clean.records[0].version.entry else {
+            unreachable!()
+        };
+        assert_eq!(state.read_object(hash)?, b"TOP\nmiddle\nBOTTOM\n");
+
+        let connector = state.peer_id()?;
+        let mut invalid = clean.clone();
+        invalid.merges.clear();
+        assert!(validate_materialized_plan_shape(&invalid, &metadata, &connector).is_err());
+        let mut invalid = clean.clone();
+        invalid.records.clear();
+        assert!(validate_materialized_plan_shape(&invalid, &metadata, &connector).is_err());
+        let mut invalid = clean.clone();
+        invalid.records[0].version.entry = Entry::Directory;
+        assert!(validate_materialized_plan_shape(&invalid, &metadata, &connector).is_err());
+        let mut invalid = clean.clone();
+        if let Entry::File { executable, .. } = &mut invalid.records[0].version.entry {
+            *executable = true;
+        }
+        assert!(validate_materialized_plan_shape(&invalid, &metadata, &connector).is_err());
+        let mut invalid = clean.clone();
+        invalid.records[0].version.peer = PeerId("forged".into());
+        assert!(validate_materialized_plan_shape(&invalid, &metadata, &connector).is_err());
+        let mut invalid = clean.clone();
+        invalid.records.push(invalid.records[0].clone());
+        assert!(validate_materialized_plan_shape(&invalid, &metadata, &connector).is_err());
+        let mut invalid = clean.clone();
+        if let Entry::File { hash, .. } = &mut invalid.records[0].version.entry {
+            *hash = ObjectHash::from_blake3(blake3::hash(b"forged"));
+        }
+        assert!(verify_materialized_plan(&state, &invalid, &metadata).is_err());
+
+        let overlap_bytes = b"other\nmiddle\nBOTTOM\n";
+        let overlap_hash = ObjectHash::from_blake3(blake3::hash(overlap_bytes));
+        state.import_object(&overlap_hash, overlap_bytes)?;
+        let overlap = merge_record("b", 3, overlap_bytes, Some(base));
+        let metadata = plan(&[a], &[overlap]);
+        let mut materialized = metadata.clone();
+        materialize_merges(&state, &share, &mut materialized)?;
+        assert!(matches!(
+            materialized.conflicts[0].resolution,
+            crate::reconcile::ConflictResolution::MergedWithOverlaps
+        ));
+        validate_materialized_plan_shape(&materialized, &metadata, &state.peer_id()?)?;
+        verify_materialized_plan(&state, &materialized, &metadata)?;
+        let mut invalid = materialized.clone();
+        invalid.conflicts[0].hunks.clear();
+        assert!(verify_materialized_plan(&state, &invalid, &metadata).is_err());
+        let mut invalid = materialized.clone();
+        invalid.conflicts.push(invalid.conflicts[0].clone());
+        assert!(validate_materialized_plan_shape(&invalid, &metadata, &state.peer_id()?).is_err());
+
+        let binary = b"\0binary";
+        let binary_hash = ObjectHash::from_blake3(blake3::hash(binary));
+        state.import_object(&binary_hash, binary)?;
+        let binary = merge_record("b", 4, binary, materialized.conflicts[0].base.clone());
+        let metadata = plan(&[materialized.conflicts[0].inputs[0].clone()], &[binary]);
+        if !metadata.merges.is_empty() {
+            let mut preview = metadata.clone();
+            preview_merges(&state, &mut preview)?;
+            let mut fallback = metadata.clone();
+            materialize_merges(&state, &share, &mut fallback)?;
+            assert!(matches!(
+                fallback.conflicts[0].resolution,
+                crate::reconcile::ConflictResolution::WholeFile {
+                    reason: crate::merge::FallbackReason::ContainsNul,
+                    ..
+                }
+            ));
+            validate_materialized_plan_shape(&fallback, &metadata, &state.peer_id()?)?;
+            verify_materialized_plan(&state, &fallback, &metadata)?;
+            let mut invalid = fallback.clone();
+            invalid.records[0] = invalid.conflicts[0].loser().clone();
+            assert!(verify_materialized_plan(&state, &invalid, &metadata).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cumulative_merge_budget_falls_back_from_the_first_exhausted_candidate() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let base_bytes = b"left\nright\n";
+        let a_bytes = b"LEFT\nright\n";
+        let b_bytes = b"left\nRIGHT\n";
+        for bytes in [
+            base_bytes.as_slice(),
+            a_bytes.as_slice(),
+            b_bytes.as_slice(),
+        ] {
+            let hash = ObjectHash::from_blake3(blake3::hash(bytes));
+            state.import_object(&hash, bytes)?;
+        }
+        let base = merge_record("base", 1, base_bytes, None)
+            .version
+            .as_base()
+            .unwrap();
+        let a = merge_record("a", 2, a_bytes, Some(base.clone()));
+        let b = merge_record("b", 2, b_bytes, Some(base));
+        let candidate = plan(&[a], &[b]).merges.remove(0);
+        let mut many = Plan {
+            records: Vec::new(),
+            conflicts: Vec::new(),
+            merges: Vec::new(),
+        };
+        for index in 0..=MAX_MERGE_CANDIDATES_PER_ROUND {
+            let path = RelativePath::from_bytes(format!("{index:03}.txt").into_bytes())?;
+            let mut next = candidate.clone();
+            next.path = path.clone();
+            next.winner.path = path.clone();
+            next.loser.path = path.clone();
+            many.records.push(next.winner.clone());
+            many.merges.push(next);
+        }
+        materialize_merges(&state, &share, &mut many)?;
+        assert_eq!(many.conflicts.len(), 1);
+        assert!(matches!(
+            many.conflicts[0].resolution,
+            crate::reconcile::ConflictResolution::WholeFile {
+                reason: crate::merge::FallbackReason::RoundMergeBudget,
+                ..
+            }
+        ));
+        assert_eq!(many.conflicts[0].path.as_bytes(), b"064.txt");
+        Ok(())
+    }
 
     #[test]
     fn install_precondition_errors_become_path_specific_invalidations() -> Result<()> {
@@ -1534,8 +2392,12 @@ mod tests {
                     version: Version {
                         peer: PeerId("peer-test".into()),
                         sequence,
+                        id_authenticator: None,
                         timestamp_ns: sequence as i64,
                         seen: Vec::new(),
+                        merge_base: None,
+                        version_authenticator: None,
+                        base_authenticator: None,
                         entry: Entry::Tombstone,
                     },
                 })
@@ -1547,6 +2409,7 @@ mod tests {
             &Plan {
                 records,
                 conflicts: Vec::new(),
+                merges: Vec::new(),
             },
         )?;
         let mut input = wire.as_slice();
@@ -1597,8 +2460,12 @@ mod tests {
             version: Version {
                 peer: PeerId("peer-test".into()),
                 sequence: 1,
+                id_authenticator: None,
                 timestamp_ns: 1,
                 seen: Vec::new(),
+                merge_base: None,
+                version_authenticator: None,
+                base_authenticator: None,
                 entry: Entry::File {
                     hash: hash.clone(),
                     size: bytes.len() as u64,

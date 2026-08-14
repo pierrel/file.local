@@ -91,7 +91,13 @@ enum Commands {
         path: PathBuf,
         conflict_id: String,
         #[arg(long, value_enum)]
-        version: RestoreVersion,
+        version: Option<RestoreVersion>,
+        #[arg(long, conflicts_with_all = ["version", "base", "merged"])]
+        input: Option<String>,
+        #[arg(long, conflicts_with_all = ["version", "input", "merged"])]
+        base: bool,
+        #[arg(long, conflicts_with_all = ["version", "input", "base"])]
+        merged: bool,
         #[arg(long = "to")]
         destination: PathBuf,
         #[arg(long)]
@@ -254,9 +260,15 @@ fn run() -> Result<()> {
             path,
             conflict_id,
             version,
+            input,
+            base,
+            merged,
             destination,
             force,
-        } => restore(&state, &path, &conflict_id, version, &destination, force)?,
+        } => {
+            let selector = RestoreSelector::new(version, input, base, merged)?;
+            restore(&state, &path, &conflict_id, selector, &destination, force)?
+        }
         Commands::Watch { path } => {
             recover_installs(&mut state)?;
             watch(&mut state, &path)?
@@ -1509,7 +1521,12 @@ fn recover_install_plan(
     share: &ShareId,
     intent: &flocal::state::InstallIntent,
 ) -> Result<()> {
-    match sync::apply_plan(state, share, &intent.records) {
+    let plan = flocal::reconcile::Plan {
+        records: intent.records.clone(),
+        conflicts: intent.conflicts.clone(),
+        merges: Vec::new(),
+    };
+    match sync::apply_complete_plan(state, share, &plan) {
         Ok(()) => Ok(()),
         Err(error) if error.downcast_ref::<sync::ApplyInvalidated>().is_some() => Ok(()),
         Err(error) => {
@@ -1583,6 +1600,7 @@ fn list_peer(state: &State, path: &Path, json: bool) -> Result<()> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PlanReport {
     Full,
+    Preview,
     Watch,
 }
 
@@ -1604,6 +1622,8 @@ fn run_sync(
     let _global_lock = state.lock_global_sync()?;
     let (share, _) = state.find_share(path)?;
     let _share_lock = state.lock_share(&share)?;
+    state.clear_pending_objects(&share)?;
+    state.prune_unreferenced_objects()?;
     let peer = state
         .peer(&share)?
         .context("no peer configured; run `flocal peer add`")?;
@@ -1632,32 +1652,16 @@ fn run_sync(
         other => bail!("unexpected handshake response: {other:?}"),
     }
     let remote_records = sync::read_snapshot(&mut remote.output)?;
-    let plan = sync::plan(&local, &remote_records);
-    if report == PlanReport::Full {
-        print_plan(&local, &remote_records, &plan, json, report)?;
-    }
-    if dry_run {
-        sync::write_message(&mut remote.input, &Message::Cancel)?;
-        remote.finish()?;
-        return Ok(SyncCompletion::default());
-    }
-    if !state.initial_complete(&share)? && !yes && !confirm("Apply this initial plan?")? {
-        sync::write_message(&mut remote.input, &Message::Cancel)?;
-        remote.finish()?;
-        return Ok(SyncCompletion::default());
-    }
+    state.validate_remote_records(&share, &local, &remote_records)?;
+    let mut plan = sync::plan(&local, &remote_records);
 
     let root = state.root_for(&share)?;
     let matcher = flocal::scan::IgnoreMatcher::new(&root)?;
-    let mut required_records = plan.records.clone();
-    for conflict in &plan.conflicts {
-        if matcher.is_record_ignored(&conflict.winner) {
-            continue;
-        }
-        required_records.push(conflict.winner.clone());
-        required_records.push(conflict.loser.clone());
-    }
-    let needs = sync::required_hashes_for_share(state, &share, &required_records)?;
+    let mut required_records = sync::plan_records_with_inputs(&plan);
+    required_records.retain(|record| !matcher.is_record_ignored(record));
+    let remote_authorized = sync::authorized_hashes(&remote_records);
+    let mut needs = sync::required_hashes_for_share(state, &share, &required_records)?;
+    needs.retain(|hash| remote_authorized.contains(hash));
     sync::write_message(
         &mut remote.input,
         &Message::Need {
@@ -1673,7 +1677,11 @@ fn run_sync(
     let transfer_limit = sync::max_transfer_bytes_per_session();
     let mut received_bytes = 0u64;
     for expected in needs {
-        match sync::read_message(&mut remote.output)? {
+        let response = match sync::read_message(&mut remote.output) {
+            Ok(response) => response,
+            Err(error) => return Err(remote.finish_after_error(error)),
+        };
+        match response {
             Message::ObjectStart { hash, size } if hash == expected => {
                 if expected_sizes.get(&hash) != Some(&size) {
                     bail!("peer object size differs from the validated plan");
@@ -1682,19 +1690,58 @@ fn run_sync(
                 if received_bytes > transfer_limit {
                     bail!("inbound object transfer exceeds session byte limit");
                 }
-                sync::receive_object(state, hash, size, &mut remote.output)?;
+                if let Err(error) =
+                    sync::receive_object_for_share(state, &share, hash, size, &mut remote.output)
+                {
+                    return Err(remote.finish_after_error(error));
+                }
             }
             other => bail!("expected object {expected}, got {other:?}"),
         }
     }
-    match sync::read_message(&mut remote.output)? {
+    let completion = match sync::read_message(&mut remote.output) {
+        Ok(response) => response,
+        Err(error) => return Err(remote.finish_after_error(error)),
+    };
+    match completion {
         Message::Done => {}
         other => bail!("expected object completion, got {other:?}"),
     }
 
+    let needs_confirmation = !state.initial_complete(&share)? && !yes;
+    if dry_run || needs_confirmation {
+        let mut preview = plan.clone();
+        sync::preview_merges(state, &mut preview)?;
+        if report == PlanReport::Full {
+            print_plan(&local, &remote_records, &preview, json, PlanReport::Preview)?;
+        }
+    }
+    if dry_run {
+        sync::write_message(&mut remote.input, &Message::Cancel)?;
+        state.clear_pending_objects(&share)?;
+        state.prune_unreferenced_objects()?;
+        remote.finish()?;
+        return Ok(SyncCompletion::default());
+    }
+    if needs_confirmation && !confirm("Apply this initial plan?")? {
+        sync::write_message(&mut remote.input, &Message::Cancel)?;
+        state.clear_pending_objects(&share)?;
+        state.prune_unreferenced_objects()?;
+        remote.finish()?;
+        return Ok(SyncCompletion::default());
+    }
+    sync::materialize_merges(state, &share, &mut plan)?;
+    if report == PlanReport::Full && !needs_confirmation {
+        print_plan(&local, &remote_records, &plan, json, report)?;
+    }
+
     sync::write_snapshot(&mut remote.input, &local)?;
     sync::write_plan(&mut remote.input, &plan)?;
-    let remote_needs = match sync::read_message(&mut remote.output)? {
+    let response = match sync::read_message(&mut remote.output) {
+        Ok(response) => response,
+        Err(error) => return Err(remote.finish_after_error(error)),
+    };
+    let remote_needs = match response {
         Message::Need { hashes } => hashes,
         other => bail!("expected remote object request, got {other:?}"),
     };
@@ -1702,15 +1749,8 @@ fn run_sync(
     if unique.len() != remote_needs.len() {
         bail!("peer object request contains duplicate hashes");
     }
-    let mut allowed_outbound: std::collections::HashSet<_> =
-        local.iter().filter_map(record_hash).collect();
-    for conflict in &plan.conflicts {
-        allowed_outbound.extend(
-            [record_hash(&conflict.winner), record_hash(&conflict.loser)]
-                .into_iter()
-                .flatten(),
-        );
-    }
+    let mut allowed_outbound = sync::authorized_hashes(&local);
+    allowed_outbound.extend(sync::authorized_hashes(&plan.records));
     let mut outbound_bytes = 0u64;
     for hash in remote_needs {
         if !allowed_outbound.contains(&hash) {
@@ -1724,14 +1764,28 @@ fn run_sync(
         sync::send_object(state, &hash, &mut remote.input)?;
     }
     sync::write_message(&mut remote.input, &Message::Done)?;
-    match sync::read_message(&mut remote.output)? {
-        Message::Applied => {}
-        Message::Error { message } => bail!("remote apply failed: {}", escaped(&message)),
-        other => bail!("expected apply response, got {other:?}"),
+    let mut remote_heads = Vec::new();
+    loop {
+        let response = match sync::read_message(&mut remote.output) {
+            Ok(response) => response,
+            Err(error) => return Err(remote.finish_after_error(error)),
+        };
+        match response {
+            Message::HeadChunk { records } => remote_heads.extend(records),
+            Message::Applied => break,
+            Message::Error { message } => bail!("remote apply failed: {}", escaped(&message)),
+            other => bail!("expected apply acknowledgement, got {other:?}"),
+        }
+        if remote_heads.len() > sync::MAX_RECORDS_PER_SESSION {
+            bail!("peer acknowledged-head manifest exceeds record limit");
+        }
     }
-    sync::apply_plan(state, &share, &plan.records)?;
-    state.add_conflicts(&share, &plan.conflicts)?;
+    sync::apply_complete_plan(state, &share, &plan)?;
     state.set_initial_complete(&share)?;
+    let current = state.records(&share)?;
+    sync::validate_ack_heads(&remote_heads, &remote_heads)?;
+    let shared_heads = sync::intersect_heads(&current, &remote_heads)?;
+    state.acknowledge_shared_heads(&share, &shared_heads)?;
     state.prune_unreferenced_objects()?;
     let committed_report = if report == PlanReport::Watch {
         let mut output = Vec::new();
@@ -1740,8 +1794,9 @@ fn run_sync(
     } else {
         None
     };
-    let finalization =
-        sync::write_message(&mut remote.input, &Message::Done).and_then(|()| remote.finish());
+    let finalization = sync::write_heads(&mut remote.input, &shared_heads)
+        .and_then(|()| sync::write_message(&mut remote.input, &Message::CommitAck))
+        .and_then(|()| remote.finish());
     if report == PlanReport::Watch {
         Ok(SyncCompletion {
             watch_report: committed_report,
@@ -1908,7 +1963,7 @@ fn serve_initial(
                 sync::refresh(state, &share)?
             };
             sync::write_snapshot(&mut output, &records)?;
-            serve_sync(state, &share, &records, &mut input, &mut output)?;
+            serve_sync(state, &share, &peer, &records, &mut input, &mut output)?;
         }
         InitialMessage::WatchOpen { .. } => {
             bail!("persistent watch requires a descriptor-backed protocol transport")
@@ -2069,6 +2124,7 @@ fn serve_watch_open(
                 let served = serve_v2_round(
                     state,
                     &share,
+                    &peer,
                     &share_root,
                     round,
                     input,
@@ -2307,6 +2363,7 @@ fn write_v2_plan(
                 V2RoundFrame::ApplyChunk {
                     records: plan.records[start..=end].to_vec(),
                     conflicts: Vec::new(),
+                    merges: Vec::new(),
                 },
             )?
         {
@@ -2318,6 +2375,7 @@ fn write_v2_plan(
             V2RoundFrame::ApplyChunk {
                 records: plan.records[start..end].to_vec(),
                 conflicts: Vec::new(),
+                merges: Vec::new(),
             },
             budget,
         )?;
@@ -2333,6 +2391,7 @@ fn write_v2_plan(
                 V2RoundFrame::ApplyChunk {
                     records: Vec::new(),
                     conflicts: plan.conflicts[start..=end].to_vec(),
+                    merges: Vec::new(),
                 },
             )?
         {
@@ -2344,6 +2403,35 @@ fn write_v2_plan(
             V2RoundFrame::ApplyChunk {
                 records: Vec::new(),
                 conflicts: plan.conflicts[start..end].to_vec(),
+                merges: Vec::new(),
+            },
+            budget,
+        )?;
+        start = end;
+    }
+    let mut start = 0;
+    while start < plan.merges.len() {
+        let mut end = start + 1;
+        while end < plan.merges.len()
+            && end - start < 128
+            && v2_frame_fits(
+                round,
+                V2RoundFrame::ApplyChunk {
+                    records: Vec::new(),
+                    conflicts: Vec::new(),
+                    merges: plan.merges[start..=end].to_vec(),
+                },
+            )?
+        {
+            end += 1;
+        }
+        write_v2_round(
+            output,
+            round,
+            V2RoundFrame::ApplyChunk {
+                records: Vec::new(),
+                conflicts: Vec::new(),
+                merges: plan.merges[start..end].to_vec(),
             },
             budget,
         )?;
@@ -2360,19 +2448,31 @@ fn read_v2_plan(
     let mut plan = flocal::reconcile::Plan {
         records: Vec::new(),
         conflicts: Vec::new(),
+        merges: Vec::new(),
     };
     loop {
         match recv_v2_round(input, round, budget)? {
-            V2RoundFrame::ApplyChunk { records, conflicts } => {
+            V2RoundFrame::ApplyChunk {
+                records,
+                conflicts,
+                merges,
+            } => {
                 budget
                     .add_metadata(serde_json::to_vec(&records)?.len())
                     .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
                 budget
                     .add_metadata(serde_json::to_vec(&conflicts)?.len())
                     .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                budget
+                    .add_metadata(serde_json::to_vec(&merges)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
                 plan.records.extend(records);
                 plan.conflicts.extend(conflicts);
-                if plan.records.len() > sync::MAX_RECORDS_PER_SESSION {
+                plan.merges.extend(merges);
+                if plan.records.len() > sync::MAX_RECORDS_PER_SESSION
+                    || plan.conflicts.len() > sync::MAX_RECORDS_PER_SESSION
+                    || plan.merges.len() > sync::MAX_RECORDS_PER_SESSION
+                {
                     watch_protocol_bail!("apply plan exceeds session record limit");
                 }
             }
@@ -2380,6 +2480,40 @@ fn read_v2_plan(
             other => watch_protocol_bail!("expected persistent apply plan, got {other:?}"),
         }
     }
+}
+
+fn write_v2_heads(
+    output: &impl AsFd,
+    round: u64,
+    records: &[flocal::model::Record],
+    budget: &sync::RoundBudget,
+) -> Result<()> {
+    let records = sync::regular_file_heads(records);
+    let mut start = 0;
+    while start < records.len() {
+        let mut end = start + 1;
+        while end < records.len()
+            && end - start < 256
+            && v2_frame_fits(
+                round,
+                V2RoundFrame::HeadChunk {
+                    records: records[start..=end].to_vec(),
+                },
+            )?
+        {
+            end += 1;
+        }
+        write_v2_round(
+            output,
+            round,
+            V2RoundFrame::HeadChunk {
+                records: records[start..end].to_vec(),
+            },
+            budget,
+        )?;
+        start = end;
+    }
+    Ok(())
 }
 
 fn send_v2_object(
@@ -2422,17 +2556,22 @@ fn send_v2_object(
 
 fn receive_v2_object(
     state: &State,
+    share: &ShareId,
     hash: flocal::model::ObjectHash,
     size: u64,
     round: u64,
     input: &impl AsFd,
     budget: &sync::RoundBudget,
 ) -> Result<()> {
-    let mut sink = state.begin_object(hash, size)?;
+    state.mark_object_receiving(share, &hash)?;
+    let mut sink = state.begin_object(hash.clone(), size)?;
     loop {
         match recv_v2_round(input, round, budget)? {
             V2RoundFrame::ObjectChunk { data } => sink.write_chunk(&data)?,
-            V2RoundFrame::ObjectEnd => return sink.finish(),
+            V2RoundFrame::ObjectEnd => {
+                sink.finish()?;
+                return state.mark_object_verified(share, &hash);
+            }
             other => watch_protocol_bail!("unexpected persistent object frame: {other:?}"),
         }
     }
@@ -2443,9 +2582,11 @@ enum ServedRound {
     Invalidated(flocal::model::RelativePath),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_v2_round(
     state: &mut State,
     share: &ShareId,
+    connector: &flocal::model::PeerId,
     root: &sync::ShareRoot,
     round: u64,
     input: &impl AsFd,
@@ -2453,6 +2594,8 @@ fn serve_v2_round(
     deferred: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<ServedRound> {
     let _global_lock = state.lock_global_sync()?;
+    state.clear_pending_objects(share)?;
+    state.prune_unreferenced_objects()?;
     let mut budget =
         sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
     budget.check()?;
@@ -2469,7 +2612,7 @@ fn serve_v2_round(
     if unique.len() != requested.len() {
         watch_protocol_bail!("object request contains duplicate hashes");
     }
-    let allowed: std::collections::HashSet<_> = advertised.iter().filter_map(record_hash).collect();
+    let allowed = sync::authorized_hashes(&advertised);
     for hash in requested {
         if !allowed.contains(&hash) {
             watch_protocol_bail!("peer requested an object outside this share");
@@ -2479,18 +2622,17 @@ fn serve_v2_round(
     write_v2_round(output, round, V2RoundFrame::Done, &budget)?;
 
     let peer_records = read_v2_snapshot(input, round, &mut budget)?;
+    state
+        .validate_remote_records(share, &advertised, &peer_records)
+        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let plan = read_v2_plan(input, round, &mut budget)?;
     let expected = sync::plan(&advertised, &peer_records);
-    if plan.records != expected.records || plan.conflicts != expected.conflicts {
-        watch_protocol_bail!("peer apply plan differs from local reconciliation");
-    }
+    sync::validate_materialized_plan_shape(&plan, &expected, connector)
+        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let applied_plan = effective_plan(&advertised, &peer_records, &plan, deferred);
     let connector_plan = effective_plan(&peer_records, &advertised, &plan, deferred);
-    let mut required = applied_plan.plan.records.clone();
-    for conflict in &applied_plan.plan.conflicts {
-        required.push(conflict.winner.clone());
-        required.push(conflict.loser.clone());
-    }
+    let mut required = sync::plan_records_with_inputs(&expected);
+    required.extend(plan.records.clone());
     let needs = sync::required_hashes_for_share(state, share, &required)?;
     let mut expected_sizes = std::collections::HashMap::new();
     for record in &required {
@@ -2515,7 +2657,7 @@ fn serve_v2_round(
                 budget
                     .add_transfer(size)
                     .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
-                receive_v2_object(state, hash, size, round, input, &budget)?;
+                receive_v2_object(state, share, hash, size, round, input, &budget)?;
             }
             other => {
                 watch_protocol_bail!("expected persistent object {expected_hash}, got {other:?}")
@@ -2526,12 +2668,14 @@ fn serve_v2_round(
         V2RoundFrame::Done => {}
         other => watch_protocol_bail!("expected persistent object completion, got {other:?}"),
     }
+    sync::verify_materialized_plan(state, &plan, &expected)
+        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     budget.check()?;
-    if let Err(error) = sync::apply_plan_with_root_skipping(
+    if let Err(error) = sync::apply_complete_plan_with_root_skipping(
         state,
         share,
         root,
-        &applied_plan.plan.records,
+        &applied_plan.plan,
         &applied_plan.retained_paths,
     ) {
         if let Some(invalidated) = error.downcast_ref::<sync::ApplyInvalidated>() {
@@ -2548,46 +2692,66 @@ fn serve_v2_round(
         return Err(error);
     }
     budget.check()?;
-    state.add_conflicts(share, &applied_plan.plan.conflicts)?;
-    budget.check()?;
     state.set_initial_complete(share)?;
     budget.check()?;
     state.prune_unreferenced_objects()?;
     budget.check()?;
+    let current = state.records(share)?;
+    write_v2_heads(output, round, &current, &budget)?;
     write_v2_round(output, round, V2RoundFrame::Applied, &budget)?;
-    match recv_v2_round(input, round, &budget)? {
-        V2RoundFrame::SyncFinished => {
-            if deferred.is_empty() {
-                state.clear_unsettled_paths(share)?;
+    let mut acknowledged = Vec::new();
+    loop {
+        match recv_v2_round(input, round, &budget)? {
+            V2RoundFrame::HeadChunk { records } => {
+                budget
+                    .add_metadata(serde_json::to_vec(&records)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                acknowledged.extend(records);
+                if acknowledged.len() > sync::MAX_RECORDS_PER_SESSION {
+                    watch_protocol_bail!("acknowledged-head manifest exceeds record limit");
+                }
             }
-            Ok(ServedRound::Completed)
+            V2RoundFrame::SyncFinished => {
+                sync::validate_ack_heads(&current, &acknowledged)
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                state.acknowledge_shared_heads(share, &acknowledged)?;
+                if deferred.is_empty() {
+                    state.clear_unsettled_paths(share)?;
+                }
+                return Ok(ServedRound::Completed);
+            }
+            V2RoundFrame::RoundInvalidated { path }
+                if accepts_invalidation(&connector_plan, &path) =>
+            {
+                state.remember_unsettled_path(share, &path)?;
+                return Ok(ServedRound::Invalidated(path));
+            }
+            other => watch_protocol_bail!("expected persistent round completion, got {other:?}"),
         }
-        V2RoundFrame::RoundInvalidated { path } if accepts_invalidation(&connector_plan, &path) => {
-            state.remember_unsettled_path(share, &path)?;
-            Ok(ServedRound::Invalidated(path))
-        }
-        other => watch_protocol_bail!("expected persistent round completion, got {other:?}"),
     }
 }
 
 fn serve_sync(
     state: &mut State,
     share: &ShareId,
+    connector: &flocal::model::PeerId,
     advertised: &[flocal::model::Record],
     input: &mut impl io::Read,
     output: &mut impl Write,
 ) -> Result<()> {
+    state.clear_pending_objects(share)?;
+    state.prune_unreferenced_objects()?;
     let mut pending = flocal::reconcile::Plan {
         records: Vec::new(),
         conflicts: Vec::new(),
+        merges: Vec::new(),
     };
     let mut plan_ready = false;
     let mut received_bytes = 0u64;
     let mut peer_records = Vec::new();
     let mut peer_snapshot_done = false;
     let mut metadata_bytes = 0usize;
-    let mut allowed_outbound: std::collections::HashSet<_> =
-        advertised.iter().filter_map(record_hash).collect();
+    let mut allowed_outbound = sync::authorized_hashes(advertised);
     for conflict in state.conflicts(share)? {
         allowed_outbound.extend(
             [record_hash(&conflict.winner), record_hash(&conflict.loser)]
@@ -2598,6 +2762,8 @@ fn serve_sync(
     let mut outbound_bytes = 0u64;
     let mut need_served = false;
     let mut requested_inbound = std::collections::HashMap::new();
+    let mut applied_records = None;
+    let mut acknowledged_heads = Vec::new();
     loop {
         match sync::read_message(input)? {
             Message::Need { hashes } => {
@@ -2636,7 +2802,7 @@ fn serve_sync(
                 if received_bytes > sync::max_transfer_bytes_per_session() {
                     bail!("object transfer exceeds session byte limit");
                 }
-                sync::receive_object(state, hash, size, input)?
+                sync::receive_object_for_share(state, share, hash, size, input)?
             }
             Message::SnapshotChunk { records } => {
                 if peer_snapshot_done || plan_ready {
@@ -2653,14 +2819,24 @@ fn serve_sync(
                 peer_records.extend(records);
             }
             Message::SnapshotEnd if !peer_snapshot_done && !plan_ready => {
+                state.validate_remote_records(share, advertised, &peer_records)?;
                 peer_snapshot_done = true;
             }
-            Message::ApplyChunk { records, conflicts } => {
+            Message::ApplyChunk {
+                records,
+                conflicts,
+                merges,
+            } => {
                 if !peer_snapshot_done || plan_ready {
                     bail!("apply chunk received out of order");
                 }
                 metadata_bytes = metadata_bytes.saturating_add(
-                    serde_json::to_vec(&(records.as_slice(), conflicts.as_slice()))?.len(),
+                    serde_json::to_vec(&(
+                        records.as_slice(),
+                        conflicts.as_slice(),
+                        merges.as_slice(),
+                    ))?
+                    .len(),
                 );
                 if metadata_bytes > sync::MAX_METADATA_BYTES_PER_SESSION {
                     bail!("apply plan exceeds session metadata limit");
@@ -2669,26 +2845,24 @@ fn serve_sync(
                     > sync::MAX_RECORDS_PER_SESSION
                     || pending.conflicts.len().saturating_add(conflicts.len())
                         > sync::MAX_RECORDS_PER_SESSION
+                    || pending.merges.len().saturating_add(merges.len())
+                        > sync::MAX_RECORDS_PER_SESSION
                 {
                     bail!("apply plan exceeds session record limit");
                 }
                 pending.records.extend(records);
                 pending.conflicts.extend(conflicts);
+                pending.merges.extend(merges);
             }
             Message::ApplyEnd => {
                 if !peer_snapshot_done || plan_ready {
                     bail!("apply end received out of order");
                 }
                 let expected = sync::plan(advertised, &peer_records);
-                if pending != expected {
-                    bail!("peer apply plan does not match deterministic reconciliation");
-                }
+                sync::validate_materialized_plan_shape(&pending, &expected, connector)?;
                 plan_ready = true;
-                let mut required_records = pending.records.clone();
-                for conflict in &pending.conflicts {
-                    required_records.push(conflict.winner.clone());
-                    required_records.push(conflict.loser.clone());
-                }
+                let mut required_records = sync::plan_records_with_inputs(&expected);
+                required_records.extend(pending.records.clone());
                 let hashes = sync::required_hashes_for_share(state, share, &required_records)?;
                 requested_inbound.clear();
                 for hash in &hashes {
@@ -2711,13 +2885,18 @@ fn serve_sync(
                 if !requested_inbound.is_empty() {
                     bail!("peer ended object transfer before satisfying requested hashes")
                 }
-                match sync::apply_plan(state, share, &pending.records) {
+                let expected = sync::plan(advertised, &peer_records);
+                sync::verify_materialized_plan(state, &pending, &expected)?;
+                match sync::apply_complete_plan(state, share, &pending) {
                     Ok(()) => {
-                        state.add_conflicts(share, &pending.conflicts)?;
                         state.prune_unreferenced_objects()?;
+                        let heads = sync::regular_file_heads(&state.records(share)?);
+                        sync::write_heads(output, &heads)?;
                         sync::write_message(output, &Message::Applied)?;
+                        applied_records = Some(state.records(share)?);
                         pending.records.clear();
                         pending.conflicts.clear();
+                        pending.merges.clear();
                         plan_ready = false;
                     }
                     Err(error) => sync::write_message(
@@ -2728,7 +2907,18 @@ fn serve_sync(
                     )?,
                 }
             }
-            Message::Done => break,
+            Message::HeadChunk { records } if applied_records.is_some() => {
+                acknowledged_heads.extend(records);
+                if acknowledged_heads.len() > sync::MAX_RECORDS_PER_SESSION {
+                    bail!("acknowledged-head manifest exceeds record limit");
+                }
+            }
+            Message::CommitAck if applied_records.is_some() => {
+                let current = applied_records.take().expect("checked above");
+                sync::validate_ack_heads(&current, &acknowledged_heads)?;
+                state.acknowledge_shared_heads(share, &acknowledged_heads)?;
+                break;
+            }
             Message::Cancel if !plan_ready => break,
             other => bail!("unexpected sync message: {other:?}"),
         }
@@ -2792,15 +2982,16 @@ fn conflicts(state: &State, command: ConflictCommand) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"schema": 1, "conflicts": conflicts})
+                        &serde_json::json!({"schema": 2, "conflicts": conflicts})
                     )?
                 );
             } else {
                 for conflict in conflicts {
                     println!(
-                        "{}  {}  winner={} loser={}",
+                        "{}  {}  {:?} winner={} loser={}",
                         conflict.id,
                         conflict.path.display(),
+                        conflict.resolution,
                         conflict.winner.version.peer.0,
                         conflict.loser.version.peer.0
                     );
@@ -2818,33 +3009,102 @@ fn conflicts(state: &State, command: ConflictCommand) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"schema": 1, "conflict": conflict})
+                        &serde_json::json!({"schema": 2, "conflict": conflict})
                     )?
                 );
             } else {
                 println!("Conflict {}: {}", conflict.id, conflict.path.display());
                 println!("Winner: {}", conflict.winner.version.peer.0);
                 println!("Loser:  {}", conflict.loser.version.peer.0);
+                println!("Resolution: {:?}", conflict.resolution);
+                if let Some(base) = &conflict.base {
+                    println!("Base: {}:{}", base.id.peer.0, base.id.sequence);
+                }
+                if let Some(merged) = &conflict.merged {
+                    println!(
+                        "Merged: {}:{}",
+                        merged.version.peer.0, merged.version.sequence
+                    );
+                }
             }
         }
     }
     Ok(())
 }
 
+enum RestoreSelector {
+    Version(RestoreVersion),
+    Input(String),
+    Base,
+    Merged,
+}
+
+impl RestoreSelector {
+    fn new(
+        version: Option<RestoreVersion>,
+        input: Option<String>,
+        base: bool,
+        merged: bool,
+    ) -> Result<Self> {
+        match (version, input, base, merged) {
+            (Some(version), None, false, false) => Ok(Self::Version(version)),
+            (None, Some(peer), false, false) => Ok(Self::Input(peer)),
+            (None, None, true, false) => Ok(Self::Base),
+            (None, None, false, true) => Ok(Self::Merged),
+            _ => bail!("select exactly one of --version, --input, --base, or --merged"),
+        }
+    }
+}
+
 fn restore(
     state: &State,
     path: &Path,
     id: &str,
-    version: RestoreVersion,
+    selector: RestoreSelector,
     destination: &Path,
     force: bool,
 ) -> Result<()> {
     let (share, _) = state.find_share(path)?;
     let conflict = state.conflict(&share, id)?;
-    let record = if matches!(version, RestoreVersion::Winner) {
-        &conflict.winner
-    } else {
-        &conflict.loser
+    let base_record;
+    let record = match selector {
+        RestoreSelector::Version(version) => {
+            if matches!(version, RestoreVersion::Winner) {
+                &conflict.winner
+            } else {
+                &conflict.loser
+            }
+        }
+        RestoreSelector::Input(peer) => conflict
+            .inputs
+            .iter()
+            .find(|record| record.version.peer.0 == peer)
+            .context("conflict has no input owned by that peer")?,
+        RestoreSelector::Base => {
+            let base = conflict
+                .base
+                .as_ref()
+                .context("conflict has no merge base")?;
+            base_record = flocal::model::Record {
+                path: conflict.path.clone(),
+                version: flocal::model::Version {
+                    peer: base.id.peer.clone(),
+                    sequence: base.id.sequence,
+                    id_authenticator: base.id.authenticator.clone(),
+                    timestamp_ns: 0,
+                    seen: Vec::new(),
+                    merge_base: None,
+                    version_authenticator: None,
+                    base_authenticator: base.authenticator.clone(),
+                    entry: base.entry.clone(),
+                },
+            };
+            &base_record
+        }
+        RestoreSelector::Merged => conflict
+            .merged
+            .as_ref()
+            .context("conflict has no merged result")?,
     };
     let hash = record_hash(record).context("selected conflict input is not a regular file")?;
     match std::fs::symlink_metadata(destination) {
@@ -3474,7 +3734,16 @@ fn effective_plan(
         .cloned()
         .collect();
     EffectivePlan {
-        plan: flocal::reconcile::Plan { records, conflicts },
+        plan: flocal::reconcile::Plan {
+            records,
+            conflicts,
+            merges: full
+                .merges
+                .iter()
+                .filter(|candidate| !is_deferred(&candidate.path))
+                .cloned()
+                .collect(),
+        },
         retained_paths,
     }
 }
@@ -3529,6 +3798,8 @@ fn connector_v2_round(
     deferred: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<ConnectorRound> {
     let _global_lock = state.lock_global_sync()?;
+    state.clear_pending_objects(share)?;
+    state.prune_unreferenced_objects()?;
     let mut budget =
         sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
     write_v2_round(
@@ -3549,14 +3820,11 @@ fn connector_v2_round(
     }
     let remote_records =
         read_connector_snapshot(input, round, &mut budget, pending_remote_generation)?;
-    let plan = sync::plan(&local, &remote_records);
-    let applied_plan = effective_plan(&local, &remote_records, &plan, deferred);
-    let responder_plan = effective_plan(&remote_records, &local, &plan, deferred);
-    let mut required = applied_plan.plan.records.clone();
-    for conflict in &applied_plan.plan.conflicts {
-        required.push(conflict.winner.clone());
-        required.push(conflict.loser.clone());
-    }
+    state
+        .validate_remote_records(share, &local, &remote_records)
+        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+    let mut plan = sync::plan(&local, &remote_records);
+    let required = sync::plan_records_with_inputs(&plan);
     let needs = sync::required_hashes_for_share(state, share, &required)?;
     let mut expected_sizes = std::collections::HashMap::new();
     for record in &required {
@@ -3583,6 +3851,7 @@ fn connector_v2_round(
                     .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
                 receive_connector_object(
                     state,
+                    share,
                     hash,
                     size,
                     round,
@@ -3599,6 +3868,10 @@ fn connector_v2_round(
         other => watch_protocol_bail!("expected persistent object completion, got {other:?}"),
     }
 
+    sync::materialize_merges(state, share, &mut plan)?;
+    let applied_plan = effective_plan(&local, &remote_records, &plan, deferred);
+    let responder_plan = effective_plan(&remote_records, &local, &plan, deferred);
+
     write_v2_snapshot(output, round, &local, &budget)?;
     write_v2_plan(output, round, &plan, &budget)?;
     let remote_needs =
@@ -3612,14 +3885,8 @@ fn connector_v2_round(
     if unique.len() != remote_needs.len() {
         watch_protocol_bail!("peer object request contains duplicate hashes");
     }
-    let mut allowed: std::collections::HashSet<_> = local.iter().filter_map(record_hash).collect();
-    for conflict in &responder_plan.plan.conflicts {
-        allowed.extend(
-            [record_hash(&conflict.winner), record_hash(&conflict.loser)]
-                .into_iter()
-                .flatten(),
-        );
-    }
+    let mut allowed = sync::authorized_hashes(&local);
+    allowed.extend(sync::authorized_hashes(&plan.records));
     for hash in remote_needs {
         if !allowed.contains(&hash) {
             watch_protocol_bail!("peer requested an object outside this share");
@@ -3627,20 +3894,34 @@ fn connector_v2_round(
         send_v2_object(state, &hash, round, output, &mut budget)?;
     }
     write_v2_round(output, round, V2RoundFrame::Done, &budget)?;
-    match recv_connector_round(input, round, &budget, pending_remote_generation, false)? {
-        V2RoundFrame::Applied => {}
-        V2RoundFrame::RoundInvalidated { path } if accepts_invalidation(&responder_plan, &path) => {
-            state.remember_unsettled_path(share, &path)?;
-            return Ok(ConnectorRound::Invalidated(path));
+    let mut remote_heads = Vec::new();
+    loop {
+        match recv_connector_round(input, round, &budget, pending_remote_generation, false)? {
+            V2RoundFrame::HeadChunk { records } => {
+                budget
+                    .add_metadata(serde_json::to_vec(&records)?.len())
+                    .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+                remote_heads.extend(records);
+                if remote_heads.len() > sync::MAX_RECORDS_PER_SESSION {
+                    watch_protocol_bail!("peer acknowledged-head manifest exceeds record limit");
+                }
+            }
+            V2RoundFrame::Applied => break,
+            V2RoundFrame::RoundInvalidated { path }
+                if accepts_invalidation(&responder_plan, &path) =>
+            {
+                state.remember_unsettled_path(share, &path)?;
+                return Ok(ConnectorRound::Invalidated(path));
+            }
+            other => watch_protocol_bail!("expected persistent apply response, got {other:?}"),
         }
-        other => watch_protocol_bail!("expected persistent apply response, got {other:?}"),
     }
     budget.check()?;
-    if let Err(error) = sync::apply_plan_with_root_skipping(
+    if let Err(error) = sync::apply_complete_plan_with_root_skipping(
         state,
         share,
         root,
-        &applied_plan.plan.records,
+        &applied_plan.plan,
         &applied_plan.retained_paths,
     ) {
         if let Some(invalidated) = error.downcast_ref::<sync::ApplyInvalidated>() {
@@ -3657,9 +3938,14 @@ fn connector_v2_round(
         return Err(error);
     }
     budget.check()?;
-    state.add_conflicts(share, &applied_plan.plan.conflicts)?;
-    budget.check()?;
     state.set_initial_complete(share)?;
+    budget.check()?;
+    sync::validate_ack_heads(&remote_heads, &remote_heads)
+        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+    let current = state.records(share)?;
+    let shared_heads = sync::intersect_heads(&current, &remote_heads)
+        .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
+    state.acknowledge_shared_heads(share, &shared_heads)?;
     budget.check()?;
     state.prune_unreferenced_objects()?;
     budget.check()?;
@@ -3693,6 +3979,7 @@ fn connector_v2_round(
         PlanReport::Watch,
     )?;
     report_settled(settled, &mut report)?;
+    write_v2_heads(output, round, &shared_heads, &budget)?;
     write_v2_round(output, round, V2RoundFrame::SyncFinished, &budget)?;
     Ok(ConnectorRound::Completed(report))
 }
@@ -3757,8 +4044,10 @@ fn read_connector_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receive_connector_object(
     state: &State,
+    share: &ShareId,
     hash: flocal::model::ObjectHash,
     size: u64,
     round: u64,
@@ -3766,11 +4055,15 @@ fn receive_connector_object(
     budget: &sync::RoundBudget,
     pending_remote_generation: &mut u64,
 ) -> Result<()> {
-    let mut sink = state.begin_object(hash, size)?;
+    state.mark_object_receiving(share, &hash)?;
+    let mut sink = state.begin_object(hash.clone(), size)?;
     loop {
         match recv_connector_round(input, round, budget, pending_remote_generation, false)? {
             V2RoundFrame::ObjectChunk { data } => sink.write_chunk(&data)?,
-            V2RoundFrame::ObjectEnd => return sink.finish(),
+            V2RoundFrame::ObjectEnd => {
+                sink.finish()?;
+                return state.mark_object_verified(share, &hash);
+            }
             other => watch_protocol_bail!("unexpected persistent object frame: {other:?}"),
         }
     }
@@ -3890,24 +4183,72 @@ fn write_plan_report(
     report: PlanReport,
 ) -> Result<()> {
     if json {
-        writeln!(output, "{}", serde_json::json!({"schema": 1, "plan": plan}))?;
+        let recovery_ids: Vec<_> = plan
+            .conflicts
+            .iter()
+            .map(|conflict| {
+                serde_json::json!({
+                    "path": conflict.path,
+                    "recovery_id": if report == PlanReport::Preview {
+                        None
+                    } else {
+                        Some(flocal::reconcile::conflict_id(conflict))
+                    }
+                })
+            })
+            .collect();
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({"schema": 2, "plan": plan, "recovery": recovery_ids})
+        )?;
         return Ok(());
     }
     let local_by_path: std::collections::HashMap<_, _> =
         local.iter().map(|r| (r.path.as_bytes(), r)).collect();
     let remote_by_path: std::collections::HashMap<_, _> =
         remote.iter().map(|r| (r.path.as_bytes(), r)).collect();
+    let conflicts_by_path: std::collections::HashMap<_, _> = plan
+        .conflicts
+        .iter()
+        .map(|conflict| (conflict.path.as_bytes(), conflict))
+        .collect();
     // `watch`'s repeating background sync timestamps every printed line and
     // omits KEEP: on an idle share almost every path matches on both peers,
     // and a KEEP line per path per rescan cycle would drown out the
     // changes a live log exists to show. `flocal sync`'s plan is unabridged.
     let prefix = match report {
-        PlanReport::Full => String::new(),
+        PlanReport::Full | PlanReport::Preview => String::new(),
         PlanReport::Watch => format!("{} ", utc_timestamp()),
     };
     for record in &plan.records {
         let local_record = local_by_path.get(record.path.as_bytes());
         let remote_record = remote_by_path.get(record.path.as_bytes());
+        if let Some(conflict) = conflicts_by_path.get(record.path.as_bytes()) {
+            let recovery = if report == PlanReport::Preview {
+                "pending".to_owned()
+            } else {
+                flocal::reconcile::conflict_id(conflict)
+            };
+            match &conflict.resolution {
+                flocal::reconcile::ConflictResolution::MergedWithOverlaps => writeln!(
+                    output,
+                    "{prefix}MERGE  {} (overlap; recovery {recovery})",
+                    record.path.display()
+                )?,
+                flocal::reconcile::ConflictResolution::WholeFile { reason, .. } => writeln!(
+                    output,
+                    "{prefix}CONFLICT {} ({reason:?}; recovery {recovery})",
+                    record.path.display()
+                )?,
+                flocal::reconcile::ConflictResolution::Destructive { .. } => writeln!(
+                    output,
+                    "{prefix}CONFLICT {} (destructive; recovery {recovery})",
+                    record.path.display()
+                )?,
+            }
+            continue;
+        }
         let action = match (&record.version.entry, local_record, remote_record) {
             (_, Some(local), Some(remote))
                 if local.version.id() == remote.version.id()
@@ -3925,9 +4266,6 @@ fn write_plan_report(
             continue;
         }
         writeln!(output, "{prefix}{action} {}", record.path.display())?;
-    }
-    for conflict in &plan.conflicts {
-        writeln!(output, "{prefix}CONFLICT {}", conflict.path.display())?;
     }
     Ok(())
 }
@@ -4147,6 +4485,17 @@ impl Remote {
         }
         Ok(())
     }
+
+    fn finish_after_error(mut self, error: anyhow::Error) -> anyhow::Error {
+        drop(self.input);
+        let status = self.child.wait();
+        let stderr = self.stderr.join().unwrap_or_default();
+        anyhow::anyhow!(
+            "{error:#}; remote exited with {:?}: {}",
+            status.ok(),
+            escaped(&String::from_utf8_lossy(&stderr))
+        )
+    }
 }
 
 struct TimedReader<R> {
@@ -4259,8 +4608,12 @@ mod tests {
             version: flocal::model::Version {
                 peer: flocal::model::PeerId(peer.into()),
                 sequence: 1,
+                id_authenticator: None,
                 timestamp_ns: 1,
                 seen: Vec::new(),
+                merge_base: None,
+                version_authenticator: None,
+                base_authenticator: None,
                 entry,
             },
         }
@@ -4280,6 +4633,7 @@ mod tests {
                 remote_stable.clone(),
             ],
             conflicts: Vec::new(),
+            merges: Vec::new(),
         };
         let deferred = std::collections::HashSet::from([b"dir/noisy".to_vec()]);
 
@@ -4323,6 +4677,7 @@ mod tests {
         let full = flocal::reconcile::Plan {
             records: vec![target_parent.clone()],
             conflicts: Vec::new(),
+            merges: Vec::new(),
         };
         let deferred = std::collections::HashSet::from([b"node/child".to_vec()]);
         let effective = effective_plan(
@@ -4374,6 +4729,7 @@ mod tests {
             plan: flocal::reconcile::Plan {
                 records: vec![record.clone()],
                 conflicts: Vec::new(),
+                merges: Vec::new(),
             },
             retained_paths: std::collections::HashSet::new(),
         };
@@ -4518,7 +4874,14 @@ mod tests {
             sync::write_message(&mut input, message)?;
         }
         let mut output = Vec::new();
-        let result = serve_sync(&mut state, &share, &[], &mut input.as_slice(), &mut output);
+        let result = serve_sync(
+            &mut state,
+            &share,
+            &flocal::model::PeerId("connector".into()),
+            &[],
+            &mut input.as_slice(),
+            &mut output,
+        );
         Ok((result, output))
     }
 
@@ -4539,7 +4902,7 @@ mod tests {
             Message::SnapshotEnd,
             Message::ApplyEnd,
             Message::Done,
-            Message::Done,
+            Message::CommitAck,
         ])?;
         result?;
         let mut messages = output.as_slice();
@@ -4573,6 +4936,7 @@ mod tests {
             vec![Message::ApplyChunk {
                 records: Vec::new(),
                 conflicts: Vec::new(),
+                merges: Vec::new(),
             }],
             vec![Message::ApplyEnd],
             vec![Message::Accepted {
@@ -4602,8 +4966,12 @@ mod tests {
             version: flocal::model::Version {
                 peer: flocal::model::PeerId("peer".into()),
                 sequence: 1,
+                id_authenticator: None,
                 timestamp_ns: 1,
                 seen: Vec::new(),
+                merge_base: None,
+                version_authenticator: None,
+                base_authenticator: None,
                 entry,
             },
         };
@@ -4622,6 +4990,7 @@ mod tests {
             &flocal::reconcile::Plan {
                 records: vec![directory.clone(), tombstone, symlink],
                 conflicts: Vec::new(),
+                merges: Vec::new(),
             },
             false,
             PlanReport::Full,
@@ -4632,6 +5001,7 @@ mod tests {
             &flocal::reconcile::Plan {
                 records: Vec::new(),
                 conflicts: Vec::new(),
+                merges: Vec::new(),
             },
             true,
             PlanReport::Full,
@@ -4646,15 +5016,48 @@ mod tests {
             &[merge_remote.clone(), download.clone()],
             &flocal::reconcile::Plan {
                 records: vec![merge_local.clone(), download, neither],
-                conflicts: vec![flocal::reconcile::Conflict {
-                    path: merge_local.path.clone(),
-                    winner: merge_local.clone(),
-                    loser: merge_remote,
-                }],
+                conflicts: vec![flocal::reconcile::Conflict::whole_file(
+                    merge_local.clone(),
+                    merge_remote.clone(),
+                    flocal::merge::FallbackReason::AbsentBase,
+                )],
+                merges: Vec::new(),
             },
             false,
             PlanReport::Full,
         )?;
+        let conflict = flocal::reconcile::Conflict::whole_file(
+            merge_local.clone(),
+            merge_remote,
+            flocal::merge::FallbackReason::AbsentBase,
+        );
+        let preview_plan = flocal::reconcile::Plan {
+            records: vec![merge_local],
+            conflicts: vec![conflict],
+            merges: Vec::new(),
+        };
+        let mut preview = Vec::new();
+        write_plan_report(
+            &mut preview,
+            &[],
+            &[],
+            &preview_plan,
+            false,
+            PlanReport::Preview,
+        )?;
+        let preview = String::from_utf8(preview)?;
+        assert!(preview.contains("recovery pending"), "{preview}");
+        let mut preview_json = Vec::new();
+        write_plan_report(
+            &mut preview_json,
+            &[],
+            &[],
+            &preview_plan,
+            true,
+            PlanReport::Preview,
+        )?;
+        let preview_json: serde_json::Value = serde_json::from_slice(&preview_json)?;
+        assert!(preview_json["recovery"][0]["recovery_id"].is_null());
         Ok(())
     }
 
@@ -4988,8 +5391,12 @@ mod tests {
         let version = flocal::model::Version {
             peer: flocal::model::PeerId("peer".into()),
             sequence: 1,
+            id_authenticator: None,
             timestamp_ns: 1,
             seen: Vec::new(),
+            merge_base: None,
+            version_authenticator: None,
+            base_authenticator: None,
             entry: Entry::Directory,
         };
         let winner = flocal::model::Record {
@@ -5000,11 +5407,12 @@ mod tests {
         loser.version.peer = flocal::model::PeerId("other".into());
         let plan = flocal::reconcile::Plan {
             records: Vec::new(),
-            conflicts: vec![flocal::reconcile::Conflict {
-                path: winner.path.clone(),
+            conflicts: vec![flocal::reconcile::Conflict::whole_file(
                 winner,
                 loser,
-            }],
+                flocal::merge::FallbackReason::AbsentBase,
+            )],
+            merges: Vec::new(),
         };
         let (writer, reader) = UnixStream::pair()?;
         let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
@@ -5138,6 +5546,7 @@ mod tests {
         let remote_share = remote_state.init_share(&remote_root)?;
         let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
         let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
+        let connector_peer = local_state.peer_id()?;
 
         let (connector_stream, responder_reader) = UnixStream::pair()?;
         let (responder_stream, connector_reader) = UnixStream::pair()?;
@@ -5156,6 +5565,7 @@ mod tests {
             serve_v2_round(
                 &mut remote_state,
                 &remote_share,
+                &connector_peer,
                 &remote_cap,
                 1,
                 &responder_reader,
@@ -5191,6 +5601,59 @@ mod tests {
     }
 
     #[test]
+    fn persistent_connector_rejects_duplicate_snapshot_paths_without_retrying() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("local");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let root = sync::ShareRoot::open(&state, &share)?;
+        let mut first = test_record(b"duplicate", "foreign", Entry::Directory);
+        let mut second = first.clone();
+        first.version.sequence = 8;
+        second.version.sequence = 9;
+
+        let (connector_stream, responder_reader) = UnixStream::pair()?;
+        let (responder_stream, connector_reader) = UnixStream::pair()?;
+        let responder = std::thread::spawn(move || -> Result<()> {
+            let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
+            assert!(matches!(
+                sync::read_v2_envelope_until(&responder_reader, budget.frame_deadline()?)?,
+                V2Envelope::Round {
+                    round: 1,
+                    frame: V2RoundFrame::SyncStart { .. }
+                }
+            ));
+            write_v2_round(&responder_stream, 1, V2RoundFrame::SyncAccepted, &budget)?;
+            write_v2_snapshot(&responder_stream, 1, &[first, second], &budget)
+        });
+
+        let mut pending_remote_generation = 0;
+        let result = connector_v2_round(
+            &mut state,
+            &share,
+            &root,
+            1,
+            0,
+            0,
+            &connector_reader,
+            &connector_stream,
+            &mut pending_remote_generation,
+            &Default::default(),
+        );
+        let error = match result {
+            Ok(_) => bail!("duplicate peer paths must terminate the persistent session"),
+            Err(error) => error,
+        };
+        responder.join().expect("responder joins")?;
+        assert_eq!(error.to_string(), "peer snapshot contains duplicate paths");
+        assert!(is_terminal_watch_error(&error));
+        Ok(())
+    }
+
+    #[test]
     fn persistent_session_handshake_startup_and_disconnect_run_in_process() -> Result<()> {
         use std::os::unix::net::UnixStream;
 
@@ -5208,6 +5671,7 @@ mod tests {
         let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
         let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
         let remote_peer = remote_state.peer_id()?;
+        let connector_peer = local_state.peer_id()?;
         let expected_remote_peer = remote_peer.clone();
         let local_seed = flocal::model::RelativePath::from_bytes(b"local-seed".to_vec())?;
         let remote_seed = flocal::model::RelativePath::from_bytes(b"remote-seed".to_vec())?;
@@ -5251,6 +5715,7 @@ mod tests {
             serve_v2_round(
                 &mut remote_state,
                 &remote_share,
+                &connector_peer,
                 &remote_cap,
                 1,
                 &responder_input,
@@ -5308,8 +5773,12 @@ mod tests {
             version: flocal::model::Version {
                 peer: flocal::model::PeerId("peer".into()),
                 sequence: 1,
+                id_authenticator: None,
                 timestamp_ns: 1,
                 seen: Vec::new(),
+                merge_base: None,
+                version_authenticator: None,
+                base_authenticator: None,
                 entry,
             },
         };
@@ -5318,11 +5787,8 @@ mod tests {
         let uploaded = record(b"uploaded", Entry::Directory);
         let plan = flocal::reconcile::Plan {
             records: vec![kept.clone(), uploaded.clone()],
-            conflicts: vec![flocal::reconcile::Conflict {
-                path: kept.path.clone(),
-                winner: kept.clone(),
-                loser: uploaded.clone(),
-            }],
+            conflicts: Vec::new(),
+            merges: Vec::new(),
         };
         let local = [kept.clone(), uploaded.clone()];
         let remote = [kept.clone()];
@@ -5332,7 +5798,6 @@ mod tests {
         let full = String::from_utf8(full)?;
         assert!(full.contains("KEEP   kept"), "{full:?}");
         assert!(full.contains("UPLOAD uploaded"), "{full:?}");
-        assert!(full.contains("CONFLICT kept"), "{full:?}");
         // The explicit `flocal sync` report is unchanged: no timestamp.
         assert!(!full.lines().next().unwrap().starts_with(char::is_numeric));
 
@@ -5352,8 +5817,8 @@ mod tests {
         let watch = String::from_utf8(watch)?;
         assert!(!watch.contains("KEEP"), "{watch:?}");
         let lines: Vec<&str> = watch.lines().collect();
-        assert_eq!(lines.len(), 2, "{watch:?}");
-        for (line, suffix) in lines.iter().zip(["UPLOAD uploaded", "CONFLICT kept"]) {
+        assert_eq!(lines.len(), 1, "{watch:?}");
+        for (line, suffix) in lines.iter().zip(["UPLOAD uploaded"]) {
             let (timestamp, rest) = line.split_once(' ').expect("timestamped line");
             assert_eq!(rest, suffix, "{watch:?}");
             assert!(

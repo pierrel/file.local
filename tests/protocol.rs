@@ -13,15 +13,19 @@ fn record(path: &[u8], entry: Entry) -> Result<Record> {
         version: Version {
             peer: PeerId("peer".into()),
             sequence: 1,
+            id_authenticator: None,
             timestamp_ns: 1,
             seen: Vec::new(),
+            merge_base: None,
+            version_authenticator: None,
+            base_authenticator: None,
             entry,
         },
     })
 }
 
 #[test]
-fn v1_wire_format_and_initial_dispatch_remain_compatible() -> Result<()> {
+fn explicit_v2_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
     let message = Message::Sync {
         protocol: sync::SYNC_PROTOCOL_VERSION,
         share: flocal::model::ShareId("share".into()),
@@ -32,11 +36,11 @@ fn v1_wire_format_and_initial_dispatch_remain_compatible() -> Result<()> {
     sync::write_message(&mut wire, &message)?;
     assert_eq!(
         &wire[4..],
-        br#"{"type":"sync","protocol":1,"share":"share","peer":"peer","dry_run":false}"#
+        br#"{"type":"sync","protocol":2,"share":"share","peer":"peer","dry_run":false}"#
     );
     assert!(matches!(
         sync::read_message(&mut wire.as_slice())?,
-        Message::Sync { protocol: 1, .. }
+        Message::Sync { protocol: 2, .. }
     ));
 
     let initial = InitialMessage::Sync {
@@ -64,11 +68,11 @@ fn v2_session_and_round_frames_are_closed_and_round_tagged() -> Result<()> {
     let peer = PeerId("peer".into());
     let hash = ObjectHash::from_blake3(blake3::hash(b"object"));
     let sample = record(b"file", Entry::Tombstone)?;
-    let conflict = Conflict {
-        path: sample.path.clone(),
-        winner: sample.clone(),
-        loser: record(b"loser", Entry::Directory)?,
-    };
+    let conflict = Conflict::whole_file(
+        sample.clone(),
+        record(b"loser", Entry::Directory)?,
+        flocal::merge::FallbackReason::IncompatibleKind,
+    );
     let session_frames = vec![
         V2SessionFrame::WatchOpen {
             protocol: sync::WATCH_PROTOCOL_VERSION,
@@ -116,6 +120,7 @@ fn v2_session_and_round_frames_are_closed_and_round_tagged() -> Result<()> {
         V2RoundFrame::ApplyChunk {
             records: vec![sample.clone()],
             conflicts: vec![conflict],
+            merges: Vec::new(),
         },
         V2RoundFrame::ApplyEnd,
         V2RoundFrame::Applied,
@@ -250,14 +255,15 @@ fn snapshot_and_plan_protocol_round_trip() -> Result<()> {
     sync::write_snapshot(&mut wire, &records)?;
     assert_eq!(sync::read_snapshot(&mut wire.as_slice())?, records);
 
-    let conflict = Conflict {
-        path: records[2].path.clone(),
-        winner: records[2].clone(),
-        loser: records[0].clone(),
-    };
+    let conflict = Conflict::whole_file(
+        records[2].clone(),
+        records[0].clone(),
+        flocal::merge::FallbackReason::AbsentBase,
+    );
     let plan = Plan {
         records: records.clone(),
         conflicts: vec![conflict],
+        merges: Vec::new(),
     };
     let mut wire = Vec::new();
     sync::write_plan(&mut wire, &plan)?;
@@ -266,7 +272,9 @@ fn snapshot_and_plan_protocol_round_trip() -> Result<()> {
     let mut observed_conflicts = Vec::new();
     loop {
         match sync::read_message(&mut input)? {
-            Message::ApplyChunk { records, conflicts } => {
+            Message::ApplyChunk {
+                records, conflicts, ..
+            } => {
                 observed_records.extend(records);
                 observed_conflicts.extend(conflicts);
             }

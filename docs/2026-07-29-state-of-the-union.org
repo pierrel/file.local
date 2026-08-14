@@ -420,9 +420,10 @@ to inspect or restore a winner/loser version.
 * Major concern: protocol, resource bounds, and safe application
 
 [[file:src/sync.rs][src/sync.rs]] owns the SSH protocol types and the mechanics
-of turning a plan into durable filesystem changes.  It has a v1 one-shot
-protocol and a v2 persistent-watch protocol.  Both use typed serde messages,
-explicit phases, and bounded framing.
+of turning a plan into durable filesystem changes.  It has a v2 one-shot
+protocol and a version-4 persistent-watch protocol.  Both use typed serde
+messages, explicit phases, and bounded framing. Version 4 adds same-session
+scan/install-race recovery and durable unsettled-state exchange.
 
 The protocol has non-negotiable resource limits:
 
@@ -582,7 +583,7 @@ with =make e2e=.  GitHub CI runs Linux, macOS, changed-line coverage, and E2E.
 
 - This is alpha software, not a substitute for backups.
 - It is two peers per share, with SSH as the initial transport.
-- Persistent managed watch requires protocol version 3 on both peers. During a
+- Persistent managed watch requires protocol version 4 on both peers. During a
   rolling upgrade the enabled watch remains reconnecting with bounded upgrade
   diagnostics until both peers are upgraded; no manual restart is required.
 - A scan/install race is recovered automatically in-session. Repeatedly changing
@@ -594,8 +595,8 @@ with =make e2e=.  GitHub CI runs Linux, macOS, changed-line coverage, and E2E.
 - Filesystem event notifications are an optimization, not the source of truth:
   reconnect and audit rounds rescan.  This favors correctness over a minimal
   incremental implementation.
-- Conflicting whole files use recoverable last-write-wins while richer three-way
-  text merging remains future work.
+- Concurrent text files with an acknowledged shared base use deterministic
+  three-way merge. Overlaps and whole-file fallbacks retain recovery records.
 - Git worktrees converge as files, but Git metadata is intentionally excluded.
   Coordinate commits, branches, and staging outside =flocal=.
 
@@ -630,6 +631,8 @@ or a half-applied transfer.
 - For protocol and recovery design decisions: [[file:docs/2026-07-24-persistent-watch-protocol-design.org][persistent watch design]] and
   [[file:docs/2026-07-25-daemon-managed-sync-design.org][daemon-managed sync design]].
 - For the original product constraints and explicit gaps: [[file:docs/2026-07-14-alpha-implementation.org][alpha implementation state]].
+- For the reconciled current baseline and accepted three-way implementation:
+  [[file:docs/2026-08-13-v0.0.1-design-reconciliation.org][v0.0.1 design reconciliation]].
 - For an approachable code exercise, read a test in
   [[file:tests/e2e/scenarios/watching.rs][tests/e2e/scenarios/watching.rs]], then follow the called behavior into
   =src/main.rs=.  Rust tests are ordinary functions marked =#[test]=; the

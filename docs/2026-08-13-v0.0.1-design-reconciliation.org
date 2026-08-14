@@ -1,0 +1,861 @@
+#+title: v0.0.1 design reconciliation and three-way merge plan
+#+date: 2026-08-13
+#+status: implemented, with final reconciliation below
+
+* 1. Decision
+
+The current alpha has proved the hard outer loop: two ordinary directories can
+reconcile through disconnects, daemon restarts, missed notifications, and a
+file that changes during installation without requiring manual state repair.
+It has not yet proved the central editing experience promised for =v0.0.1=.
+Two concurrent text edits still select one whole file and retain the other only
+as recovery material.
+
+The next feature adds deterministic line-oriented three-way text merge. It also
+adds the minimum ancestry, protocol verification, and recovery representation
+needed to make that merge safe. This is one coherent feature. Adding a diff
+routine without retaining a known shared base would only make the common case
+look implemented while silently falling back after garbage collection.
+
+This document is the current reconciliation point. It does not rewrite the
+historical dated documents. It records what =main= actually does on 2026-08-13,
+which earlier statements are obsolete, what the three-way feature will change,
+and which other items remain separate alpha-exit work in [[file:../ROADMAP.org][the roadmap]]. It
+supersedes the original detailed design where later implementation evidence or
+platform behavior produced a narrower decision.
+
+** 1.1 Final implementation reconciliation
+
+Implementation and adversarial review produced four smaller decisions than the
+initial plan below. This subsection is normative where the later planning text
+still describes the rejected alternative.
+
+1. The wire and SQLite representation remains the existing top-level =Version=
+   with additive optional authenticators and =merge_base=. New versions always
+   carry all three keyed tags. On the first upgraded scan, unverifiable foreign
+   current versions are reissued by the holder and untagged causal IDs are
+   discarded. This can cause one conservative whole-file recovery decision
+   after upgrade, but it never treats unverifiable legacy metadata as ancestry.
+   The custom nested decoder and permanent legacy-commitment tables proposed in
+   section 5 were not added.
+2. =pending_objects= is share scoped rather than round-ID scoped because every
+   mutating round already holds the installation-wide sync lock. Cleanup occurs
+   only while holding that lock at the beginning or end of a round. Merely
+   opening state never clears pending roots, so a concurrent read-only command
+   cannot collect a live transfer or merge result. Rows abandoned by a crash are
+   cleared by the next serialized round.
+3. The existing install intent keeps records, conflicts, and per-path temporary
+   phases. Recovery replays that idempotent intent. It does not add a second
+   =completed_paths= journal. If an apply is invalidated, an original recovery
+   conflict is retained only when that action completed in the current replay
+   or the recovered filesystem already contains its visible winner. This makes
+   a conflict for an unapplied action unreachable without another checkpoint
+   mechanism.
+4. Dry-run hashes scanned regular files into the private content-addressed
+   cache so it can compute the exact merge, but it reserves no sequence, stores
+   no record, and publishes no generated merge object. The cache entries are
+   pruned on cancellation while the sync lock is held; a crash can leave only
+   unreferenced private cache bytes for the next round to collect.
+
+Merged versions do follow the stronger identity rule from the plan: the
+connector reserves a fresh local sequence after confirmation, retains the
+common base until acknowledgement, authenticates the complete version, and
+sends it for independent byte-level verification by the responder.
+
+* 2. Current implementation baseline
+
+The following behavior is present on =main= before the three-way work begins.
+
+1. A share binds exactly two peer identities and two filesystem roots. The
+   connector reaches the responder through a validated noninteractive SSH
+   command. The responder cannot initiate a session.
+2. =make install= installs =flocal= and one per-user daemon through systemd on
+   Linux or a LaunchAgent in a macOS graphical session. The daemon restores
+   enabled connector watches after restart and owns their worker threads.
+3. A managed worker keeps one version-4 persistent SSH session, observes both
+   filesystems, debounces events, exchanges heartbeats, performs full safety
+   audits, and reconnects temporary failures with bounded backoff. Filesystem
+   notifications are hints; every synchronization round still scans.
+4. SQLite in WAL mode with =synchronous=FULL= stores installation/share IDs,
+   peer binding, current path records, retained conflicts, root device/inode,
+   durable install intents, managed-watch intent, blocked diagnostics, and
+   unsettled paths. State and control directories are private and reject
+   symlink substitution.
+5. Regular files are immutable BLAKE3 objects while they are referenced.
+   Transfer, frame, metadata, record-count, session-duration, and state-object
+   budgets are cumulative and bounded. Files themselves stream in bounded
+   chunks.
+6. Reconciliation is causal first. A descendant beats its ancestor regardless
+   of clocks. Genuinely concurrent versions use timestamp, peer ID, and sequence
+   as a total last-write-wins order. Divergent file/file inputs retain winner
+   and loser objects.
+7. Apply holds a root directory capability, uses descriptor-relative traversal,
+   rejects symlink parents, validates expected entries, uses atomic
+   exchange/no-replace operations, and keeps a durable install intent until the
+   resulting inode and containing directories are durable.
+8. A proven scan/install race rolls back without losing either entry, retires
+   the obsolete intent transactionally, persists an unsettled path, and starts
+   a fresh round in the same SSH session. Repeatedly changing paths are isolated
+   so stable siblings continue.
+9. Tombstones survive indefinitely and prevent offline resurrection. General
+   acknowledgement-based tombstone collection is not implemented.
+10. =flocal conflicts list/show= and =restore --version winner|loser= expose
+    current file/file recovery. Conflicts cannot yet be pruned.
+11. Linux and macOS build, unit, integration, lint, and coverage gates run in
+    CI. The Docker E2E suite exercises two Linux peers over real SSH. Native
+    cross-machine macOS/Linux filesystem acceptance is still required.
+
+The July alpha state said background services were deferred and described
+known-failing E2E scenarios. Those statements are historical. Managed daemon
+ownership, persistent watch, all current Docker scenarios, durable root
+identity, and automatic stale-install recovery have since landed. The alpha
+state keeps dated addenda instead of pretending they existed in the original
+implementation.
+
+* 3. Current gaps that shape this feature
+
+The present =Version= carries a vector-like =seen= list of peer sequence IDs.
+That proves ancestry, but it does not name or retain the content of the last
+version known to be installed on both peers. The object collector references
+only current records, conflicts, and install intents. Once both sides edit a
+former current file, its object may therefore be unreferenced and deleted.
+
+The current plan is also derivable from metadata alone. Both peers independently
+calculate it and reject any transmitted plan that differs. A merged file adds a
+new content hash and a new version. A responder cannot validate those merely by
+trusting a connector-provided result because an SSH-authenticated peer remains
+untrusted protocol input.
+
+Finally, =Conflict= and its SQLite table hold exactly =winner= and =loser=.
+They cannot describe a base, a merged result, overlapping hunks, or a
+delete-versus-edit input whose visible winner is not a regular file.
+
+These are representation gaps, not reasons to add an unbounded history graph.
+The proposed solution retains one last acknowledged shared regular-file base
+per live path and a small local acknowledgement marker. It does not retain
+every historical version.
+
+* 4. User experience
+
+After both peers have synchronized a text file at least once on the upgraded
+version, concurrent edits from that shared file behave as follows.
+
+#+begin_example
+base                  Mac                    remote agent
+----                  ---                    ------------
+buy milk              buy oat milk           buy milk
+call Alice            call Alice             call Alice tomorrow
+
+merged working file
+-------------------
+buy oat milk
+call Alice tomorrow
+#+end_example
+
+No conflict record is created for that clean merge. If both sides change the
+same region, all clean regions still merge and the greater existing
+last-write-wins input supplies only the overlapping region. The working file
+contains no conflict markers. One recovery record retains the base, both
+inputs, the exact merged result, ordering, and hunk ranges.
+
+Binary files, inputs above the merge limits, invalid UTF-8, NUL-containing
+files, and concurrent files without the same retained base use recoverable
+whole-file last-write-wins. Delete-versus-edit and incompatible path-kind
+conflicts also retain every available regular-file input before a destructive
+winner is installed. A resource limit never prevents ordinary file transfer;
+it only selects the whole-file fallback after recovery inputs are durable.
+
+The existing =winner=/=loser= restore spelling remains accepted during this
+feature for compatibility. =winner= means the visible resolution, including the
+merged result when one exists; =loser= means the lower ordered complete input.
+Conflict output additionally identifies =base=, both peer-named inputs, and
+=merged= when present, so the higher ordered input remains directly selectable.
+Restore can select every retained regular-file version. Conflict pruning is a
+separate roadmap item, so this feature must not falsely advertise a prune
+command.
+
+Legacy shares do not invent a base. Only the first fully acknowledged v2 round
+that leaves the *same regular-file record* on both peers may mark that record
+shared. Edits made after that point are mergeable. A conflict already pending
+during upgrade safely uses whole-file last-write-wins once; no migration
+guesses ancestry.
+
+The ordinary plan report makes the outcome visible before an initial-sync
+confirmation and after each committed watch round. A clean result prints
+=MERGE path=. A previewed overlap prints =MERGE path (overlap; recovery
+pending)=; committed explicit/watch output replaces =pending= with its recovery
+ID. Whole-file fallback follows the same rule and prints =CONFLICT path (REASON;
+recovery pending|ID)=, using the stable =FallbackReason= spelling. JSON plan
+schema 2 represents the same distinction and uses =recovery_id: null= in a
+preview. Schema 2 keeps the complete =plan= and adds a parallel =recovery=
+array of ={ path, recovery_id }= entries; preview IDs are =null=, so callers do
+not mistake a provisional conflict for durable recovery. =--dry-run= may fetch and verify bounded candidate bytes
+and hashes local files into the owner-only object cache so it can produce the
+real result. It computes merged bytes in memory and does not reserve an ID,
+publish a generated merge object, or change records, conflicts, install
+intents, pending objects, shared heads, or the synchronized tree. Cancellation
+prunes unreferenced cache bytes while holding the sync lock. Normal sync
+publishes the generated result only after confirmation; watch logs the outcome
+only after its complete plan commits.
+
+* 5. Version and shared-base state
+
+** 5.1 Wire model
+
+Add one bounded optional snapshot to =Version=:
+
+#+begin_src rust
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BaseVersion {
+    pub id: VersionId,
+    pub entry: Entry,
+    #[serde(default)]
+    pub authenticator: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VersionId {
+    pub peer: PeerId,
+    pub sequence: u64,
+    #[serde(default)]
+    pub authenticator: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Version {
+    pub peer: PeerId,
+    pub sequence: u64,
+    #[serde(default)]
+    pub id_authenticator: Option<String>,
+    pub timestamp_ns: i64,
+    #[serde(default)]
+    pub seen: Vec<VersionId>,
+    #[serde(default)]
+    pub merge_base: Option<BaseVersion>,
+    #[serde(default)]
+    pub version_authenticator: Option<String>,
+    #[serde(default)]
+    pub base_authenticator: Option<String>,
+    pub entry: Entry,
+}
+#+end_src
+
+=Version= deliberately keeps its existing top-level shape. Additive optional
+fields let existing alpha state decode without a second model or table. New
+wire protocol versions make the behavioral incompatibility explicit even
+though stored JSON remains readable.
+
+Protocol-created =VersionId= values gain a required =authenticator= for new
+versions. It is a keyed BLAKE3 tag over a protocol domain, share ID, owner peer
+ID, and sequence, using an owner-only random key stored in private installation
+state. The complete-record tag separately binds that ID and normalized path to
+its timestamp, canonical causal summary, merge base, and entry in the same
+protocol/share domain; the =BaseVersion= tag binds
+its ID and entry in that domain. This lets an owner
+validate the small ID echoed in =seen= without retaining full history while
+also preventing different full/base metadata from being attached to it. Tags
+are not content secrets and are never accepted as object capabilities. Their
+inputs are domain-separated serialized tuples containing the share and owned
+metadata. A peer can relay a tagged ID but cannot invent a locally owned gap or
+attach different metadata to an old ID.
+
+A full =Version= carries the fields needed to project its authenticated
+=VersionId= and the base-projection
+tag created by the owner. Therefore any endpoint can later project
+=Version::id()= or =Version::as_base()= byte-for-byte without the owner's key;
+it never recomputes or strips an authenticator while relaying ancestry.
+
+Before its first upgraded wire snapshot, each installation reissues an
+untagged foreign current Version under its own identity. When authenticating
+an untagged locally owned current Version, it removes untagged causal IDs and
+an untagged base. This is a conservative legacy relay, not proof of the former
+owner. It preserves current bytes while refusing unverifiable ancestry. If two
+relays diverge, the first upgraded round uses recoverable whole-file ordering;
+equal entries converge without invented ancestry. The acknowledged result then
+becomes an ordinary authenticated shared base.
+
+=BaseVersion= is not recursive. It contains an immutable version identity and
+the entry metadata needed to locate and validate one base object. It is valid
+only when its =entry= is a regular file and its =id= is present in the child
+version's =seen= summary. Validated model/wire construction rejects a duplicate
+peer in =seen=, an invalid locally owned authenticator, or a base that is not a
+causal ancestor. Candidate validation requires the two child
+snapshots to carry byte-for-byte equal base snapshots, and each endpoint
+rehashes that named object before merge. These checks prevent a peer from
+attaching arbitrary old content to a new version merely because the bytes happen
+to be in the installation object store. The existing snapshot and metadata
+limits bound its wire cost.
+
+The additive representation is backward-readable for stored legacy JSON, but
+the wire protocol versions change because an older peer would ignore the
+behavior the fields enable.
+
+** 5.2 Local shared-head marker
+
+Add a local table with at most one row per shared regular-file path:
+
+#+begin_src sql
+CREATE TABLE shared_heads (
+    share_id TEXT NOT NULL,
+    path BLOB NOT NULL,
+    base_json TEXT NOT NULL,
+    PRIMARY KEY (share_id, path)
+);
+#+end_src
+
+Each =base_json= is a canonical =BaseVersion=, not just a version ID. It lets
+scan compare the prior record's ID *and* entry before inheriting it, and it is
+itself an object-GC reference. The row means this installation received the
+other endpoint's durable acknowledgement that both endpoints committed that
+exact regular-file record. It is evidence from the bound peer, not authority to
+request arbitrary objects or to rewrite a record.
+
+After commit, each endpoint has an ordered =HeadSnapshot= of *all* its current
+regular-file records. The final acknowledged-head manifest is their
+intersection: it contains a path only where both snapshots report the same
+complete regular-file =Record=. Tombstones, directories, symlinks, ignored
+paths, retained/deferred paths, and a path whose two post-commit records differ
+are absent and have any old shared-head row deleted. Sending the complete
+post-commit set preserves an untouched shared base across an unrelated round;
+thus an ignored or deferred action cannot manufacture a merge base.
+
+Explicit sync uses the existing acknowledgement direction, but makes the
+manifest part of it. The responder commits its complete effective plan, sends
+bounded =HeadChunk= frames for its =HeadSnapshot=, then sends =Applied=. The
+connector commits its own complete effective plan, intersects its current
+records with that snapshot, atomically stores the result, sends the resulting
+bounded =HeadChunk= frames, and finishes with =CommitAck=. The responder
+validates every supplied head against its current record and atomically replaces
+its shared-head rows with that manifest. Persistent watch uses the same chunks
+followed by =Applied= and then =SyncFinished=. Chunks are path-sorted, unique,
+and charged to the existing record and metadata budgets. The connector may
+store its rows after its own commit and the responder's =Applied=; the responder
+may store them only after the final acknowledgement. A dropped final frame
+leaves one endpoint conservative. Neither path sets a row merely because two
+pre-apply snapshots matched.
+
+When scan creates a local file version:
+
+1. If the previous current record has the local shared-head marker's exact ID
+   and entry, copy that marker into =merge_base=.
+2. If the previous record is an unshared local descendant, inherit its existing
+   =merge_base= instead of advancing the base. “Local descendant” requires the
+   version ID to be owned and authenticator-validated by this installation and
+   already canonical in local state; a peer cannot manufacture this inheritance
+   by supplying this installation's peer ID.
+3. If neither condition holds, use no base and fall back safely if a concurrent
+   change appears.
+
+The scanner writes the changed record and any inherited base in the same SQLite
+transaction that replaces the current records. It never first replaces the
+record and later adds its base. Repeated offline saves therefore coalesce around
+the last version actually known by both peers rather than the immediately
+preceding local save. A shared-head row is replaced only by a later acknowledged
+head, never by scan.
+
+** 5.3 Merged versions
+
+The connector creates one new version for a successful clean or overlapping
+merge. Preview computes a provisional result without a version ID. Only after
+initial confirmation, or immediately for an already confirmed share, the
+connector revalidates the frozen inputs, durably reserves a fresh local
+sequence, and builds the final plan. That version contains the exact merged
+hash and size and records both input heads plus their causal histories in =seen=. Its
+timestamp is the greater input timestamp, with the ordinary peer/sequence order
+remaining the deterministic tie-break. The executable bit is taken from the
+greater whole-file input independently of text hunks.
+
+Until the round is acknowledged, the merged version keeps the inputs' common
+=merge_base=. After the round is marked shared, a later local edit naturally
+uses the merged version itself as its new base. The connector must not create a
+merged version whose =seen= summary omits either input head or whose common base
+is not present in both inputs' causal summaries. An abandoned sequence
+reservation is never reused.
+
+* 6. Deterministic merge engine
+
+Add a small pure =merge= module. It accepts three verified byte slices plus the
+already established ordering of the two inputs and returns either a merged
+result with hunk metadata or a typed fallback reason. It performs no state,
+filesystem, protocol, clock, or logging work.
+
+Use =similar= version =3.1.2= with default features disabled. Its pure-Rust,
+Apache-2.0 API exposes structured =DiffOp= ranges. The adapter runs its fixed
+Myers algorithm from base to each side, turns the two edit scripts into
+three-way regions, selects the ordered winner for an overlap, and records exact
+ranges. It avoids parsing conflict-marker text and does not invoke Git or
+another subprocess. Pin the dependency in =Cargo.lock= and advertise the
+capability as =similar-myers-3.1.2=. This supersedes both the original
+proposal's vague “Git-compatible” wording and the reviewed =merge3= draft:
+=merge3 0.2.1='s default =difflib 0.4.0= backend discards ordinary unique
+anchors for inputs of at least 200 lines because its popularity filter is
+reversed. Enabling its optional patience backend would add a GPL dependency.
+=v0.0.1= instead promises the explicit rules and pinned fixtures below.
+
+All three inputs must be valid UTF-8, contain no NUL byte, and individually be
+at most 256 KiB and 4,096 lines. Before splitting, checked arithmetic requires
+=(base_lines + a_lines)^2 + (base_lines + b_lines)^2 <= 8,000,000= and
+=base_bytes + a_bytes + b_bytes <= 768 KiB=. Before emitting a recovery record,
+the adapter also caps overlap hunks at 1,024 and merged bytes at 512 KiB. The
+squared sum bounds the worst-case work of the two Myers diffs; the line and
+hunk limits bound their linear-space frontier, edit scripts, and three-way
+region vector. These are wire-verifiable rules, not local performance hints.
+Inputs outside a limit use typed whole-file fallback and remain ordinary
+streamable synchronized files. No background merge thread, timeout that
+abandons live computation, or spill file is needed at these deliberately small
+limits.
+
+Split lines inclusively so original LF/CRLF bytes and final-newline state remain
+part of each line. For every composed three-way region:
+
+- =Unchanged= copies the base range.
+- =Same= copies the identical changed range once.
+- =A= or =B= copies that side's non-overlapping range.
+- =Conflict= copies the greater last-write-wins input range and records the
+  base and both input line ranges.
+
+The result is assembled with checked size arithmetic and cannot exceed the
+merged-byte, existing object, or session budgets. The adapter owns the stable
+=FallbackReason= names and hunk serialization; it does not serialize
+=similar::DiffOp= directly. Empty files, insertion at end of file,
+deletion of lines, different final-newline state, CRLF, identical changes,
+files above and below 200 lines, mostly unique lines, and repeated lines receive
+explicit fixtures. A clean merge has no conflict record. Any overlap has
+exactly one recovery conflict containing all overlap hunks.
+
+Candidate paths are processed in canonical raw-byte path order. Both endpoints
+debit the same fixed per-round profile before each candidate: at most 64
+candidates, 32,000,000 squared comparison-work units, 4,096 overlap hunks, and
+2 MiB of merged output. Checked arithmetic is mandatory. Once a remaining
+candidate would exceed a cumulative limit, that candidate and later candidates
+use the reproducible =round_merge_budget= fallback. This bounds total worker
+CPU and memory even when an authenticated peer advertises many individually
+valid candidates.
+
+* 7. Reconciliation and protocol verification
+
+** 7.1 Two-stage reconciliation
+
+Keep metadata reconciliation pure, but make its output explicit about merge
+candidates. Causal descendants and identical entries continue to resolve
+without content. Concurrent divergent file inputs with equal regular-file
+=merge_base= snapshots produce a =MergeCandidate= only when that base is a
+causal ancestor of both inputs. The candidate names the path, the canonical
+base snapshot, the two complete input records sorted by =VersionId=, and the
+already established input order. Other divergent pairs produce a typed
+=WholeFileFallback= decision and the existing deterministic winner. This
+metadata-only category covers absent or unequal bases, delete-versus-edit, and
+incompatible kinds; it is not a merge candidate.
+
+The connector then materializes candidates only after it has verified the base
+and both input objects. It stores the merged bytes as a normal immutable object,
+creates the merged version, and completes the final plan. A =MergeProof= names
+the candidate's base and inputs, the ordered winner side, the merge-limit
+profile, the merged record, and the canonical overlap ranges. Materialization
+is deterministic for the frozen snapshots. If a local file changes later, the
+existing apply-precondition invalidation path abandons the plan and recalculates
+from fresh scans.
+
+Every eligible regular-file candidate has exactly one explicit
+=CandidateOutcome=: =Merged { proof }= or =Fallback { reason }=. Candidate
+fallback is reserved for facts both endpoints reproduce from verified bytes
+and the fixed profile: invalid UTF-8, NUL, an input/output/work limit, or the
+cumulative round budget. Metadata-only =WholeFileFallback= decisions remain
+outside this type. An advertised equal base that is locally missing or corrupt
+is not a fallback reason. The endpoint re-requests and verifies that authorized
+object; if the bound peer cannot supply it, the round fails actionably before
+mutation. This prevents two endpoints from choosing different outcomes because
+only one object store was damaged.
+
+** 7.2 Protocol versions
+
+Bump explicit synchronization from version 1 to version 2 and persistent watch
+from version 3 to version 4. The new explicit messages distinguish
+=HeadChunk=, =Applied=, and the connector's final =CommitAck=; the new
+persistent frames distinguish =HeadChunk=, =Applied=, and =SyncFinished=.
+Pairing/registration remains structurally the same. Mixed binaries receive the
+existing actionable upgrade rejection; persistent workers remain in bounded
+reconnect rather than silently dropping merge semantics.
+
+No independent second protocol implementation is added. One-shot and
+persistent orchestration call the same candidate materialization, plan
+validation, object authorization, and merge verification helpers.
+
+** 7.3 Round flow
+
+For each round:
+
+1. Both peers freeze and exchange their current snapshots as today.
+2. The connector derives metadata reconciliation and requests any missing
+   remote input or advertised base object needed for a candidate.
+3. The connector runs the bounded merge, assigns the merged version for a
+   successful merge, and sends the final plan with exactly one structured
+   =CandidateOutcome= for each candidate. During dry-run or before an initial
+   confirmation, it reports only provisional bytes, hunks, and fallback reason;
+   it assigns no version ID and sends no final plan. After confirmation it
+   revalidates the frozen inputs, reserves the sequence, creates the
+   pending-object GC root described below, publishes the result, builds the
+   final plan, and sends its =Merged= proof. If revalidation fails, it abandons
+   the provisional result and starts a fresh round. =Fallback= carries the
+   reproducible typed reason and remains an ordinary deterministic recovery
+   conflict.
+4. The responder validates all non-merge decisions from the two snapshots. It
+   checks that every candidate outcome names exactly one eligible candidate,
+   that the two inputs and base match advertised metadata, and that a merged
+   version causally covers both inputs. The merged ID must be owned by the bound
+   connector, absent from the frozen metadata map, and greater than every
+   connector-owned sequence in the bounded canonical map. The connector also
+   requires it to equal its own durable reservation. The responder rejects a
+   missing, duplicate, reordered, or surplus outcome before requesting an
+   object.
+5. The responder requests only missing objects authorized by the current plan.
+   A sender serves only hashes rooted in that sender's durable state for this
+   share: its local frozen records and bases, conflicts, install/pending
+   intents, or its proposed generated results. Peer-supplied metadata may
+   constrain candidate equality but never creates an outbound object
+   capability. The receiver verifies size and BLAKE3 hash during transfer.
+6. With all three candidate inputs available, the responder runs the same
+   bounded pure merge and requires identical merged bytes, hash, overlap
+   ranges, and ordering metadata. This is verification, not an independently
+   published result. A limit or input-validation result must also equal the
+   connector's typed fallback reason.
+7. Before visible mutation, each peer validates and makes durable every object
+   referenced by its complete effective plan, then stores one install intent
+   containing that plan's target records and recovery conflicts. Each commits
+   records, conflicts, and intent removal in one transaction only after the
+   filesystem changes are durable. Both peers complete the explicit
+   acknowledgement manifest before marking shared heads. Object collection runs
+   only after that durable commit, never in the gap between visible replacement
+   and conflict insertion.
+
+The protocol never accepts a connector-selected merged hash merely because the
+connector is authenticated. A malformed candidate, unexpected base request,
+duplicate proof, oversized metadata set, wrong phase, or non-deterministic
+result fails the round before visible mutation.
+
+At validated wire decode, each endpoint builds one bounded
+=OwnerSequence -> canonical Record= map, where =OwnerSequence= is the
+=(peer, sequence)= pair, from full Records in the two frozen snapshots. Other
+plan, conflict, intent, base, acknowledgement, and proof structures are checked
+against those frozen Records by their phase-specific exact-shape validators.
+Each peer snapshot must also contain exactly one current Record per normalized
+path; a repeated path is a terminal protocol error rather than an
+ordering-dependent reconciliation choice.
+Reusing an owner/sequence with a different path, ID tag, or complete metadata
+is a protocol error. Each endpoint validates every peer-supplied locally owned
+tagged ID through its authenticator, including IDs in =seen=.
+The complete-record authenticator binds the normalized path as well as all
+Version metadata, so a retired authentic version cannot later be replayed at a
+different path.
+Read-only preview may accept an untagged legacy Record only when the peer echoes
+the byte-for-byte identical Record already present in the frozen local
+snapshot. Divergent legacy state uses the ordinary mutating scan, which
+conservatively reissues it before exchange.
+Untagged legacy IDs are removed during conservative scan normalization. These
+checks make identity ownership and crash-safe sequence creation part of plan
+validity, not an assumption of SSH authentication.
+
+* 8. Conflict and recovery representation
+
+Replace the two-field conflict shape with a versioned recovery shape that can
+also read legacy rows:
+
+#+begin_src rust
+pub struct Conflict {
+    pub path: RelativePath,
+    pub resolution: ConflictResolution,
+    pub base: Option<BaseVersion>,
+    pub inputs: [Record; 2],
+    pub merged: Option<Record>,
+    pub hunks: Vec<ConflictHunk>,
+}
+
+pub enum ConflictResolution {
+    MergedWithOverlaps,
+    WholeFile { winner: usize, reason: FallbackReason },
+    Destructive { winner: usize },
+}
+#+end_src
+
+The two inputs are sorted by peer ID, then version sequence, so storage, JSON,
+IDs, and verification do not depend on which machine called one side “local.”
+The resolution identifies the visible result. Hunk ranges are line indexes into
+base and both complete inputs and are bounded by the line limit.
+
+SQLite stores one versioned =conflict_json= document per conflict rather than
+adding a nullable column for every future input kind. During migration, legacy
+=winner_json=/=loser_json= rows decode into =WholeFile= conflicts with two
+inputs and no base/merged/hunks. The migration sorts the inputs but carries the
+old visible winner into the new =winner= index. It preserves the existing
+conflict ID, so old =show= and =restore= invocations continue to name the same
+recovery record. New IDs hash canonical path bytes, both complete records in
+canonical input order, resolution, hunk list, and merged record when present;
+they never include local creation time. A retry is therefore idempotent on both
+peers.
+
+=conflicts list/show --json= advances its schema and exposes the complete
+shape. Human =show= labels inputs by peer. Restore accepts =--input PEER=,
+=--base=, and =--merged= while retaining =--version winner|loser= for legacy and
+script transition. Selecting an unavailable or non-file record fails before
+creating a destination. Existing final-component no-follow checks, atomic
+destination replacement, and =--force= rules remain unchanged; this feature
+does not claim that the current pathname-based restore has descriptor-relative
+ancestor-race protection.
+
+Conflict pruning is not added in this feature. The migration and object
+collector nevertheless understand every new reference so no recovery object is
+deleted prematurely.
+
+* 9. Object retention, garbage collection, and migration
+
+The object collector adds references from:
+
+1. every current file entry;
+2. every current version's regular-file =merge_base= and every =shared_heads=
+   base;
+3. every conflict base, input, and merged record;
+4. every current record, base, input, and merged result named by a pending
+   install intent;
+5. every verified or locally generated object named by =pending_objects=.
+
+Replace =apply_plan(records)= plus a later =add_conflicts= with one
+=commit_plan(effective_plan)= operation. It first derives the effective plan
+(including ignore/deferred decisions), validates every conflict reference, and
+ensures every referenced object is durable and rehashed. It then commits an
+=InstallIntent { records, conflicts, temps }= before the first visible
+replacement. After all replacements and directory fsyncs, one SQLite
+transaction replaces current records, inserts the intent conflicts, updates any
+eligible local bookkeeping, and deletes the intent. It leaves
+=shared_heads= untouched: the separate acknowledgement transaction may replace
+them only after proof that the other endpoint also committed. This closes the
+existing crash window between visible replacement and conflict insertion: a
+loser, base, or merged result is collector-visible before it can be displaced.
+
+Add =pending_objects(share_id, hash, provenance)= as the publication crash root for
+*every* incoming or generated plan object not already rooted in durable local
+share state. Before receive/publication, insert and commit the pending
+reference for incoming bytes; a crash at that point leaves a harmless reference
+to a missing object. Generated bytes are published first and rooted before the
+sync lock can be released. Intent insertion then replaces object ownership and
+clears the share's pending rows in the next SQLite statement. A crash between
+those statements leaves only an extra conservative root. A cancelled preview
+creates no generated object and therefore needs no generated pending row.
+
+All mutating rounds hold the installation-wide sync lock before clearing stale
+pending rows and invoking the object collector. State opening does neither.
+Consequently another command cannot erase a live round's roots, while a crash
+leaves rows for the next serialized round to clear. Object publication and
+collection still use the narrower object lock internally. Cleanup is
+idempotent and prevents a peer from accumulating pending roots by repeatedly
+abandoning transfers.
+
+=provenance= is =receiving=, =verified_from_bound_peer=, or =generated_local=.
+All three values are GC ownership, but =receiving= is never outbound authority.
+When an incoming hash already exists only through another share, this share
+still requires its bound sender to stream the bounded bytes and verifies them
+before changing the row to =verified_from_bound_peer=. Thus knowing a hash and
+adding a pending row cannot expose another share's object. Outbound
+authorization accepts only this share's durable records/bases/recovery/intents,
+=generated_local= results proposed in this round, or prior
+=verified_from_bound_peer= provenance.
+
+The full intent does not add a second completed-path journal. Per-path
+temporary phases plus the descriptor-relative filesystem scan make replay
+idempotent. If a later path invalidates, retirement derives a complete recovered
+plan from the intent and a fresh scan. It retains an original intent conflict
+only when its action completed in the current replay or the recovered file
+already equals its visible winner, then unions newly derived conflicts. One
+transaction replaces current records, inserts that set, records the unsettled
+path, and deletes the intent.
+
+State opening performs additive idempotent SQLite migrations for the private
+authentication key, =shared_heads=, =pending_objects=, and =conflict_json=.
+Legacy conflict columns remain readable and are decoded as two-input
+whole-file conflicts when =conflict_json= is absent. Existing =version_json=
+and install-intent JSON decode new optional fields as absent. The next scan
+conservatively authenticates or reissues those current versions as described in
+section 5.1. This avoids a parallel legacy state machine and never accepts
+untagged metadata as new merge ancestry.
+
+After upgrade, a fully acknowledged round establishes shared heads only for
+equal regular-file post-commit records. The collector keeps both the current
+objects and the shared-head references. Only a later local edit turns that
+shared head into a =merge_base= on a new version, so migration requires no eager
+copy or full-history reconstruction.
+
+* 10. Failure and security boundaries
+
+- Peer snapshots, bases, proofs, acknowledgement manifests, object sizes,
+  hashes, paths, hunk ranges, and conflict documents are untrusted. Validate
+  them before allocation, object authorization, database insertion, or apply.
+- A sender serves a base hash only when its own frozen durable record advertises
+  it as =merge_base= or its recovery/intent state retains it. The receiver's
+  peer-supplied metadata never grants access. Content-addressed storage is
+  installation-wide, but authorization remains directional and share-scoped.
+- Merge byte, line, hunk, metadata, transfer, duration, and state budgets are
+  cumulative. Checked arithmetic rejects overflow. The merge-limit profile is
+  fixed by this protocol version and checked by both peers. Fallback does not
+  bypass the requirement that both file inputs be durable before a destructive
+  result.
+- Generated and received plan objects use the same owner-only temporary, hash,
+  fsync, pending-reference, and atomic-publication lifecycle. Neither peer
+  writes unverified bytes into the synchronized tree.
+- Absent equal base metadata causes recoverable whole-file fallback for ordinary
+  legacy/incomplete history. An advertised base that is locally missing or
+  corrupt is repaired through authorized transfer; failure to supply it, or
+  contradictory records for the same owner/sequence, causes a protocol error,
+  not fallback.
+- An acknowledgement manifest may contain only the canonical intersection of
+  current regular-file records. A peer rejects a head it cannot match to its
+  durable current record, and never treats an acknowledgement as an object
+  capability. This limits a malicious bound peer to refusing convergence; it
+  cannot make the other endpoint retain or request unrelated content.
+- Scan/apply races continue through the typed invalidation path. A merge retry
+  does not reuse a stale plan, splice prior actions, reconnect SSH, or create an
+  unbounded immediate loop.
+- The feature adds no shell command, listener, secret, network transport, path
+  traversal, or link-following operation. SSH and the private daemon socket keep
+  their existing boundaries.
+
+* 11. Platform behavior
+
+The merge algorithm operates on verified object bytes and is platform neutral.
+LF and CRLF bytes are retained from selected ranges. It does not normalize text,
+filenames, or Unicode.
+
+macOS FSEvents cannot reliably pair every rename notification. This feature
+does not claim first-class rename semantics from an ambiguous event. A later
+roadmap slice may correlate a rename only when the backend supplies an
+unambiguous pair or identity; otherwise it must report and use path-wise
+delete-plus-create.
+
+Exact filename representability, case/normalization collisions, destination
+ACL/xattr preservation, and complete native macOS crash acceptance remain
+separate alpha-exit gates. Three-way merge must not weaken existing raw-byte
+path validation or capability-relative apply while those gates are pending.
+
+* 12. Implementation sequence
+
+1. Add failing pure tests for clean non-overlap, identical edits, ordered
+   overlap, line endings, final newlines, all merge limits, and deterministic
+   input symmetry. Add a Docker E2E scenario in =e2e::known_failure= in which
+   two offline peers edit different lines and current =main= does not preserve
+   both in the working file.
+2. Add =BaseVersion= validation, =merge_base= deserialization, =shared_heads=,
+   atomic scan/current-record update rules, base-aware object references, and
+   upgrade tests. Do not add merge behavior until a base survives scan, restart,
+   and pruning.
+3. Add the bounded pure merge adapter using =similar= Myers =DiffOp= ranges.
+   Pin the dependency with default features disabled, compose its two edit
+   scripts locally, and prove per-file and per-round output is bounded before
+   it handles protocol data.
+4. Split metadata reconciliation into ordinary decisions, merge candidates, and
+   typed fallback conflicts. Add merged-version construction and deterministic
+   conflict IDs.
+5. Migrate conflict storage and extend inspection/restore without removing the
+   legacy selector. Test preservation of legacy IDs and winner/loser spelling.
+6. Replace split apply/conflict writes with full-effective-plan intents and one
+   commit transaction. Reuse per-path temporary phases for idempotent replay,
+   add =pending_objects= roots for every unrooted received/generated plan
+   object, and test publication and intent crash boundaries.
+7. Bump both wire protocols and add candidate proof, base/result object
+   authorization, responder recomputation, phase validation, and the two
+   explicit acknowledgement manifests. Reuse the same helpers in one-shot and
+   persistent paths, including deferred-path filtering.
+8. Integrate merged apply with invalidation, action reporting, conflict
+   transactions, and garbage collection. Promote the known failure only after
+   the Linux Docker E2E proves the fixed behavior.
+9. Add overlapping/fallback/reconnect/crash cases, and
+   reconcile the README, roadmap state, alpha state, state-of-the-union, and
+   final implementation report against the reviewed code.
+
+* 13. Acceptance criteria
+
+The feature is complete only when all of the following are proven.
+
+1. A base synchronized on both peers, followed by offline non-overlapping text
+   edits, converges to exact bytes containing both edits on both peers with no
+   conflict record.
+2. Multiple clean regions around one or more overlaps converge identically;
+   only each overlap uses the greater input, no conflict markers appear, and
+   one recovery record restores base, either input, and merged output.
+3. Identical edits appear once. Insertions, deletions, empty files, missing final
+   newline, LF, CRLF, mostly unique files above 200 lines, and repeated-line
+   files match pinned fixtures and are symmetric under peer argument order when
+   the ordering value is held constant.
+4. Invalid UTF-8, NUL, oversized, over-line-limit, absent/unequal base metadata,
+   binary, delete-versus-edit, and incompatible-kind cases choose documented
+   recoverable fallback without losing an available regular-file object. A
+   missing or corrupt advertised base object is repaired from the peer or fails
+   the round without mutation; it never selects an endpoint-local fallback.
+5. Repeated offline edits retain the last shared base, not every intermediate
+   save. Garbage collection before and after restart keeps exactly all current,
+   shared-head, base, conflict, full-plan install-intent, and pending-object
+   references.
+6. Legacy state opens without invented ancestry. Its first fully acknowledged
+   upgraded round establishes a base only for equal regular-file heads, and
+   legacy conflict restore keeps working. Existing additive =version_json=,
+   conflict, and install-intent rows decode with new fields absent. Each holder
+   reissues an untagged foreign current Version under its own authenticated
+   identity and removes unverifiable causal IDs, so the upgraded round preserves
+   current bytes without trusting obsolete foreign ownership claims.
+7. The responder rejects forged merge bytes/hash, wrong base, contradictory
+   version metadata, invalid hunk ranges, unauthorized object requests,
+   duplicates, wrong phases, and cumulative budget excess before mutation.
+   Per-round candidate/work/hunk/output exhaustion chooses the same bounded
+   fallback on both endpoints.
+8. A disconnect or process restart at each base/result publication, full-plan
+   intent commit, visible apply, conflict/current-record finalization, either
+   acknowledgement phase, and pruning boundary leaves either the prior state or
+   a recoverable retry. Chunked acknowledgement manifests are complete, sorted,
+   budgeted, and idempotent. The system never leaves a falsely acknowledged
+   head or deletes the only recovery object.
+9. A file changing during merged apply follows the existing same-session
+   invalidation behavior. Stable siblings finish, abandoned merge actions are
+   not logged, and the path later settles without a manual repair.
+10. One-shot SSH, managed persistent watch, Docker E2E, native Linux tests, and
+    native macOS build/tests pass. =make check= retains at least 90 percent
+    whole-project and changed-line coverage, =make e2e= passes, and every local
+    design/code review lens converges.
+11. Human and JSON =sync --dry-run=, initial confirmation preview, and committed
+    watch output distinguish a clean merge, an overlap with its recovery ID,
+    and whole-file fallback with its stable reason. Dry-run and a declined
+    confirmation leave no generated object or durable synchronization state.
+
+* 14. Work deliberately outside this feature
+
+This implementation does not claim that the whole alpha exit is complete.
+Conflict pruning and configurable recovery budgets, clean sync removal, durable
+last-success/error status, destination-local ACL/xattr preservation, first-class
+unambiguous rename operations, exact target-name representability, complete
+crash fault injection, and native Mac/Linux dogfooding remain separate roadmap
+items.
+
+It also does not add more than two peers, CRDTs, live collaborative cursors,
+semantic language merges, arbitrary history browsing, delta transfer,
+incremental scans, automatic tombstone collection, a GUI, or packaged
+installers.
+
+* 15. Accepted reconciled decisions
+
+The implementation evidence and independent review support these decisions:
+
+- Retain one last known shared base, not an unbounded version DAG.
+- Establish “shared” only from the existing two-sided protocol acknowledgement,
+  never from matching timestamps, hashes, or optimistic local state.
+- Let the connector publish one merged version, but require the responder to
+  recompute and verify it before apply.
+- Use structured pure-Rust merge regions, fixed text limits, and whole-file
+  fallback instead of parsing conflict markers, spawning Git, or introducing a
+  cancellable worker subsystem.
+- Store versioned conflict JSON so recovery can grow from two inputs without a
+  wide nullable schema.
+- Preserve historical documents with dated reconciliation rather than editing
+  old implementation claims into something that was not true at the time.
+
+Independent reviewers tested the plan through the required simplicity,
+platform/dependency, user-guidance, end-to-end, interface, filesystem, and
+threat-model lenses. The review changed the dependency, preview boundary,
+version authentication, resource budgets, object provenance, crash roots,
+legacy migration, invalidation recovery, and output contract before converging
+with no remaining findings.

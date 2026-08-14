@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -13,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::model::{
     Entry, ObjectHash, PeerConfig, PeerId, Record, RelativePath, ShareId, Version, VersionId,
 };
-use crate::reconcile::Conflict;
+use crate::reconcile::{Conflict, ConflictResolution};
 
 #[derive(Debug)]
 pub struct RootIdentityChanged(String);
@@ -38,6 +39,11 @@ pub struct StoredConflict {
     pub path: RelativePath,
     pub winner: Record,
     pub loser: Record,
+    pub resolution: ConflictResolution,
+    pub base: Option<crate::model::BaseVersion>,
+    pub inputs: [Record; 2],
+    pub merged: Option<Record>,
+    pub hunks: Vec<crate::merge::ConflictHunk>,
     pub created_ns: i64,
 }
 
@@ -65,6 +71,8 @@ pub struct RootIdentity {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstallIntent {
     pub records: Vec<Record>,
+    #[serde(default)]
+    pub conflicts: Vec<Conflict>,
     pub temps: Vec<InstallTemp>,
 }
 
@@ -210,7 +218,8 @@ impl State {
             "
             CREATE TABLE IF NOT EXISTS installation (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                peer_id TEXT NOT NULL
+                peer_id TEXT NOT NULL,
+                auth_key BLOB
             );
             CREATE TABLE IF NOT EXISTS shares (
                 share_id TEXT PRIMARY KEY,
@@ -237,7 +246,8 @@ impl State {
                 path BLOB NOT NULL,
                 winner_json TEXT NOT NULL,
                 loser_json TEXT NOT NULL,
-                created_ns TEXT NOT NULL
+                created_ns TEXT NOT NULL,
+                conflict_json TEXT
             );
             CREATE TABLE IF NOT EXISTS install_intents (
                 share_id TEXT PRIMARY KEY,
@@ -248,6 +258,18 @@ impl State {
                 path BLOB NOT NULL,
                 PRIMARY KEY (share_id, path)
             );
+            CREATE TABLE IF NOT EXISTS shared_heads (
+                share_id TEXT NOT NULL,
+                path BLOB NOT NULL,
+                base_json TEXT NOT NULL,
+                PRIMARY KEY (share_id, path)
+            );
+            CREATE TABLE IF NOT EXISTS pending_objects (
+                share_id TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                provenance TEXT NOT NULL CHECK (provenance IN ('receiving','verified_from_bound_peer','generated_local')),
+                PRIMARY KEY (share_id, hash)
+            );
             ",
         )?;
         let columns: Vec<String> = {
@@ -255,7 +277,23 @@ impl State {
             stmt.query_map([], |row| row.get(1))?
                 .collect::<Result<_, _>>()?
         };
+        let conflict_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(conflicts)")?;
+            stmt.query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?
+        };
+        let installation_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(installation)")?;
+            stmt.query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?
+        };
         let transaction = conn.transaction()?;
+        if !conflict_columns.iter().any(|name| name == "conflict_json") {
+            transaction.execute("ALTER TABLE conflicts ADD COLUMN conflict_json TEXT", [])?;
+        }
+        if !installation_columns.iter().any(|name| name == "auth_key") {
+            transaction.execute("ALTER TABLE installation ADD COLUMN auth_key BLOB", [])?;
+        }
         if !columns.iter().any(|name| name == "bound_peer") {
             transaction.execute("ALTER TABLE shares ADD COLUMN bound_peer TEXT", [])?;
         }
@@ -351,6 +389,114 @@ impl State {
         Ok(id)
     }
 
+    fn authentication_key(&self) -> Result<[u8; 32]> {
+        if let Some(bytes) = self
+            .conn
+            .query_row(
+                "SELECT auth_key FROM installation WHERE singleton=1",
+                [],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            return bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("installation authentication key is invalid"));
+        }
+        let key: [u8; 32] = rand::random();
+        self.conn.execute(
+            "UPDATE installation SET auth_key=?1 WHERE singleton=1",
+            [key.as_slice()],
+        )?;
+        Ok(key)
+    }
+
+    pub fn authenticate_record(&self, share: &ShareId, record: &mut Record) -> Result<()> {
+        let key = self.authentication_key()?;
+        let version = &mut record.version;
+        version.id_authenticator = Some(authenticate(
+            &key,
+            &serde_json::to_vec(&(
+                "flocal-version-id-v2",
+                &share.0,
+                &version.peer.0,
+                version.sequence,
+            ))?,
+        ));
+        version.base_authenticator = Some(authenticate(
+            &key,
+            &serde_json::to_vec(&(
+                "flocal-base-version-v2",
+                &share.0,
+                version.id(),
+                &version.entry,
+            ))?,
+        ));
+        version.version_authenticator = Some(version_tag(&key, share, &record.path, version)?);
+        Ok(())
+    }
+
+    pub fn validate_remote_records<'a>(
+        &self,
+        share: &ShareId,
+        local_records: &'a [Record],
+        remote_records: &'a [Record],
+    ) -> Result<()> {
+        let local = self.peer_id()?;
+        let key = self.authentication_key()?;
+        let mut canonical = std::collections::HashMap::new();
+        let mut remote_paths = std::collections::HashSet::new();
+        for record in local_records {
+            insert_canonical_record(&mut canonical, record)?;
+        }
+        for record in remote_records {
+            if !remote_paths.insert(record.path.as_bytes()) {
+                bail!("peer snapshot contains duplicate paths");
+            }
+            let identity = (&record.version.peer, record.version.sequence);
+            let untagged_legacy = record.version.id_authenticator.is_none()
+                && record.version.version_authenticator.is_none()
+                && record.version.base_authenticator.is_none();
+            if untagged_legacy
+                && canonical
+                    .get(&identity)
+                    .is_some_and(|local_record| *local_record == record)
+            {
+                continue;
+            }
+            validate_owned_id(&key, share, &local, &record.version.id())?;
+            for seen in &record.version.seen {
+                validate_owned_id(&key, share, &local, seen)?;
+            }
+            if let Some(base) = &record.version.merge_base {
+                validate_owned_id(&key, share, &local, &base.id)?;
+                if base.id.peer == local {
+                    let expected = authenticate(
+                        &key,
+                        &serde_json::to_vec(&(
+                            "flocal-base-version-v2",
+                            &share.0,
+                            &base.id,
+                            &base.entry,
+                        ))?,
+                    );
+                    if base.authenticator.as_deref() != Some(&expected) {
+                        bail!("peer supplied an invalid locally owned merge base");
+                    }
+                }
+            }
+            if record.version.peer == local {
+                let expected = version_tag(&key, share, &record.path, &record.version)?;
+                if record.version.version_authenticator.as_deref() != Some(&expected) {
+                    bail!("peer supplied invalid metadata for a locally owned version");
+                }
+            }
+            insert_canonical_record(&mut canonical, record)?;
+        }
+        Ok(())
+    }
+
     pub fn install_intent(&self, share: &ShareId) -> Result<Option<InstallIntent>> {
         let json: Option<String> = self
             .conn
@@ -369,14 +515,24 @@ impl State {
         share: &ShareId,
         records: &[Record],
     ) -> Result<(InstallIntent, bool)> {
+        self.set_plan_install_intent(share, records, &[])
+    }
+
+    pub fn set_plan_install_intent(
+        &self,
+        share: &ShareId,
+        records: &[Record],
+        conflicts: &[Conflict],
+    ) -> Result<(InstallIntent, bool)> {
         if let Some(intent) = self.install_intent(share)? {
-            if intent.records != records {
+            if intent.records != records || intent.conflicts != conflicts {
                 bail!("a different install is already pending for this share");
             }
             return Ok((intent, false));
         }
         let intent = InstallIntent {
             records: records.to_vec(),
+            conflicts: conflicts.to_vec(),
             temps: records
                 .iter()
                 .map(|record| InstallTemp {
@@ -391,7 +547,133 @@ impl State {
              ON CONFLICT(share_id) DO UPDATE SET records_json=excluded.records_json",
             params![share.0, serde_json::to_string(&intent)?],
         )?;
+        self.conn
+            .execute("DELETE FROM pending_objects WHERE share_id=?1", [&share.0])?;
         Ok((intent, true))
+    }
+
+    pub fn mark_object_receiving(&self, share: &ShareId, hash: &ObjectHash) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_objects(share_id,hash,provenance) VALUES(?1,?2,'receiving')
+             ON CONFLICT(share_id,hash) DO UPDATE SET provenance='receiving'",
+            params![share.0, hash.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_object_verified(&self, share: &ShareId, hash: &ObjectHash) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE pending_objects SET provenance='verified_from_bound_peer'
+             WHERE share_id=?1 AND hash=?2 AND provenance='receiving'",
+            params![share.0, hash.as_str()],
+        )?;
+        if changed != 1 {
+            bail!("received object is missing its pending ownership record");
+        }
+        Ok(())
+    }
+
+    pub fn mark_object_generated(&self, share: &ShareId, hash: &ObjectHash) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_objects(share_id,hash,provenance) VALUES(?1,?2,'generated_local')
+             ON CONFLICT(share_id,hash) DO UPDATE SET provenance='generated_local'",
+            params![share.0, hash.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pending_objects(&self, share: &ShareId) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_objects WHERE share_id=?1", [&share.0])?;
+        Ok(())
+    }
+
+    pub fn share_authorized_objects(&self, share: &ShareId) -> Result<HashSet<ObjectHash>> {
+        let mut authorized = HashSet::new();
+        for record in self.records(share)? {
+            remember_entry_hash(&mut authorized, &record.version.entry);
+            if let Some(base) = record.version.merge_base {
+                remember_entry_hash(&mut authorized, &base.entry);
+            }
+        }
+        for base in self.shared_heads(share)?.into_values() {
+            remember_entry_hash(&mut authorized, &base.entry);
+        }
+        for conflict in self.conflicts(share)? {
+            for record in conflict.inputs {
+                remember_entry_hash(&mut authorized, &record.version.entry);
+            }
+            if let Some(base) = conflict.base {
+                remember_entry_hash(&mut authorized, &base.entry);
+            }
+            if let Some(record) = conflict.merged {
+                remember_entry_hash(&mut authorized, &record.version.entry);
+            }
+        }
+        if let Some(intent) = self.install_intent(share)? {
+            for record in intent.records {
+                remember_entry_hash(&mut authorized, &record.version.entry);
+            }
+            for conflict in intent.conflicts {
+                for record in conflict.inputs {
+                    remember_entry_hash(&mut authorized, &record.version.entry);
+                }
+                if let Some(base) = conflict.base {
+                    remember_entry_hash(&mut authorized, &base.entry);
+                }
+                if let Some(record) = conflict.merged {
+                    remember_entry_hash(&mut authorized, &record.version.entry);
+                }
+            }
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT hash FROM pending_objects
+             WHERE share_id=?1 AND provenance!='receiving'",
+        )?;
+        for row in statement.query_map([&share.0], |row| row.get::<_, String>(0))? {
+            authorized.insert(ObjectHash::parse(row?)?);
+        }
+        Ok(authorized)
+    }
+
+    pub fn finish_install(
+        &mut self,
+        share: &ShareId,
+        expected: &InstallIntent,
+        records: &[Record],
+    ) -> Result<()> {
+        let current = self
+            .install_intent(share)?
+            .context("install intent disappeared before commit")?;
+        if current.records != expected.records
+            || current.conflicts != expected.conflicts
+            || current.temps.len() != expected.temps.len()
+            || current
+                .temps
+                .iter()
+                .zip(&expected.temps)
+                .any(|(current, expected)| current.path != expected.path)
+        {
+            bail!("install intent changed before commit");
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
+        for record in records {
+            tx.execute(
+                "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
+                params![
+                    share.0,
+                    record.path.as_bytes(),
+                    serde_json::to_string(&record.version)?
+                ],
+            )?;
+        }
+        for conflict in &current.conflicts {
+            insert_conflict(&tx, share, conflict)?;
+        }
+        tx.execute("DELETE FROM install_intents WHERE share_id=?1", [&share.0])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn clear_install_intent(&self, share: &ShareId) -> Result<()> {
@@ -827,6 +1109,55 @@ impl State {
         .collect()
     }
 
+    pub fn shared_heads(
+        &self,
+        share: &ShareId,
+    ) -> Result<std::collections::HashMap<Vec<u8>, crate::model::BaseVersion>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path, base_json FROM shared_heads WHERE share_id=?1 ORDER BY path")?;
+        statement
+            .query_map([&share.0], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (path, base) = row?;
+                Ok((path, serde_json::from_str(&base)?))
+            })
+            .collect()
+    }
+
+    /// Marks only plan records that exactly match this endpoint's durable
+    /// current record. Calling this after the peer's commit acknowledgement
+    /// makes one-sided failures conservative without inventing a shared base.
+    pub fn acknowledge_shared_heads(&mut self, share: &ShareId, plan: &[Record]) -> Result<()> {
+        let current: std::collections::HashMap<_, _> = self
+            .records(share)?
+            .into_iter()
+            .map(|record| (record.path.as_bytes().to_vec(), record))
+            .collect();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM shared_heads WHERE share_id=?1", [&share.0])?;
+        for record in plan {
+            if current.get(record.path.as_bytes()) != Some(record) {
+                continue;
+            }
+            let Some(base) = record.version.as_base() else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO shared_heads(share_id,path,base_json) VALUES(?1,?2,?3)",
+                params![
+                    share.0,
+                    record.path.as_bytes(),
+                    serde_json::to_string(&base)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn replace_records(&mut self, id: &ShareId, records: &[Record]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM records WHERE share_id=?1", [&id.0])?;
@@ -894,7 +1225,7 @@ impl State {
 
     pub fn conflicts(&self, share: &ShareId) -> Result<Vec<StoredConflict>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,path,winner_json,loser_json,created_ns FROM conflicts
+            "SELECT id,path,winner_json,loser_json,created_ns,conflict_json FROM conflicts
              WHERE share_id=?1 ORDER BY CAST(created_ns AS INTEGER) DESC",
         )?;
         let rows = stmt.query_map([&share.0], |r| {
@@ -904,15 +1235,33 @@ impl State {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, path, winner, loser, created) = row?;
+            let (id, path, winner, loser, created, conflict) = row?;
+            let legacy_winner: Record = serde_json::from_str(&winner)?;
+            let legacy_loser: Record = serde_json::from_str(&loser)?;
+            let conflict: Conflict = conflict
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    Conflict::whole_file(
+                        legacy_winner.clone(),
+                        legacy_loser.clone(),
+                        crate::merge::FallbackReason::Legacy,
+                    )
+                });
             Ok(StoredConflict {
                 id,
                 path: RelativePath::from_bytes(path)?,
-                winner: serde_json::from_str(&winner)?,
-                loser: serde_json::from_str(&loser)?,
+                winner: conflict.winner().clone(),
+                loser: conflict.loser().clone(),
+                resolution: conflict.resolution,
+                base: conflict.base,
+                inputs: conflict.inputs,
+                merged: conflict.merged,
+                hunks: conflict.hunks,
                 created_ns: created.parse()?,
             })
         })
@@ -1276,33 +1625,79 @@ impl State {
         {
             let mut statement = self.conn.prepare("SELECT version_json FROM records")?;
             for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let version = serde_json::from_str::<Version>(&row?)?;
+                remember_entry_hash(&mut referenced, &version.entry);
+                if let Some(base) = version.merge_base {
+                    remember_entry_hash(&mut referenced, &base.entry);
+                }
+            }
+        }
+        {
+            let mut statement = self.conn.prepare("SELECT base_json FROM shared_heads")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
                 remember_entry_hash(
                     &mut referenced,
-                    &serde_json::from_str::<Version>(&row?)?.entry,
+                    &serde_json::from_str::<crate::model::BaseVersion>(&row?)?.entry,
                 );
             }
         }
         {
             let mut statement = self
                 .conn
-                .prepare("SELECT winner_json, loser_json FROM conflicts")?;
+                .prepare("SELECT winner_json, loser_json, conflict_json FROM conflicts")?;
             for row in statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })? {
-                let (winner, loser) = row?;
-                remember_entry_hash(
-                    &mut referenced,
-                    &serde_json::from_str::<Record>(&winner)?.version.entry,
-                );
-                remember_entry_hash(
-                    &mut referenced,
-                    &serde_json::from_str::<Record>(&loser)?.version.entry,
-                );
+                let (winner, loser, conflict) = row?;
+                let conflict = conflict
+                    .map(|json| serde_json::from_str::<Conflict>(&json))
+                    .transpose()?;
+                if let Some(conflict) = conflict {
+                    for input in &conflict.inputs {
+                        remember_entry_hash(&mut referenced, &input.version.entry);
+                    }
+                    if let Some(base) = &conflict.base {
+                        remember_entry_hash(&mut referenced, &base.entry);
+                    }
+                    if let Some(merged) = &conflict.merged {
+                        remember_entry_hash(&mut referenced, &merged.version.entry);
+                    }
+                } else {
+                    remember_entry_hash(
+                        &mut referenced,
+                        &serde_json::from_str::<Record>(&winner)?.version.entry,
+                    );
+                    remember_entry_hash(
+                        &mut referenced,
+                        &serde_json::from_str::<Record>(&loser)?.version.entry,
+                    );
+                }
             }
         }
         for (_, intent) in self.install_intents()? {
             for record in intent.records {
                 remember_entry_hash(&mut referenced, &record.version.entry);
+            }
+            for conflict in intent.conflicts {
+                for input in conflict.inputs {
+                    remember_entry_hash(&mut referenced, &input.version.entry);
+                }
+                if let Some(base) = conflict.base {
+                    remember_entry_hash(&mut referenced, &base.entry);
+                }
+                if let Some(merged) = conflict.merged {
+                    remember_entry_hash(&mut referenced, &merged.version.entry);
+                }
+            }
+        }
+        {
+            let mut statement = self.conn.prepare("SELECT hash FROM pending_objects")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                referenced.insert(ObjectHash::parse(row?)?);
             }
         }
         for entry in fs::read_dir(self.dir.join("objects"))? {
@@ -1463,6 +1858,66 @@ fn remember_entry_hash(hashes: &mut std::collections::HashSet<ObjectHash>, entry
     }
 }
 
+fn authenticate(key: &[u8; 32], bytes: &[u8]) -> String {
+    blake3::keyed_hash(key, bytes).to_hex().to_string()
+}
+
+fn version_tag(
+    key: &[u8; 32],
+    share: &ShareId,
+    path: &RelativePath,
+    version: &Version,
+) -> Result<String> {
+    Ok(authenticate(
+        key,
+        &serde_json::to_vec(&(
+            "flocal-complete-record-v3",
+            &share.0,
+            path,
+            &version.peer.0,
+            version.sequence,
+            &version.id_authenticator,
+            version.timestamp_ns,
+            &version.seen,
+            &version.merge_base,
+            &version.base_authenticator,
+            &version.entry,
+        ))?,
+    ))
+}
+
+fn insert_canonical_record<'a>(
+    canonical: &mut std::collections::HashMap<(&'a PeerId, u64), &'a Record>,
+    record: &'a Record,
+) -> Result<()> {
+    let identity = (&record.version.peer, record.version.sequence);
+    if let Some(previous) = canonical.insert(identity, record)
+        && previous != record
+    {
+        bail!("the same version identity has contradictory records");
+    }
+    Ok(())
+}
+
+fn validate_owned_id(
+    key: &[u8; 32],
+    share: &ShareId,
+    local: &PeerId,
+    id: &VersionId,
+) -> Result<()> {
+    if &id.peer != local {
+        return Ok(());
+    }
+    let expected = authenticate(
+        key,
+        &serde_json::to_vec(&("flocal-version-id-v2", &share.0, &id.peer.0, id.sequence))?,
+    );
+    if id.authenticator.as_deref() != Some(&expected) {
+        bail!("peer supplied an invalid locally owned version identity");
+    }
+    Ok(())
+}
+
 fn object_path_matches(path: &Path, expected: &ObjectHash) -> Result<bool> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -1574,22 +2029,18 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 
 fn insert_conflict(connection: &Connection, share: &ShareId, conflict: &Conflict) -> Result<()> {
-    let digest = blake3::hash(&serde_json::to_vec(&(
-        conflict.path.as_bytes(),
-        &conflict.winner.version,
-        &conflict.loser.version,
-    ))?);
-    let id = format!("c-{}", &digest.to_hex()[..12]);
+    let id = crate::reconcile::conflict_id(conflict);
     connection.execute(
-        "INSERT OR IGNORE INTO conflicts(id,share_id,path,winner_json,loser_json,created_ns)
-         VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT OR IGNORE INTO conflicts(id,share_id,path,winner_json,loser_json,created_ns,conflict_json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
             id,
             share.0,
             conflict.path.as_bytes(),
-            serde_json::to_string(&conflict.winner)?,
-            serde_json::to_string(&conflict.loser)?,
+            serde_json::to_string(conflict.winner())?,
+            serde_json::to_string(conflict.loser())?,
             now_ns().to_string(),
+            serde_json::to_string(conflict)?,
         ],
     )?;
     Ok(())
@@ -1638,8 +2089,12 @@ pub fn file_record(
         version: Version {
             peer,
             sequence,
+            id_authenticator: None,
             timestamp_ns,
             seen,
+            merge_base: None,
+            version_authenticator: None,
+            base_authenticator: None,
             entry,
         },
     }
@@ -1652,6 +2107,111 @@ mod tests {
     use std::process::Command;
 
     const PERMISSIVE_UMASK_STATE_DIR: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_STATE_DIR";
+
+    #[test]
+    fn canonical_snapshot_rejects_reused_owner_sequence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let original = file_record(
+            RelativePath::from_bytes(b"original".to_vec())?,
+            PeerId("foreign".into()),
+            7,
+            now_ns(),
+            Vec::new(),
+            Entry::Directory,
+        );
+        state.validate_remote_records(
+            &share,
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&original),
+        )?;
+
+        let mut contradictory = original.clone();
+        contradictory.version.id_authenticator = Some("different".into());
+        assert!(
+            state
+                .validate_remote_records(&share, std::slice::from_ref(&original), &[contradictory],)
+                .is_err()
+        );
+        let mut replayed = original.clone();
+        replayed.path = RelativePath::from_bytes(b"replayed".to_vec())?;
+        assert!(
+            state
+                .validate_remote_records(&share, &[], &[original, replayed])
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_snapshot_rejects_duplicate_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let first = file_record(
+            RelativePath::from_bytes(b"duplicate".to_vec())?,
+            PeerId("foreign".into()),
+            8,
+            now_ns(),
+            Vec::new(),
+            Entry::Directory,
+        );
+        let mut second = first.clone();
+        second.version.sequence = 9;
+        let error = state
+            .validate_remote_records(&share, &[], &[first, second])
+            .expect_err("a peer snapshot must contain each path once");
+        assert_eq!(error.to_string(), "peer snapshot contains duplicate paths");
+        Ok(())
+    }
+
+    #[test]
+    fn exact_untagged_legacy_record_is_valid_for_read_only_preview() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let legacy = file_record(
+            RelativePath::from_bytes(b"legacy".to_vec())?,
+            state.peer_id()?,
+            1,
+            now_ns(),
+            Vec::new(),
+            Entry::Directory,
+        );
+
+        state.validate_remote_records(
+            &share,
+            std::slice::from_ref(&legacy),
+            std::slice::from_ref(&legacy),
+        )?;
+        let mut changed = legacy.clone();
+        changed.path = RelativePath::from_bytes(b"changed".to_vec())?;
+        assert!(
+            state
+                .validate_remote_records(&share, std::slice::from_ref(&legacy), &[changed])
+                .is_err()
+        );
+        let mut forged = legacy;
+        forged.version.id_authenticator = Some("forged".into());
+        assert!(
+            state
+                .validate_remote_records(
+                    &share,
+                    std::slice::from_ref(&forged),
+                    std::slice::from_ref(&forged),
+                )
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn private_directory_creation_ignores_a_permissive_umask() -> Result<()> {

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod merge;
 pub mod model;
 pub mod reconcile;
 pub mod scan;
