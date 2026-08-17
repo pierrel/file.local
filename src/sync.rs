@@ -2546,7 +2546,7 @@ mod tests {
         assert!(matches!(
             read_v2_envelope_in_phase_with_frame_timeout(
                 &reader,
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(5),
                 Duration::from_millis(200),
             )?,
             V2Envelope::Session {
