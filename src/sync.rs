@@ -2534,7 +2534,7 @@ mod tests {
 
         let (reader, writer) = UnixStream::pair()?;
         let sender = std::thread::spawn(move || -> Result<()> {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(500));
             write_v2_envelope_until(
                 &writer,
                 &V2Envelope::Session {
@@ -2547,7 +2547,7 @@ mod tests {
             read_v2_envelope_in_phase_with_frame_timeout(
                 &reader,
                 Instant::now() + Duration::from_secs(1),
-                Duration::from_millis(20),
+                Duration::from_millis(200),
             )?,
             V2Envelope::Session {
                 frame: V2SessionFrame::Ping { nonce: 7 }
