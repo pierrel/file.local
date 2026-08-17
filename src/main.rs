@@ -1547,6 +1547,8 @@ fn recover_install_plan(
     share: &ShareId,
     intent: &flocal::state::InstallIntent,
 ) -> Result<()> {
+    #[cfg(feature = "e2e-test-hooks")]
+    e2e_delay_install_recovery(state)?;
     let plan = flocal::reconcile::Plan {
         records: intent.records.clone(),
         conflicts: intent.conflicts.clone(),
@@ -1559,6 +1561,41 @@ fn recover_install_plan(
             Err(error).with_context(|| format!("recovering interrupted install for {}", share.0))
         }
     }
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_delay_install_recovery(state: &State) -> Result<()> {
+    let Some(claimed) = e2e_claim_install_recovery_delay(state)? else {
+        return Ok(());
+    };
+    std::thread::sleep(Duration::from_secs(35));
+    std::fs::remove_file(claimed).context("consuming E2E install recovery delay marker")
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_claim_install_recovery_delay(state: &State) -> Result<Option<PathBuf>> {
+    let marker = state.dir.join(".e2e-delay-install-recovery");
+    let claimed = state.dir.join(".e2e-delay-install-recovery-claimed");
+    match std::fs::rename(&marker, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&claimed) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error).context("claiming E2E install recovery delay marker"),
+    }
+    let metadata = std::fs::symlink_metadata(&claimed)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("E2E install recovery delay marker is not a regular file");
+    }
+    anyhow::ensure!(
+        metadata.len() == 0,
+        "E2E install recovery delay marker is not empty"
+    );
+    Ok(Some(claimed))
 }
 
 fn add_peer(state: &State, path: &Path, host: &str, remote_path: &Path) -> Result<()> {
@@ -2015,6 +2052,7 @@ fn serve_watch_open(
     input: &impl AsFd,
     output: &impl AsFd,
 ) -> Result<()> {
+    let startup_deadline = std::time::Instant::now() + sync::default_phase_deadline();
     if protocol != sync::WATCH_PROTOCOL_VERSION {
         return write_v2_session(
             output,
@@ -2099,7 +2137,7 @@ fn serve_watch_open(
         },
     )?;
     write_watch_ready(output, 0, &state.unsettled_paths(&share)?)?;
-    if let Err(error) = read_watch_ready(state, &share, input) {
+    if let Err(error) = read_watch_ready(state, &share, input, startup_deadline) {
         write_v2_session(
             output,
             V2SessionFrame::Error {
@@ -2256,12 +2294,16 @@ fn write_watch_ready(
     )
 }
 
-fn read_watch_ready(state: &mut State, share: &ShareId, input: &impl AsFd) -> Result<()> {
+fn read_watch_ready(
+    state: &mut State,
+    share: &ShareId,
+    input: &impl AsFd,
+    phase_deadline: std::time::Instant,
+) -> Result<()> {
     let mut unsettled = Vec::new();
-    let mut budget =
-        sync::RoundBudget::new(std::time::Instant::now() + sync::default_frame_deadline());
+    let mut budget = sync::RoundBudget::new(phase_deadline);
     loop {
-        match sync::read_v2_envelope_until(input, budget.frame_deadline()?)? {
+        match sync::read_v2_envelope_in_phase(input, budget.phase_deadline()?)? {
             V2Envelope::Session {
                 frame: frame @ V2SessionFrame::UnsettledChunk { .. },
             } => {
@@ -2319,7 +2361,7 @@ fn recv_v2_round(
     expected_round: u64,
     budget: &sync::RoundBudget,
 ) -> Result<V2RoundFrame> {
-    match sync::read_v2_envelope_until(input, budget.frame_deadline()?)? {
+    match sync::read_v2_envelope_in_phase(input, budget.phase_deadline()?)? {
         V2Envelope::Round { round, frame } if round == expected_round => Ok(frame),
         other => Err(watch_protocol_error(format!(
             "unexpected persistent round frame: {other:?}"
@@ -2637,7 +2679,7 @@ fn serve_v2_round(
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
-        sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
+        sync::RoundBudget::new(std::time::Instant::now() + sync::default_phase_deadline());
     budget.check()?;
     let advertised = sync::refresh_with_root(state, share, root)?;
     budget.check()?;
@@ -3887,6 +3929,7 @@ fn persistent_watch_session_io(
     remote_input: &impl AsFd,
     remote_output: &impl AsFd,
 ) -> Result<()> {
+    let startup_deadline = std::time::Instant::now() + sync::default_phase_deadline();
     sync::write_initial_message_until(
         remote_output,
         &InitialMessage::WatchOpen {
@@ -3896,10 +3939,7 @@ fn persistent_watch_session_io(
         },
         std::time::Instant::now() + sync::default_frame_deadline(),
     )?;
-    let accepted = sync::read_v2_envelope_until(
-        remote_input,
-        std::time::Instant::now() + sync::default_frame_deadline(),
-    )?;
+    let accepted = sync::read_v2_envelope_in_phase(remote_input, startup_deadline)?;
     match accepted {
         V2Envelope::Session {
             frame:
@@ -3920,7 +3960,7 @@ fn persistent_watch_session_io(
             )));
         }
     }
-    read_watch_ready(state, share, remote_input)?;
+    read_watch_ready(state, share, remote_input, startup_deadline)?;
     write_watch_ready(remote_output, 0, &state.unsettled_paths(share)?)?;
 
     let mut remote_generation = 0u64;
@@ -4279,7 +4319,7 @@ fn connector_v2_round(
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
-        sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(5 * 60));
+        sync::RoundBudget::new(std::time::Instant::now() + sync::default_phase_deadline());
     write_v2_round(
         output,
         round,
@@ -4472,7 +4512,7 @@ fn recv_connector_round(
     allow_prior_session_frames: bool,
 ) -> Result<V2RoundFrame> {
     loop {
-        match sync::read_v2_envelope_until(input, budget.frame_deadline()?)? {
+        match sync::read_v2_envelope_in_phase(input, budget.phase_deadline()?)? {
             V2Envelope::Round {
                 round,
                 frame: V2RoundFrame::SyncFailed { retryable, message },
@@ -5082,6 +5122,36 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn e2e_recovery_delay_claim_survives_a_killed_process() -> Result<()> {
+        let temp = tempdir()?;
+        let state = State::open(temp.path().join("state"))?;
+        assert!(e2e_claim_install_recovery_delay(&state)?.is_none());
+
+        let marker = state.dir.join(".e2e-delay-install-recovery");
+        let claimed = state.dir.join(".e2e-delay-install-recovery-claimed");
+        std::fs::write(&marker, b"")?;
+        assert_eq!(
+            e2e_claim_install_recovery_delay(&state)?,
+            Some(claimed.clone())
+        );
+        assert!(!marker.exists());
+        assert!(claimed.exists());
+        assert_eq!(
+            e2e_claim_install_recovery_delay(&state)?,
+            Some(claimed.clone())
+        );
+
+        std::fs::remove_file(&claimed)?;
+        std::fs::write(&marker, b"duration")?;
+        assert!(e2e_claim_install_recovery_delay(&state).is_err());
+        std::fs::remove_file(&claimed)?;
+        std::fs::create_dir(&marker)?;
+        assert!(e2e_claim_install_recovery_delay(&state).is_err());
+        Ok(())
+    }
+
     fn test_record(path: &[u8], peer: &str, entry: Entry) -> flocal::model::Record {
         flocal::model::Record {
             path: flocal::model::RelativePath::from_bytes(path.to_vec()).unwrap(),
@@ -5265,8 +5335,13 @@ mod tests {
             },
         )?;
         write_v2_session(&writer, V2SessionFrame::Ping { nonce: 1 })?;
-        let error = read_watch_ready(&mut state, &share, &reader)
-            .expect_err("a non-readiness frame must fail the handshake");
+        let error = read_watch_ready(
+            &mut state,
+            &share,
+            &reader,
+            std::time::Instant::now() + sync::default_frame_deadline(),
+        )
+        .expect_err("a non-readiness frame must fail the handshake");
         assert!(error.downcast_ref::<WatchProtocolError>().is_some());
         assert!(!state.unsettled_paths(&share)?.contains(&partial));
 
@@ -5278,8 +5353,13 @@ mod tests {
                 message: "peer rejected readiness".into(),
             },
         )?;
-        let error = read_watch_ready(&mut state, &share, &reader)
-            .expect_err("a remote error must fail the handshake");
+        let error = read_watch_ready(
+            &mut state,
+            &share,
+            &reader,
+            std::time::Instant::now() + sync::default_frame_deadline(),
+        )
+        .expect_err("a remote error must fail the handshake");
         let remote = error
             .downcast_ref::<RemoteWatchError>()
             .expect("the remote error remains typed");
@@ -6269,7 +6349,12 @@ mod tests {
                 },
             )?;
             write_watch_ready(&responder_output, 0, std::slice::from_ref(&remote_seed))?;
-            read_watch_ready(&mut remote_state, &remote_share, &responder_input)?;
+            read_watch_ready(
+                &mut remote_state,
+                &remote_share,
+                &responder_input,
+                std::time::Instant::now() + sync::default_phase_deadline(),
+            )?;
             let unsettled = remote_state.unsettled_paths(&remote_share)?;
             assert!(unsettled.contains(&expected_local_seed));
             assert!(unsettled.contains(&expected_remote_seed));

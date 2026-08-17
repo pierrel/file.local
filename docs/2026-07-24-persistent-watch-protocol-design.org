@@ -267,9 +267,14 @@ remain the synchronization state and repair boundary.
    remove/re-init/re-pair rather than retrying; watcher-capacity exhaustion identifies inotify/FSEvents
    setup and points Linux users to their inotify watch limit or advises reducing
    watched trees. Periodic summaries may be shorter but retain the latest cause.
-8. Every framed transport read and write has a 30-second hard absolute deadline
-   covering its four-byte prefix and entire payload; slow-drip bytes do not
-   reset it. Connector child stdin/stdout and responder stdin/stdout are put in
+8. Every framed transport write and every frame after its first byte has a
+   30-second hard absolute deadline. A read waiting for a peer's synchronous
+   filesystem phase uses the applicable startup or round absolute five-minute
+   deadline for the first byte, then the lesser of that phase deadline and 30
+   more seconds for the rest of the frame. That 30-second deadline covers the remaining
+   three prefix bytes and the entire payload; slow-drip bytes do not reset it,
+   and neither bytes nor frames renew the absolute phase deadline. Connector
+   child stdin/stdout and responder stdin/stdout are put in
    nonblocking mode and driven with =rustix= =poll= against the remaining
    monotonic deadline. =WouldBlock= returns to polling; zero progress does not
    extend the deadline. This makes a responder blocked on connector output, and

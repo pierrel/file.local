@@ -15,6 +15,11 @@ const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 const WATCH_PIDFILE: &str = "/tmp/flocal-watch.pid";
 const WATCH_LOG: &str = "/home/peer/.flocal-watch.log";
 const APPLY_STOP_MARKER: &str = "/home/peer/.local/state/file.local/.e2e-stop-before-apply";
+const APPLY_STOP_PIDFILE: &str = "/home/peer/.local/state/file.local/.e2e-apply-stop.pid";
+const RECOVERY_DELAY_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-delay-install-recovery";
+const RECOVERY_DELAY_CLAIMED: &str =
+    "/home/peer/.local/state/file.local/.e2e-delay-install-recovery-claimed";
 const OBJECT_ENOSPC_MARKER: &str = "/home/peer/.local/state/file.local/.e2e-object-enospc";
 const RECOVERY_BUDGET_MARKER: &str =
     "/home/peer/.local/state/file.local/.e2e-recovery-budget-bytes";
@@ -523,21 +528,9 @@ impl Connector {
     }
 
     pub fn watch_start_with_apply_stops(&self, count: u8) -> Result<Watch<'_>> {
-        anyhow::ensure!(
-            matches!(count, 1 | 2),
-            "apply stop count must be one or two"
-        );
         let watch = self.watch_start()?;
         watch.wait_for_log("Peer connected")?;
-        let count = count.to_string();
-        self.exec_ok(&[
-            "sh",
-            "-c",
-            "printf %s \"$1\" >\"$2\"",
-            "sh",
-            &count,
-            APPLY_STOP_MARKER,
-        ])?;
+        self.arm_apply_stops(count)?;
         Ok(watch)
     }
 }
@@ -611,6 +604,7 @@ impl Watch<'_> {
     }
 
     pub fn resume_to_next_apply_stop(&self) -> Result<()> {
+        self.peer.remove_apply_stop_pidfile()?;
         self.resume()?;
         self.peer.poll_until(
             "second E2E apply-stop marker was not consumed",
@@ -642,6 +636,10 @@ impl Watch<'_> {
 
     pub fn wait_for_log(&self, needle: &str) -> Result<()> {
         self.peer.wait_for_text(WATCH_LOG, needle)
+    }
+
+    pub fn wait_for_log_within(&self, needle: &str, deadline: Duration) -> Result<()> {
+        self.peer.wait_for_text_within(WATCH_LOG, needle, deadline)
     }
 
     /// Terminates the watcher inside the container — killing the `docker
@@ -698,6 +696,94 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn arm_apply_stops(&self, count: u8) -> Result<()> {
+        anyhow::ensure!(
+            matches!(count, 1 | 2),
+            "apply stop count must be one or two"
+        );
+        self.remove_apply_stop_pidfile()?;
+        let count = count.to_string();
+        self.exec_ok(&[
+            "sh",
+            "-c",
+            "printf %s \"$1\" >\"$2\"",
+            "sh",
+            &count,
+            APPLY_STOP_MARKER,
+        ])?;
+        Ok(())
+    }
+
+    pub fn arm_install_recovery_delay(&self) -> Result<()> {
+        self.exec_ok(&[
+            "rm",
+            "-f",
+            "--",
+            RECOVERY_DELAY_MARKER,
+            RECOVERY_DELAY_CLAIMED,
+        ])?;
+        self.exec_ok(&["touch", "--", RECOVERY_DELAY_MARKER])?;
+        Ok(())
+    }
+
+    pub fn wait_for_stopped_protocol_server(&self) -> Result<u32> {
+        self.poll_until(
+            "flocal protocol serve did not stop at the apply boundary",
+            DEADLINE,
+            |peer| {
+                let output = peer.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
+                if !output.status.success() {
+                    return Ok(None);
+                }
+                let Some(pid) = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                else {
+                    return Ok(None);
+                };
+                Ok(peer.is_stopped_protocol_server(pid)?.then_some(pid))
+            },
+        )
+    }
+
+    pub fn resume_protocol_to_next_apply_stop(&self, pid: u32) -> Result<u32> {
+        self.require_stopped_protocol_server(pid)?;
+        self.remove_apply_stop_pidfile()?;
+        self.require_stopped_protocol_server(pid)?;
+        let output = self.signal("CONT", pid)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: resuming flocal protocol serve (pid {pid}) failed: {}",
+                self.alias,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let next = self.wait_for_stopped_protocol_server()?;
+        anyhow::ensure!(
+            next == pid,
+            "responder protocol process changed across apply stops: {pid} -> {next}"
+        );
+        Ok(next)
+    }
+
+    pub fn kill_stopped_protocol_server(&self, pid: u32) -> Result<()> {
+        self.require_stopped_protocol_server(pid)?;
+        let output = self.signal("KILL", pid)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: killing flocal protocol serve (pid {pid}) failed: {}",
+                self.alias,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        self.poll_until(
+            &format!("flocal protocol serve (pid {pid}) survived SIGKILL"),
+            DEADLINE,
+            move |peer| Ok((!peer.is_protocol_server(pid)?).then_some(())),
+        )
+    }
+
     fn start_daemon(&self) -> Result<()> {
         self.context.docker_ok(&[
             "exec",
@@ -892,9 +978,13 @@ impl Peer {
     }
 
     fn wait_for_text(&self, path: &str, needle: &str) -> Result<()> {
+        self.wait_for_text_within(path, needle, DEADLINE)
+    }
+
+    fn wait_for_text_within(&self, path: &str, needle: &str, deadline: Duration) -> Result<()> {
         self.poll_until(
             &format!("{path} never contained {needle:?}"),
-            DEADLINE,
+            deadline,
             |peer| {
                 let output = peer.exec_raw(&["cat", "--", path])?;
                 Ok((output.status.success()
@@ -1336,6 +1426,49 @@ impl Peer {
         }
         let cmdline = String::from_utf8_lossy(&output.stdout);
         Ok(cmdline.contains("flocal") && cmdline.contains("watch"))
+    }
+
+    fn remove_apply_stop_pidfile(&self) -> Result<()> {
+        self.exec_ok(&["rm", "-f", "--", APPLY_STOP_PIDFILE])?;
+        Ok(())
+    }
+
+    fn is_protocol_server(&self, pid: u32) -> Result<bool> {
+        let output = self.exec_raw(&["cat", "--", &format!("/proc/{pid}/cmdline")])?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let arguments: Vec<_> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .collect();
+        Ok(matches!(arguments.as_slice(), [executable, protocol, serve]
+            if executable.ends_with(b"/flocal-real")
+                && *protocol == b"protocol"
+                && *serve == b"serve"))
+    }
+
+    fn is_stopped_protocol_server(&self, pid: u32) -> Result<bool> {
+        if !self.is_protocol_server(pid)? {
+            return Ok(false);
+        }
+        let output = self.exec_raw(&["cat", "--", &format!("/proc/{pid}/status")])?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("State:\tT")))
+    }
+
+    fn require_stopped_protocol_server(&self, pid: u32) -> Result<()> {
+        anyhow::ensure!(
+            self.is_stopped_protocol_server(pid)?,
+            "{}: pid {pid} is not a stopped flocal protocol serve process",
+            self.alias
+        );
+        Ok(())
     }
 
     /// Polls `probe` every `POLL` until it yields `Some(value)`, or dumps and

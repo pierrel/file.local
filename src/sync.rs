@@ -58,6 +58,11 @@ impl RoundBudget {
         Ok(self.deadline.min(Instant::now() + default_frame_deadline()))
     }
 
+    pub fn phase_deadline(&self) -> Result<Instant> {
+        self.check()?;
+        Ok(self.deadline)
+    }
+
     pub fn add_metadata(&mut self, bytes: usize) -> Result<()> {
         self.metadata_bytes = self.metadata_bytes.saturating_add(bytes);
         if self.metadata_bytes > MAX_METADATA_BYTES_PER_SESSION {
@@ -344,6 +349,34 @@ fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
 pub fn read_v2_envelope_until(reader: &impl AsFd, deadline: Instant) -> Result<V2Envelope> {
     let mut length = [0u8; 4];
     read_exact_until(reader, &mut length, deadline)?;
+    read_v2_envelope_body_until(reader, length, deadline)
+}
+
+pub fn read_v2_envelope_in_phase(
+    reader: &impl AsFd,
+    phase_deadline: Instant,
+) -> Result<V2Envelope> {
+    read_v2_envelope_in_phase_with_frame_timeout(reader, phase_deadline, default_frame_deadline())
+}
+
+fn read_v2_envelope_in_phase_with_frame_timeout(
+    reader: &impl AsFd,
+    phase_deadline: Instant,
+    frame_timeout: Duration,
+) -> Result<V2Envelope> {
+    let mut length = [0u8; 4];
+    read_exact_until(reader, &mut length[..1], phase_deadline)
+        .context("waiting for persistent protocol phase result")?;
+    let frame_deadline = phase_deadline.min(Instant::now() + frame_timeout);
+    read_exact_until(reader, &mut length[1..], frame_deadline)?;
+    read_v2_envelope_body_until(reader, length, frame_deadline)
+}
+
+fn read_v2_envelope_body_until(
+    reader: &impl AsFd,
+    length: [u8; 4],
+    deadline: Instant,
+) -> Result<V2Envelope> {
     let length = u32::from_be_bytes(length) as usize;
     if length > MAX_FRAME {
         bail!("protocol frame too large");
@@ -440,6 +473,10 @@ fn wait_fd(fd: &impl AsFd, flags: rustix::event::PollFlags, deadline: Instant) -
 
 pub fn default_frame_deadline() -> Duration {
     Duration::from_secs(30)
+}
+
+pub fn default_phase_deadline() -> Duration {
+    Duration::from_secs(5 * 60)
 }
 
 pub fn input_ready_until(reader: &impl AsFd, deadline: Instant) -> Result<bool> {
@@ -960,8 +997,24 @@ pub fn apply_complete_plan_with_root_skipping(
 #[cfg(feature = "e2e-test-hooks")]
 fn e2e_stop_before_apply(state: &State) -> Result<()> {
     if e2e_claim_apply_stop(state)? {
+        e2e_publish_apply_stop_pid(state)?;
         signal_hook::low_level::raise(signal_hook::consts::SIGSTOP)?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_publish_apply_stop_pid(state: &State) -> Result<()> {
+    use std::io::Write as _;
+
+    let path = state.dir.join(".e2e-apply-stop.pid");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .context("publishing E2E stopped apply pid")?;
+    write!(file, "{}", std::process::id())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -2376,6 +2429,24 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn e2e_apply_stop_pid_is_created_without_following_an_existing_entry() -> Result<()> {
+        let temp = tempdir()?;
+        let state = State::open(temp.path().join("state"))?;
+        let pidfile = state.dir.join(".e2e-apply-stop.pid");
+        e2e_publish_apply_stop_pid(&state)?;
+        assert_eq!(
+            fs::read_to_string(&pidfile)?,
+            std::process::id().to_string()
+        );
+        assert!(e2e_publish_apply_stop_pid(&state).is_err());
+        fs::remove_file(&pidfile)?;
+        std::os::unix::fs::symlink(temp.path().join("target"), &pidfile)?;
+        assert!(e2e_publish_apply_stop_pid(&state).is_err());
+        Ok(())
+    }
+
     #[test]
     fn no_replace_race_removes_the_owned_staged_entry() -> Result<()> {
         let temp = tempdir()?;
@@ -2442,6 +2513,7 @@ mod tests {
         let expired = RoundBudget::new(Instant::now() - Duration::from_millis(1));
         assert!(expired.check().is_err());
         assert!(expired.frame_deadline().is_err());
+        assert!(expired.phase_deadline().is_err());
 
         let mut metadata = RoundBudget::new(Instant::now() + Duration::from_secs(1));
         metadata
@@ -2454,6 +2526,125 @@ mod tests {
             .add_transfer(max_transfer_bytes_per_session())
             .unwrap();
         assert!(transfer.add_transfer(1).is_err());
+    }
+
+    #[test]
+    fn phase_read_starts_its_frame_timeout_at_the_first_byte() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let (reader, writer) = UnixStream::pair()?;
+        let sender = std::thread::spawn(move || -> Result<()> {
+            std::thread::sleep(Duration::from_millis(50));
+            write_v2_envelope_until(
+                &writer,
+                &V2Envelope::Session {
+                    frame: V2SessionFrame::Ping { nonce: 7 },
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+        });
+        assert!(matches!(
+            read_v2_envelope_in_phase_with_frame_timeout(
+                &reader,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(20),
+            )?,
+            V2Envelope::Session {
+                frame: V2SessionFrame::Ping { nonce: 7 }
+            }
+        ));
+        sender.join().expect("sender did not panic")
+    }
+
+    #[test]
+    fn phase_read_does_not_renew_incomplete_frame_deadlines() -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (mut prefix_writer, prefix_reader) = UnixStream::pair()?;
+        prefix_writer.write_all(&[0])?;
+        let prefix_error = read_v2_envelope_in_phase_with_frame_timeout(
+            &prefix_reader,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .expect_err("an incomplete prefix must time out");
+        assert!(prefix_error.to_string().contains("deadline exceeded"));
+
+        let (mut body_writer, body_reader) = UnixStream::pair()?;
+        body_writer.write_all(&1u32.to_be_bytes())?;
+        let body_error = read_v2_envelope_in_phase_with_frame_timeout(
+            &body_reader,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .expect_err("an incomplete body must time out");
+        assert!(body_error.to_string().contains("deadline exceeded"));
+        Ok(())
+    }
+
+    #[test]
+    fn phase_read_does_not_renew_a_slow_drip_body() -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let envelope = V2Envelope::Session {
+            frame: V2SessionFrame::Ping { nonce: 9 },
+        };
+        let body = serde_json::to_vec(&envelope)?;
+        let (mut writer, reader) = UnixStream::pair()?;
+        let sender = std::thread::spawn(move || {
+            if writer
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .is_err()
+            {
+                return;
+            }
+            for byte in body {
+                if writer.write_all(&[byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let error = read_v2_envelope_in_phase_with_frame_timeout(
+            &reader,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(40),
+        )
+        .expect_err("body bytes must not renew the frame deadline");
+        assert!(error.to_string().contains("deadline exceeded"));
+        drop(reader);
+        sender.join().expect("sender did not panic");
+        Ok(())
+    }
+
+    #[test]
+    fn phase_read_enforces_its_absolute_cap_and_frame_size() -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (_silent_writer, silent_reader) = UnixStream::pair()?;
+        let phase_error = read_v2_envelope_in_phase_with_frame_timeout(
+            &silent_reader,
+            Instant::now() + Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+        .expect_err("a silent phase must time out");
+        assert!(
+            format!("{phase_error:#}").contains("waiting for persistent protocol phase result")
+        );
+
+        let (mut writer, reader) = UnixStream::pair()?;
+        writer.write_all(&((MAX_FRAME + 1) as u32).to_be_bytes())?;
+        let size_error = read_v2_envelope_in_phase_with_frame_timeout(
+            &reader,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect_err("an oversized frame must fail before allocation");
+        assert!(size_error.to_string().contains("protocol frame too large"));
+        Ok(())
     }
 
     #[test]
