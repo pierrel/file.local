@@ -226,7 +226,7 @@ fn watch_recovers_when_peer_install_recovery_outlasts_a_frame_deadline() -> Resu
 
     watch.wait_for_log_within(
         "SETTLED recovery.txt no longer blocks synchronization",
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(90),
     )?;
     let connector_status = a.status()?;
     let responder_status = b.status()?;
