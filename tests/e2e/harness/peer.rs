@@ -622,6 +622,11 @@ impl Watch<'_> {
             .wait_for_text("/home/peer/.flocal-stderr.log", needle)
     }
 
+    pub fn wait_for_error_within(&self, needle: &str, deadline: Duration) -> Result<()> {
+        self.peer
+            .wait_for_text_within("/home/peer/.flocal-stderr.log", needle, deadline)
+    }
+
     pub fn assert_log_absent(&self, needle: &str) -> Result<()> {
         let output = self.peer.exec_ok(&["cat", "--", WATCH_LOG])?;
         let log = String::from_utf8_lossy(&output.stdout);

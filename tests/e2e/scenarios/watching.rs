@@ -276,6 +276,7 @@ fn watch_recovers_after_network_loss_during_process_suspension() -> Result<()> {
         watch_max_session_bytes: None,
     })?;
     let watch = a.watch_start()?;
+    watch.wait_for_log("Peer connected")?;
     let sessions_before_sleep = b.ssh_session_count()?;
 
     // Model a laptop sleeping while its network disappears: stop the watch
@@ -287,7 +288,10 @@ fn watch_recovers_after_network_loss_during_process_suspension() -> Result<()> {
     b.write("remote-during-sleep.txt", "remote offline edit")?;
     std::thread::sleep(std::time::Duration::from_secs(2));
     watch.resume()?;
-    watch.wait_for_error("synchronization failed; retrying in background")?;
+    watch.wait_for_error_within(
+        "synchronization failed; retrying in background",
+        std::time::Duration::from_secs(60),
+    )?;
     b.online()?;
 
     b.wait_for_file("local-during-sleep.txt", "local offline edit")?;

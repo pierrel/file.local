@@ -279,15 +279,17 @@ The bug workflow produced a machine-checked transition:
    failed with =the replacement SSH session did not survive install recovery=.
 2. With the fix but the wrapper still present, it failed for the opposite
    reason, reporting that the scenario now passed and must be promoted.
-3. After removing the wrapper, the promoted scenario passed. Its final focused
-   run, including the content assertions, completed in 51.57 seconds.
+3. After removing the wrapper, the promoted scenario passed. A focused run on
+   the reviewed implementation, including the content assertions, completed in
+   40.98 seconds.
 
-The complete ignored Docker suite passed: 34 scenarios, zero failures, 177.36
-seconds. The E2E binary lists 35 tests in total; its one nonignored harness unit
-is filtered out by =make e2e= and runs under the native test gate. The Docker
-run includes the existing two-stop invalidation, stale-install recovery, daemon
-restart, offline return, process suspension, conflict recovery, resource limits,
-symlinks, ignores, and ordinary synchronization.
+After the final test-reliability fixes, the complete ignored Docker suite passed:
+34 scenarios, zero failures, 206.24 seconds. The E2E binary lists 35 tests in
+total; its one nonignored harness unit is filtered out by =make e2e= and runs
+under the native test gate. The Docker run includes the existing two-stop
+invalidation, stale-install recovery, daemon restart, offline return, process
+suspension, conflict recovery, resource limits, symlinks, ignores, and ordinary
+synchronization.
 
 =make check= passed all native tests, formatting, and Clippy with warnings denied.
 Whole-project line coverage is 91.86 percent. Changed executable line coverage
@@ -307,8 +309,12 @@ cross-platform filesystem behavior, adversarial security, and documentation
 alignment. Findings fixed during review included exact responder invalidation,
 safe PID identity, crash-persistent delay semantics, the existing two-stop PID
 lifecycle, explicit expected content, a true slow-drip test, and precise README
-wording about startup versus round budgets. The final affected-lens reruns were
-clear.
+wording about startup versus round budgets. External review and hosted CI also
+found narrow test-reliability issues: the long-recovery E2E and deadline unit
+test needed more scheduler headroom, while the sleep/network E2E needed to
+establish a connected session and allow for SSH's separate 30-to-45-second
+keepalive failure detection. These fixes change only tests and their harness.
+The final affected-lens reruns were clear.
 
 * Remaining limits
 
