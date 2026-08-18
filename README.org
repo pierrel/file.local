@@ -179,6 +179,14 @@ failures are summarized every five minutes without log flooding, and recovery
 reports how many attempts failed. Explicit =flocal sync= output remains a
 proposed plan because it may precede initial confirmation.
 
+Startup waits up to five minutes for the peer's first response. Each
+synchronization round carries a five-minute elapsed budget checked between
+synchronous filesystem operations. Protocol reads use the time remaining in
+the applicable startup or round budget. Once a frame starts, its remaining
+prefix and payload still have a hard 30-second deadline. This lets an
+interrupted install recover without a reconnect loop while keeping partial
+frames and silent peers bounded.
+
 If a file changes after a round scans it but before installation, watch keeps
 that local change, records the path as =UNSETTLED=, and recalculates immediately
 without reconnecting. A path that changes again is isolated so stable sibling

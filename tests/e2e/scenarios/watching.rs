@@ -196,6 +196,60 @@ fn changing_path_does_not_block_a_stable_sibling() -> Result<()> {
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
+fn watch_recovers_when_peer_install_recovery_outlasts_a_frame_deadline() -> Result<()> {
+    let (a, b) = e2e::pair_with(e2e::Config {
+        watch_max_session_bytes: None,
+    })?;
+    a.write("recovery.txt", "base")?;
+    a.sync()?;
+    let watch = a.watch_start()?;
+    watch.wait_for_log("Peer connected")?;
+
+    b.arm_apply_stops(2)?;
+    a.write("recovery.txt", "connector edit")?;
+    let responder = b.wait_for_stopped_protocol_server()?;
+    b.write("recovery.txt", "responder edit")?;
+    let responder = b.resume_protocol_to_next_apply_stop(responder)?;
+    watch.wait_for_log("UNSETTLED recovery.txt changed while synchronizing")?;
+
+    anyhow::ensure!(
+        a.status()?.unsettled == vec![b"recovery.txt".to_vec()],
+        "connector did not persist the unsettled path"
+    );
+    anyhow::ensure!(
+        b.status()?.pending_install,
+        "responder did not retain the interrupted install"
+    );
+    b.arm_install_recovery_delay()?;
+    let sessions_before_kill = b.ssh_session_count()?;
+    b.kill_stopped_protocol_server(responder)?;
+
+    watch.wait_for_log_within(
+        "SETTLED recovery.txt no longer blocks synchronization",
+        std::time::Duration::from_secs(90),
+    )?;
+    let connector_status = a.status()?;
+    let responder_status = b.status()?;
+    anyhow::ensure!(
+        !connector_status.pending_install && connector_status.unsettled.is_empty(),
+        "connector remained unsettled after recovery: {connector_status:?}"
+    );
+    anyhow::ensure!(
+        !responder_status.pending_install && responder_status.unsettled.is_empty(),
+        "responder retained recovery state: {responder_status:?}"
+    );
+    anyhow::ensure!(
+        b.ssh_session_count()? == sessions_before_kill + 1,
+        "the replacement SSH session did not survive install recovery"
+    );
+    a.assert_file("recovery.txt", "responder edit")?;
+    b.assert_file("recovery.txt", "responder edit")?;
+    e2e::assert_trees_equal(&a, &b)?;
+    watch.stop()
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
 fn watch_rescans_both_directions_after_process_suspension() -> Result<()> {
     let (a, b) = e2e::pair_with(e2e::Config {
         watch_max_session_bytes: None,
@@ -222,6 +276,7 @@ fn watch_recovers_after_network_loss_during_process_suspension() -> Result<()> {
         watch_max_session_bytes: None,
     })?;
     let watch = a.watch_start()?;
+    watch.wait_for_log("Peer connected")?;
     let sessions_before_sleep = b.ssh_session_count()?;
 
     // Model a laptop sleeping while its network disappears: stop the watch
@@ -233,7 +288,10 @@ fn watch_recovers_after_network_loss_during_process_suspension() -> Result<()> {
     b.write("remote-during-sleep.txt", "remote offline edit")?;
     std::thread::sleep(std::time::Duration::from_secs(2));
     watch.resume()?;
-    watch.wait_for_error("synchronization failed; retrying in background")?;
+    watch.wait_for_error_within(
+        "synchronization failed; retrying in background",
+        std::time::Duration::from_secs(60),
+    )?;
     b.online()?;
 
     b.wait_for_file("local-during-sleep.txt", "local offline edit")?;

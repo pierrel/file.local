@@ -1,0 +1,204 @@
+#+title: Persistent watch recovery deadline
+#+date: 2026-08-17
+#+status: implemented
+
+* 1. User outcome
+
+A foreground or daemon-managed watch must recover an interrupted responder
+install without a manual command, even when safe recovery takes longer than one
+protocol frame timeout.  The connector remains =reconnecting= until the
+responder becomes ready, then performs the normal startup reconciliation.
+Durable unsettled paths settle, both trees converge, and the log reports
+=SETTLED= only after that round commits.
+
+This changes timeout handling only.  It adds no wire frame, protocol version,
+state field, dependency, or new background task.
+
+* 2. Observed failure
+
+=flocal protocol serve= runs pending-install recovery before reading or writing
+protocol frames.  A connector starts SSH, writes =WatchOpen=, and currently gives
+the responder 30 seconds to begin =WatchAccepted=.  If responder recovery takes
+longer, the connector kills SSH.  The next process finds the same pending work,
+starts recovery again, and is killed at the same boundary.  Bounded reconnect
+backoff prevents log flooding but cannot make progress.
+
+The important distinction is between time waiting for a phase result and time
+allowed to finish a frame after a peer starts one.  Recovery may legitimately
+consume the former.  The latter must stay short against a stalled or malicious
+peer.
+
+* 3. Exact deadline contract
+
+Add this descriptor-backed read alongside the existing fixed-deadline reader:
+
+#+begin_src rust
+pub fn read_v2_envelope_in_phase(
+    reader: &impl AsFd,
+    phase_deadline: Instant,
+) -> Result<V2Envelope>
+#+end_src
+
+Its semantics are exact:
+
+1. Read the first byte of the four-byte length prefix with the absolute
+   =phase_deadline=.
+2. Once that byte arrives, calculate one fixed =frame_deadline =
+   min(phase_deadline, Instant::now() + default_frame_deadline())=.
+3. Read the remaining three length bytes and the complete body under that same
+   frame deadline.  Receiving more bytes never renews it.
+4. Reject a declared length above =MAX_FRAME= before allocating the body, then
+   deserialize exactly as =read_v2_envelope_until= does today.
+
+An absolute persistent startup phase is five minutes.  =RoundBudget= keeps its
+existing absolute five-minute round deadline and exposes a checked
+=phase_deadline() -> Result<Instant>= accessor.  =frame_deadline()= remains the
+deadline for writes, where a ready receiver must continue consuming data.
+
+* 4. Protocol integration
+
+=persistent_watch_session_io= creates one startup deadline before writing
+=WatchOpen=.  The write retains its 30-second bound.  Reading =WatchAccepted=
+and every responder readiness envelope uses =read_v2_envelope_in_phase= with
+that one startup deadline.  =read_watch_ready= accepts the same deadline so
+readiness chunks cannot extend startup indefinitely.  The responder uses the
+same readiness-reader contract for the connector's startup frames.
+
+All round receive paths use the existing round's absolute deadline:
+
+- =recv_v2_round= on the responder;
+- =recv_connector_round= on the connector; and
+- snapshot, plan, head, object, and completion readers reached through them.
+
+Idle heartbeat dispatch keeps its current readiness polling and ordinary frame
+completion bound.  Initial one-shot protocol reads are unchanged.  The wire is
+unchanged, so explicit sync remains protocol 3 and persistent watch remains
+protocol 5.
+
+* 5. End-to-end regression
+
+Add a Docker E2E scenario under =e2e::known_failure= before the fix, then remove
+the wrapper when it passes:
+
+1. Pair connector A and responder B, synchronize a base file, and start A's
+   foreground watch.
+2. Arm two apply stops in B's private test state and make an edit on A that
+   requires B to apply.  Wait until B's first =flocal protocol serve= process
+   is stopped.
+3. Change the same path directly on B, invalidating B's pending apply, resume B,
+   and wait for A to report the path
+   =UNSETTLED=.  The immediate recalculation reaches B's second apply stop,
+   leaving B with a durable pending install.
+4. Arm B's one-shot recovery-delay hook, verify B has the pending intent, and
+   kill the stopped responder process with =SIGKILL= instead of resuming it.
+5. The replacement responder claims the hook and sleeps for 35 seconds inside
+   pending-install recovery before any protocol frame is emitted.  The claimed
+   marker remains durable during the sleep, so a recovery process killed with
+   it can find and repeat the delay on its next attempt.
+6. Without restarting watch or issuing =sync start=, require A to report
+   =SETTLED=, require both status views to have no pending install or unsettled
+   path, and assert both trees converge to the intended content.
+7. Assert that exactly one replacement SSH session was opened after the
+   intentional kill.  That replacement must survive the 35-second recovery and
+   complete startup instead of being killed and replaced every 30 seconds.
+
+The apply-stop hook publishes its own PID to a fixed file in the private state
+directory immediately before =SIGSTOP=.  Before every =SIGCONT= or =SIGKILL=,
+the harness verifies that PID's Linux =/proc/<pid>/status= is stopped and its
+NUL-separated =/proc/<pid>/cmdline= is exactly a =flocal-real protocol serve=
+process.  Arming a stop removes a stale pidfile; waiting for a second stop
+removes the first pidfile before resuming and requires the hook to recreate it.
+The harness never searches by process name or uses a broad =pkill=.  Scenario
+polls that cover the deliberate delay use a local timeout above 35 seconds;
+ordinary harness deadlines do not increase.
+
+The test-only recovery hook is compiled only by =e2e-test-hooks=.  After
+=recover_installs= selects a durable intent, but before =apply_complete_plan=
+can mutate the tree or retire that intent, it atomically renames a fixed marker
+to a fixed claimed name and validates the claimed entry is a regular
+non-symlink.  A claimed name left by a killed predecessor is itself the next
+attempt's input.  The hook sleeps for 35 seconds and only then removes the
+claimed marker, immediately before applying the durable plan.  It accepts no
+duration or path input.  Thus killing the recovery process cannot make the next
+attempt artificially fast, while a session that grants the recovery phase 35
+seconds consumes the hook once and proceeds.  Docker showed that abandoning the
+SSH client can sometimes leave its remote recovery process alive long enough to
+finish; the fail-to-pass assertion is therefore the invariant that the original
+session is abandoned and extra sessions open, not that every environment must
+kill the remote process at the same instant.
+
+The =/proc= process control is Linux-only E2E harness machinery.  The production
+descriptor logic and its native unit tests run on both Linux and macOS; Docker
+pins the same protocol and durable-state transition as the observed
+macOS-connector/Linux-responder failure without pretending to exercise FSEvents.
+
+* 6. UX, failures, and security
+
+While no byte has arrived, the log remains truthfully at =Connecting to peer=;
+it does not claim the peer is connected or invent a recovery progress frame.
+Successful startup retains the existing committed =UNSETTLED=/=SETTLED= report
+and then the existing =Peer connected= or resumed message.  If no byte arrives
+by five minutes, or a started frame does not finish within 30 seconds, the
+normal retryable failure report and bounded reconnect backoff apply.
+
+The five-minute allowance is not a five-minute frame timeout.  A hostile peer
+gets at most the phase deadline before its first byte and at most 30 seconds
+after starting a frame.  =MAX_FRAME=, cumulative metadata and transfer limits,
+round counts, exact frame parsing, peer/share identity checks, SSH child
+cleanup, and the single absolute phase deadline remain unchanged.  A stream of
+partial bytes or many frames cannot refresh either deadline.
+
+* 7. Implementation plan
+
+1. Add =read_v2_envelope_in_phase= and unit tests for delayed first byte,
+   incomplete prefix, slow body, maximum-frame rejection, and the absolute
+   phase cap.  Keep the existing fixed reader for callers without a phase.
+2. Add =RoundBudget::phase_deadline= and route startup/readiness and both round
+   receive functions through the phase-aware reader.  Leave write deadlines
+   and idle polling unchanged.
+3. Add the fixed one-shot E2E recovery-delay hook and the minimum harness
+   controls needed to construct and kill the two responder apply stops.
+4. Land the strict fail-to-pass E2E, including automatic =SETTLED=, status,
+   convergence, and connection-count assertions.
+5. Reconcile =README.org=, the persistent-watch design, state-of-the-union,
+   and the final implementation report with the reviewed behavior.  Run the
+   full native, coverage, Linux/macOS CI, and Docker gates.
+
+* 8. Acceptance criteria
+
+1. A responder silent for 35 seconds while recovering a pending install does
+   not lose its replacement SSH session and completes startup automatically.
+2. No first byte by five minutes fails; a frame begun in time still cannot run
+   beyond the lesser of 30 more seconds and the phase deadline.
+3. Existing maximum-frame, cumulative-resource, malformed-frame, identity,
+   child-reaping, and retry-reporting tests remain green.
+4. The new E2E proves the original pending-install plus unsettled-path state,
+   not merely an artificial delayed =WatchAccepted=.
+5. No protocol constant, frame enum, or durable schema changes.
+
+* 9. Alternatives rejected
+
+Raising every frame deadline to five minutes gives a partial-frame slowloris
+five minutes and weakens all ordinary reads.  Sending a =Recovering= frame
+requires moving recovery after protocol startup or adding a pre-recovery wire
+path and version bump.  Moving recovery after =WatchAccepted= advertises a
+session before the responder has made its durable state consistent.  Retrying
+more aggressively only repeats the destructive 30-second boundary.  The
+phase-aware first-byte rule fixes the observed lifecycle with one bounded read
+primitive and no protocol or recovery reordering.
+
+* 10. Implementation reconciliation
+
+The implementation follows the deadline, protocol, resource, and test contracts
+above. Docker added one useful process-boundary observation: abandoning the
+local SSH client can leave a remote recovery process alive long enough to
+finish. The promoted E2E therefore pins the invariant that the replacement
+session survives the 35-second recovery without another reconnect, while the
+test marker still survives when the recovery process itself is killed.
+
+=README.org= and the original persistent-watch design now state the split
+startup/round/frame timing. The current v0.0.1 design reconciliation was reviewed
+and has no transport-deadline contract to change. The reader-first account of
+the shipped code, Rust mechanisms, difficult parts, validation, limits, and
+field test is
+[[file:2026-08-17-persistent-recovery-deadline-final-report.org][the final report]].
