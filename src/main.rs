@@ -15,7 +15,8 @@ use base64::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flocal::model::{Entry, PeerConfig, ShareId};
 use flocal::state::{
-    EndpointBinding, IncomingRemoval, PreparedRemoval, RegistrationOutcome, State,
+    EndpointBinding, IncomingRemoval, PreparedRemoval, RegistrationOutcome, RemovalFailureState,
+    State,
 };
 use flocal::sync::{
     self, InitialMessage, Message, RegisterRelationshipResponse, RelationshipRequest,
@@ -760,10 +761,7 @@ fn remove_sync_relationship(
         eprintln!("flocal: finishing an interrupted install before removal");
     }
     if let Err(error) = recover_daemon_share_install(state, &share) {
-        let _ = state.set_removal_diagnostic(&share, &removal.relationship, &format!("{error:#}"));
-        bail!(
-            "relationship removal is pending and disabled; retry after correcting install recovery: {error:#}"
-        )
+        return report_install_recovery_failure(state, &removal, &error);
     }
 
     let detached = if local_only {
@@ -771,12 +769,7 @@ fn remove_sync_relationship(
     } else {
         let remote = remove_remote_relationship(state, &removal);
         if let Err(error) = remote {
-            let _ =
-                state.set_removal_diagnostic(&share, &removal.relationship, &format!("{error:#}"));
-            bail!(
-                "relationship removal is pending and disabled; rerun `flocal sync remove --share {}` to retry: {error:#}",
-                share.0
-            )
+            return report_remote_removal_failure(state, &removal, &error);
         }
         state.finalize_connector_removal(&removal)?
     };
@@ -794,6 +787,58 @@ fn remove_sync_relationship(
         println!("Removed the relationship from both endpoints.");
     }
     Ok(())
+}
+
+fn report_remote_removal_failure(
+    state: &State,
+    removal: &PreparedRemoval,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let EndpointBinding::Connector(peer) = &removal.binding else {
+        unreachable!("remote removal requires a connector binding")
+    };
+    match state.record_removal_failure(removal, &format!("{error:#}")) {
+        Ok(RemovalFailureState::Pending) => bail!(
+            "relationship removal is pending and disabled as of this peer failure; rerun `flocal sync remove --share {}` to retry: {error:#}",
+            removal.share.0
+        ),
+        Ok(RemovalFailureState::Finalized) => bail!(
+            "the local relationship was removed concurrently before the peer failure was classified, but removal from peer {} could not be confirmed; on that peer, run `flocal sync remove --share {} --local-only` before reusing its root: {error:#}",
+            escaped(&peer.host),
+            removal.share.0
+        ),
+        Ok(RemovalFailureState::Changed) => bail!(
+            "removal from peer {} failed and the local relationship changed before that failure could be recorded; remote state is unconfirmed, so run `flocal sync remove --share {} --local-only` on that peer before reusing its root; remote error: {error:#}",
+            escaped(&peer.host),
+            removal.share.0
+        ),
+        Err(local_error) => bail!(
+            "removal from peer {} failed, and the local removal failure could not be classified or recorded; inspect `flocal sync list` to determine whether this relationship is still pending. Remote state is unconfirmed, so run `flocal sync remove --share {} --local-only` on that peer before reusing its root; remote error: {error:#}; local state error: {local_error:#}",
+            escaped(&peer.host),
+            removal.share.0
+        ),
+    }
+}
+
+fn report_install_recovery_failure(
+    state: &State,
+    removal: &PreparedRemoval,
+    error: &anyhow::Error,
+) -> Result<()> {
+    match state.record_removal_failure(removal, &format!("{error:#}")) {
+        Ok(RemovalFailureState::Pending) => bail!(
+            "relationship removal is pending and disabled as of this install recovery failure; retry after correcting install recovery: {error:#}"
+        ),
+        Ok(RemovalFailureState::Finalized) => bail!(
+            "the local relationship was removed concurrently before this install recovery failure was classified; no local removal retry remained at that point: {error:#}"
+        ),
+        Ok(RemovalFailureState::Changed) => bail!(
+            "install recovery failed and the local relationship changed before that failure could be recorded; inspect `flocal sync list` before retrying: {error:#}"
+        ),
+        Err(local_error) => bail!(
+            "install recovery failed, and the local removal failure could not be classified or recorded; inspect `flocal sync list` to determine whether this relationship is still pending; recovery error: {error:#}; local state error: {local_error:#}"
+        ),
+    }
 }
 
 fn remove_remote_relationship(state: &State, prepared: &PreparedRemoval) -> Result<()> {
@@ -7766,6 +7811,115 @@ mod tests {
                 .blocked_diagnostic
                 .is_some_and(|message| message.contains("configured root"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_failure_classifies_local_removal_state_truthfully() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let mut state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let connector = test_connector("peer-concurrent-removal");
+        state.set_peer(&share, &connector)?;
+        let removal = state.prepare_removal(&share, &EndpointBinding::Connector(connector))?;
+        let remote_error = anyhow::anyhow!("broken pipe");
+
+        let pending = report_remote_removal_failure(&state, &removal, &remote_error)
+            .expect_err("a failed two-sided removal remains pending");
+        assert!(pending.to_string().contains("pending and disabled"));
+        assert_eq!(
+            state.managed_share(&share)?.blocked_diagnostic.as_deref(),
+            Some("broken pipe")
+        );
+
+        let lock_owner = State::open(&state_dir)?;
+        let held_sync = lock_owner.lock_global_sync()?;
+        let unclassified = report_remote_removal_failure(&state, &removal, &remote_error)
+            .expect_err("a busy global lock prevents local-state classification");
+        let message = unclassified.to_string();
+        assert!(message.contains("could not be classified or recorded"));
+        assert!(message.contains("flocal sync list"));
+        assert!(!message.contains("local relationship changed"));
+        assert!(message.contains("test-peer"));
+        assert!(message.contains("--local-only"));
+        assert!(message.contains("broken pipe"));
+        drop(held_sync);
+
+        let mut concurrent = State::open(&state_dir)?;
+        concurrent.finalize_local_removal(&removal)?;
+        let finalized = report_remote_removal_failure(&state, &removal, &remote_error)
+            .expect_err("unconfirmed remote state remains an error");
+        let message = finalized.to_string();
+        assert!(message.contains("local relationship was removed concurrently"));
+        assert!(message.contains("removal from peer"));
+        assert!(message.contains("--local-only"));
+        assert!(message.contains("broken pipe"));
+        assert!(!message.contains("pending and disabled"));
+
+        let mut replacement = test_connector("peer-replacement");
+        replacement.host = "replacement-peer".into();
+        concurrent.set_peer(&share, &replacement)?;
+        let changed = report_remote_removal_failure(&state, &removal, &remote_error)
+            .expect_err("a changed local binding cannot absorb the old failure");
+        let message = changed.to_string();
+        assert!(message.contains("local relationship changed"));
+        assert!(message.contains("remote state is unconfirmed"));
+        assert!(message.contains("test-peer"));
+        assert!(message.contains("broken pipe"));
+        assert!(message.contains("--local-only"));
+        Ok(())
+    }
+
+    #[test]
+    fn install_recovery_failure_classifies_local_removal_state_truthfully() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let mut state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let connector = test_connector("peer-concurrent-recovery");
+        state.set_peer(&share, &connector)?;
+        let removal = state.prepare_removal(&share, &EndpointBinding::Connector(connector))?;
+        let recovery_error = anyhow::anyhow!("configured root identity changed");
+
+        let pending = report_install_recovery_failure(&state, &removal, &recovery_error)
+            .expect_err("the exact removal remains pending");
+        assert!(pending.to_string().contains("pending and disabled as of"));
+
+        let lock_owner = State::open(&state_dir)?;
+        let held_sync = lock_owner.lock_global_sync()?;
+        let unclassified = report_install_recovery_failure(&state, &removal, &recovery_error)
+            .expect_err("a busy global lock prevents local-state classification");
+        let message = unclassified.to_string();
+        assert!(message.contains("could not be classified or recorded"));
+        assert!(message.contains("flocal sync list"));
+        assert!(message.contains("configured root identity changed"));
+        assert!(!message.contains("local relationship changed"));
+        drop(held_sync);
+
+        let mut concurrent = State::open(&state_dir)?;
+        concurrent.finalize_local_removal(&removal)?;
+        let finalized = report_install_recovery_failure(&state, &removal, &recovery_error)
+            .expect_err("the recovery error remains visible after concurrent finalization");
+        let message = finalized.to_string();
+        assert!(message.contains("local relationship was removed concurrently"));
+        assert!(message.contains("no local removal retry remained"));
+        assert!(message.contains("configured root identity changed"));
+        assert!(!message.contains("pending and disabled"));
+
+        let replacement = test_connector("peer-replacement-after-recovery");
+        concurrent.set_peer(&share, &replacement)?;
+        let changed = report_install_recovery_failure(&state, &removal, &recovery_error)
+            .expect_err("a changed binding cannot absorb the old recovery failure");
+        let message = changed.to_string();
+        assert!(message.contains("install recovery failed"));
+        assert!(message.contains("local relationship changed"));
+        assert!(message.contains("flocal sync list"));
+        assert!(message.contains("configured root identity changed"));
         Ok(())
     }
 

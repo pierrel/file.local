@@ -109,9 +109,12 @@ run =sync remove --local-only= before reusing that root.
 Before detaching, removal must finish any already-durable =install_intents=
 journal with the existing recovery path.  That journal may represent a
 partially exchanged filesystem entry and cannot safely be discarded.  A
-recovery failure leaves the relationship marked, disabled, and retryable; no
-endpoint is reported detached.  Removal performs no new reconciliation, but
-it may finish a filesystem install that had committed before removal began.
+recovery failure on the unchanged snapshot leaves the relationship marked,
+disabled, and retryable; no endpoint is reported detached.  If another command
+finishes or changes removal concurrently, the failure path reports that
+observed state instead of claiming the old snapshot remains pending.  Removal
+performs no new reconciliation, but it may finish a filesystem install that
+had committed before removal began.
 
 After recovery, detaching one endpoint is one role-checked SQLite transaction.
 It compare-and-sets the marker and original =EndpointBinding=, clears only that
@@ -134,6 +137,13 @@ for restore.  Object collection runs after commit; conflicts protect recovery
 objects.  Finalization returns =Detached { cleanup_warning }=: a collection
 error is printed as post-removal cleanup, not returned as a generic detach
 failure, and cannot undo or misreport the completed detach.
+
+A repeated finalization has one narrow terminal exception to the snapshot
+check.  If another removal already left the share =Unpaired= with no removal
+marker, finalization succeeds idempotently.  It does not repeat the install or
+common-row mutation, but it does rerun object pruning so an earlier cleanup
+warning can heal.  Any active binding or removal marker still has to match the
+original role and snapshot exactly.
 
 The transaction does not open, traverse, rename, delete, or rewrite anything
 under the synchronized root.  Files are byte-for-byte unchanged by detach
@@ -181,9 +191,16 @@ Rerunning the command resumes from the marker.
 The daemon never owns remote transport.  For normal removal the CLI sends the
 canonical ID from =PreparedRemoval= to the peer.  Only a
 validated success response permits the local detach transaction.  Transport,
-identity, or protocol failure sets the bounded diagnostic, prints that removal
-is pending and disabled, and exits nonzero.  Retry is manual and reuses the
-same marker.
+identity, or protocol failure exits nonzero.  On the unchanged snapshot it
+sets the bounded diagnostic, reports that removal was pending and disabled
+when recorded, and gives the manual retry using the same marker.  Recording
+that failure holds the global synchronization lock and
+classifies the exact local state.  An unchanged snapshot stores the diagnostic
+and remains pending.  An already-unpaired terminal state or a changed binding
+still exits nonzero because the peer result is unknown, but reports that local
+state truth and gives the old peer's explicit local-only cleanup command.  If
+the state cannot be inspected, the command says so and asks the user to inspect
+=sync list=; it never guesses that the relationship changed.
 
 One bounded relationship-transport helper owns registration and removal SSH
 children.  Registration has a 30-second absolute deadline.  Removal has an
@@ -196,7 +213,8 @@ exact tracked child handle, waits it, and joins stderr capture; a peer cannot
 return a valid frame and then keep the command alive.  PID-only killing is not
 used.
 
-Finalization compare-and-sets the same marker and original typed role.
+Finalization compare-and-sets the same marker and original typed role, except
+for the already-=Unpaired=, no-marker terminal replay described above.
 =finalize_connector_removal= clears only the connector binding and common rows;
 =finalize_local_removal= accepts either expected role; responder protocol uses
 =detach_incoming_relationship=.  No API broadly scrubs an unvalidated row.
@@ -374,13 +392,17 @@ pending network or ownership failure is never success and exits nonzero.
 | Before confirmation | No change. |
 | After marker/disable, before worker exit | Removing and disabled; restart cannot launch it. |
 | Worker or other owner stalls | Removing with ownership error; no peer request; retry. |
-| Install recovery fails | Removing with recovery error; relationship and records intact; retry. |
+| Install recovery fails while the snapshot is unchanged | Removing with recovery error; relationship and records intact; retry. |
 | Before peer request | Removing; retry sends the same relationship ID. |
-| Peer rejects or is unreachable | Removing with bounded error; retry is manual. |
+| Peer rejects or is unreachable while the snapshot is unchanged | Removing with bounded error as observed when recorded; retry is manual. |
 | Peer commits, reply is lost | Peer is detached; retry receives “relationship absent” for the same ID. |
 | Reply validates, before local commit | Local marker remains; retry is safe. |
 | During local detach | SQLite leaves the full pre-detach state or full detached state. |
 | Local commit, before success output | Rerun reports that no relationship remains, without claiming a new detach. |
+| Concurrent normal and local-only removal after peer success | The slower normal finalization observes the terminal unpaired state, reruns object pruning, and succeeds without repeating row mutation. |
+| Peer failure while the original local removal is pending | The bounded peer error is stored against the exact marker; the command reports pending and manual retry. |
+| Peer failure after concurrent local finalization | The command reports local removal and unconfirmed remote state, then gives the old peer's local-only cleanup command. |
+| Peer failure after local re-pair, or while local state cannot be inspected | A changed binding is reported without modifying it; an inspection failure is reported as unclassified.  Both preserve the peer error and old-peer cleanup guidance. |
 | Pending normal removal changed to local-only | New warning/confirmation, then atomic local detach regardless of unknown remote result. |
 | Local-only during active responder session | Marked and disabled; ownership error until connector stops. |
 
@@ -468,19 +490,20 @@ Native state/protocol/CLI tests cover:
     prepared connector.  Before- and after-remote-commit abandonment both show
     the possible-binding warning and responder cleanup; registration and
     removal each test no-response and valid-response/non-exiting child cleanup.
+12. concurrent normal and local-only removal treats an already-completed local
+    finalization as idempotent after peer success.  After peer failure, tests
+    distinguish exact pending, finalized, changed, and unclassifiable local
+    states while preserving the remote error and old-peer cleanup guidance.
 
-Docker E2E covers reachable two-sided removal without a pending journal and
-exact tree bytes, plus disclosed completion of an already-committed install,
-hidden final
-list rows, status/conflict/restore bytes before and after removal, offline
-pending then manual retry, lost reply, active-worker stop, local-only on both
-roles, and pending-normal escalation to local-only.  Fresh-pair tests use a new
-third peer in both connector directions and prove an old tombstone is absent
-from the new initial plan while retained conflicts still restore exactly.
-Registration E2E drops the SSH response, starts a fresh CLI invocation, verifies
-=registering= status, and retries to completion with the same relationship ID;
-a separate path abandons locally and verifies the possible responder binding
-and its local-only cleanup.
+Docker E2E covers the four operator-level boundaries implemented in
+=tests/e2e/scenarios/relationships.rs=: reachable two-sided removal with exact
+visible bytes, retained conflict restore, hidden final list rows, status, and a
+fresh same-peer pairing; offline pending followed by manual retry; explicit
+local-only asymmetry followed by peer-side cleanup; and an active foreground
+watch that keeps removal pending until ownership is released.  The lower-level
+lost-reply, install-journal, incarnation replay, third-peer remap, registration
+restart, and pending-to-local-only cases above are deterministic native tests,
+not Docker scenarios.
 
 Acceptance requires native Linux and macOS tests, the complete Docker suite,
 formatting, Clippy with warnings denied, and whole-project and changed-line

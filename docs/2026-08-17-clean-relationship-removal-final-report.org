@@ -106,8 +106,10 @@ Removal is a small state machine with durable compare-and-swap boundaries:
 1. Select and preview an exact binding.
 2. Ask the daemon to persist =removing_relationship= and disable the worker.
 3. Stop and reap that exact worker with a bounded escalation path.
-4. Finish any already-committed install journal.  A failure leaves the
-   relationship and fresh-sync records intact and stores a bounded diagnostic.
+4. Finish any already-committed install journal.  A failure on the unchanged
+   snapshot leaves the relationship and fresh-sync records intact and stores a
+   bounded diagnostic; a concurrent finalization or change is reported
+   truthfully instead of being mislabeled pending.
 5. For normal removal, authenticate and detach the exact responder binding.
 6. Atomically detach the same snapshotted connector binding.
 7. Clear fresh-sync state while retaining recovery and root metadata.
@@ -116,8 +118,10 @@ The marker is written before stopping the worker.  Start, explicit sync,
 watch, registration, and worker restoration all consult the same durable
 predicate, so another process cannot restart synchronization in the gap.
 Finalization compares the current role, peer configuration, relationship ID,
-and removal marker with =PreparedRemoval=.  If any changed, it refuses to
-detach.
+and removal marker with =PreparedRemoval=.  If another exact removal already
+left the terminal =Unpaired= state with no marker, a replay succeeds without
+repeating install or common-row mutation and reruns object pruning.  Any active
+or marked binding that changed still refuses to detach.
 
 The responder returns =Absent= both when it just detached the requested
 relationship and when that exact relationship was already absent.  This makes
@@ -190,7 +194,10 @@ canonical ancestor and creates each missing component relative to that held
 descriptor with =mkdirat=, reopening each with =O_NOFOLLOW=.  A retargeted
 alias or injected symlink therefore cannot redirect creation or adoption.
 Removal preparation records the marker with a snapshot of the binding.
-Finalization accepts only the correct role and exact snapshot.
+Finalization accepts only the correct role and exact snapshot while a binding
+is active.  The sole terminal exception is an already-=Unpaired= row with no
+marker: this means another removal completed, so replay is an idempotent
+success that skips row mutation and reruns object pruning.
 
 The held ancestor is represented by Rust's owning =File= type.  Its descriptor
 closes automatically when the value is dropped, including on an early =?=
@@ -220,14 +227,7 @@ let DaemonResponse::Prepared { removal } = response else {
 };
 
 if let Err(error) = recover_daemon_share_install(state, &share) {
-    let _ = state.set_removal_diagnostic(
-        &share,
-        &removal.relationship,
-        &format!("{error:#}"),
-    );
-    bail!(
-        "relationship removal is pending and disabled; retry after correcting install recovery: {error:#}"
-    )
+    return report_install_recovery_failure(state, &removal, &error);
 }
 
 let detached = if local_only {
@@ -235,15 +235,7 @@ let detached = if local_only {
 } else {
     let remote = remove_remote_relationship(state, &removal);
     if let Err(error) = remote {
-        let _ = state.set_removal_diagnostic(
-            &share,
-            &removal.relationship,
-            &format!("{error:#}"),
-        );
-        bail!(
-            "relationship removal is pending and disabled; rerun `flocal sync remove --share {}` to retry: {error:#}",
-            share.0
-        )
+        return report_remote_removal_failure(state, &removal, &error);
     }
     state.finalize_connector_removal(&removal)?
 };
@@ -251,10 +243,12 @@ let detached = if local_only {
 
 =let ... else= is Rust's concise way to require one pattern and exit the
 current function for every other variant.  The =?= operator propagates errors
-with their context.  =if let= handles the one error branch that needs to store
-additional durable state before returning.  The underscore in =let _ ==
-deliberately ignores a secondary diagnostic-write failure so it cannot hide
-the primary recovery failure.
+with their context.  Each =if let= error branch uses the same atomic
+local-state classification before returning.  The reporting helpers distinguish a
+still-pending exact snapshot, an already-finalized terminal state, a changed
+binding, and failure to inspect state.  Every outcome preserves the primary
+recovery or peer error; only the exact pending outcome writes it as the durable
+diagnostic.
 
 The daemon's =PrepareRemove= request serializes marking and worker shutdown
 with its live worker table.  Shutdown is bounded: it requests cooperative
@@ -405,6 +399,18 @@ found that every persistent connector round, not merely session startup, must
 consult the durable removal marker.  Deterministic regression tests now pin
 all three boundaries.
 
+The second hosted review exposed one more command-level interleaving: a normal
+removal can wait on SSH while another process completes local-only removal.
+After peer success, the slower normal command now treats the exact terminal
+unpaired state as idempotent success and reruns pruning.  After peer failure it
+never converts uncertainty into success.  Under the global lock it either
+records the error on the unchanged pending marker, observes that local removal
+already finished, or observes a changed binding.  If it cannot acquire that
+lock or inspect state, it reports the classification failure instead of
+guessing.  Every non-pending outcome preserves the peer error and names the old
+peer's explicit local-only cleanup command.  Deterministic tests cover all four
+observations.
+
 The full E2E run exposed one real regression: the new removal guard initially
 ran before responder identity validation, so a wiped and re-created responder
 reported =removing= rather than the expected peer-identity mismatch.  Moving
@@ -422,12 +428,12 @@ coverage.
 
 The implementation passed:
 
-- =make check=: 62 library unit tests, 51 binary unit tests, 65 integration
-  tests across the non-Docker targets, formatting, and Clippy with warnings as
-  errors;
+- =make check=: 63 library unit tests, 53 binary unit tests, 65 integration
+  tests plus the non-Docker E2E harness self-test, formatting, and Clippy with
+  warnings as errors;
 - whole-project line coverage at or above the repository's 90% gate;
-- changed executable-line coverage of 2324/2548, or 91.21%;
-- =make e2e=: all 38 Docker scenarios in 242.67 seconds, including every pre-existing sync,
+- changed executable-line coverage of 2457/2645, or 92.89%;
+- =make e2e=: all 38 Docker scenarios in 243.23 seconds, including every pre-existing sync,
   conflict, offline, filesystem-transition, persistent-watch, suspension, and
   reconnection scenario; and
 - =git diff --check= and the final documentation-alignment pass.
@@ -461,6 +467,21 @@ contract gap: locally generated errors were bounded but not sanitized to one
 line, and peer errors were not rejected for CR/LF.  Both sides of the boundary
 and their tests were fixed.  Focused correctness, filesystem/security, and
 documentation re-reviews are clear, and the complete local gates passed again.
+Copilot's second review produced no formal comments but surfaced one real
+suppressed concurrency finding: successful remote removal could be followed by
+a false local-finalization error when local-only removal won the race.  The
+terminal replay and truthful peer-error classification above fix that root
+cause without broadening what an active snapshot may mutate.
+
+The mandatory post-fix local loop then found the same truthfulness risk in the
+earlier install-recovery error path.  It had ignored a diagnostic-write failure
+and always said removal was pending, even if another command had finalized or
+changed the relationship.  Reusing the same atomic four-state classifier fixed
+the root cause and added direct assertions for every install-specific message.
+The documentation-alignment pass also found that the design had mislabeled
+several native interruption tests as Docker E2E coverage; the final design now
+names exactly the four relationship scenarios that actually cross real SSH and
+daemon process boundaries.
 
 * Remaining limits
 

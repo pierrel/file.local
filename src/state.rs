@@ -194,6 +194,13 @@ pub struct Detached {
     pub cleanup_warning: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalFailureState {
+    Pending,
+    Finalized,
+    Changed,
+}
+
 pub struct State {
     pub dir: PathBuf,
     conn: Connection,
@@ -1727,6 +1734,36 @@ impl State {
         Ok(())
     }
 
+    pub fn record_removal_failure(
+        &self,
+        prepared: &PreparedRemoval,
+        diagnostic: &str,
+    ) -> Result<RemovalFailureState> {
+        prepared.relationship.validate()?;
+        let _global_lock = self.lock_global_sync()?;
+        let (binding, marker) =
+            binding_and_marker(&self.conn, &prepared.share)?.context("share not found")?;
+        if matches!((&binding, &marker), (EndpointBinding::Unpaired, None)) {
+            return Ok(RemovalFailureState::Finalized);
+        }
+        if binding != prepared.binding || marker.as_ref() != Some(&prepared.relationship) {
+            return Ok(RemovalFailureState::Changed);
+        }
+        let changed = self.conn.execute(
+            "UPDATE shares SET blocked_diagnostic=?3
+             WHERE share_id=?1 AND removing_relationship=?2",
+            params![
+                prepared.share.0,
+                prepared.relationship.0,
+                bounded_diagnostic(diagnostic)
+            ],
+        )?;
+        if changed != 1 {
+            bail!("relationship changed before recording its removal failure");
+        }
+        Ok(RemovalFailureState::Pending)
+    }
+
     pub fn finalize_connector_removal(&mut self, prepared: &PreparedRemoval) -> Result<Detached> {
         match &prepared.binding {
             EndpointBinding::Connector(config) if config.peer_id.is_some() => {}
@@ -1762,51 +1799,53 @@ impl State {
         let transaction = self.conn.transaction()?;
         let (binding, marker) =
             binding_and_marker(&transaction, &prepared.share)?.context("share not found")?;
-        if binding != prepared.binding
-            || marker.as_ref() != Some(&prepared.relationship)
-            || !role.accepts(&binding)
-        {
-            bail!("relationship changed before removal finalization");
-        }
-        let installs: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM install_intents WHERE share_id=?1",
-            [&prepared.share.0],
-            |row| row.get(0),
-        )?;
-        if installs != 0 {
-            bail!("interrupted install must be recovered before relationship removal");
-        }
-        match binding {
-            EndpointBinding::Connector(_) => {
-                transaction.execute(
-                    "UPDATE shares SET peer_json=NULL WHERE share_id=?1",
-                    [&prepared.share.0],
-                )?;
+        if !matches!((&binding, &marker), (EndpointBinding::Unpaired, None)) {
+            if binding != prepared.binding
+                || marker.as_ref() != Some(&prepared.relationship)
+                || !role.accepts(&binding)
+            {
+                bail!("relationship changed before removal finalization");
             }
-            EndpointBinding::Responder { .. } => {
-                transaction.execute(
-                    "UPDATE shares SET bound_peer=NULL, bound_relationship=NULL WHERE share_id=?1",
-                    [&prepared.share.0],
-                )?;
+            let installs: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM install_intents WHERE share_id=?1",
+                [&prepared.share.0],
+                |row| row.get(0),
+            )?;
+            if installs != 0 {
+                bail!("interrupted install must be recovered before relationship removal");
             }
-            EndpointBinding::Unpaired => unreachable!("validated above"),
-        }
-        transaction.execute(
-            "UPDATE shares SET removing_relationship=NULL, blocked_diagnostic=NULL,
-             initial_complete=0, watch_enabled=0,
-             intent_generation=intent_generation+1 WHERE share_id=?1",
-            [&prepared.share.0],
-        )?;
-        for table in [
-            "records",
-            "shared_heads",
-            "unsettled_paths",
-            "pending_objects",
-        ] {
+            match binding {
+                EndpointBinding::Connector(_) => {
+                    transaction.execute(
+                        "UPDATE shares SET peer_json=NULL WHERE share_id=?1",
+                        [&prepared.share.0],
+                    )?;
+                }
+                EndpointBinding::Responder { .. } => {
+                    transaction.execute(
+                        "UPDATE shares SET bound_peer=NULL, bound_relationship=NULL WHERE share_id=?1",
+                        [&prepared.share.0],
+                    )?;
+                }
+                EndpointBinding::Unpaired => unreachable!("validated above"),
+            }
             transaction.execute(
-                &format!("DELETE FROM {table} WHERE share_id=?1"),
+                "UPDATE shares SET removing_relationship=NULL, blocked_diagnostic=NULL,
+                 initial_complete=0, watch_enabled=0,
+                 intent_generation=intent_generation+1 WHERE share_id=?1",
                 [&prepared.share.0],
             )?;
+            for table in [
+                "records",
+                "shared_heads",
+                "unsettled_paths",
+                "pending_objects",
+            ] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE share_id=?1"),
+                    [&prepared.share.0],
+                )?;
+            }
         }
         transaction.commit()?;
         let cleanup_warning = self
@@ -4415,6 +4454,26 @@ mod tests {
             state.removing_relationship(&share)?,
             Some(prepared.relationship)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_removal_finalization_is_idempotent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let mut first = State::open(&state_dir)?;
+        let share = first.init_share(&root)?;
+        let config = completed_connector("responder", "relationship-concurrent-remove");
+        first.set_peer(&share, &config)?;
+        let prepared = first.prepare_removal(&share, &EndpointBinding::Connector(config))?;
+
+        let mut concurrent = State::open(&state_dir)?;
+        concurrent.finalize_local_removal(&prepared)?;
+        first.finalize_connector_removal(&prepared)?;
+        assert_eq!(first.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        assert_eq!(first.removing_relationship(&share)?, None);
         Ok(())
     }
 
