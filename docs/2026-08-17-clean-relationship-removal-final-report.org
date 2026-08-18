@@ -185,8 +185,17 @@ State methods own the transitions rather than exposing general-purpose row
 scrubbing.  Registration locks the global synchronization boundary, validates
 the exact root and stored device/inode, rejects overlapping roots and identity
 collisions, and either creates the responder or remaps a completely unpaired
-retained root.  Removal preparation records the marker with a snapshot of the
-binding.  Finalization accepts only the correct role and exact snapshot.
+retained root.  When the root is new and missing, it opens the nearest existing
+canonical ancestor and creates each missing component relative to that held
+descriptor with =mkdirat=, reopening each with =O_NOFOLLOW=.  A retargeted
+alias or injected symlink therefore cannot redirect creation or adoption.
+Removal preparation records the marker with a snapshot of the binding.
+Finalization accepts only the correct role and exact snapshot.
+
+The held ancestor is represented by Rust's owning =File= type.  Its descriptor
+closes automatically when the value is dropped, including on an early =?=
+return.  Passing =&File= to =mkdirat= and =openat= makes the directory itself,
+rather than a path string that can be retargeted, the authority for each step.
 
 The role is an =enum= rather than a set of booleans.  Pattern matching makes
 the allowed states and role-specific operations explicit.  The database reader
@@ -290,7 +299,9 @@ has a =type= discriminator such as =remove_relationship=.
 protocol instead of silently ignoring their extra meaning.
 
 The protocol has absolute read/write deadlines, a bounded frame size, a
-16-KiB root bound, 128-byte safe IDs, and 4-KiB UTF-8 error messages.  The SSH
+16-KiB root bound, 128-byte safe IDs, and single-line 4-KiB UTF-8 error
+messages.  Local producers replace CR/LF with spaces before byte truncation;
+the encoder and decoder reject multiline peer errors.  The SSH
 child receives structured framed data on standard input.  The validated host
 is one SSH argument, and the discovered executable must match a safe absolute
 path grammar before interpolation into the fixed remote command.  Root, peer,
@@ -375,6 +386,14 @@ requested directory without following its final component, binds that opened
 identity to the canonical spelling, queries the stored canonical root, and
 rechecks the original path before returning.
 
+Incoming registration adds a harder version of that boundary because a new
+root may not exist yet.  Resolving the intended canonical path and then calling
+=create_dir_all= through the original alias left a retarget window.  The final
+implementation holds the resolved ancestor open and creates the missing tail
+descriptor-relatively.  A deterministic test retargets the alias and injects a
+symlink after resolution; creation remains attached to the opened ancestor and
+refuses the injected component.
+
 Independent review found two concurrency boundaries that ordinary happy-path
 testing did not expose.  Removal originally skipped the per-share lock when no
 install journal existed, which allowed a foreground watch to remain active,
@@ -403,12 +422,12 @@ coverage.
 
 The implementation passed:
 
-- =make check=: 61 library unit tests, 51 binary unit tests, 65 integration
+- =make check=: 62 library unit tests, 51 binary unit tests, 65 integration
   tests across the non-Docker targets, formatting, and Clippy with warnings as
   errors;
 - whole-project line coverage at or above the repository's 90% gate;
-- changed executable-line coverage of 2251/2479, or 90.80%;
-- =make e2e=: all 38 Docker scenarios in 243.28 seconds, including every pre-existing sync,
+- changed executable-line coverage of 2324/2548, or 91.21%;
+- =make e2e=: all 38 Docker scenarios in 242.67 seconds, including every pre-existing sync,
   conflict, offline, filesystem-transition, persistent-watch, suspension, and
   reconnection scenario; and
 - =git diff --check= and the final documentation-alignment pass.
@@ -417,7 +436,8 @@ Independent code review covers correctness and design adherence; concurrency
 and event-loop liveness; error handling and edge cases; adversarial security;
 simplicity, interfaces, duplication, and line count; Linux/macOS filesystem
 behavior; readability and existing patterns; and documentation/comment
-alignment.  Three rounds converged with no remaining findings.  Review found
+alignment.  The pre-publication review ran three rounds and converged with no
+remaining findings.  It found
 four blockers, five important issues, and seven real cleanup or documentation
 nits.  All were fixed.  The blockers were the foreground-owner race, a missing
 persistent-round removal guard, cross-share object-pruning races, and a
@@ -429,6 +449,18 @@ an obsolete compatibility shim, an unnecessary one-variant enum, and stale or
 imprecise documentation.  One parallel recovery-test failure was rejected as
 nonreproducible after its isolated rerun, the complete target rerun, and the
 serialized full suite all passed.
+
+The first GitHub CI run then exposed two macOS-only failures: the retained-root
+precheck still used a noncanonical spelling, and one private-helper test made
+the same Linux-only assumption.  The first correction resolved the stable
+=/var= to =/private/var= case, but focused local security review found that
+creation could still traverse a retargeted alias.  The descriptor-relative
+implementation above fixed that deeper important issue and the platform test
+assumption.  Copilot's first review produced two comments describing one real
+contract gap: locally generated errors were bounded but not sanitized to one
+line, and peer errors were not rejected for CR/LF.  Both sides of the boundary
+and their tests were fixed.  Focused correctness, filesystem/security, and
+documentation re-reviews are clear, and the complete local gates passed again.
 
 * Remaining limits
 

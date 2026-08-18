@@ -396,6 +396,9 @@ fn validate_relationship_error(message: &str) -> Result<()> {
     if message.len() > MAX_RELATIONSHIP_ERROR_BYTES {
         bail!("relationship error exceeds {MAX_RELATIONSHIP_ERROR_BYTES} UTF-8 bytes");
     }
+    if message.contains(['\n', '\r']) {
+        bail!("relationship error must be a single line");
+    }
     Ok(())
 }
 

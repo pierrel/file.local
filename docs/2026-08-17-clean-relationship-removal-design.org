@@ -306,11 +306,14 @@ confirmation.
 The reverse direction must work too.  If an incoming new
 =RegisterRelationship= names a different share ID but its root exactly matches
 one retained, fully unpaired row, registration atomically remaps that row and
-its conflicts to the incoming share ID before binding it.  It detects an exact
-stored-path match before =create_dir_all=, rejects a final symlink, opens and
-checks the stored device/inode, refuses a missing/replaced retained root, and
-rechecks identity immediately before commit.  It never recreates a retained
-root as part of remap.  Under the existing lock order (installation-wide sync,
+its conflicts to the incoming share ID before binding it.  It opens the nearest
+existing ancestor, binds its identity to the canonical path, and detects an
+exact stored-path match before creating anything.  A missing new tail is
+created relative to that held descriptor with =mkdirat= and each component is
+reopened with =O_NOFOLLOW=.  Registration rejects a final symlink, a concurrent
+component, any canonical-path or identity change, and a missing/replaced
+retained root.  It never recreates a retained root as part of remap.  Under the
+existing lock order (installation-wide sync,
 then registration lock), it retains the registration lock
 across retained-row lookup, overlap/identity validation, remap, and binding,
 and requires =records=, =install_intents=, =shared_heads=, =unsettled_paths=, and
@@ -390,7 +393,9 @@ pending network or ownership failure is never success and exits nonzero.
   distinct generated/validated newtypes.  Share and peer IDs reuse the
   existing 128-byte safe-ID grammar; relationship IDs have the same fixed
   semantic bound.  =MAX_RELATIONSHIP_ROOT_BYTES= is 16 KiB and
-  =MAX_RELATIONSHIP_ERROR_BYTES= is 4096 UTF-8 bytes.  Stored removal
+  =MAX_RELATIONSHIP_ERROR_BYTES= is 4096 UTF-8 bytes on one line.  Local
+  producers replace CR/LF with spaces before byte truncation, while the
+  encoder and decoder reject peer errors containing CR/LF.  Stored removal
   diagnostics use the same 4096-byte bound; older worker diagnostics retain
   their 4096-Unicode-scalar limit.  Escaped human rendering remains bounded.
   The aggregate frame length is checked

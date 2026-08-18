@@ -1160,9 +1160,9 @@ impl State {
         relationship: &RelationshipId,
     ) -> Result<RegistrationOutcome> {
         relationship.validate()?;
-        let root_bytes_before_open = path_bytes(root);
-        if root_bytes_before_open.contains(&0)
-            || root_bytes_before_open.len() > crate::sync::MAX_RELATIONSHIP_ROOT_BYTES
+        let requested_root_bytes = path_bytes(root);
+        if requested_root_bytes.contains(&0)
+            || requested_root_bytes.len() > crate::sync::MAX_RELATIONSHIP_ROOT_BYTES
         {
             bail!("relationship root exceeds its safe wire bound or contains NUL");
         }
@@ -1171,40 +1171,41 @@ impl State {
         }
         let _global_lock = self.lock_global_sync()?;
         let _registration_lock = self.lock_registration()?;
+        let resolved = resolve_registration_path(root)?;
         let retained_before_create: Option<String> = self
             .conn
             .query_row(
                 "SELECT share_id FROM shares WHERE root=?1",
-                [&root_bytes_before_open],
+                [path_bytes(&resolved.canonical)],
                 |row| row.get(0),
             )
             .optional()?;
-        match fs::symlink_metadata(root) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("relationship root must not be a symbolic link")
+        let root_file = if resolved.missing.is_empty() {
+            let metadata = fs::symlink_metadata(root)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("relationship root must be a directory, not a symbolic link");
             }
-            Ok(metadata) if !metadata.is_dir() => {
-                bail!("relationship root must be a directory")
+            resolved.ancestor
+        } else {
+            match fs::symlink_metadata(root) {
+                Ok(_) => bail!("relationship root changed while preparing registration"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Ok(_) => {}
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && retained_before_create.is_some() =>
-            {
+            if retained_before_create.is_some() {
                 bail!("retained relationship root is missing and will not be recreated")
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(root)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = fs::symlink_metadata(root)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!("relationship root must be a directory, not a symbolic link");
-        }
+            create_registration_tail(resolved.ancestor, &resolved.missing)?
+        };
         let requested_path = root.to_path_buf();
-        let identity = root_identity(root)?;
+        let identity = file_root_identity(&root_file, &resolved.canonical)?;
+        if root_identity(root)? != identity {
+            bail!("relationship root identity changed while preparing registration");
+        }
         let root = canonical_registration_root(root, identity)?;
+        if root != resolved.canonical {
+            bail!("relationship root path changed while preparing registration");
+        }
         let root_bytes = path_bytes(&root);
         let exact_root_share: Option<ShareId> = self
             .conn
@@ -3424,6 +3425,11 @@ fn root_identity(path: &Path) -> Result<RootIdentity> {
         )
     })?;
     let file = File::from(descriptor);
+    file_root_identity(&file, path)
+}
+
+#[cfg(unix)]
+fn file_root_identity(file: &File, path: &Path) -> Result<RootIdentity> {
     let metadata = file.metadata()?;
     if !metadata.is_dir() {
         bail!("configured root {} is not a directory", path.display());
@@ -3440,6 +3446,90 @@ fn canonical_registration_root(root: &Path, identity: RootIdentity) -> Result<Pa
         bail!("relationship root identity changed while resolving its path");
     }
     Ok(canonical)
+}
+
+struct ResolvedRegistrationPath {
+    canonical: PathBuf,
+    ancestor: File,
+    missing: Vec<std::ffi::OsString>,
+}
+
+fn resolve_registration_path(path: &Path) -> Result<ResolvedRegistrationPath> {
+    use rustix::fs::{Mode, OFlags};
+
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                let opened = File::from(rustix::fs::open(
+                    &existing,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?);
+                let opened_identity = file_root_identity(&opened, &existing)?;
+                let ancestor_path = existing.canonicalize()?;
+                let ancestor = File::from(rustix::fs::open(
+                    &ancestor_path,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?);
+                if file_root_identity(&ancestor, &ancestor_path)? != opened_identity {
+                    bail!("relationship root changed while resolving its existing ancestor");
+                }
+                missing.reverse();
+                let mut canonical = ancestor_path;
+                for component in &missing {
+                    canonical.push(component);
+                }
+                return Ok(ResolvedRegistrationPath {
+                    canonical,
+                    ancestor,
+                    missing,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let component = existing
+            .file_name()
+            .context("relationship root has no resolvable existing ancestor")?
+            .to_owned();
+        missing.push(component);
+        if !existing.pop() {
+            bail!("relationship root has no resolvable existing ancestor");
+        }
+    }
+}
+
+fn create_registration_tail(mut current: File, missing: &[std::ffi::OsString]) -> Result<File> {
+    use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
+    let mode = Mode::RUSR
+        | Mode::WUSR
+        | Mode::XUSR
+        | Mode::RGRP
+        | Mode::WGRP
+        | Mode::XGRP
+        | Mode::ROTH
+        | Mode::WOTH
+        | Mode::XOTH;
+    for component in missing {
+        mkdirat(&current, component, mode).map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                anyhow::anyhow!("relationship root changed while creating it")
+            } else {
+                error.into()
+            }
+        })?;
+        current = File::from(openat(
+            &current,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+    }
+    Ok(current)
 }
 
 fn validate_identity_values(
@@ -4471,7 +4561,11 @@ mod tests {
             EndpointBinding::Unpaired
         );
 
-        let missing_root = temp.path().join("missing-root");
+        let missing_parent = temp.path().join("missing-parent");
+        let missing_alias = temp.path().join("missing-alias");
+        fs::create_dir(&missing_parent)?;
+        std::os::unix::fs::symlink(&missing_parent, &missing_alias)?;
+        let missing_root = missing_alias.join("missing-root");
         fs::create_dir(&missing_root)?;
         let missing_share = state.init_share(&missing_root)?;
         fs::remove_dir(&missing_root)?;
@@ -4503,6 +4597,7 @@ mod tests {
         let state = State::open(temp.path().join("state"))?;
         let first_share = state.init_share(&first_root)?;
         let second_share = state.init_share(&second_root)?;
+        let first_stored_root = state.root_for(&first_share)?;
         let opened_identity = root_identity(&first_root)?;
 
         fs::rename(&first_root, temp.path().join("first-moved"))?;
@@ -4511,7 +4606,7 @@ mod tests {
         assert!(state.find_share_by_exact_root(&first_root).is_err());
         assert_eq!(
             state
-                .find_share_by_exact_root_identity(&first_root, opened_identity)?
+                .find_share_by_exact_root_identity(&first_stored_root, opened_identity)?
                 .0,
             first_share
         );
@@ -4540,6 +4635,39 @@ mod tests {
             share
         );
         assert_eq!(state.find_share_by_exact_root(&nested.join(".."))?.0, share);
+        Ok(())
+    }
+
+    #[test]
+    fn registration_creation_stays_with_its_opened_ancestor() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&first)?;
+        fs::create_dir(&second)?;
+        std::os::unix::fs::symlink(&first, &alias)?;
+
+        let requested = alias.join("root");
+        let resolved = resolve_registration_path(&requested)?;
+        let expected = resolved.canonical.clone();
+        fs::remove_file(&alias)?;
+        std::os::unix::fs::symlink(&second, &alias)?;
+        fs::create_dir(second.join("root"))?;
+
+        let created = create_registration_tail(resolved.ancestor, &resolved.missing)?;
+        let created_identity = file_root_identity(&created, &expected)?;
+        assert!(first.join("root").is_dir());
+        assert_ne!(root_identity(&requested)?, created_identity);
+        assert!(canonical_registration_root(&requested, created_identity).is_err());
+
+        let injection_target = temp.path().join("injection-target");
+        fs::create_dir(&injection_target)?;
+        let injected = first.join("injected").join("root");
+        let resolved = resolve_registration_path(&injected)?;
+        std::os::unix::fs::symlink(&injection_target, first.join("injected"))?;
+        assert!(create_registration_tail(resolved.ancestor, &resolved.missing).is_err());
+        assert!(!injection_target.join("root").exists());
         Ok(())
     }
 

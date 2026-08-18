@@ -356,6 +356,17 @@ fn relationship_wire_semantic_limits_are_exact() -> Result<()> {
     raw.extend(body);
     assert!(sync::read_register_relationship_response(&mut raw.as_slice()).is_err());
 
+    for message in ["first\nsecond", "first\rsecond"] {
+        let response = RegisterRelationshipResponse::Error {
+            message: message.into(),
+        };
+        assert!(sync::write_register_relationship_response(&mut Vec::new(), &response).is_err());
+        let body = serde_json::to_vec(&response)?;
+        let mut raw = (body.len() as u32).to_be_bytes().to_vec();
+        raw.extend(body);
+        assert!(sync::read_register_relationship_response(&mut raw.as_slice()).is_err());
+    }
+
     let invalid_prior = RegisterRelationshipResponse::Registered {
         registration_protocol: sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION,
         share: ShareId("share".into()),

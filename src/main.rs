@@ -2441,6 +2441,13 @@ fn bounded_relationship_error(message: &str) -> String {
     let mut bytes = 0usize;
     message
         .chars()
+        .map(|character| {
+            if matches!(character, '\n' | '\r') {
+                ' '
+            } else {
+                character
+            }
+        })
         .take_while(|character| {
             let next = bytes.saturating_add(character.len_utf8());
             if next > sync::MAX_RELATIONSHIP_ERROR_BYTES {
@@ -5971,6 +5978,10 @@ mod tests {
 
         let bounded = bounded_relationship_error(&"é".repeat(5000));
         assert_eq!(bounded.len(), sync::MAX_RELATIONSHIP_ERROR_BYTES);
+        assert_eq!(
+            bounded_relationship_error("first\nsecond\rthird"),
+            "first second third"
+        );
         Ok(())
     }
 
