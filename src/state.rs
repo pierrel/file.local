@@ -12,7 +12,8 @@ use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::{
-    Entry, ObjectHash, PeerConfig, PeerId, Record, RelativePath, ShareId, Version, VersionId,
+    Entry, ObjectHash, PeerConfig, PeerId, Record, RelationshipId, RelativePath, ShareId, Version,
+    VersionId,
 };
 use crate::reconcile::{Conflict, ConflictResolution};
 
@@ -143,10 +144,54 @@ pub struct StoredConflict {
 pub struct ManagedShare {
     pub id: ShareId,
     pub root: PathBuf,
-    pub peer: Option<PeerConfig>,
+    pub binding: EndpointBinding,
     pub initial_complete: bool,
     pub watch_enabled: bool,
     pub blocked_diagnostic: Option<String>,
+    pub removing_relationship: Option<RelationshipId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum EndpointBinding {
+    Connector(PeerConfig),
+    Responder {
+        peer: PeerId,
+        relationship: Option<RelationshipId>,
+    },
+    Unpaired,
+}
+
+impl EndpointBinding {
+    pub fn relationship(&self) -> Option<&RelationshipId> {
+        match self {
+            Self::Connector(peer) => peer.relationship.as_ref(),
+            Self::Responder { relationship, .. } => relationship.as_ref(),
+            Self::Unpaired => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedRemoval {
+    pub share: ShareId,
+    pub relationship: RelationshipId,
+    pub binding: EndpointBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistrationOutcome {
+    pub prior_share: Option<ShareId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IncomingRemoval {
+    Absent,
+    Prepared(PreparedRemoval),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Detached {
+    pub cleanup_warning: Option<String>,
 }
 
 pub struct State {
@@ -342,6 +387,8 @@ impl State {
                 initial_complete INTEGER NOT NULL DEFAULT 0,
                 peer_json TEXT,
                 bound_peer TEXT,
+                bound_relationship TEXT,
+                removing_relationship TEXT,
                 root_device TEXT,
                 root_inode TEXT,
                 watch_enabled INTEGER NOT NULL DEFAULT 0,
@@ -411,6 +458,15 @@ impl State {
         }
         if !columns.iter().any(|name| name == "bound_peer") {
             transaction.execute("ALTER TABLE shares ADD COLUMN bound_peer TEXT", [])?;
+        }
+        if !columns.iter().any(|name| name == "bound_relationship") {
+            transaction.execute("ALTER TABLE shares ADD COLUMN bound_relationship TEXT", [])?;
+        }
+        if !columns.iter().any(|name| name == "removing_relationship") {
+            transaction.execute(
+                "ALTER TABLE shares ADD COLUMN removing_relationship TEXT",
+                [],
+            )?;
         }
         if !columns.iter().any(|name| name == "root_device") {
             transaction.execute("ALTER TABLE shares ADD COLUMN root_device TEXT", [])?;
@@ -1096,51 +1152,194 @@ impl State {
         Ok(())
     }
 
-    pub fn register_share_bound(&mut self, id: &ShareId, root: &Path, peer: &PeerId) -> Result<()> {
+    pub fn register_relationship(
+        &mut self,
+        id: &ShareId,
+        root: &Path,
+        peer: &PeerId,
+        relationship: &RelationshipId,
+    ) -> Result<RegistrationOutcome> {
+        relationship.validate()?;
+        let root_bytes_before_open = path_bytes(root);
+        if root_bytes_before_open.contains(&0)
+            || root_bytes_before_open.len() > crate::sync::MAX_RELATIONSHIP_ROOT_BYTES
+        {
+            bail!("relationship root exceeds its safe wire bound or contains NUL");
+        }
+        if !root.is_absolute() {
+            bail!("relationship root must be absolute");
+        }
+        let _global_lock = self.lock_global_sync()?;
         let _registration_lock = self.lock_registration()?;
-        fs::create_dir_all(root)?;
-        let root = root.canonicalize()?;
-        let root_bytes = path_bytes(&root);
-        let identity = root_identity(&root)?;
-        self.reject_overlapping_root_except(&root, Some(id))?;
-        let transaction = self.conn.transaction()?;
-        let existing: Option<(Vec<u8>, Option<String>, String, String)> = transaction
+        let retained_before_create: Option<String> = self
+            .conn
             .query_row(
-                "SELECT root, bound_peer, root_device, root_inode FROM shares WHERE share_id=?1",
-                [&id.0],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                "SELECT share_id FROM shares WHERE root=?1",
+                [&root_bytes_before_open],
+                |row| row.get(0),
             )
             .optional()?;
-        match existing {
-            Some((path, _, _, _)) if path != root_bytes => {
-                bail!("share ID is already registered to a different directory")
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("relationship root must not be a symbolic link")
             }
-            Some((_, Some(bound), _, _)) if bound != peer.0 => {
-                bail!("share is bound to a different peer")
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!("relationship root must be a directory")
             }
-            Some((_, _, device, inode)) => {
-                validate_identity_values(&root, identity, &device, &inode)?;
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && retained_before_create.is_some() =>
+            {
+                bail!("retained relationship root is missing and will not be recreated")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(root)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = fs::symlink_metadata(root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("relationship root must be a directory, not a symbolic link");
+        }
+        let requested_path = root.to_path_buf();
+        let identity = root_identity(root)?;
+        let root = canonical_registration_root(root, identity)?;
+        let root_bytes = path_bytes(&root);
+        let exact_root_share: Option<ShareId> = self
+            .conn
+            .query_row(
+                "SELECT share_id FROM shares WHERE root=?1",
+                [&root_bytes],
+                |row| Ok(ShareId(row.get(0)?)),
+            )
+            .optional()?;
+        let requested_root: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT root FROM shares WHERE share_id=?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if requested_root
+            .as_ref()
+            .is_some_and(|stored| stored != &root_bytes)
+        {
+            bail!("share ID is already registered to a different directory");
+        }
+        self.reject_overlapping_root_except(&root, exact_root_share.as_ref())?;
+        ensure_relationship_available(&self.conn, id, relationship)?;
+
+        let transaction = self.conn.transaction()?;
+        let outcome = match exact_root_share {
+            Some(existing_id) if existing_id == *id => {
+                let (binding, marker) = binding_and_marker(&transaction, id)?
+                    .context("share disappeared during registration")?;
+                if marker.is_some() {
+                    bail!("relationship removal is pending");
+                }
+                validate_stored_root_identity(&transaction, id, &root, identity)?;
+                match binding {
+                    EndpointBinding::Responder {
+                        peer: bound,
+                        relationship: Some(bound_relationship),
+                    } if bound == *peer && bound_relationship == *relationship => {
+                        RegistrationOutcome { prior_share: None }
+                    }
+                    EndpointBinding::Unpaired => {
+                        ensure_unpaired_registration_state(&transaction, id)?;
+                        transaction.execute(
+                            "UPDATE shares SET bound_peer=?2, bound_relationship=?3
+                             WHERE share_id=?1",
+                            params![id.0, peer.0, relationship.0],
+                        )?;
+                        RegistrationOutcome { prior_share: None }
+                    }
+                    _ => bail!("share is already bound to a different relationship"),
+                }
+            }
+            Some(prior_share) => {
+                let (binding, marker) = binding_and_marker(&transaction, &prior_share)?
+                    .context("retained root disappeared during registration")?;
+                if marker.is_some() || !matches!(binding, EndpointBinding::Unpaired) {
+                    bail!("matching root is paired or pending removal");
+                }
+                ensure_unpaired_registration_state(&transaction, &prior_share)?;
+                validate_stored_root_identity(&transaction, &prior_share, &root, identity)?;
                 transaction.execute(
-                    "UPDATE shares SET bound_peer=?2 WHERE share_id=?1",
-                    params![id.0, peer.0],
+                    "UPDATE shares SET share_id=?2, bound_peer=?3, bound_relationship=?4
+                     WHERE share_id=?1",
+                    params![prior_share.0, id.0, peer.0, relationship.0],
                 )?;
+                transaction.execute(
+                    "UPDATE conflicts SET share_id=?2 WHERE share_id=?1",
+                    params![prior_share.0, id.0],
+                )?;
+                RegistrationOutcome {
+                    prior_share: Some(prior_share),
+                }
             }
             None => {
                 transaction.execute(
-                    "INSERT INTO shares(share_id, root, bound_peer, root_device, root_inode)
-                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO shares(
+                         share_id,root,bound_peer,bound_relationship,root_device,root_inode
+                     ) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![
                         id.0,
                         root_bytes,
                         peer.0,
+                        relationship.0,
                         identity.device.to_string(),
                         identity.inode.to_string()
                     ],
                 )?;
+                RegistrationOutcome { prior_share: None }
             }
+        };
+        if root_identity(&requested_path)? != identity || root_identity(&root)? != identity {
+            bail!("relationship root identity changed during registration");
         }
         transaction.commit()?;
-        Ok(())
+        Ok(outcome)
+    }
+
+    pub fn acknowledge_legacy_registration(
+        &mut self,
+        id: &ShareId,
+        root: &Path,
+        peer: &PeerId,
+    ) -> Result<()> {
+        let _global_lock = self.lock_global_sync()?;
+        let _registration_lock = self.lock_registration()?;
+        let metadata = fs::symlink_metadata(root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("legacy relationship root must be an existing directory");
+        }
+        let root = root.canonicalize()?;
+        let root_bytes = path_bytes(&root);
+        let identity = root_identity(&root)?;
+        let (binding, marker) = binding_and_marker(&self.conn, id)?
+            .context("legacy registration cannot create a relationship")?;
+        if marker.is_some() {
+            bail!("relationship removal is pending");
+        }
+        let stored: Vec<u8> = self.conn.query_row(
+            "SELECT root FROM shares WHERE share_id=?1",
+            [&id.0],
+            |row| row.get(0),
+        )?;
+        if stored != root_bytes {
+            bail!("share ID is registered to a different directory");
+        }
+        validate_stored_root_identity(&self.conn, id, &root, identity)?;
+        match binding {
+            EndpointBinding::Responder {
+                peer: bound,
+                relationship: None,
+            } if bound == *peer => Ok(()),
+            _ => bail!("legacy registration is not an exact existing legacy binding"),
+        }
     }
 
     pub fn find_share(&self, path: &Path) -> Result<(ShareId, PathBuf)> {
@@ -1161,6 +1360,37 @@ impl State {
             }
         }
         best.context("path is not inside an initialized share")
+    }
+
+    pub fn find_share_by_exact_root(&self, path: &Path) -> Result<(ShareId, PathBuf)> {
+        let requested = std::path::absolute(path)?;
+        let identity = root_identity(&requested)?;
+        let root = canonical_registration_root(&requested, identity)?;
+        let share = self.find_share_by_exact_root_identity(&root, identity)?;
+        if root_identity(&requested)? != identity {
+            bail!("relationship root identity changed while selecting it for removal");
+        }
+        Ok(share)
+    }
+
+    fn find_share_by_exact_root_identity(
+        &self,
+        root: &Path,
+        identity: RootIdentity,
+    ) -> Result<(ShareId, PathBuf)> {
+        let row: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT share_id,root_device,root_inode FROM shares WHERE root=?1",
+                [path_bytes(root)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (share, device, inode) = row.context(
+            "removal PATH must name the configured sync root; use --share when it is unavailable",
+        )?;
+        validate_identity_values(root, identity, &device, &inode)?;
+        Ok((ShareId(share), root.to_path_buf()))
     }
 
     pub fn root_for(&self, id: &ShareId) -> Result<PathBuf> {
@@ -1305,44 +1535,336 @@ impl State {
         Ok(())
     }
 
-    pub fn set_peer(&self, id: &ShareId, peer: &PeerConfig) -> Result<()> {
-        self.conn.execute(
-            "UPDATE shares SET peer_json=?2 WHERE share_id=?1",
+    pub fn endpoint_binding(&self, id: &ShareId) -> Result<EndpointBinding> {
+        binding_and_marker(&self.conn, id)?
+            .map(|(binding, _)| binding)
+            .context("share not found")
+    }
+
+    pub fn removing_relationship(&self, id: &ShareId) -> Result<Option<RelationshipId>> {
+        binding_and_marker(&self.conn, id)?
+            .map(|(_, marker)| marker)
+            .context("share not found")
+    }
+
+    pub fn ensure_not_removing(&self, id: &ShareId) -> Result<()> {
+        if self.removing_relationship(id)?.is_some() {
+            bail!(
+                "relationship removal is pending; rerun `flocal sync remove --share {}`",
+                id.0
+            );
+        }
+        Ok(())
+    }
+
+    pub fn prepare_connector_registration(
+        &mut self,
+        id: &ShareId,
+        expected: &EndpointBinding,
+        host: &str,
+        remote_path: &[u8],
+        executable: &str,
+    ) -> Result<PeerConfig> {
+        let _global_lock = self.lock_global_sync()?;
+        let _registration_lock = self.lock_registration()?;
+        self.validate_root_identity(id)?;
+        let transaction = self.conn.transaction()?;
+        let (binding, marker) = binding_and_marker(&transaction, id)?.context("share not found")?;
+        if marker.is_some() {
+            bail!("relationship removal is pending");
+        }
+        if let EndpointBinding::Connector(existing) = &binding {
+            if existing.relationship.is_some()
+                && existing.host == host
+                && existing.remote_path == remote_path
+            {
+                return Ok(existing.clone());
+            }
+            bail!("share already has a connector configuration");
+        }
+        if &binding != expected || !matches!(binding, EndpointBinding::Unpaired) {
+            bail!("share relationship changed since pairing preview");
+        }
+        let config = PeerConfig {
+            peer_id: None,
+            host: host.to_owned(),
+            remote_path: remote_path.to_vec(),
+            executable: executable.to_owned(),
+            relationship: Some(RelationshipId::generate()),
+        };
+        config.validate()?;
+        transaction.execute(
+            "UPDATE shares SET peer_json=?2, watch_enabled=0,
+             intent_generation=intent_generation+1 WHERE share_id=?1",
+            params![id.0, serde_json::to_string(&config)?],
+        )?;
+        transaction.commit()?;
+        Ok(config)
+    }
+
+    pub fn complete_connector_registration(
+        &mut self,
+        id: &ShareId,
+        prepared: &PeerConfig,
+        peer: &PeerId,
+    ) -> Result<PeerConfig> {
+        prepared.validate()?;
+        if prepared.relationship.is_none() {
+            bail!("connector registration completion requires a relationship identity");
+        }
+        let _global_lock = self.lock_global_sync()?;
+        let _registration_lock = self.lock_registration()?;
+        let transaction = self.conn.transaction()?;
+        let (binding, marker) = binding_and_marker(&transaction, id)?.context("share not found")?;
+        if marker.is_some() {
+            bail!("relationship removal is pending");
+        }
+        let completed = if let Some(expected_peer) = &prepared.peer_id {
+            if expected_peer != peer {
+                bail!("connector registration response changed peer identity");
+            }
+            prepared.clone()
+        } else {
+            PeerConfig {
+                peer_id: Some(peer.clone()),
+                ..prepared.clone()
+            }
+        };
+        match binding {
+            EndpointBinding::Connector(current)
+                if current == *prepared && prepared.peer_id.is_none() =>
+            {
+                let changed = transaction.execute(
+                    "UPDATE shares SET peer_json=?2 WHERE share_id=?1 AND peer_json=?3",
+                    params![
+                        id.0,
+                        serde_json::to_string(&completed)?,
+                        serde_json::to_string(prepared)?
+                    ],
+                )?;
+                if changed != 1 {
+                    bail!("connector registration changed during completion");
+                }
+                transaction.commit()?;
+                Ok(completed)
+            }
+            EndpointBinding::Connector(current) if current == completed => Ok(completed),
+            _ => bail!("connector registration changed before completion"),
+        }
+    }
+
+    pub fn prepare_removal(
+        &mut self,
+        id: &ShareId,
+        expected: &EndpointBinding,
+    ) -> Result<PreparedRemoval> {
+        let transaction = self.conn.transaction()?;
+        let prepared = prepare_removal_transaction(&transaction, id, expected, None)?;
+        transaction.commit()?;
+        Ok(prepared)
+    }
+
+    pub fn prepare_incoming_removal(
+        &mut self,
+        id: &ShareId,
+        peer: &PeerId,
+        relationship: &RelationshipId,
+    ) -> Result<IncomingRemoval> {
+        relationship.validate()?;
+        let _global_lock = self.lock_global_sync()?;
+        let Some((binding, marker)) = binding_and_marker(&self.conn, id)? else {
+            return Ok(IncomingRemoval::Absent);
+        };
+        if marker.as_ref().is_some_and(|marker| marker != relationship) {
+            return Ok(IncomingRemoval::Absent);
+        }
+        match &binding {
+            EndpointBinding::Responder {
+                peer: bound,
+                relationship: Some(bound_relationship),
+            } if bound_relationship != relationship => return Ok(IncomingRemoval::Absent),
+            EndpointBinding::Responder {
+                peer: bound,
+                relationship: Some(_),
+            } if bound != peer => bail!("relationship binding does not match requester"),
+            EndpointBinding::Responder {
+                peer: bound,
+                relationship: None,
+            } if bound != peer => bail!("legacy relationship binding does not match requester"),
+            EndpointBinding::Responder { .. } => {}
+            EndpointBinding::Connector(config)
+                if config.relationship.as_ref() == Some(relationship) =>
+            {
+                bail!("relationship identity is bound in the wrong role")
+            }
+            EndpointBinding::Connector(_) | EndpointBinding::Unpaired => {
+                return Ok(IncomingRemoval::Absent);
+            }
+        }
+        let transaction = self.conn.transaction()?;
+        let prepared = prepare_removal_transaction(&transaction, id, &binding, Some(relationship))?;
+        transaction.commit()?;
+        Ok(IncomingRemoval::Prepared(prepared))
+    }
+
+    pub fn set_removal_diagnostic(
+        &self,
+        id: &ShareId,
+        relationship: &RelationshipId,
+        diagnostic: &str,
+    ) -> Result<()> {
+        relationship.validate()?;
+        let diagnostic = bounded_diagnostic(diagnostic);
+        let changed = self.conn.execute(
+            "UPDATE shares SET blocked_diagnostic=?3
+             WHERE share_id=?1 AND removing_relationship=?2",
+            params![id.0, relationship.0, diagnostic],
+        )?;
+        if changed != 1 {
+            bail!("relationship removal changed before storing its diagnostic");
+        }
+        Ok(())
+    }
+
+    pub fn finalize_connector_removal(&mut self, prepared: &PreparedRemoval) -> Result<Detached> {
+        match &prepared.binding {
+            EndpointBinding::Connector(config) if config.peer_id.is_some() => {}
+            EndpointBinding::Connector(_) => {
+                bail!("incomplete registration requires local-only removal")
+            }
+            _ => bail!("connector removal requires a connector binding"),
+        }
+        self.finalize_removal(prepared, RemovalRole::Connector)
+    }
+
+    pub fn finalize_local_removal(&mut self, prepared: &PreparedRemoval) -> Result<Detached> {
+        if matches!(prepared.binding, EndpointBinding::Unpaired) {
+            bail!("no relationship is configured");
+        }
+        self.finalize_removal(prepared, RemovalRole::Either)
+    }
+
+    pub fn detach_incoming_relationship(&mut self, prepared: &PreparedRemoval) -> Result<Detached> {
+        if !matches!(prepared.binding, EndpointBinding::Responder { .. }) {
+            bail!("incoming removal requires a responder binding");
+        }
+        self.finalize_removal(prepared, RemovalRole::Responder)
+    }
+
+    fn finalize_removal(
+        &mut self,
+        prepared: &PreparedRemoval,
+        role: RemovalRole,
+    ) -> Result<Detached> {
+        prepared.relationship.validate()?;
+        let _global_lock = self.lock_global_sync()?;
+        let transaction = self.conn.transaction()?;
+        let (binding, marker) =
+            binding_and_marker(&transaction, &prepared.share)?.context("share not found")?;
+        if binding != prepared.binding
+            || marker.as_ref() != Some(&prepared.relationship)
+            || !role.accepts(&binding)
+        {
+            bail!("relationship changed before removal finalization");
+        }
+        let installs: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM install_intents WHERE share_id=?1",
+            [&prepared.share.0],
+            |row| row.get(0),
+        )?;
+        if installs != 0 {
+            bail!("interrupted install must be recovered before relationship removal");
+        }
+        match binding {
+            EndpointBinding::Connector(_) => {
+                transaction.execute(
+                    "UPDATE shares SET peer_json=NULL WHERE share_id=?1",
+                    [&prepared.share.0],
+                )?;
+            }
+            EndpointBinding::Responder { .. } => {
+                transaction.execute(
+                    "UPDATE shares SET bound_peer=NULL, bound_relationship=NULL WHERE share_id=?1",
+                    [&prepared.share.0],
+                )?;
+            }
+            EndpointBinding::Unpaired => unreachable!("validated above"),
+        }
+        transaction.execute(
+            "UPDATE shares SET removing_relationship=NULL, blocked_diagnostic=NULL,
+             initial_complete=0, watch_enabled=0,
+             intent_generation=intent_generation+1 WHERE share_id=?1",
+            [&prepared.share.0],
+        )?;
+        for table in [
+            "records",
+            "shared_heads",
+            "unsettled_paths",
+            "pending_objects",
+        ] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE share_id=?1"),
+                [&prepared.share.0],
+            )?;
+        }
+        transaction.commit()?;
+        let cleanup_warning = self
+            .prune_unreferenced_objects()
+            .err()
+            .map(|error| bounded_diagnostic(&format!("{error:#}")));
+        Ok(Detached { cleanup_warning })
+    }
+
+    pub fn set_peer(&mut self, id: &ShareId, peer: &PeerConfig) -> Result<()> {
+        peer.validate()?;
+        let transaction = self.conn.transaction()?;
+        let (binding, marker) = binding_and_marker(&transaction, id)?.context("share not found")?;
+        if marker.is_some() {
+            bail!("relationship removal is pending");
+        }
+        match binding {
+            EndpointBinding::Unpaired => {}
+            EndpointBinding::Connector(existing) if existing == *peer => return Ok(()),
+            EndpointBinding::Connector(_) => bail!("share already has a connector configuration"),
+            EndpointBinding::Responder { .. } => {
+                bail!("responder share cannot also have a connector configuration")
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE shares SET peer_json=?2
+             WHERE share_id=?1 AND removing_relationship IS NULL",
             params![id.0, serde_json::to_string(peer)?],
         )?;
+        if changed != 1 {
+            bail!("share not found or relationship removal is pending");
+        }
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn bound_peer(&self, id: &ShareId) -> Result<Option<PeerId>> {
-        // A share this installation never registered has no binding; it must
-        // not surface as an internal database error, because the responder
-        // turns a binding mismatch into its graceful rejection.
-        let value: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "SELECT bound_peer FROM shares WHERE share_id=?1",
-                [&id.0],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(value.flatten().map(PeerId))
+        match binding_and_marker(&self.conn, id)? {
+            Some((EndpointBinding::Responder { peer, .. }, _)) => Ok(Some(peer)),
+            Some((EndpointBinding::Connector(_) | EndpointBinding::Unpaired, _)) | None => Ok(None),
+        }
     }
 
     pub fn peer(&self, id: &ShareId) -> Result<Option<PeerConfig>> {
-        let json: Option<String> = self.conn.query_row(
-            "SELECT peer_json FROM shares WHERE share_id=?1",
-            [&id.0],
-            |r| r.get(0),
-        )?;
-        json.map(|v| serde_json::from_str(&v).map_err(Into::into))
-            .transpose()
+        match binding_and_marker(&self.conn, id)?.context("share not found")? {
+            (EndpointBinding::Connector(peer), _) => Ok(Some(peer)),
+            (EndpointBinding::Responder { .. } | EndpointBinding::Unpaired, _) => Ok(None),
+        }
     }
 
     pub fn set_initial_complete(&self, id: &ShareId) -> Result<()> {
-        self.conn.execute(
-            "UPDATE shares SET initial_complete=1 WHERE share_id=?1",
+        let changed = self.conn.execute(
+            "UPDATE shares SET initial_complete=1
+             WHERE share_id=?1 AND removing_relationship IS NULL",
             [&id.0],
         )?;
+        if changed != 1 {
+            bail!("share not found or relationship removal is pending");
+        }
         Ok(())
     }
 
@@ -2070,7 +2592,8 @@ impl State {
 
     pub fn managed_shares(&self) -> Result<Vec<ManagedShare>> {
         let mut statement = self.conn.prepare(
-            "SELECT share_id, root, peer_json, initial_complete, watch_enabled, blocked_diagnostic
+            "SELECT share_id, root, peer_json, initial_complete, watch_enabled, blocked_diagnostic,
+                    bound_peer, bound_relationship, removing_relationship
              FROM shares ORDER BY share_id",
         )?;
         statement
@@ -2082,7 +2605,8 @@ impl State {
     pub fn managed_share(&self, id: &ShareId) -> Result<ManagedShare> {
         self.conn
             .query_row(
-                "SELECT share_id, root, peer_json, initial_complete, watch_enabled, blocked_diagnostic
+                "SELECT share_id, root, peer_json, initial_complete, watch_enabled, blocked_diagnostic,
+                        bound_peer, bound_relationship, removing_relationship
                  FROM shares WHERE share_id=?1",
                 [&id.0],
                 managed_share_from_row,
@@ -2093,11 +2617,12 @@ impl State {
 
     pub fn set_watch_enabled(&self, id: &ShareId, enabled: bool) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE shares SET watch_enabled=?2, intent_generation=intent_generation+1 WHERE share_id=?1",
+            "UPDATE shares SET watch_enabled=?2, intent_generation=intent_generation+1
+             WHERE share_id=?1 AND removing_relationship IS NULL",
             params![id.0, i64::from(enabled)],
         )?;
         if changed == 0 {
-            bail!("share not found");
+            bail!("share not found or relationship removal is pending");
         }
         Ok(())
     }
@@ -2110,11 +2635,11 @@ impl State {
     ) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE shares SET watch_enabled=?2, intent_generation=intent_generation+1
-             WHERE share_id=?1 AND intent_generation=?3",
+             WHERE share_id=?1 AND intent_generation=?3 AND removing_relationship IS NULL",
             params![id.0, i64::from(enabled), expected_generation],
         )?;
         if changed == 0 {
-            bail!("sync was stopped or reconfigured while its initial plan was running");
+            bail!("sync was stopped, removed, or reconfigured while its initial plan was running");
         }
         Ok(())
     }
@@ -2137,11 +2662,12 @@ impl State {
         let transaction = self.conn.transaction()?;
         let changed = transaction.execute(
             "UPDATE shares SET initial_complete=1, watch_enabled=1, blocked_diagnostic=NULL,
-             intent_generation=intent_generation+1 WHERE share_id=?1 AND intent_generation=?2",
+             intent_generation=intent_generation+1
+             WHERE share_id=?1 AND intent_generation=?2 AND removing_relationship IS NULL",
             params![id.0, expected_generation],
         )?;
         if changed == 0 {
-            bail!("sync was stopped or reconfigured while its initial plan was running");
+            bail!("sync was stopped, removed, or reconfigured while its initial plan was running");
         }
         transaction.commit()?;
         Ok(())
@@ -2150,22 +2676,24 @@ impl State {
     pub fn set_blocked(&self, id: &ShareId, diagnostic: &str) -> Result<()> {
         let diagnostic = diagnostic.chars().take(4096).collect::<String>();
         let changed = self.conn.execute(
-            "UPDATE shares SET blocked_diagnostic=?2 WHERE share_id=?1",
+            "UPDATE shares SET blocked_diagnostic=?2
+             WHERE share_id=?1 AND removing_relationship IS NULL",
             params![id.0, diagnostic],
         )?;
         if changed == 0 {
-            bail!("share not found");
+            bail!("share not found or relationship removal is pending");
         }
         Ok(())
     }
 
     pub fn clear_blocked(&self, id: &ShareId) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE shares SET blocked_diagnostic=NULL WHERE share_id=?1",
+            "UPDATE shares SET blocked_diagnostic=NULL
+             WHERE share_id=?1 AND removing_relationship IS NULL",
             [&id.0],
         )?;
         if changed == 0 {
-            bail!("share not found");
+            bail!("share not found or relationship removal is pending");
         }
         Ok(())
     }
@@ -2417,25 +2945,256 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RemovalRole {
+    Connector,
+    Responder,
+    Either,
+}
+
+impl RemovalRole {
+    fn accepts(self, binding: &EndpointBinding) -> bool {
+        match self {
+            Self::Connector => matches!(binding, EndpointBinding::Connector(_)),
+            Self::Responder => matches!(binding, EndpointBinding::Responder { .. }),
+            Self::Either => !matches!(binding, EndpointBinding::Unpaired),
+        }
+    }
+}
+
+fn bounded_diagnostic(diagnostic: &str) -> String {
+    let mut bytes = 0usize;
+    diagnostic
+        .chars()
+        .take_while(|character| {
+            let next = bytes.saturating_add(character.len_utf8());
+            if next > 4096 {
+                false
+            } else {
+                bytes = next;
+                true
+            }
+        })
+        .collect()
+}
+
+struct BindingColumns {
+    peer_json: Option<String>,
+    bound_peer: Option<String>,
+    bound_relationship: Option<String>,
+    marker: Option<String>,
+}
+
+fn binding_and_marker(
+    connection: &Connection,
+    share: &ShareId,
+) -> Result<Option<(EndpointBinding, Option<RelationshipId>)>> {
+    let row: Option<BindingColumns> = connection
+        .query_row(
+            "SELECT peer_json,bound_peer,bound_relationship,removing_relationship
+             FROM shares WHERE share_id=?1",
+            [&share.0],
+            |row| {
+                Ok(BindingColumns {
+                    peer_json: row.get(0)?,
+                    bound_peer: row.get(1)?,
+                    bound_relationship: row.get(2)?,
+                    marker: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    row.map(decode_binding_columns).transpose()
+}
+
+fn decode_binding_columns(
+    columns: BindingColumns,
+) -> Result<(EndpointBinding, Option<RelationshipId>)> {
+    let peer = columns
+        .peer_json
+        .map(|json| serde_json::from_str::<PeerConfig>(&json))
+        .transpose()
+        .context("stored connector configuration is invalid")?;
+    let bound_relationship = columns
+        .bound_relationship
+        .map(RelationshipId::parse)
+        .transpose()
+        .context("stored responder relationship is invalid")?;
+    let marker = columns
+        .marker
+        .map(RelationshipId::parse)
+        .transpose()
+        .context("stored removal relationship is invalid")?;
+    let binding = match (peer, columns.bound_peer, bound_relationship) {
+        (Some(_), Some(_), _) | (Some(_), None, Some(_)) => {
+            bail!("share has simultaneous connector and responder bindings")
+        }
+        (Some(peer), None, None) => EndpointBinding::Connector(peer),
+        (None, Some(peer), relationship) => EndpointBinding::Responder {
+            peer: PeerId(peer),
+            relationship,
+        },
+        (None, None, Some(_)) => bail!("responder relationship has no bound peer"),
+        (None, None, None) => EndpointBinding::Unpaired,
+    };
+    Ok((binding, marker))
+}
+
+fn prepare_removal_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    share: &ShareId,
+    expected: &EndpointBinding,
+    legacy_relationship: Option<&RelationshipId>,
+) -> Result<PreparedRemoval> {
+    let (binding, marker) = binding_and_marker(transaction, share)?.context("share not found")?;
+    if &binding != expected {
+        bail!("share relationship changed since removal preview");
+    }
+    if matches!(binding, EndpointBinding::Unpaired) {
+        bail!("no relationship is configured");
+    }
+    let relationship = if let Some(marker) = marker {
+        if binding
+            .relationship()
+            .is_some_and(|relationship| relationship != &marker)
+        {
+            bail!("removal marker does not match the current relationship");
+        }
+        if legacy_relationship.is_some_and(|requested| requested != &marker) {
+            bail!("removal marker does not match the requested relationship");
+        }
+        marker
+    } else {
+        let relationship = match (binding.relationship(), legacy_relationship) {
+            (Some(stored), Some(requested)) if stored != requested => {
+                bail!("requested relationship does not match the current binding")
+            }
+            (Some(stored), _) => stored.clone(),
+            (None, Some(requested)) => requested.clone(),
+            (None, None) => RelationshipId::generate(),
+        };
+        let changed = transaction.execute(
+            "UPDATE shares SET removing_relationship=?2, watch_enabled=0,
+             blocked_diagnostic=NULL, intent_generation=intent_generation+1
+             WHERE share_id=?1 AND removing_relationship IS NULL",
+            params![share.0, relationship.0],
+        )?;
+        if changed != 1 {
+            bail!("relationship changed while preparing removal");
+        }
+        relationship
+    };
+    Ok(PreparedRemoval {
+        share: share.clone(),
+        relationship,
+        binding,
+    })
+}
+
+fn ensure_relationship_available(
+    connection: &Connection,
+    requested_share: &ShareId,
+    relationship: &RelationshipId,
+) -> Result<()> {
+    let responder_collision: Option<String> = connection
+        .query_row(
+            "SELECT share_id FROM shares
+             WHERE (bound_relationship=?1 OR removing_relationship=?1)
+               AND share_id<>?2 LIMIT 1",
+            params![relationship.0, requested_share.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if responder_collision.is_some() {
+        bail!("relationship identity is already bound to another share");
+    }
+    let mut statement = connection.prepare(
+        "SELECT share_id,peer_json FROM shares WHERE peer_json IS NOT NULL AND share_id<>?1",
+    )?;
+    let rows = statement.query_map([&requested_share.0], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (_, json) = row?;
+        let config: PeerConfig =
+            serde_json::from_str(&json).context("stored connector configuration is invalid")?;
+        if config.relationship.as_ref() == Some(relationship) {
+            bail!("relationship identity is already bound to another share");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unpaired_registration_state(connection: &Connection, share: &ShareId) -> Result<()> {
+    let (initial_complete, watch_enabled): (i64, i64) = connection.query_row(
+        "SELECT initial_complete,watch_enabled FROM shares WHERE share_id=?1",
+        [&share.0],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if initial_complete != 0 || watch_enabled != 0 {
+        bail!("unpaired retained root has active synchronization state");
+    }
+    for table in [
+        "records",
+        "install_intents",
+        "shared_heads",
+        "unsettled_paths",
+        "pending_objects",
+    ] {
+        let count: i64 = connection.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE share_id=?1"),
+            [&share.0],
+            |row| row.get(0),
+        )?;
+        if count != 0 {
+            bail!("unpaired retained root still has {table} state");
+        }
+    }
+    Ok(())
+}
+
+fn validate_stored_root_identity(
+    connection: &Connection,
+    share: &ShareId,
+    root: &Path,
+    actual: RootIdentity,
+) -> Result<()> {
+    let (device, inode): (String, String) = connection.query_row(
+        "SELECT root_device,root_inode FROM shares WHERE share_id=?1",
+        [&share.0],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    validate_identity_values(root, actual, &device, &inode)
+}
+
 fn managed_share_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedShare> {
-    let peer: Option<String> = row.get(2)?;
+    let (binding, removing_relationship) = decode_binding_columns(BindingColumns {
+        peer_json: row.get(2)?,
+        bound_peer: row.get(6)?,
+        bound_relationship: row.get(7)?,
+        marker: row.get(8)?,
+    })
+    .map_err(|error| invalid_binding_columns(2, error))?;
     Ok(ManagedShare {
         id: ShareId(row.get(0)?),
         root: bytes_path(row.get::<_, Vec<u8>>(1)?),
-        peer: peer
-            .map(|json| serde_json::from_str(&json))
-            .transpose()
-            .map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?,
+        binding,
         initial_complete: row.get::<_, i64>(3)? != 0,
         watch_enabled: row.get::<_, i64>(4)? != 0,
         blocked_diagnostic: row.get(5)?,
+        removing_relationship,
     })
+}
+
+fn invalid_binding_columns(column: usize, error: anyhow::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
+    )
 }
 
 #[cfg(unix)]
@@ -2673,6 +3432,14 @@ fn root_identity(path: &Path) -> Result<RootIdentity> {
         device: metadata.dev(),
         inode: metadata.ino(),
     })
+}
+
+fn canonical_registration_root(root: &Path, identity: RootIdentity) -> Result<PathBuf> {
+    let canonical = root.canonicalize()?;
+    if root_identity(&canonical)? != identity {
+        bail!("relationship root identity changed while resolving its path");
+    }
+    Ok(canonical)
 }
 
 fn validate_identity_values(
@@ -3123,6 +3890,749 @@ mod tests {
     use std::process::Command;
 
     const PERMISSIVE_UMASK_STATE_DIR: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_STATE_DIR";
+
+    fn relationship(value: &str) -> RelationshipId {
+        RelationshipId::parse(value.to_owned()).unwrap()
+    }
+
+    fn completed_connector(peer: &str, relationship: &str) -> PeerConfig {
+        PeerConfig {
+            peer_id: Some(PeerId(peer.into())),
+            host: "peer-host".into(),
+            remote_path: b"/remote/root".to_vec(),
+            executable: "/usr/bin/flocal".into(),
+            relationship: Some(self::relationship(relationship)),
+        }
+    }
+
+    fn recovery_conflict() -> Result<Conflict> {
+        Ok(Conflict::whole_file(
+            file_record(
+                RelativePath::from_bytes(b"conflicted".to_vec())?,
+                PeerId("winner".into()),
+                2,
+                2,
+                Vec::new(),
+                Entry::Directory,
+            ),
+            file_record(
+                RelativePath::from_bytes(b"conflicted".to_vec())?,
+                PeerId("loser".into()),
+                1,
+                1,
+                Vec::new(),
+                Entry::Tombstone,
+            ),
+            crate::merge::FallbackReason::AbsentBase,
+        ))
+    }
+
+    #[test]
+    fn relationship_columns_migrate_and_legacy_peer_json_decodes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let identity = root_identity(&root)?;
+        let state_dir = temp.path().join("state");
+        fs::create_dir(&state_dir)?;
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))?;
+        let connection = Connection::open(state_dir.join("state.sqlite3"))?;
+        connection.execute_batch(
+            "CREATE TABLE shares (
+                share_id TEXT PRIMARY KEY,
+                root BLOB NOT NULL UNIQUE,
+                sequence INTEGER NOT NULL DEFAULT 0,
+                initial_complete INTEGER NOT NULL DEFAULT 0,
+                peer_json TEXT,
+                bound_peer TEXT,
+                root_device TEXT,
+                root_inode TEXT,
+                watch_enabled INTEGER NOT NULL DEFAULT 0,
+                blocked_diagnostic TEXT,
+                intent_generation INTEGER NOT NULL DEFAULT 0,
+                recovery_budget_bytes INTEGER NOT NULL DEFAULT 10737418240
+            );",
+        )?;
+        let legacy =
+            r#"{"peer_id":"peer-old","host":"host","remote_path":[47],"executable":"/flocal"}"#;
+        connection.execute(
+            "INSERT INTO shares(share_id,root,peer_json,root_device,root_inode)
+             VALUES('share-old',?1,?2,?3,?4)",
+            params![
+                path_bytes(&root),
+                legacy,
+                identity.device.to_string(),
+                identity.inode.to_string()
+            ],
+        )?;
+        drop(connection);
+
+        let state = State::open(&state_dir)?;
+        assert_eq!(
+            state.endpoint_binding(&ShareId("share-old".into()))?,
+            EndpointBinding::Connector(PeerConfig {
+                peer_id: Some(PeerId("peer-old".into())),
+                host: "host".into(),
+                remote_path: b"/".to_vec(),
+                executable: "/flocal".into(),
+                relationship: None,
+            })
+        );
+        let columns: Vec<String> = state
+            .conn
+            .prepare("PRAGMA table_info(shares)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        assert!(columns.contains(&"bound_relationship".to_owned()));
+        assert!(columns.contains(&"removing_relationship".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn connector_registration_is_durable_retryable_and_cas_completed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let mut state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let prepared = state.prepare_connector_registration(
+            &share,
+            &EndpointBinding::Unpaired,
+            "host",
+            b"/remote",
+            "/first/flocal",
+        )?;
+        assert!(prepared.peer_id.is_none());
+        let durable_relationship = prepared.relationship.clone().unwrap();
+        drop(state);
+
+        let mut state = State::open(&state_dir)?;
+        assert_eq!(
+            state.endpoint_binding(&share)?,
+            EndpointBinding::Connector(prepared.clone())
+        );
+        let retry = state.prepare_connector_registration(
+            &share,
+            &EndpointBinding::Connector(prepared.clone()),
+            "host",
+            b"/remote",
+            "/newly-discovered/flocal",
+        )?;
+        assert_eq!(retry, prepared);
+        assert_eq!(retry.relationship, Some(durable_relationship));
+        assert!(
+            state
+                .prepare_connector_registration(
+                    &share,
+                    &EndpointBinding::Connector(prepared.clone()),
+                    "host",
+                    b"/different",
+                    "/first/flocal",
+                )
+                .is_err()
+        );
+
+        let mut stale = prepared.clone();
+        stale.host = "other".into();
+        assert!(
+            state
+                .complete_connector_registration(&share, &stale, &PeerId("responder".into()))
+                .is_err()
+        );
+        let completed = state.complete_connector_registration(
+            &share,
+            &prepared,
+            &PeerId("responder".into()),
+        )?;
+        assert_eq!(completed.peer_id, Some(PeerId("responder".into())));
+        assert_eq!(
+            state.prepare_connector_registration(
+                &share,
+                &EndpointBinding::Connector(completed.clone()),
+                "host",
+                b"/remote",
+                "/another/flocal",
+            )?,
+            completed
+        );
+        assert_eq!(
+            state.complete_connector_registration(
+                &share,
+                &completed,
+                &PeerId("responder".into())
+            )?,
+            completed
+        );
+        assert_eq!(
+            state.complete_connector_registration(
+                &share,
+                &prepared,
+                &PeerId("responder".into())
+            )?,
+            completed
+        );
+        assert!(
+            state
+                .complete_connector_registration(&share, &prepared, &PeerId("other".into()))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binding_decode_rejects_corrupt_durable_roles() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+
+        state.conn.execute(
+            "UPDATE shares SET peer_json='not json' WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(state.endpoint_binding(&share).is_err());
+        assert!(state.managed_share(&share).is_err());
+
+        state.conn.execute(
+            "UPDATE shares SET peer_json=NULL,bound_peer='connector',bound_relationship='bad;id'
+             WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(state.endpoint_binding(&share).is_err());
+        assert!(state.managed_share(&share).is_err());
+
+        state.conn.execute(
+            "UPDATE shares SET bound_peer=NULL,bound_relationship='relationship-orphaned'
+             WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(state.endpoint_binding(&share).is_err());
+        assert!(state.managed_share(&share).is_err());
+
+        state.conn.execute(
+            "UPDATE shares SET bound_relationship=NULL,removing_relationship='bad;id'
+             WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(state.endpoint_binding(&share).is_err());
+        assert!(state.managed_share(&share).is_err());
+
+        state.conn.execute(
+            "UPDATE shares SET removing_relationship=NULL WHERE share_id=?1",
+            [&share.0],
+        )?;
+        let config = completed_connector("responder", "relationship-corrupt");
+        state.set_peer(&share, &config)?;
+        state.conn.execute(
+            "UPDATE shares SET bound_peer='connector',removing_relationship=NULL WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(state.endpoint_binding(&share).is_err());
+        assert!(state.peer(&share).is_err());
+        assert!(state.managed_share(&share).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_connector_can_only_be_abandoned_locally() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let config = state.prepare_connector_registration(
+            &share,
+            &EndpointBinding::Unpaired,
+            "host",
+            b"/remote",
+            "/flocal",
+        )?;
+        let prepared = state.prepare_removal(&share, &EndpointBinding::Connector(config))?;
+        assert!(state.finalize_connector_removal(&prepared).is_err());
+        state.finalize_local_removal(&prepared)?;
+        assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        Ok(())
+    }
+
+    #[test]
+    fn connector_registration_rejects_a_replaced_local_root_before_persisting() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        fs::rename(&root, temp.path().join("original-root"))?;
+        fs::create_dir(&root)?;
+        assert!(
+            state
+                .prepare_connector_registration(
+                    &share,
+                    &EndpointBinding::Unpaired,
+                    "host",
+                    b"/remote",
+                    "/flocal",
+                )
+                .is_err()
+        );
+        assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        Ok(())
+    }
+
+    #[test]
+    fn finalization_clears_fresh_sync_state_and_preserves_recovery_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let config = completed_connector("responder", "relationship-remove");
+        state.set_peer(&share, &config)?;
+        state.add_conflicts(&share, &[recovery_conflict()?])?;
+        let record = file_record(
+            RelativePath::from_bytes(b"old".to_vec())?,
+            PeerId("owner".into()),
+            1,
+            1,
+            Vec::new(),
+            Entry::Directory,
+        );
+        state.replace_records(&share, std::slice::from_ref(&record))?;
+        state.conn.execute(
+            "INSERT INTO shared_heads(share_id,path,base_json) VALUES(?1,?2,'{}')",
+            params![share.0, b"old".as_slice()],
+        )?;
+        state.conn.execute(
+            "INSERT INTO unsettled_paths(share_id,path) VALUES(?1,?2)",
+            params![share.0, b"old".as_slice()],
+        )?;
+        state.conn.execute(
+            "INSERT INTO pending_objects(share_id,hash,provenance)
+             VALUES(?1,?2,'generated_local')",
+            params![share.0, "a".repeat(64)],
+        )?;
+        state.conn.execute(
+            "UPDATE shares SET sequence=41,initial_complete=1,watch_enabled=1,
+             recovery_budget_bytes=123456 WHERE share_id=?1",
+            [&share.0],
+        )?;
+        let identity = state.expected_root_identity(&share)?;
+        let generation = state.watch_intent_generation(&share)?;
+        let prepared = state.prepare_removal(&share, &EndpointBinding::Connector(config))?;
+        assert!(state.ensure_not_removing(&share).is_err());
+        state.set_removal_diagnostic(&share, &prepared.relationship, &"é".repeat(5000))?;
+        let diagnostic = state.managed_share(&share)?.blocked_diagnostic.unwrap();
+        assert_eq!(diagnostic.len(), 4096);
+        assert_eq!(diagnostic.chars().count(), 2048);
+        state.finalize_connector_removal(&prepared)?;
+
+        assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        let row: (i64, i64, i64, i64, Option<String>, Option<String>) = state.conn.query_row(
+            "SELECT sequence,initial_complete,watch_enabled,recovery_budget_bytes,
+                    removing_relationship,blocked_diagnostic FROM shares WHERE share_id=?1",
+            [&share.0],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(row, (41, 0, 0, 123456, None, None));
+        assert_eq!(state.expected_root_identity(&share)?, identity);
+        assert!(state.watch_intent_generation(&share)? >= generation + 2);
+        for table in [
+            "records",
+            "shared_heads",
+            "unsettled_paths",
+            "pending_objects",
+        ] {
+            let count: i64 = state.conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE share_id=?1"),
+                [&share.0],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0, "{table}");
+        }
+        assert_eq!(state.conflicts(&share)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn finalization_refuses_a_durable_install_journal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let config = completed_connector("responder", "relationship-install");
+        state.set_peer(&share, &config)?;
+        let prepared =
+            state.prepare_removal(&share, &EndpointBinding::Connector(config.clone()))?;
+        state.conn.execute(
+            "INSERT INTO install_intents(share_id,records_json) VALUES(?1,?2)",
+            params![
+                share.0,
+                serde_json::to_string(&InstallIntent {
+                    records: Vec::new(),
+                    conflicts: Vec::new(),
+                    temps: Vec::new(),
+                })?
+            ],
+        )?;
+        assert!(state.finalize_connector_removal(&prepared).is_err());
+        assert_eq!(
+            state.endpoint_binding(&share)?,
+            EndpointBinding::Connector(config)
+        );
+        assert_eq!(
+            state.removing_relationship(&share)?,
+            Some(prepared.relationship)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removal_preparation_and_finalization_are_exact_snapshot_cas_operations() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let config = completed_connector("responder", "relationship-cas");
+        state.set_peer(&share, &config)?;
+        let mut stale = config.clone();
+        stale.host = "stale-host".into();
+        assert!(
+            state
+                .prepare_removal(&share, &EndpointBinding::Connector(stale))
+                .is_err()
+        );
+        assert_eq!(state.removing_relationship(&share)?, None);
+
+        let prepared = state.prepare_removal(&share, &EndpointBinding::Connector(config))?;
+        assert!(state.detach_incoming_relationship(&prepared).is_err());
+        assert_eq!(state.prepare_removal(&share, &prepared.binding)?, prepared);
+        let mut wrong_marker = prepared.clone();
+        wrong_marker.relationship = relationship("relationship-wrong-marker");
+        assert!(state.finalize_local_removal(&wrong_marker).is_err());
+        assert_eq!(
+            state.removing_relationship(&share)?,
+            Some(prepared.relationship)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incoming_removal_is_absent_idempotent_and_does_not_create_share_locks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let missing = ShareId("share-missing".into());
+        assert!(!state.dir.join("locks").exists());
+        assert_eq!(
+            state.prepare_incoming_removal(
+                &missing,
+                &PeerId("connector".into()),
+                &relationship("relationship-missing")
+            )?,
+            IncomingRemoval::Absent
+        );
+        assert!(!state.dir.join("locks").exists());
+
+        let root = temp.path().join("remote-root");
+        let share = ShareId("share-incoming".into());
+        let connector = PeerId("connector".into());
+        let relationship = relationship("relationship-incoming");
+        assert_eq!(
+            state.register_relationship(&share, &root, &connector, &relationship)?,
+            RegistrationOutcome { prior_share: None }
+        );
+        assert_eq!(
+            state.prepare_incoming_removal(
+                &share,
+                &connector,
+                &self::relationship("relationship-other")
+            )?,
+            IncomingRemoval::Absent
+        );
+        assert!(
+            state
+                .prepare_incoming_removal(&share, &PeerId("wrong".into()), &relationship)
+                .is_err()
+        );
+        let IncomingRemoval::Prepared(prepared) =
+            state.prepare_incoming_removal(&share, &connector, &relationship)?
+        else {
+            panic!("matching incoming removal must prepare");
+        };
+        assert!(state.finalize_connector_removal(&prepared).is_err());
+        assert_eq!(
+            state.prepare_incoming_removal(&share, &connector, &relationship)?,
+            IncomingRemoval::Prepared(prepared.clone())
+        );
+        state.detach_incoming_relationship(&prepared)?;
+        assert_eq!(
+            state.prepare_incoming_removal(&share, &connector, &relationship)?,
+            IncomingRemoval::Absent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relationship_registration_is_exact_and_remaps_only_retained_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("retained-root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let prior = state.init_share(&root)?;
+        state.add_conflicts(&prior, &[recovery_conflict()?])?;
+        state.conn.execute(
+            "UPDATE shares SET sequence=17,recovery_budget_bytes=98765 WHERE share_id=?1",
+            [&prior.0],
+        )?;
+        let identity = state.expected_root_identity(&prior)?;
+        let incoming = ShareId("share-remapped".into());
+        let peer = PeerId("connector".into());
+        let relationship = relationship("relationship-remapped");
+        assert_eq!(
+            state.register_relationship(&incoming, &root, &peer, &relationship)?,
+            RegistrationOutcome {
+                prior_share: Some(prior.clone())
+            }
+        );
+        assert!(state.endpoint_binding(&prior).is_err());
+        assert_eq!(
+            state.endpoint_binding(&incoming)?,
+            EndpointBinding::Responder {
+                peer: peer.clone(),
+                relationship: Some(relationship.clone())
+            }
+        );
+        assert_eq!(state.conflicts(&incoming)?.len(), 1);
+        assert_eq!(state.expected_root_identity(&incoming)?, identity);
+        let retained: (i64, i64) = state.conn.query_row(
+            "SELECT sequence,recovery_budget_bytes FROM shares WHERE share_id=?1",
+            [&incoming.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(retained, (17, 98765));
+        assert_eq!(
+            state.register_relationship(&incoming, &root, &peer, &relationship)?,
+            RegistrationOutcome { prior_share: None }
+        );
+        assert!(
+            state
+                .register_relationship(&incoming, &root, &PeerId("different".into()), &relationship)
+                .is_err()
+        );
+
+        let dirty_root = temp.path().join("dirty-root");
+        fs::create_dir(&dirty_root)?;
+        let dirty = state.init_share(&dirty_root)?;
+        state.conn.execute(
+            "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,'{}')",
+            params![dirty.0, b"old".as_slice()],
+        )?;
+        assert!(
+            state
+                .register_relationship(
+                    &ShareId("share-dirty-remap".into()),
+                    &dirty_root,
+                    &peer,
+                    &self::relationship("relationship-dirty")
+                )
+                .is_err()
+        );
+        assert_eq!(state.endpoint_binding(&dirty)?, EndpointBinding::Unpaired);
+
+        let replaced_root = temp.path().join("replaced-root");
+        fs::create_dir(&replaced_root)?;
+        let replaced_share = state.init_share(&replaced_root)?;
+        let original = temp.path().join("original-root-moved");
+        fs::rename(&replaced_root, &original)?;
+        fs::create_dir(&replaced_root)?;
+        assert!(
+            state
+                .register_relationship(
+                    &ShareId("share-replacement".into()),
+                    &replaced_root,
+                    &peer,
+                    &self::relationship("relationship-replacement")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            state.endpoint_binding(&replaced_share)?,
+            EndpointBinding::Unpaired
+        );
+
+        let missing_root = temp.path().join("missing-root");
+        fs::create_dir(&missing_root)?;
+        let missing_share = state.init_share(&missing_root)?;
+        fs::remove_dir(&missing_root)?;
+        assert!(
+            state
+                .register_relationship(
+                    &ShareId("share-missing-root".into()),
+                    &missing_root,
+                    &peer,
+                    &self::relationship("relationship-missing-root")
+                )
+                .is_err()
+        );
+        assert!(!missing_root.exists());
+        assert_eq!(
+            state.endpoint_binding(&missing_share)?,
+            EndpointBinding::Unpaired
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opened_root_identity_cannot_be_retargeted_to_another_share() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        fs::create_dir(&first_root)?;
+        fs::create_dir(&second_root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let first_share = state.init_share(&first_root)?;
+        let second_share = state.init_share(&second_root)?;
+        let opened_identity = root_identity(&first_root)?;
+
+        fs::rename(&first_root, temp.path().join("first-moved"))?;
+        std::os::unix::fs::symlink(&second_root, &first_root)?;
+
+        assert!(state.find_share_by_exact_root(&first_root).is_err());
+        assert_eq!(
+            state
+                .find_share_by_exact_root_identity(&first_root, opened_identity)?
+                .0,
+            first_share
+        );
+        assert_ne!(first_share, second_share);
+        assert!(canonical_registration_root(&first_root, opened_identity).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_root_selection_accepts_equivalent_canonical_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let real_parent = temp.path().join("real");
+        let root = real_parent.join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested)?;
+        let alias_parent = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real_parent, &alias_parent)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&alias_parent.join("root"))?;
+
+        assert_eq!(state.find_share_by_exact_root(&root)?.0, share);
+        assert_eq!(
+            state
+                .find_share_by_exact_root(&alias_parent.join("root"))?
+                .0,
+            share
+        );
+        assert_eq!(state.find_share_by_exact_root(&nested.join(".."))?.0, share);
+        Ok(())
+    }
+
+    #[test]
+    fn removal_collection_cannot_race_another_shares_uncommitted_object() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        fs::create_dir(&first_root)?;
+        fs::create_dir(&second_root)?;
+        let state_dir = temp.path().join("state");
+        let mut state = State::open(&state_dir)?;
+        let first_share = state.init_share(&first_root)?;
+        let second_share = state.init_share(&second_root)?;
+        let connector = completed_connector("responder", "relationship-collector");
+        state.set_peer(&first_share, &connector)?;
+        let removal =
+            state.prepare_removal(&first_share, &EndpointBinding::Connector(connector))?;
+
+        let source = temp.path().join("captured");
+        fs::write(&source, b"captured before its record commits")?;
+        let (hash, size) = state.store_object(File::open(&source)?)?;
+        let object_path = state.object_path(&hash);
+        let held_sync = state.lock_global_sync()?;
+        let mut remover = State::open(&state_dir)?;
+        assert!(remover.finalize_connector_removal(&removal).is_err());
+        assert!(object_path.exists());
+
+        state.replace_records(
+            &second_share,
+            &[file_record(
+                RelativePath::from_bytes(b"captured".to_vec())?,
+                PeerId("owner".into()),
+                1,
+                1,
+                Vec::new(),
+                Entry::File {
+                    hash,
+                    size,
+                    executable: false,
+                },
+            )],
+        )?;
+        drop(held_sync);
+        remover.finalize_connector_removal(&removal)?;
+        assert!(object_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_registration_only_acknowledges_an_existing_null_incarnation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("legacy-root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.conn.execute(
+            "UPDATE shares SET bound_peer='legacy-peer' WHERE share_id=?1",
+            [&share.0],
+        )?;
+        state.acknowledge_legacy_registration(&share, &root, &PeerId("legacy-peer".into()))?;
+        assert!(
+            state
+                .acknowledge_legacy_registration(&share, &root, &PeerId("wrong".into()))
+                .is_err()
+        );
+        assert!(
+            state
+                .acknowledge_legacy_registration(
+                    &ShareId("missing".into()),
+                    &root,
+                    &PeerId("legacy-peer".into())
+                )
+                .is_err()
+        );
+        let removal_relationship = relationship("relationship-legacy-removal");
+        assert!(
+            state
+                .prepare_incoming_removal(&share, &PeerId("wrong".into()), &removal_relationship)
+                .is_err()
+        );
+        let IncomingRemoval::Prepared(prepared) = state.prepare_incoming_removal(
+            &share,
+            &PeerId("legacy-peer".into()),
+            &removal_relationship,
+        )?
+        else {
+            panic!("legacy relationship must prepare for its matching peer");
+        };
+        assert_eq!(prepared.relationship, removal_relationship);
+        state.detach_incoming_relationship(&prepared)?;
+        Ok(())
+    }
 
     #[test]
     fn planned_conflict_ids_are_exactly_idempotent() -> Result<()> {

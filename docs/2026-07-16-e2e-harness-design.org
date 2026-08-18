@@ -1285,3 +1285,15 @@ post-pairing baseline, edits only the responder, requires prompt convergence,
 and proves that =watch= opened exactly one SSH session while remaining idle.
 =Config= now retains only the per-session transfer-budget override used by the
 committed-action failure scenario.
+
+* Update 2026-08-17: clean relationship removal
+
+Three scenarios in =tests/e2e/scenarios/relationships.rs= exercise the reviewed
+relationship lifecycle through public commands over real SSH: reachable
+two-sided removal retains files and conflict recovery before a fresh initial
+union; an unreachable responder leaves a disabled =removing= relationship until
+the same command is retried; and local-only removal leaves visible responder
+asymmetry until that endpoint also removes locally. Both daemons run in managed
+scenarios so =sync list --json= is asserted on each endpoint. The harness pins
+list schema 2 and status schema 5, including hidden unpaired list rows and the
+=registering=/=removing=/=unpaired= relationship fields.

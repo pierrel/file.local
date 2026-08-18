@@ -727,3 +727,53 @@ bootstrap behavior.
 6. Run the full local review loop, all deterministic gates, Docker recovery
    scenarios, and platform service checks before presenting the result for
    review.
+
+* Update 2026-08-17: relationship lifecycle
+
+The reviewed
+[[file:2026-08-17-clean-relationship-removal-design.org][relationship-lifecycle design]] supersedes this document's registration and
+removal contract. A new connector durably records a prepared relationship ID
+before the first remote mutation. A lost reply leaves =sync add= visibly
+=registering= and disabled. Retrying the exact host and remote root reuses its
+share and relationship ID; a different target is rejected. If reachable, retry
+the add and then use normal removal. Explicit local-only abandonment warns that
+the responder may already be registered and must also be detached locally
+before that root is reused.
+
+=flocal sync remove [PATH | --share SHARE] [--local-only] [--yes]= normally
+runs on the connector. The daemon stops that relationship's worker before the
+CLI asks the responder to detach the matching ID and then detaches locally. A
+responder directs the user to the connector. Confirmation defaults to no;
+decline, empty input, or end of input changes nothing and succeeds. =--yes=
+skips the prompt but not the preview or warnings. =--local-only= is an explicit
+warning-bearing operation on either endpoint and is never an automatic
+fallback.
+
+A failed normal removal remains disabled and visibly =removing=. The user
+retries the same removal command after fixing the reported cause; there is no
+background removal loop. The daemon's pending-removal marker prevents worker
+restart. A committed =install_intents= recovery must finish before either
+endpoint reports detach, and its failure leaves removal pending. Removal itself
+does not change synchronized files. It retains the root and share registration,
+root identity, recovery budget, conflicts, and recovery objects while clearing
+the relationship, shared heads, and unsettled or pending-object relationship
+state. Path-based recovery still requires an unavailable root to be restored.
+
+=sync list --json= advances to schema 2 and adds =role=,
+=registration_pending=, and =removal_pending=. Its human states include
+=disabled registering= and =disabled removing=; unpaired retained roots are not
+listed. =status --json= advances to schema 5 and adds =bound_peer=,
+=relationship_state=, =removal_pending=, and =removal_error=. Human status
+reports =registering=, =connector=, =responder=, =removing=, or =unpaired= and
+continues to show recovery and pending-install state. Unlike list, status by
+path shows a retained unpaired root as not configured.
+
+Re-pairing a retained root uses a new relationship ID and a fresh initial union
+plan. Reverse-direction pairing may atomically remap the retained root and its
+conflicts to the incoming share ID; list or status reports that new ID and the
+old =--share= selector no longer applies. The new
+version-1 registration and removal capabilities use the separate fixed
+=flocal protocol relationship= entrypoint. Explicit synchronization remains
+version 3 and persistent watch remains version 5 on =protocol serve=. Both
+peers must be upgraded for new pairing or removal, while existing legacy pairs
+continue to synchronize.

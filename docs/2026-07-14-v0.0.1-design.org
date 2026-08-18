@@ -6,6 +6,10 @@ The original proposal is retained below. Its current implementation baseline
 and the accepted plan for the next three-way merge slice are reconciled in
 [[file:2026-08-13-v0.0.1-design-reconciliation.org][the 2026-08-13 design reconciliation]]. That document supersedes this one where
 later implementation evidence or platform behavior changed a decision.
+The reviewed
+[[file:2026-08-17-clean-relationship-removal-design.org][2026-08-17 relationship-lifecycle design]] further supersedes the pairing,
+removal, status, and relationship-protocol portions below. It is the intended
+implementation contract, not a claim that those changes have passed validation.
 
 * Summary
 
@@ -262,7 +266,7 @@ expires in v0.0.1.
 flocal init PATH [--name NAME]
 flocal peer add PATH --host SSH_DEST --remote-path REMOTE_PATH
 flocal peer list PATH [--json]
-flocal peer remove PATH [--local-only] [--yes]
+flocal sync remove [PATH | --share SHARE_ID] [--local-only] [--yes]
 flocal sync PATH [--dry-run] [--yes] [--json]
 flocal watch PATH [--json]
 flocal service install PATH
@@ -289,13 +293,17 @@ Git. Destructive remote effects are always shown in dry-run output.
 compatibility, share identity, case-sensitivity compatibility, and whether
 another process currently owns the share lock.
 
-=peer remove= is a connector-only command and requires confirmation that it will
-stop the local service. On a responder it prints the connector on which to run
-the command. It removes the peer registration on both endpoints when reachable,
-and retains synchronized files, share metadata, and recovery objects. If the
-peer is permanently unreachable, =--local-only= warns about asymmetric
-registration and forgets it locally. =service uninstall= removes only the
-generated service definition; it never removes user data or share metadata.
+=sync remove= normally runs on the connector and requires default-no
+confirmation after showing the root, share, known peer, and scope. It stops the
+relationship worker, asks the responder to detach the same durable relationship
+ID, then detaches locally. On a responder it prints the connector on which to
+run the command. =--local-only= is an explicit, warning-bearing escape hatch on
+either endpoint when the peer is permanently unavailable; it is never an
+automatic fallback. Declining changes nothing. Removal retains synchronized
+files, the root and its identity, recovery records and objects, conflicts, and
+the recovery budget. Any committed install recovery completes before detach.
+=service uninstall= removes only the generated service definition; it never
+removes user data or share metadata.
 
 When =watch= or the service owns a share, an explicit =sync= asks that process
 to reconcile over a per-share Unix-domain control socket stored in the user-only
@@ -556,6 +564,12 @@ The initiating process runs a fixed remote command equivalent to:
 #+begin_example
 /absolute/path/to/flocal protocol serve
 #+end_example
+
+Explicit synchronization version 3 and persistent watch version 5 continue to
+use =protocol serve=. The intended version-1 relationship registration and
+removal capabilities use the separate fixed =protocol relationship=
+entrypoint. Both peers must be upgraded before a new relationship can be added
+or removed; existing legacy relationships continue to synchronize.
 
 OpenSSH sends even an argv-supplied remote command through the login shell, so
 the command contains only the previously validated executable path and fixed

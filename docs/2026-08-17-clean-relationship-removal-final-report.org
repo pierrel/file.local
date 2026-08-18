@@ -1,0 +1,471 @@
+#+title: Clean relationship removal: implementation report
+#+date: 2026-08-17
+#+status: implemented, reviewed, and validated
+
+* What shipped
+
+=file.local= now has an explicit lifecycle for ending a synchronization
+relationship without deleting either synchronized directory:
+
+#+begin_src sh
+flocal sync remove PATH
+flocal sync remove --share SHARE
+flocal sync remove PATH --local-only
+#+end_src
+
+The normal command is deliberately two-sided.  It runs on the connector, stops
+that share's managed worker, asks the responder to detach the exact same
+relationship, and only then detaches the connector.  If the peer is offline or
+rejects the request, the local relationship remains durably marked =removing=
+and disabled.  The user repairs the reported problem and reruns the same
+command.  The system never silently changes a two-sided request into a
+one-sided operation.
+
+=--local-only= is the explicit escape hatch when an endpoint is permanently
+unavailable.  It works on either endpoint, warns that the other endpoint may
+remain registered, and leaves that asymmetry visible until the other endpoint
+is also removed locally.
+
+Removal does not delete synchronized files.  It retains the local root and
+share identity, recovery budget, conflicts, and recovery objects.  It clears
+the old relationship's ordinary records, shared heads, unsettled paths, and
+pending object requests so a later pairing starts as a fresh union instead of
+carrying old tombstones or causal history into a new relationship.
+
+* The user experience
+
+The command accepts exactly one selector.  =PATH= must be the exact configured
+root and must still have its recorded filesystem identity.  =--share= exists
+for the important case where the root is missing, replaced, or now a symlink.
+The preview names the root, share, role, peer, and whether the scope is one or
+both endpoints.  Confirmation defaults to no; =--yes= skips only the question,
+not the preview or warnings.
+
+An already-unpaired root is a successful no-op.  A responder explains that
+normal removal must run on the machine that originally issued =sync add=,
+because only the connector knows how to reach the other endpoint.  It gives the
+durable peer ID rather than inventing a hostname the responder never stored.
+
+The operational states are now visible instead of being inferred from a failed
+watch:
+
+- =registering=: the connector durably recorded a pairing attempt but has not
+  recorded the responder's acknowledgement;
+- =connector=: the endpoint owns the SSH connection configuration;
+- =responder=: the endpoint accepts that connector;
+- =removing=: removal is durable, disabled, and waiting for a manual retry; and
+- =unpaired=: retained local metadata has no synchronization relationship.
+
+=sync list --json= is schema 2 and includes role, registration-pending, and
+removal-pending fields.  =status --json= is schema 5 and includes the bound
+peer, relationship state, pending-removal flag, and last removal error.
+
+Pairing also became crash-safe.  The connector records a fresh relationship ID
+and the complete target before contacting the responder.  If a reply is lost,
+rerunning the exact =sync add= resumes the same attempt.  A different target is
+rejected.  After removal, re-pairing creates a new relationship ID and a fresh
+initial union.  A reverse-direction re-pair may atomically remap a retained
+root and its conflicts to the incoming share ID.
+
+* Final design
+
+The durable identity is a relationship incarnation, not just a share ID or a
+pair of peer IDs.  Each new pairing gets a generated =RelationshipId=.  Both
+endpoints store it, and every registration or removal message echoes it.  A
+delayed removal for an old incarnation therefore proves only that the old
+relationship is absent; it cannot remove a newer relationship that happens to
+reuse the same root or share.
+
+Each share has exactly one endpoint role:
+
+#+begin_src rust
+pub enum EndpointBinding {
+    Connector(PeerConfig),
+    Responder {
+        peer: PeerId,
+        relationship: Option<RelationshipId>,
+    },
+    Unpaired,
+}
+
+pub struct PreparedRemoval {
+    pub share: ShareId,
+    pub relationship: RelationshipId,
+    pub binding: EndpointBinding,
+}
+#+end_src
+
+The optional responder relationship exists only for an upgraded database that
+still contains a legacy binding.  A prepared connector can likewise have a
+relationship but no peer acknowledgement yet.  Normal synchronization requires
+a completed connector.  Local-only removal can abandon either incomplete or
+legacy state explicitly.
+
+Removal is a small state machine with durable compare-and-swap boundaries:
+
+1. Select and preview an exact binding.
+2. Ask the daemon to persist =removing_relationship= and disable the worker.
+3. Stop and reap that exact worker with a bounded escalation path.
+4. Finish any already-committed install journal.  A failure leaves the
+   relationship and fresh-sync records intact and stores a bounded diagnostic.
+5. For normal removal, authenticate and detach the exact responder binding.
+6. Atomically detach the same snapshotted connector binding.
+7. Clear fresh-sync state while retaining recovery and root metadata.
+
+The marker is written before stopping the worker.  Start, explicit sync,
+watch, registration, and worker restoration all consult the same durable
+predicate, so another process cannot restart synchronization in the gap.
+Finalization compares the current role, peer configuration, relationship ID,
+and removal marker with =PreparedRemoval=.  If any changed, it refuses to
+detach.
+
+The responder returns =Absent= both when it just detached the requested
+relationship and when that exact relationship was already absent.  This makes
+a lost success response retryable without a growing receipt table.  A matching
+relationship attached to the wrong peer is rejected instead of being treated
+as absent.
+
+Registration and removal use version 1 of a separate
+=flocal protocol relationship= entrypoint.  Explicit sync remains protocol 3
+and persistent watch remains protocol 5 on =flocal protocol serve=.  A rolling
+upgrade therefore cannot accidentally reinterpret lifecycle frames as file
+exchange frames.  Both peers must be upgraded before adding or removing a new
+relationship; an existing legacy relationship continues to synchronize.
+
+* Code changes, component by component
+
+** Validated relationship identities
+
+=RelationshipId= is a Rust newtype: a small wrapper that makes a plain =String=
+mean something more specific to the compiler.  Callers cannot accidentally
+pass a peer or share ID where a relationship is required.  Deserialization
+validates the value at the trust boundary:
+
+#+begin_src rust
+impl RelationshipId {
+    pub fn parse(value: String) -> Result<Self> {
+        if value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("relationship ID must be 1-128 safe ASCII characters");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for RelationshipId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+#+end_src
+
+The =impl<'de> Deserialize<'de>= block is a Serde trait implementation.  The
+='de= lifetime says the decoder may borrow input for the duration of
+deserialization; this implementation immediately owns the resulting string.
+The =?= operator returns early on a decoding error.  =map_err= translates the
+application's validation error into the error type Serde expects.
+
+** Durable state and migrations
+
+SQLite gains =bound_relationship= beside the responder's =bound_peer= and a
+single =removing_relationship= marker.  Connector configuration gains optional
+=peer_id= and =relationship= fields so one row can represent a prepared pairing
+without another intent table.  Existing JSON and legacy responder rows remain
+readable.
+
+State methods own the transitions rather than exposing general-purpose row
+scrubbing.  Registration locks the global synchronization boundary, validates
+the exact root and stored device/inode, rejects overlapping roots and identity
+collisions, and either creates the responder or remaps a completely unpaired
+retained root.  Removal preparation records the marker with a snapshot of the
+binding.  Finalization accepts only the correct role and exact snapshot.
+
+The role is an =enum= rather than a set of booleans.  Pattern matching makes
+the allowed states and role-specific operations explicit.  The database reader
+also rejects corrupt combinations, including simultaneous connector and
+responder columns, malformed durable relationship IDs, or a responder
+relationship without a peer.
+
+** CLI and daemon orchestration
+
+The top-level removal flow keeps the risky ordering readable:
+
+#+begin_src rust
+let response = daemon_request(
+    state,
+    DaemonRequest::PrepareRemove {
+        share: share.0.clone(),
+        expected_binding: binding.clone(),
+    },
+)?;
+let DaemonResponse::Prepared { removal } = response else {
+    bail!("daemon returned an invalid removal response")
+};
+
+if let Err(error) = recover_daemon_share_install(state, &share) {
+    let _ = state.set_removal_diagnostic(
+        &share,
+        &removal.relationship,
+        &format!("{error:#}"),
+    );
+    bail!(
+        "relationship removal is pending and disabled; retry after correcting install recovery: {error:#}"
+    )
+}
+
+let detached = if local_only {
+    state.finalize_local_removal(&removal)?
+} else {
+    let remote = remove_remote_relationship(state, &removal);
+    if let Err(error) = remote {
+        let _ = state.set_removal_diagnostic(
+            &share,
+            &removal.relationship,
+            &format!("{error:#}"),
+        );
+        bail!(
+            "relationship removal is pending and disabled; rerun `flocal sync remove --share {}` to retry: {error:#}",
+            share.0
+        )
+    }
+    state.finalize_connector_removal(&removal)?
+};
+#+end_src
+
+=let ... else= is Rust's concise way to require one pattern and exit the
+current function for every other variant.  The =?= operator propagates errors
+with their context.  =if let= handles the one error branch that needs to store
+additional durable state before returning.  The underscore in =let _ ==
+deliberately ignores a secondary diagnostic-write failure so it cannot hide
+the primary recovery failure.
+
+The daemon's =PrepareRemove= request serializes marking and worker shutdown
+with its live worker table.  Shutdown is bounded: it requests cooperative
+termination, escalates if required, waits for the child to be reaped, and only
+then returns the prepared snapshot.  A CLI process that disappears after this
+point leaves an honest, retryable =removing= record.
+
+Selection has two intentionally different paths.  PATH performs a no-follow
+check on the final component and verifies the configured root identity before
+any prompt.  =--share= selects durable metadata even if the filesystem root is
+unavailable.  Both paths converge on the same preview and state transition.
+
+** The isolated lifecycle protocol
+
+Lifecycle messages are closed, tagged Serde enums with unknown fields denied:
+
+#+begin_src rust
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RelationshipRequest {
+    RegisterRelationship {
+        registration_protocol: u32,
+        share: ShareId,
+        peer: PeerId,
+        root: Vec<u8>,
+        relationship: RelationshipId,
+    },
+    RemoveRelationship {
+        removal_protocol: u32,
+        share: ShareId,
+        peer: PeerId,
+        expected_peer: PeerId,
+        relationship: RelationshipId,
+    },
+}
+#+end_src
+
+=derive= asks the compiler and Serde procedural macros to generate standard
+implementations from the declared structure.  The internally tagged JSON shape
+has a =type= discriminator such as =remove_relationship=.
+=deny_unknown_fields= rejects messages from an incompatible or confused
+protocol instead of silently ignoring their extra meaning.
+
+The protocol has absolute read/write deadlines, a bounded frame size, a
+16-KiB root bound, 128-byte safe IDs, and 4-KiB UTF-8 error messages.  The SSH
+child receives structured framed data on standard input.  The validated host
+is one SSH argument, and the discovered executable must match a safe absolute
+path grammar before interpolation into the fixed remote command.  Root, peer,
+share, and relationship values remain framed data.  The client verifies every
+identity echoed by a success response and waits for a clean child exit.
+
+The responder handler validates protocol version and its own peer identity
+before selecting state.  An absent or old relationship returns an idempotent
+=Absent= response.  A matching binding recovers only that selected share's
+install journal and atomically detaches it.  Detailed local mismatch errors are
+collapsed to a bounded generic network error so the protocol does not disclose
+unrelated durable state.
+
+** Status, list, and compatibility
+
+Managed-list output distinguishes the durable enabled flag from relationship
+progress and live worker state.  Fully unpaired rows disappear from list but
+remain visible through =status= for recovery.  Pending registration and removal
+are disabled by construction and include retry guidance.
+
+The schema bumps are explicit because scripts should not guess at new fields.
+The relationship protocol versions are independent from synchronization
+versions, and legacy pairing can only acknowledge an exact existing legacy
+binding.  It cannot create or rebind a share after upgrade.
+
+** End-to-end coverage
+
+The Docker harness can now operate two managed daemons and inspect the new list
+and status schemas.  Four new scenarios pin the primary contracts:
+
+#+begin_src rust
+b.offline()?;
+a.sync_remove_expect_err("relationship removal is pending and disabled")?;
+a.assert_sync_removing()?;
+
+b.online()?;
+a.assert_sync_removing()?;
+a.sync_remove()?;
+a.assert_sync_list_empty()?;
+b.assert_sync_list_empty()?;
+#+end_src
+
+The reachable scenario creates a real two-sided conflict, removes the
+relationship, verifies both visible trees and recovery inputs remain intact,
+then re-pairs and proves the new union converges.  The offline scenario proves
+there is no hidden automatic retry or implicit local-only fallback.  The
+local-only scenario proves the two endpoints remain intentionally asymmetric
+until each is detached.  The foreground-watch scenario proves removal cannot
+detach either endpoint while another process owns the share: it remains
+durably pending, then succeeds when the user retries after the watch exits.
+
+Focused state and protocol tests cover prepared registration restart, exact
+retry, stale snapshot rejection, old-request harmlessness, legacy bindings,
+retained-root remap, install-journal refusal, malformed and oversized frames,
+response identity mismatch, CLI selectors, confirmation, and every visible
+durable role.  Corrupt on-disk role combinations are rejected rather than
+adopted.
+
+* What was hard
+
+The hardest part was not deleting configuration.  It was defining an
+interruption-safe point at which every observer tells the same truth.  Stopping
+a worker before persisting intent permits another process to restart it.
+Persisting intent without a common guard permits explicit sync to run anyway.
+Detaching locally before the peer acknowledges success lies about two-sided
+completion.  The final sequence uses one durable marker, one shared guard, and
+exact snapshot finalization so those bad states are unreachable.
+
+Lost responses were the second hard boundary.  A receipt table would make
+retry work but would need an unbounded retention policy.  Treating any absent
+share as success without an incarnation could let an old request detach a new
+pairing.  The relationship ID makes =Absent= safe and naturally idempotent.
+
+The filesystem boundary was subtle because removal must still work when the
+configured root is gone, but it must never adopt a replacement directory.  The
+split between exact PATH selection and durable =--share= selection preserves
+that distinction.  A pending install remains the sole reason the original root
+must be restored before removal can complete.  Exact selection also has to
+accept equivalent canonical paths.  This matters on macOS, where =/var= and
+=/tmp= commonly resolve beneath =/private=.  The implementation opens the
+requested directory without following its final component, binds that opened
+identity to the canonical spelling, queries the stored canonical root, and
+rechecks the original path before returning.
+
+Independent review found two concurrency boundaries that ordinary happy-path
+testing did not expose.  Removal originally skipped the per-share lock when no
+install journal existed, which allowed a foreground watch to remain active,
+and object collection originally lacked the global lock needed to protect an
+object captured by a different share but not yet committed.  The final code
+always acquires the share lock before inspecting recovery state and holds the
+global synchronization lock through finalization and pruning.  Review also
+found that every persistent connector round, not merely session startup, must
+consult the durable removal marker.  Deterministic regression tests now pin
+all three boundaries.
+
+The full E2E run exposed one real regression: the new removal guard initially
+ran before responder identity validation, so a wiped and re-created responder
+reported =removing= rather than the expected peer-identity mismatch.  Moving
+the guard after identity validation restored the security-relevant diagnosis
+without weakening the removal block.
+
+Coverage instrumentation also exposed a process-boundary detail.  A daemon
+test intentionally kills an unresponsive remote child; letting that child
+write LLVM's default profile could leave a truncated profile file and poison
+the coverage merge.  Only that deliberately killed test child now discards its
+profile.  Normally exiting relationship and SSH children still contribute
+coverage.
+
+* Validation and review
+
+The implementation passed:
+
+- =make check=: 61 library unit tests, 51 binary unit tests, 65 integration
+  tests across the non-Docker targets, formatting, and Clippy with warnings as
+  errors;
+- whole-project line coverage at or above the repository's 90% gate;
+- changed executable-line coverage of 2251/2479, or 90.80%;
+- =make e2e=: all 38 Docker scenarios in 243.28 seconds, including every pre-existing sync,
+  conflict, offline, filesystem-transition, persistent-watch, suspension, and
+  reconnection scenario; and
+- =git diff --check= and the final documentation-alignment pass.
+
+Independent code review covers correctness and design adherence; concurrency
+and event-loop liveness; error handling and edge cases; adversarial security;
+simplicity, interfaces, duplication, and line count; Linux/macOS filesystem
+behavior; readability and existing patterns; and documentation/comment
+alignment.  Three rounds converged with no remaining findings.  Review found
+four blockers, five important issues, and seven real cleanup or documentation
+nits.  All were fixed.  The blockers were the foreground-owner race, a missing
+persistent-round removal guard, cross-share object-pruning races, and a
+filesystem identity check/follow race.  Important fixes covered daemon recovery
+diagnostics, incoming registration identity binding, lifecycle-frame validation
+before state migration, managed-list query/state duplication, and canonical
+PATH compatibility on macOS.  The cleanup removed duplicated SSH child code,
+an obsolete compatibility shim, an unnecessary one-variant enum, and stale or
+imprecise documentation.  One parallel recovery-test failure was rejected as
+nonreproducible after its isolated rerun, the complete target rerun, and the
+serialized full suite all passed.
+
+* Remaining limits
+
+This feature does not uninstall the global per-user daemon; an idle daemon may
+remain installed with no enabled syncs.  That is not required for alpha exit.
+
+There is no automatic two-sided removal retry.  A failed removal is durable,
+disabled, visible, and manually retried.  This is intentional: only the user
+can decide that an unreachable endpoint is permanently gone and authorize
+=--local-only=.
+
+Both peers must run the upgraded binary before new pairing or removal.  Existing
+legacy relationships continue to synchronize, but the legacy registration
+shape cannot create or rebind a relationship.
+
+Removal retains recovery metadata, so object storage is not guaranteed to
+shrink.  Unreferenced ordinary synchronization objects are pruned as a cleanup
+step; a cleanup failure is reported as a warning after the relationship has
+already been safely removed.
+
+* Upgrade and testing note
+
+Install this build on both endpoints before testing.  On the connector, the
+recommended manual checks are:
+
+1. Run =flocal sync remove PATH= and answer no.  Verify =sync list= and
+   =status= are unchanged.
+2. Remove normally while both endpoints are reachable.  Verify files remain,
+   both =sync list= commands omit the relationship, and =status= says
+   =unpaired= on both sides.
+3. Take the responder offline, remove normally, and verify the connector says
+   =disabled removing= with an error.  Bring it back and rerun
+   =flocal sync remove --share SHARE=; verify both sides detach.
+4. Pair again and verify files unique to each endpoint form a fresh union.
+5. If testing disaster recovery, use =--local-only= on one endpoint and verify
+   the other still reports =responder= until it is also removed locally.
+
+The feature branch can be installed with =make install=.  Because state-schema
+changes are migrated forward on open, back up the managed state directory
+before deliberately testing binary downgrades.

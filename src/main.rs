@@ -3,7 +3,7 @@ use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,8 +14,13 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flocal::model::{Entry, PeerConfig, ShareId};
-use flocal::state::State;
-use flocal::sync::{self, InitialMessage, Message, V2Envelope, V2RoundFrame, V2SessionFrame};
+use flocal::state::{
+    EndpointBinding, IncomingRemoval, PreparedRemoval, RegistrationOutcome, State,
+};
+use flocal::sync::{
+    self, InitialMessage, Message, RegisterRelationshipResponse, RelationshipRequest,
+    RemoveRelationshipResponse, V2Envelope, V2RoundFrame, V2SessionFrame,
+};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Debug)]
@@ -156,6 +161,15 @@ enum SyncCommand {
         #[arg(long)]
         share: Option<String>,
     },
+    Remove {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        share: Option<String>,
+        #[arg(long)]
+        local_only: bool,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +204,7 @@ enum PeerCommand {
 #[derive(Subcommand)]
 enum ProtocolCommand {
     Serve,
+    Relationship,
 }
 
 #[derive(Subcommand)]
@@ -245,6 +260,14 @@ fn run() -> Result<()> {
     if let Commands::Sync(arguments) = &cli.command {
         validate_sync_arguments(arguments)?;
     }
+    if matches!(
+        &cli.command,
+        Commands::Protocol {
+            command: ProtocolCommand::Relationship
+        }
+    ) {
+        return serve_relationship();
+    }
     let mut state = State::open_default()?;
     match cli.command {
         Commands::Init { path } => {
@@ -261,7 +284,7 @@ fn run() -> Result<()> {
                 path,
                 host,
                 remote_path,
-            } => add_peer(&state, &path, &host, &remote_path)?,
+            } => add_peer(&mut state, &path, &host, &remote_path)?,
             PeerCommand::List { path, json } => list_peer(&state, &path, json)?,
         },
         Commands::Sync(SyncArgs {
@@ -314,6 +337,9 @@ fn run() -> Result<()> {
             recover_installs(&mut state)?;
             serve(&mut state)?
         }
+        Commands::Protocol {
+            command: ProtocolCommand::Relationship,
+        } => unreachable!("relationship protocol returns before state is opened"),
     }
     Ok(())
 }
@@ -323,7 +349,7 @@ fn validate_sync_arguments(arguments: &SyncArgs) -> Result<()> {
         .path
         .as_deref()
         .and_then(Path::to_str)
-        .is_some_and(|name| matches!(name, "add" | "list" | "start" | "stop"));
+        .is_some_and(|name| matches!(name, "add" | "list" | "start" | "stop" | "remove"));
     if (arguments.command.is_some() || managed_name)
         && (arguments.dry_run || arguments.yes || arguments.json)
     {
@@ -345,6 +371,10 @@ enum DaemonRequest {
     Stop {
         share: String,
     },
+    PrepareRemove {
+        share: String,
+        expected_binding: EndpointBinding,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -354,6 +384,9 @@ enum DaemonResponse {
     List {
         syncs: Vec<DaemonSync>,
         next: Option<String>,
+    },
+    Prepared {
+        removal: PreparedRemoval,
     },
     Error {
         message: String,
@@ -371,6 +404,9 @@ struct DaemonSync {
     state: String,
     diagnostic: Option<String>,
     unsettled: usize,
+    role: String,
+    registration_pending: bool,
+    removal_pending: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -438,6 +474,9 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                                 "directory is already paired to a different remote; use `flocal sync start PATH`"
                             );
                         }
+                        if peer.peer_id.is_none() {
+                            add_peer(state, &path, &host, &remote_path)?;
+                        }
                     } else {
                         add_peer(state, &path, &host, &remote_path)?;
                     }
@@ -491,7 +530,7 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"schema": 1, "syncs": syncs})
+                        &serde_json::json!({"schema": 2, "syncs": syncs})
                     )?
                 );
             } else {
@@ -501,14 +540,14 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                         (Some(host), Some(path)) => {
                             format!(
                                 "{host}:{}",
-                                bytes_path(&daemon_path_bytes(&path)?).display()
+                                bytes_path(&daemon_path_bytes(&path)?).to_string_lossy()
                             )
                         }
-                        _ => "responder only".into(),
+                        _ => "responder".into(),
                     };
                     let diagnostic = sync
                         .diagnostic
-                        .map(|value| format!("; {value}"))
+                        .map(|value| format!("; {}", escaped(&value)))
                         .unwrap_or_default();
                     let desired = if sync.enabled { "enabled" } else { "disabled" };
                     let unsettled = if sync.unsettled == 0 {
@@ -517,17 +556,26 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                         format!(
                             "; {} unsettled paths (see `flocal status {}`)",
                             sync.unsettled,
-                            root.display()
+                            escaped(&root.to_string_lossy())
                         )
                     };
+                    let guidance = if sync.removal_pending {
+                        format!("; rerun `flocal sync remove --share {}`", sync.share)
+                    } else if sync.registration_pending {
+                        "; rerun `flocal sync add` or abandon with `flocal sync remove --local-only`"
+                            .into()
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{}  {}  {}  {}{}{}",
-                        root.display(),
-                        peer,
+                        "{}  {}  {}  {}{}{}{}",
+                        escaped(&root.to_string_lossy()),
+                        escaped(&peer),
                         desired,
                         sync.state,
                         diagnostic,
                         unsettled,
+                        guidance,
                     );
                 }
             }
@@ -557,6 +605,12 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
             let share = select_share(state, path.as_deref(), share.as_deref())?;
             daemon_request(state, DaemonRequest::Stop { share: share.0 })?;
         }
+        SyncCommand::Remove {
+            path,
+            share,
+            local_only,
+            yes,
+        } => remove_sync_relationship(state, path.as_deref(), share.as_deref(), local_only, yes)?,
     }
     Ok(())
 }
@@ -594,6 +648,211 @@ fn select_share(state: &State, path: Option<&Path>, share: Option<&str>) -> Resu
             .managed_share(&ShareId(share.into()))
             .map(|share| share.id),
     }
+}
+
+fn select_share_for_removal(
+    state: &State,
+    path: Option<&Path>,
+    share: Option<&str>,
+) -> Result<ShareId> {
+    match (path, share) {
+        (Some(_), Some(_)) | (None, None) => bail!("provide exactly one of PATH or --share"),
+        (None, Some(share)) => {
+            validate_share_id(share)?;
+            state
+                .managed_share(&ShareId(share.into()))
+                .map(|share| share.id)
+        }
+        (Some(path), None) => state.find_share_by_exact_root(path).map(|(share, _)| share),
+    }
+}
+
+fn remove_sync_relationship(
+    state: &mut State,
+    path: Option<&Path>,
+    share: Option<&str>,
+    local_only: bool,
+    yes: bool,
+) -> Result<()> {
+    let share = select_share_for_removal(state, path, share)?;
+    let root = state.root_for(&share)?;
+    let binding = state.endpoint_binding(&share)?;
+    if matches!(&binding, EndpointBinding::Unpaired) {
+        println!("No relationship is configured; nothing to remove.");
+        return Ok(());
+    }
+    let pending = state.removing_relationship(&share)?.is_some();
+    let pending_install = state.install_intent(&share)?.is_some();
+
+    println!("Remove relationship for:");
+    println!("  Root:  {}", escaped(&root.to_string_lossy()));
+    println!("  Share: {}", escaped(&share.0));
+    match &binding {
+        EndpointBinding::Connector(peer) => {
+            println!("  Role:  connector");
+            println!(
+                "  Peer:  {}:{}",
+                escaped(&peer.host),
+                escaped(&bytes_path(&peer.remote_path).to_string_lossy())
+            );
+            if !local_only && peer.peer_id.is_none() {
+                bail!(
+                    "connector registration is incomplete; retry `flocal sync add` or use `flocal sync remove --local-only` to abandon it"
+                );
+            }
+        }
+        EndpointBinding::Responder { peer, .. } => {
+            println!("  Role:  responder");
+            println!("  Peer:  {}", escaped(&peer.0));
+            if !local_only {
+                bail!(
+                    "this endpoint is the responder; run this command on the machine that originally ran `flocal sync add` (peer ID {}), or use `--local-only` here only if that connector is permanently unavailable",
+                    escaped(&peer.0)
+                );
+            }
+        }
+        EndpointBinding::Unpaired => unreachable!(),
+    }
+    if local_only {
+        println!("  Scope: local endpoint only");
+        if pending {
+            println!(
+                "Warning: a prior two-sided removal may already have committed remotely even though its reply was lost."
+            );
+        } else if matches!(
+            &binding,
+            EndpointBinding::Connector(PeerConfig { peer_id: None, .. })
+        ) {
+            println!(
+                "Warning: registration may already have committed remotely even though no reply was recorded."
+            );
+            println!(
+                "Retry `flocal sync add` and then use normal removal if the responder is reachable."
+            );
+        }
+        println!(
+            "Warning: the peer may remain registered and must later run `flocal sync remove --local-only` before reusing that root."
+        );
+    } else {
+        println!("  Scope: both endpoints");
+    }
+    println!(
+        "If an earlier install was interrupted, its already-committed changes must finish before detach and may update visible entries."
+    );
+    if !yes && !confirm("Remove this relationship?")? {
+        println!("Relationship unchanged.");
+        return Ok(());
+    }
+
+    ensure_daemon(state)?;
+    let response = daemon_request(
+        state,
+        DaemonRequest::PrepareRemove {
+            share: share.0.clone(),
+            expected_binding: binding.clone(),
+        },
+    )?;
+    let DaemonResponse::Prepared { removal } = response else {
+        bail!("daemon returned an invalid removal response")
+    };
+
+    if pending_install || state.install_intent(&share)?.is_some() {
+        eprintln!("flocal: finishing an interrupted install before removal");
+    }
+    if let Err(error) = recover_daemon_share_install(state, &share) {
+        let _ = state.set_removal_diagnostic(&share, &removal.relationship, &format!("{error:#}"));
+        bail!(
+            "relationship removal is pending and disabled; retry after correcting install recovery: {error:#}"
+        )
+    }
+
+    let detached = if local_only {
+        state.finalize_local_removal(&removal)?
+    } else {
+        let remote = remove_remote_relationship(state, &removal);
+        if let Err(error) = remote {
+            let _ =
+                state.set_removal_diagnostic(&share, &removal.relationship, &format!("{error:#}"));
+            bail!(
+                "relationship removal is pending and disabled; rerun `flocal sync remove --share {}` to retry: {error:#}",
+                share.0
+            )
+        }
+        state.finalize_connector_removal(&removal)?
+    };
+    if let Some(warning) = detached.cleanup_warning {
+        eprintln!(
+            "flocal: relationship removed; object cleanup remains pending: {}",
+            escaped(&warning)
+        );
+    }
+    if local_only {
+        println!(
+            "Removed the local relationship. The peer may still require `flocal sync remove --local-only`."
+        );
+    } else {
+        println!("Removed the relationship from both endpoints.");
+    }
+    Ok(())
+}
+
+fn remove_remote_relationship(state: &State, prepared: &PreparedRemoval) -> Result<()> {
+    let EndpointBinding::Connector(peer) = &prepared.binding else {
+        bail!("two-sided removal requires a connector binding")
+    };
+    let expected_peer = peer.completed_peer_id()?.clone();
+    let remote = RelationshipRemote::spawn(
+        &peer.host,
+        &peer.executable,
+        sync::default_phase_deadline() + sync::default_frame_deadline(),
+    )?;
+    let request = RelationshipRequest::RemoveRelationship {
+        removal_protocol: sync::RELATIONSHIP_REMOVAL_PROTOCOL_VERSION,
+        share: prepared.share.clone(),
+        peer: state.peer_id()?,
+        expected_peer: expected_peer.clone(),
+        relationship: prepared.relationship.clone(),
+    };
+    let exchange = (|| -> Result<RemoveRelationshipResponse> {
+        sync::write_relationship_request_until(
+            remote.input.as_ref().context("ssh stdin unavailable")?,
+            &request,
+            remote.deadline,
+        )?;
+        sync::read_remove_relationship_response_until(
+            remote.output.as_ref().context("ssh stdout unavailable")?,
+            remote.deadline,
+        )
+    })();
+    let response = match exchange {
+        Ok(response) => response,
+        Err(error) => return Err(remote.finish_after_error(error)),
+    };
+    match response {
+        RemoveRelationshipResponse::Absent {
+            removal_protocol,
+            share,
+            peer,
+            relationship,
+        } if removal_protocol == sync::RELATIONSHIP_REMOVAL_PROTOCOL_VERSION
+            && share == prepared.share
+            && peer == expected_peer
+            && relationship == prepared.relationship => {}
+        RemoveRelationshipResponse::Error { message } => {
+            let finish = remote.finish();
+            finish?;
+            bail!(
+                "remote rejected relationship removal: {}",
+                escaped(&message)
+            )
+        }
+        _ => {
+            return Err(remote.finish_after_error(anyhow::anyhow!(
+                "remote returned a mismatched relationship-removal response"
+            )));
+        }
+    }
+    remote.finish()
 }
 
 fn daemon_socket(state: &State) -> PathBuf {
@@ -667,7 +926,12 @@ fn daemon_request(state: &State, request: DaemonRequest) -> Result<DaemonRespons
 fn daemon_request_inner(socket: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("cannot connect to {}", socket.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let read_timeout = if matches!(request, DaemonRequest::PrepareRemove { .. }) {
+        Duration::from_secs(20)
+    } else {
+        Duration::from_secs(10)
+    };
+    stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
@@ -1158,10 +1422,13 @@ fn restore_watches(
     events: &std::sync::mpsc::Sender<WorkerEvent>,
 ) -> Result<()> {
     for share in state.managed_shares()? {
-        if share.peer.is_some()
-            && share.initial_complete
+        if matches!(
+            &share.binding,
+            EndpointBinding::Connector(peer) if peer.peer_id.is_some()
+        ) && share.initial_complete
             && share.watch_enabled
             && share.blocked_diagnostic.is_none()
+            && share.removing_relationship.is_none()
         {
             start_worker(state, workers, events, share.id)?;
         }
@@ -1238,6 +1505,18 @@ fn handle_daemon_request(
                 },
             }
         }
+        Ok(DaemonRequest::PrepareRemove {
+            share,
+            expected_binding,
+        }) => {
+            let share = ShareId(share);
+            match prepare_managed_removal(state, workers, &share, &expected_binding) {
+                Ok(removal) => DaemonResponse::Prepared { removal },
+                Err(error) => DaemonResponse::Error {
+                    message: format!("{error:#}"),
+                },
+            }
+        }
         Err(error) => DaemonResponse::Error {
             message: format!("invalid daemon request: {error}"),
         },
@@ -1252,6 +1531,20 @@ fn handle_daemon_request(
     Ok(())
 }
 
+fn prepare_managed_removal(
+    state: &mut State,
+    workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
+    share: &ShareId,
+    expected_binding: &EndpointBinding,
+) -> Result<PreparedRemoval> {
+    let prepared = state.prepare_removal(share, expected_binding)?;
+    if let Err(error) = stop_worker_and_wait(workers, share) {
+        let _ = state.set_removal_diagnostic(share, &prepared.relationship, &format!("{error:#}"));
+        return Err(error);
+    }
+    Ok(prepared)
+}
+
 fn daemon_syncs(
     state: &State,
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
@@ -1259,42 +1552,56 @@ fn daemon_syncs(
     let workers = workers
         .lock()
         .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
-    state
-        .managed_shares()?
-        .into_iter()
-        .map(|share| {
-            let state_name = if share.blocked_diagnostic.is_some() {
-                "blocked"
-            } else if let Some(worker) = workers.get(&share.id) {
-                if worker.stopping.load(Ordering::Relaxed) {
-                    "stopping"
-                } else {
-                    match worker.state.load(Ordering::Relaxed) {
-                        WORKER_STARTING => "starting",
-                        WORKER_RECONNECTING => "reconnecting",
-                        WORKER_WATCHING => "watching",
-                        _ => "starting",
-                    }
-                }
+    let mut syncs = Vec::new();
+    for share in state.managed_shares()? {
+        let (role, registration_pending) = match &share.binding {
+            EndpointBinding::Connector(peer) => ("connector", peer.peer_id.is_none()),
+            EndpointBinding::Responder { .. } => ("responder", false),
+            EndpointBinding::Unpaired => continue,
+        };
+        let removal_pending = share.removing_relationship.is_some();
+        let state_name = if removal_pending {
+            "removing"
+        } else if registration_pending {
+            "registering"
+        } else if share.blocked_diagnostic.is_some() {
+            "blocked"
+        } else if let Some(worker) = workers.get(&share.id) {
+            if worker.stopping.load(Ordering::Relaxed) {
+                "stopping"
             } else {
-                "stopped"
-            };
-            Ok(DaemonSync {
-                share: share.id.0.clone(),
-                root: daemon_path(&path_bytes(&share.root)),
-                host: share.peer.as_ref().map(|peer| peer.host.clone()),
-                remote_path: share
-                    .peer
-                    .as_ref()
-                    .map(|peer| daemon_path(&peer.remote_path)),
-                enabled: share.watch_enabled,
-                initial_complete: share.initial_complete,
-                state: state_name.into(),
-                diagnostic: share.blocked_diagnostic,
-                unsettled: state.unsettled_paths(&share.id)?.len(),
-            })
-        })
-        .collect()
+                match worker.state.load(Ordering::Relaxed) {
+                    WORKER_STARTING => "starting",
+                    WORKER_RECONNECTING => "reconnecting",
+                    WORKER_WATCHING => "watching",
+                    _ => "starting",
+                }
+            }
+        } else {
+            "stopped"
+        };
+        syncs.push(DaemonSync {
+            share: share.id.0.clone(),
+            root: daemon_path(&path_bytes(&share.root)),
+            host: match &share.binding {
+                EndpointBinding::Connector(peer) => Some(peer.host.clone()),
+                EndpointBinding::Responder { .. } | EndpointBinding::Unpaired => None,
+            },
+            remote_path: match &share.binding {
+                EndpointBinding::Connector(peer) => Some(daemon_path(&peer.remote_path)),
+                EndpointBinding::Responder { .. } | EndpointBinding::Unpaired => None,
+            },
+            enabled: share.watch_enabled,
+            initial_complete: share.initial_complete,
+            state: state_name.into(),
+            diagnostic: share.blocked_diagnostic,
+            unsettled: state.unsettled_paths(&share.id)?.len(),
+            role: role.into(),
+            registration_pending,
+            removal_pending,
+        });
+    }
+    Ok(syncs)
 }
 
 fn daemon_sync_page(
@@ -1343,9 +1650,11 @@ fn start_managed_share(
     generation: Option<i64>,
 ) -> Result<()> {
     let managed = state.managed_share(&share)?;
-    if managed.peer.is_none() {
-        bail!("this machine is responder-only for the selected share");
-    }
+    state.ensure_not_removing(&share)?;
+    let EndpointBinding::Connector(peer) = &managed.binding else {
+        bail!("this machine is responder-only for the selected share")
+    };
+    peer.completed_peer_id()?;
     if !managed.initial_complete {
         bail!("initial synchronization is incomplete; rerun `flocal sync start PATH` to review it");
     }
@@ -1378,23 +1687,44 @@ fn stop_managed_share(
     state.managed_share(&share)?;
     state.set_watch_enabled(&share, false)?;
     state.clear_blocked(&share)?;
-    let finished = {
+    stop_worker_and_wait(workers, &share)
+}
+
+fn stop_worker_and_wait(
+    workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
+    share: &ShareId,
+) -> Result<()> {
+    let worker = {
         let workers = workers
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
-        workers.get(&share).map(|worker| {
+        workers.get(share).map(|worker| {
             worker.stopping.store(true, Ordering::Relaxed);
             worker.stop.store(true, Ordering::Relaxed);
-            worker.finished.clone()
+            (worker.finished.clone(), worker.child.clone())
         })
     };
-    if let Some(finished) = finished {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    if let Some((finished, child)) = worker {
+        let deadline = std::time::Instant::now() + Duration::from_secs(9);
         while !finished.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
         if !finished.load(Ordering::Relaxed) {
-            bail!("sync stop is still waiting for the active round to finish; it remains disabled");
+            let mut child = child
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon worker child state is poisoned"))?;
+            if let Some(mut child) = child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            drop(child);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !finished.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if !finished.load(Ordering::Relaxed) {
+                bail!("sync stop could not end the active worker; it remains disabled");
+            }
         }
     }
     Ok(())
@@ -1460,6 +1790,7 @@ fn run_daemon_worker(
     state.validate_root_identity(share)?;
     let root = state.root_for(share)?;
     let _share_lock = state.lock_share(share)?;
+    state.ensure_not_removing(share)?;
     live.store(WORKER_RECONNECTING, Ordering::Relaxed);
     persistent_watch_loop_control(
         &mut state,
@@ -1518,7 +1849,11 @@ fn recover_daemon_installs(state: &mut State) -> Result<()> {
     for (share, intent) in state.install_intents()? {
         let recovery = recover_daemon_share_install_locked(state, &share, &intent);
         if let Err(error) = recovery {
-            state.set_blocked(&share, &format!("{error:#}"))?;
+            if let Some(relationship) = state.removing_relationship(&share)? {
+                state.set_removal_diagnostic(&share, &relationship, &format!("{error:#}"))?;
+            } else {
+                state.set_blocked(&share, &format!("{error:#}"))?;
+            }
         }
     }
     Ok(())
@@ -1526,10 +1861,12 @@ fn recover_daemon_installs(state: &mut State) -> Result<()> {
 
 fn recover_daemon_share_install(state: &mut State, share: &ShareId) -> Result<()> {
     let _global_lock = state.lock_global_sync()?;
+    let _share_lock = state.lock_share(share)?;
     let Some(intent) = state.install_intent(share)? else {
         return Ok(());
     };
-    recover_daemon_share_install_locked(state, share, &intent)
+    state.validate_root_identity(share)?;
+    recover_install_plan(state, share, &intent)
 }
 
 fn recover_daemon_share_install_locked(
@@ -1598,45 +1935,106 @@ fn e2e_claim_install_recovery_delay(state: &State) -> Result<Option<PathBuf>> {
     Ok(Some(claimed))
 }
 
-fn add_peer(state: &State, path: &Path, host: &str, remote_path: &Path) -> Result<()> {
+fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> Result<()> {
     validate_host(host)?;
     if !remote_path.is_absolute() {
         bail!("--remote-path must be absolute");
     }
     let (share, _) = state.find_share(path)?;
     let executable = discover_executable(host)?;
-    let mut remote = Remote::spawn(host, &executable)?;
-    sync::write_message(
-        &mut remote.input,
-        &Message::Register {
-            protocol: sync::PROTOCOL_VERSION,
-            share: share.clone(),
-            peer: state.peer_id()?,
-            root: path_bytes(remote_path),
-        },
+    let expected = state.endpoint_binding(&share)?;
+    let prepared = state.prepare_connector_registration(
+        &share,
+        &expected,
+        host,
+        &path_bytes(remote_path),
+        &executable,
     )?;
-    let peer_id = match sync::read_message(&mut remote.output)? {
-        Message::Accepted { protocol, peer } if protocol == sync::PROTOCOL_VERSION => peer,
-        Message::Accepted { .. } => bail!("remote protocol version is incompatible"),
-        Message::Error { message } => bail!("remote rejected pairing: {}", escaped(&message)),
-        other => bail!("unexpected pairing response: {other:?}"),
+    let relationship = prepared
+        .relationship
+        .clone()
+        .context("prepared connector is missing its relationship identity")?;
+    let remote = match RelationshipRemote::spawn(
+        &prepared.host,
+        &prepared.executable,
+        Duration::from_secs(30),
+    ) {
+        Ok(remote) => remote,
+        Err(error) => {
+            let _ = state.set_blocked(&share, &format!("{error:#}"));
+            bail!(
+                "connector registration remains prepared; rerun `flocal sync add` after correcting the SSH launch failure: {error:#}"
+            )
+        }
+    };
+    let request = RelationshipRequest::RegisterRelationship {
+        registration_protocol: sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION,
+        share: share.clone(),
+        peer: state.peer_id()?,
+        root: prepared.remote_path.clone(),
+        relationship: relationship.clone(),
+    };
+    let exchange = (|| -> Result<RegisterRelationshipResponse> {
+        sync::write_relationship_request_until(
+            remote.input.as_ref().context("ssh stdin unavailable")?,
+            &request,
+            remote.deadline,
+        )?;
+        sync::read_register_relationship_response_until(
+            remote.output.as_ref().context("ssh stdout unavailable")?,
+            remote.deadline,
+        )
+    })();
+    let response = match exchange {
+        Ok(response) => response,
+        Err(error) => {
+            let error = remote.finish_after_error(error);
+            let _ = state.set_blocked(&share, &format!("{error:#}"));
+            bail!(
+                "connector registration remains prepared; ensure both peers are upgraded and rerun `flocal sync add`: {error:#}"
+            )
+        }
+    };
+    let (peer_id, prior_share) = match response {
+        RegisterRelationshipResponse::Registered {
+            registration_protocol,
+            share: accepted_share,
+            peer,
+            relationship: accepted_relationship,
+            prior_share,
+        } if registration_protocol == sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION
+            && accepted_share == share
+            && accepted_relationship == relationship =>
+        {
+            (peer, prior_share)
+        }
+        RegisterRelationshipResponse::Error { message } => {
+            remote.finish()?;
+            state.set_blocked(&share, &message)?;
+            bail!("remote rejected pairing: {}", escaped(&message))
+        }
+        _ => {
+            return Err(remote.finish_after_error(anyhow::anyhow!(
+                "remote returned a mismatched relationship-registration response"
+            )));
+        }
     };
     remote.finish()?;
-    state.set_peer(
-        &share,
-        &PeerConfig {
-            peer_id,
-            host: host.into(),
-            remote_path: path_bytes(remote_path),
-            executable,
-        },
-    )?;
+    state.complete_connector_registration(&share, &prepared, &peer_id)?;
+    state.clear_blocked(&share)?;
     println!(
         "Connected {} to {}:{}",
-        share.0,
-        host,
-        remote_path.display()
+        escaped(&share.0),
+        escaped(&prepared.host),
+        escaped(&bytes_path(&prepared.remote_path).to_string_lossy())
     );
+    if let Some(prior_share) = prior_share {
+        println!(
+            "Responder remapped retained root from {} to {}.",
+            escaped(&prior_share.0),
+            escaped(&share.0)
+        );
+    }
     Ok(())
 }
 
@@ -1649,7 +2047,16 @@ fn list_peer(state: &State, path: &Path, json: bool) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({"schema": 1, "peer": peer}))?
         );
     } else if let Some(peer) = peer {
-        println!("{}:{}", peer.host, bytes_path(&peer.remote_path).display());
+        println!(
+            "{}:{}{}",
+            escaped(&peer.host),
+            escaped(&bytes_path(&peer.remote_path).to_string_lossy()),
+            if peer.peer_id.is_none() {
+                " (registration pending)"
+            } else {
+                ""
+            }
+        );
     } else {
         println!("No peer configured");
     }
@@ -1685,6 +2092,7 @@ fn run_sync(
     let _global_lock = state.lock_global_sync()?;
     let (share, _) = state.find_share(path)?;
     let _share_lock = state.lock_share(&share)?;
+    state.ensure_not_removing(&share)?;
     state.clear_pending_objects(&share)?;
     state.prune_unreferenced_objects()?;
     let peer = state
@@ -1709,7 +2117,7 @@ fn run_sync(
         Message::Accepted {
             protocol,
             peer: actual,
-        } if protocol == sync::PROTOCOL_VERSION && actual == peer.peer_id => {}
+        } if protocol == sync::PROTOCOL_VERSION && &actual == peer.completed_peer_id()? => {}
         Message::Accepted { .. } => bail!("remote protocol or peer identity changed"),
         Message::Error { message } => bail!("remote rejected sync: {}", escaped(&message)),
         other => bail!("unexpected handshake response: {other:?}"),
@@ -1899,6 +2307,152 @@ fn serve(state: &mut State) -> Result<()> {
     }
 }
 
+fn serve_relationship() -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let request = sync::read_relationship_request_until(
+        &stdin,
+        std::time::Instant::now() + Duration::from_secs(30),
+    )?;
+    let mut state = State::open_default()?;
+    match handle_relationship_request(&mut state, request)? {
+        RelationshipResponse::Register(response) => {
+            sync::write_register_relationship_response_until(
+                &stdout,
+                &response,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )
+        }
+        RelationshipResponse::Remove(response) => sync::write_remove_relationship_response_until(
+            &stdout,
+            &response,
+            std::time::Instant::now() + sync::default_frame_deadline(),
+        ),
+    }
+}
+
+enum RelationshipResponse {
+    Register(RegisterRelationshipResponse),
+    Remove(RemoveRelationshipResponse),
+}
+
+fn handle_relationship_request(
+    state: &mut State,
+    request: RelationshipRequest,
+) -> Result<RelationshipResponse> {
+    match request {
+        RelationshipRequest::RegisterRelationship {
+            registration_protocol,
+            share,
+            peer,
+            root,
+            relationship,
+        } => {
+            let response = if registration_protocol
+                != sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION
+            {
+                RegisterRelationshipResponse::Error {
+                    message: bounded_relationship_error(
+                        "unsupported relationship-registration protocol version",
+                    ),
+                }
+            } else {
+                match state.register_relationship(&share, &bytes_path(&root), &peer, &relationship)
+                {
+                    Ok(RegistrationOutcome { prior_share }) => {
+                        RegisterRelationshipResponse::Registered {
+                            registration_protocol: sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION,
+                            share,
+                            peer: state.peer_id()?,
+                            relationship,
+                            prior_share,
+                        }
+                    }
+                    Err(error) => RegisterRelationshipResponse::Error {
+                        message: bounded_relationship_error(&format!("{error:#}")),
+                    },
+                }
+            };
+            Ok(RelationshipResponse::Register(response))
+        }
+        RelationshipRequest::RemoveRelationship {
+            removal_protocol,
+            share,
+            peer,
+            expected_peer,
+            relationship,
+        } => {
+            let local_peer = state.peer_id()?;
+            let response = if removal_protocol != sync::RELATIONSHIP_REMOVAL_PROTOCOL_VERSION
+                || expected_peer != local_peer
+            {
+                RemoveRelationshipResponse::Error {
+                    message: bounded_relationship_error("relationship binding does not match"),
+                }
+            } else {
+                match state.prepare_incoming_removal(&share, &peer, &relationship) {
+                    Ok(IncomingRemoval::Absent) => RemoveRelationshipResponse::Absent {
+                        removal_protocol: sync::RELATIONSHIP_REMOVAL_PROTOCOL_VERSION,
+                        share,
+                        peer: local_peer,
+                        relationship,
+                    },
+                    Ok(IncomingRemoval::Prepared(prepared)) => {
+                        let removal = recover_daemon_share_install(state, &share)
+                            .and_then(|()| state.detach_incoming_relationship(&prepared));
+                        match removal {
+                            Ok(detached) => {
+                                if let Some(warning) = detached.cleanup_warning {
+                                    eprintln!(
+                                        "flocal: relationship removed; object cleanup remains pending: {}",
+                                        escaped(&warning)
+                                    );
+                                }
+                                RemoveRelationshipResponse::Absent {
+                                    removal_protocol: sync::RELATIONSHIP_REMOVAL_PROTOCOL_VERSION,
+                                    share,
+                                    peer: local_peer,
+                                    relationship,
+                                }
+                            }
+                            Err(error) => {
+                                let _ = state.set_removal_diagnostic(
+                                    &share,
+                                    &prepared.relationship,
+                                    &format!("{error:#}"),
+                                );
+                                RemoveRelationshipResponse::Error {
+                                    message: bounded_relationship_error(&format!("{error:#}")),
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => RemoveRelationshipResponse::Error {
+                        message: bounded_relationship_error("relationship binding does not match"),
+                    },
+                }
+            };
+            Ok(RelationshipResponse::Remove(response))
+        }
+    }
+}
+
+fn bounded_relationship_error(message: &str) -> String {
+    let mut bytes = 0usize;
+    message
+        .chars()
+        .take_while(|character| {
+            let next = bytes.saturating_add(character.len_utf8());
+            if next > sync::MAX_RELATIONSHIP_ERROR_BYTES {
+                false
+            } else {
+                bytes = next;
+                true
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn serve_io(
     state: &mut State,
@@ -1931,31 +2485,9 @@ fn serve_initial(
                 )?;
                 return Ok(());
             }
-            let _global_lock = match state.lock_global_sync() {
-                Ok(lock) => lock,
-                Err(error) => {
-                    sync::write_message(
-                        &mut output,
-                        &Message::Error {
-                            message: format!("{error:#}"),
-                        },
-                    )?;
-                    return Ok(());
-                }
-            };
-            let _share_lock = match state.lock_share(&share) {
-                Ok(lock) => lock,
-                Err(error) => {
-                    sync::write_message(
-                        &mut output,
-                        &Message::Error {
-                            message: format!("{error:#}"),
-                        },
-                    )?;
-                    return Ok(());
-                }
-            };
-            if let Err(error) = state.register_share_bound(&share, &bytes_path(&root), &peer) {
+            if let Err(error) =
+                state.acknowledge_legacy_registration(&share, &bytes_path(&root), &peer)
+            {
                 sync::write_message(
                     &mut output,
                     &Message::Error {
@@ -2016,6 +2548,15 @@ fn serve_initial(
                     &mut output,
                     &Message::Error {
                         message: "peer identity mismatch".into(),
+                    },
+                )?;
+                return Ok(());
+            }
+            if let Err(error) = state.ensure_not_removing(&share) {
+                sync::write_message(
+                    &mut output,
+                    &Message::Error {
+                        message: format!("{error:#}"),
                     },
                 )?;
                 return Ok(());
@@ -2082,6 +2623,15 @@ fn serve_watch_open(
             V2SessionFrame::Error {
                 retryable: false,
                 message: "peer identity mismatch".into(),
+            },
+        );
+    }
+    if let Err(error) = state.ensure_not_removing(&share) {
+        return write_v2_session(
+            output,
+            V2SessionFrame::Error {
+                retryable: false,
+                message: format!("{error:#}"),
             },
         );
     }
@@ -2154,6 +2704,15 @@ fn serve_watch_open(
     let mut round = 0u64;
     let mut invalidation_cycle = InvalidationCycle::default();
     loop {
+        if let Err(error) = state.ensure_not_removing(&share) {
+            return write_v2_session(
+                output,
+                V2SessionFrame::Error {
+                    retryable: false,
+                    message: format!("{error:#}"),
+                },
+            );
+        }
         if watch_rx.try_recv().is_ok() {
             debounce.notify(std::time::Instant::now());
         }
@@ -2676,6 +3235,7 @@ fn serve_v2_round(
     deferred: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<ServedRound> {
     let _global_lock = state.lock_global_sync()?;
+    state.ensure_not_removing(share)?;
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
@@ -3041,7 +3601,28 @@ fn ensure_connector_recovery_limits(
 
 fn status(state: &State, path: &Path, json: bool) -> Result<()> {
     let (share, root) = state.find_share(path)?;
-    let peer = state.peer(&share)?;
+    let managed = state.managed_share(&share)?;
+    let (relationship_state, bound_peer) = if managed.removing_relationship.is_some() {
+        (
+            "removing",
+            match &managed.binding {
+                EndpointBinding::Connector(peer) => peer.peer_id.clone(),
+                EndpointBinding::Responder { peer, .. } => Some(peer.clone()),
+                EndpointBinding::Unpaired => None,
+            },
+        )
+    } else {
+        match &managed.binding {
+            EndpointBinding::Connector(peer) if peer.peer_id.is_none() => ("registering", None),
+            EndpointBinding::Connector(peer) => ("connector", peer.peer_id.clone()),
+            EndpointBinding::Responder { peer, .. } => ("responder", Some(peer.clone())),
+            EndpointBinding::Unpaired => ("unpaired", None),
+        }
+    };
+    let removal_pending = managed.removing_relationship.is_some();
+    let removal_error = removal_pending
+        .then(|| managed.blocked_diagnostic.clone())
+        .flatten();
     let records = state.records(&share)?;
     let entries = records
         .iter()
@@ -3054,20 +3635,27 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         .any(|(pending, _)| pending == &share);
     let unsettled = state.unsettled_paths(&share)?;
     let recovery = state.recovery_usage(&share)?;
+    let peer = match &managed.binding {
+        EndpointBinding::Connector(peer) => Some(peer),
+        EndpointBinding::Responder { .. } | EndpointBinding::Unpaired => None,
+    };
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":4,"share":share.0,"root":root,"peer":peer,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install,"unsettled":unsettled,"recovery":recovery})
+            serde_json::json!({"schema":5,"share":share.0,"root":root,"peer":peer,"bound_peer":bound_peer,"relationship_state":relationship_state,"removal_pending":removal_pending,"removal_error":removal_error,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install,"unsettled":unsettled,"recovery":recovery})
         );
     } else {
-        println!("Share: {}", share.0);
-        println!("Root:  {}", root.display());
+        println!("Share: {}", escaped(&share.0));
+        println!("Root:  {}", escaped(&root.to_string_lossy()));
         println!(
             "Peer:  {}",
-            peer.as_ref()
-                .map(|p| p.host.as_str())
-                .unwrap_or("not configured")
+            peer.map(|p| escaped(&p.host))
+                .unwrap_or_else(|| "not configured".into())
         );
+        println!("Relationship: {relationship_state}");
+        if let Some(peer) = bound_peer {
+            println!("Bound peer: {}", escaped(&peer.0));
+        }
         println!("Entries: {entries}");
         println!("Tombstones: {tombstones}");
         println!(
@@ -3095,6 +3683,15 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         );
         if pending_install {
             println!("Warning: an interrupted install will be recovered by the next sync/watch");
+        }
+        if removal_pending {
+            println!(
+                "Removal is pending; rerun `flocal sync remove --share {}`.",
+                escaped(&share.0)
+            );
+            if let Some(error) = removal_error {
+                println!("Last removal error: {}", escaped(&error));
+            }
         }
         if !unsettled.is_empty() {
             println!("Unsettled paths:");
@@ -3417,7 +4014,7 @@ fn restart_after_recovery(
     if !blocked {
         return Ok(());
     }
-    if managed.watch_enabled && managed.peer.is_some() {
+    if managed.watch_enabled && matches!(&managed.binding, EndpointBinding::Connector(_)) {
         let restart = || -> Result<()> {
             ensure_daemon(state)?;
             daemon_request(
@@ -3436,7 +4033,7 @@ fn restart_after_recovery(
             )
         })?;
         eprintln!("flocal: restarted the managed synchronization worker");
-    } else if managed.peer.is_none() {
+    } else if !matches!(&managed.binding, EndpointBinding::Connector(_)) {
         eprintln!(
             "flocal: this installation is the responder; on the connector, run `flocal sync start PATH` with root {}",
             root.display()
@@ -3947,7 +4544,7 @@ fn persistent_watch_session_io(
                     protocol,
                     peer: actual,
                 },
-        } if protocol == sync::WATCH_PROTOCOL_VERSION && actual == peer.peer_id => {}
+        } if protocol == sync::WATCH_PROTOCOL_VERSION && &actual == peer.completed_peer_id()? => {}
         V2Envelope::Session {
             frame: V2SessionFrame::Error { retryable, message },
         } => {
@@ -4316,6 +4913,7 @@ fn connector_v2_round(
     deferred: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<ConnectorRound> {
     let _global_lock = state.lock_global_sync()?;
+    state.ensure_not_removing(share)?;
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
@@ -4868,6 +5466,14 @@ struct Remote {
     stderr: std::thread::JoinHandle<Vec<u8>>,
 }
 
+struct RelationshipRemote {
+    child: Option<Child>,
+    input: Option<ChildStdin>,
+    output: Option<ChildStdout>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    deadline: std::time::Instant,
+}
+
 enum PersistentEvent {
     Wake,
 }
@@ -4879,45 +5485,70 @@ struct PersistentRemote {
     stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
 
+struct SshProtocolChild {
+    child: Child,
+    input: ChildStdin,
+    output: ChildStdout,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+}
+
+fn spawn_ssh_protocol(host: &str, executable: &str, protocol: &str) -> Result<SshProtocolChild> {
+    validate_host(host)?;
+    validate_executable(executable)?;
+    let command = format!("{executable} protocol {protocol}");
+    let mut child = Command::new("ssh")
+        .args([
+            "-T",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=2",
+            host,
+            &command,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let input = child.stdin.take().context("ssh stdin unavailable")?;
+    let output = child.stdout.take().context("ssh stdout unavailable")?;
+    let stderr = drain_bounded_stderr(child.stderr.take().context("ssh stderr unavailable")?);
+    Ok(SshProtocolChild {
+        child,
+        input,
+        output,
+        stderr,
+    })
+}
+
+fn drain_bounded_stderr(mut child_stderr: ChildStderr) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match child_stderr.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) if kept.len() < 64 * 1024 => {
+                    let remaining = 64 * 1024 - kept.len();
+                    kept.extend_from_slice(&buffer[..count.min(remaining)]);
+                }
+                Ok(_) => {}
+            }
+        }
+        kept
+    })
+}
+
 impl PersistentRemote {
     fn spawn(host: &str, executable: &str, child_slot: Arc<Mutex<Option<Child>>>) -> Result<Self> {
-        validate_host(host)?;
-        validate_executable(executable)?;
-        let command = format!("{executable} protocol serve");
-        let mut child = Command::new("ssh")
-            .args([
-                "-T",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=2",
-                host,
-                &command,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let input = child.stdin.take().context("ssh stdin unavailable")?;
-        let output = child.stdout.take().context("ssh stdout unavailable")?;
-        let mut child_stderr = child.stderr.take().context("ssh stderr unavailable")?;
-        let stderr = std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut buffer = [0u8; 8192];
-            loop {
-                match child_stderr.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(count) if kept.len() < 64 * 1024 => {
-                        let remaining = 64 * 1024 - kept.len();
-                        kept.extend_from_slice(&buffer[..count.min(remaining)]);
-                    }
-                    Ok(_) => {}
-                }
-            }
-            kept
-        });
+        let SshProtocolChild {
+            child,
+            input,
+            output,
+            stderr,
+        } = spawn_ssh_protocol(host, executable, "serve")?;
         *child_slot
             .lock()
             .map_err(|_| anyhow::anyhow!("persistent remote child state is poisoned"))? =
@@ -4947,49 +5578,16 @@ impl Drop for PersistentRemote {
 
 impl Remote {
     fn spawn(host: &str, executable: &str) -> Result<Self> {
-        validate_host(host)?;
-        validate_executable(executable)?;
-        let command = format!("{executable} protocol serve");
-        let mut child = Command::new("ssh")
-            .args([
-                "-T",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=2",
-                host,
-                &command,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let input = BufWriter::new(child.stdin.take().context("ssh stdin unavailable")?);
-        let output = BufReader::new(TimedReader::new(
-            child.stdout.take().context("ssh stdout unavailable")?,
-        ));
-        let mut child_stderr = child.stderr.take().context("ssh stderr unavailable")?;
-        let stderr = std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut buffer = [0u8; 8192];
-            loop {
-                match child_stderr.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(count) if kept.len() < 64 * 1024 => {
-                        let remaining = 64 * 1024 - kept.len();
-                        kept.extend_from_slice(&buffer[..count.min(remaining)]);
-                    }
-                    Ok(_) => {}
-                }
-            }
-            kept
-        });
-        Ok(Self {
+        let SshProtocolChild {
             child,
             input,
             output,
+            stderr,
+        } = spawn_ssh_protocol(host, executable, "serve")?;
+        Ok(Self {
+            child,
+            input: BufWriter::new(input),
+            output: BufReader::new(TimedReader::new(output)),
             stderr,
         })
     }
@@ -5015,6 +5613,93 @@ impl Remote {
             status.ok(),
             escaped(&String::from_utf8_lossy(&stderr))
         )
+    }
+}
+
+impl RelationshipRemote {
+    fn spawn(host: &str, executable: &str, timeout: Duration) -> Result<Self> {
+        let SshProtocolChild {
+            child,
+            input,
+            output,
+            stderr,
+        } = spawn_ssh_protocol(host, executable, "relationship")?;
+        Ok(Self {
+            child: Some(child),
+            input: Some(input),
+            output: Some(output),
+            stderr: Some(stderr),
+            deadline: std::time::Instant::now() + timeout,
+        })
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.input.take();
+        self.output.take();
+        let child = self.child.take().context("ssh child is unavailable")?;
+        let status = wait_relationship_child(child, self.deadline)?;
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default();
+        if !status.success() {
+            bail!(
+                "ssh exited with {status}: {}",
+                escaped(&String::from_utf8_lossy(&stderr))
+            )
+        }
+        Ok(())
+    }
+
+    fn finish_after_error(mut self, error: anyhow::Error) -> anyhow::Error {
+        self.input.take();
+        self.output.take();
+        let status = self.child.take().map(|mut child| {
+            let _ = child.kill();
+            child.wait().ok()
+        });
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "{error:#}; remote exited with {:?}: {}",
+            status.flatten(),
+            escaped(&String::from_utf8_lossy(&stderr))
+        )
+    }
+}
+
+impl Drop for RelationshipRemote {
+    fn drop(&mut self) {
+        self.input.take();
+        self.output.take();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
+    }
+}
+
+fn wait_relationship_child(
+    mut child: Child,
+    deadline: std::time::Instant,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("relationship protocol process exceeded its deadline")
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -5167,6 +5852,193 @@ mod tests {
                 entry,
             },
         }
+    }
+
+    fn test_connector(peer: &str) -> PeerConfig {
+        PeerConfig {
+            peer_id: Some(flocal::model::PeerId(peer.into())),
+            relationship: None,
+            host: "test-peer".into(),
+            remote_path: b"/remote".to_vec(),
+            executable: "/bin/false".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn serve_test_daemon(
+        state_dir: &Path,
+        requests: usize,
+    ) -> Result<std::thread::JoinHandle<Result<()>>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let run = state_dir.join("run");
+        std::fs::create_dir_all(&run)?;
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
+        let socket = run.join("daemon.sock");
+        match std::fs::remove_file(&socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let listener = std::os::unix::net::UnixListener::bind(socket)?;
+        let state_dir = state_dir.to_path_buf();
+        Ok(std::thread::spawn(move || {
+            let mut state = State::open(state_dir)?;
+            let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let (events, _event_rx) = std::sync::mpsc::channel();
+            for stream in listener.incoming().take(requests) {
+                handle_daemon_request(&mut state, &workers, &events, stream?)?;
+            }
+            Ok(())
+        }))
+    }
+
+    #[test]
+    fn relationship_handler_is_versioned_bound_and_idempotent() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("remote-root");
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = ShareId("share-relationship-handler".into());
+        let connector = flocal::model::PeerId("peer-connector".into());
+        let relationship = flocal::model::RelationshipId::generate();
+
+        let register = |protocol| RelationshipRequest::RegisterRelationship {
+            registration_protocol: protocol,
+            share: share.clone(),
+            peer: connector.clone(),
+            root: path_bytes(&root),
+            relationship: relationship.clone(),
+        };
+        assert!(matches!(
+            handle_relationship_request(
+                &mut state,
+                register(sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION + 1)
+            )?,
+            RelationshipResponse::Register(RegisterRelationshipResponse::Error { .. })
+        ));
+        assert!(matches!(
+            handle_relationship_request(
+                &mut state,
+                register(sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION)
+            )?,
+            RelationshipResponse::Register(RegisterRelationshipResponse::Registered { .. })
+        ));
+        assert!(matches!(
+            handle_relationship_request(
+                &mut state,
+                register(sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION)
+            )?,
+            RelationshipResponse::Register(RegisterRelationshipResponse::Registered { .. })
+        ));
+
+        let local_peer = state.peer_id()?;
+        let remove = |expected_peer, peer| RelationshipRequest::RemoveRelationship {
+            removal_protocol: sync::RELATIONSHIP_REMOVAL_PROTOCOL_VERSION,
+            share: share.clone(),
+            peer,
+            expected_peer,
+            relationship: relationship.clone(),
+        };
+        assert!(matches!(
+            handle_relationship_request(
+                &mut state,
+                remove(
+                    flocal::model::PeerId("wrong-endpoint".into()),
+                    connector.clone()
+                )
+            )?,
+            RelationshipResponse::Remove(RemoveRelationshipResponse::Error { .. })
+        ));
+        assert!(matches!(
+            handle_relationship_request(
+                &mut state,
+                remove(
+                    local_peer.clone(),
+                    flocal::model::PeerId("wrong-connector".into())
+                )
+            )?,
+            RelationshipResponse::Remove(RemoveRelationshipResponse::Error { .. })
+        ));
+        assert!(matches!(
+            handle_relationship_request(&mut state, remove(local_peer.clone(), connector.clone()))?,
+            RelationshipResponse::Remove(RemoveRelationshipResponse::Absent { .. })
+        ));
+        assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        assert!(matches!(
+            handle_relationship_request(&mut state, remove(local_peer, connector))?,
+            RelationshipResponse::Remove(RemoveRelationshipResponse::Absent { .. })
+        ));
+
+        let bounded = bounded_relationship_error(&"é".repeat(5000));
+        assert_eq!(bounded.len(), sync::MAX_RELATIONSHIP_ERROR_BYTES);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relationship_cli_selectors_and_status_cover_every_durable_role() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+
+        assert_eq!(select_share_for_removal(&state, Some(&root), None)?, share);
+        assert_eq!(
+            select_share_for_removal(&state, None, Some(&share.0))?,
+            share
+        );
+        assert!(select_share_for_removal(&state, None, None).is_err());
+        assert!(select_share_for_removal(&state, Some(&root), Some(&share.0)).is_err());
+        assert!(select_share_for_removal(&state, Some(&nested), None).is_err());
+        assert!(select_share_for_removal(&state, None, Some("bad share")).is_err());
+        let link = temp.path().join("root-link");
+        std::os::unix::fs::symlink(&root, &link)?;
+        assert!(select_share_for_removal(&state, Some(&link), None).is_err());
+
+        status(&state, &root, false)?;
+        status(&state, &root, true)?;
+        remove_sync_relationship(&mut state, Some(&root), None, false, true)?;
+
+        let prepared = state.prepare_connector_registration(
+            &share,
+            &EndpointBinding::Unpaired,
+            "host",
+            b"/remote",
+            "/flocal",
+        )?;
+        status(&state, &root, false)?;
+        assert!(remove_sync_relationship(&mut state, Some(&root), None, false, true).is_err());
+        assert!(prepared.peer_id.is_none());
+        let daemon = serve_test_daemon(&state.dir, 2)?;
+        remove_sync_relationship(&mut state, Some(&root), None, true, true)?;
+        daemon.join().expect("test daemon joins")?;
+
+        let responder = flocal::model::PeerId("peer-responder-view".into());
+        state.register_relationship(
+            &share,
+            &root,
+            &responder,
+            &flocal::model::RelationshipId::generate(),
+        )?;
+        status(&state, &root, false)?;
+        assert!(remove_sync_relationship(&mut state, None, Some(&share.0), false, true).is_err());
+        let binding = state.endpoint_binding(&share)?;
+        let removal = state.prepare_removal(&share, &binding)?;
+        state.set_removal_diagnostic(&share, &removal.relationship, "offline")?;
+        state.set_install_intent(&share, &[])?;
+        status(&state, &root, false)?;
+        status(&state, &root, true)?;
+        let syncs = daemon_syncs(
+            &state,
+            &Arc::new(Mutex::new(std::collections::HashMap::new())),
+        )?;
+        assert_eq!(syncs[0].state, "removing");
+        let daemon = serve_test_daemon(&state.dir, 2)?;
+        remove_sync_relationship(&mut state, None, Some(&share.0), true, true)?;
+        daemon.join().expect("test daemon joins")?;
+        Ok(())
     }
 
     #[test]
@@ -5875,17 +6747,13 @@ mod tests {
         let root = temp.path().join("watch-root");
         std::fs::create_dir(&root)?;
         let mut state = State::open(temp.path().join("watch-state"))?;
-        let share = state.init_share(&root)?;
+        let share = ShareId("share-watch-setup".into());
         let bound_peer = flocal::model::PeerId("bound-peer".into());
-        state.register_share_bound(&share, &root, &bound_peer)?;
-        state.set_peer(
+        state.register_relationship(
             &share,
-            &flocal::model::PeerConfig {
-                host: "host".into(),
-                executable: "/flocal".into(),
-                remote_path: path_bytes(&root),
-                peer_id: bound_peer.clone(),
-            },
+            &root,
+            &bound_peer,
+            &flocal::model::RelationshipId::generate(),
         )?;
 
         let reject = |state: &mut State, protocol, peer| -> Result<V2SessionFrame> {
@@ -6094,17 +6962,13 @@ mod tests {
         let root = temp.path().join("idle-root");
         std::fs::create_dir(&root)?;
         let mut state = State::open(temp.path().join("idle-state"))?;
-        let share = state.init_share(&root)?;
+        let share = ShareId("share-idle".into());
         let peer = flocal::model::PeerId("idle-peer".into());
-        state.register_share_bound(&share, &root, &peer)?;
-        state.set_peer(
+        state.register_relationship(
             &share,
-            &flocal::model::PeerConfig {
-                host: "host".into(),
-                executable: "/flocal".into(),
-                remote_path: path_bytes(&root),
-                peer_id: peer.clone(),
-            },
+            &root,
+            &peer,
+            &flocal::model::RelationshipId::generate(),
         )?;
         let (client_output, server_input) = UnixStream::pair()?;
         let (server_output, client_input) = UnixStream::pair()?;
@@ -6386,7 +7250,8 @@ mod tests {
             host: "in-process".into(),
             executable: "/flocal".into(),
             remote_path: path_bytes(&remote_root),
-            peer_id: expected_remote_peer,
+            peer_id: Some(expected_remote_peer),
+            relationship: None,
         };
         let watch_state = flocal::watch::WatchState::default();
         let (_events_tx, events_rx) = std::sync::mpsc::sync_channel(1);
@@ -6501,7 +7366,7 @@ mod tests {
         result?;
         assert!(matches!(
             sync::read_message(&mut output.as_slice())?,
-            Message::Accepted { .. }
+            Message::Error { .. }
         ));
 
         for message in [
@@ -6534,7 +7399,7 @@ mod tests {
         result?;
         assert!(matches!(
             sync::read_message(&mut output.as_slice())?,
-            Message::Error { message } if message == "peer identity mismatch"
+            Message::Error { .. }
         ));
         assert!(initial_message(Message::Done)?.0.is_err());
         Ok(())
@@ -6548,7 +7413,12 @@ mod tests {
         let mut state = State::open(temp.path().join("state"))?;
         let share = ShareId("share-bound".into());
         let peer = flocal::model::PeerId("peer-bound".into());
-        state.register_share_bound(&share, &root, &peer)?;
+        state.register_relationship(
+            &share,
+            &root,
+            &peer,
+            &flocal::model::RelationshipId::generate(),
+        )?;
         let mut input = Vec::new();
         sync::write_message(
             &mut input,
@@ -6575,7 +7445,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_reports_lock_and_binding_failures() -> Result<()> {
+    fn legacy_registration_rejects_creation_and_rebinding() -> Result<()> {
         fn register(
             state: &mut State,
             share: &ShareId,
@@ -6605,7 +7475,7 @@ mod tests {
         let peer = flocal::model::PeerId("peer-register".into());
         assert!(matches!(
             register(&mut state, &share, &peer, &first)?,
-            Message::Accepted { .. }
+            Message::Error { .. }
         ));
         assert!(matches!(
             register(&mut state, &share, &peer, &second)?,
@@ -6620,19 +7490,6 @@ mod tests {
             )?,
             Message::Error { .. }
         ));
-
-        let global = state.lock_global_sync()?;
-        assert!(matches!(
-            register(&mut state, &ShareId("global-lock".into()), &peer, &first)?,
-            Message::Error { .. }
-        ));
-        drop(global);
-        let share_lock = state.lock_share(&ShareId("share-lock".into()))?;
-        assert!(matches!(
-            register(&mut state, &ShareId("share-lock".into()), &peer, &first)?,
-            Message::Error { .. }
-        ));
-        drop(share_lock);
         Ok(())
     }
 
@@ -6755,6 +7612,7 @@ mod tests {
         std::fs::create_dir(&root)?;
         let mut state = State::open(temp.path().join("state"))?;
         let share = state.init_share(&root)?;
+        state.set_peer(&share, &test_connector("peer-list"))?;
         state.set_watch_enabled(&share, true)?;
         state.set_blocked(&share, "repair required")?;
         let (server, mut client) = UnixStream::pair()?;
@@ -6789,11 +7647,12 @@ mod tests {
     #[test]
     fn daemon_list_pages_large_valid_state() -> Result<()> {
         let temp = tempdir()?;
-        let state = State::open(temp.path().join("state"))?;
+        let mut state = State::open(temp.path().join("state"))?;
         for index in 0..20 {
             let root = temp.path().join(format!("root-{index}"));
             std::fs::create_dir(&root)?;
             let share = state.init_share(&root)?;
+            state.set_peer(&share, &test_connector(&format!("peer-{index}")))?;
             state.set_blocked(&share, &"x".repeat(4096))?;
         }
         let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -6830,6 +7689,76 @@ mod tests {
     }
 
     #[test]
+    fn removal_owns_the_share_and_blocks_every_connector_round() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let mut state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+
+        let foreground_owner = state.lock_share(&share)?;
+        let mut competing = State::open(&state_dir)?;
+        assert!(recover_daemon_share_install(&mut competing, &share).is_err());
+        drop(foreground_owner);
+
+        state.set_peer(&share, &test_connector("peer-removing"))?;
+        let root = sync::ShareRoot::open(&state, &share)?;
+        let binding = state.endpoint_binding(&share)?;
+        state.prepare_removal(&share, &binding)?;
+        let (local, _remote) = UnixStream::pair()?;
+        let mut pending_remote_generation = 0;
+        let error = match connector_v2_round(
+            &mut state,
+            &share,
+            &root,
+            1,
+            0,
+            0,
+            &local,
+            &local,
+            &mut pending_remote_generation,
+            &Default::default(),
+        ) {
+            Ok(_) => bail!("a removal-pending connector began another round"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("relationship removal is pending")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_recovery_failure_updates_a_pending_removal_diagnostic() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let connector = test_connector("peer-removing");
+        state.set_peer(&share, &connector)?;
+        let removal = state.prepare_removal(&share, &EndpointBinding::Connector(connector))?;
+        state.set_install_intent(&share, &[])?;
+        std::fs::rename(&root, temp.path().join("root-moved"))?;
+
+        recover_daemon_installs(&mut state)?;
+
+        let managed = state.managed_share(&share)?;
+        assert_eq!(managed.removing_relationship, Some(removal.relationship));
+        assert!(
+            managed
+                .blocked_diagnostic
+                .is_some_and(|message| message.contains("configured root"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn managed_controls_validate_state_and_stop_a_worker() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("root");
@@ -6849,7 +7778,8 @@ mod tests {
         state.set_peer(
             &share,
             &PeerConfig {
-                peer_id: flocal::model::PeerId("peer-test".into()),
+                peer_id: Some(flocal::model::PeerId("peer-test".into())),
+                relationship: None,
                 host: "example.invalid".into(),
                 remote_path: path_bytes(Path::new("/remote")),
                 executable: "/bin/false".into(),
@@ -6895,7 +7825,8 @@ mod tests {
         state.set_peer(
             &share,
             &PeerConfig {
-                peer_id: flocal::model::PeerId("peer-test".into()),
+                peer_id: Some(flocal::model::PeerId("peer-test".into())),
+                relationship: None,
                 host: "127.0.0.1".into(),
                 remote_path: path_bytes(Path::new("/remote")),
                 executable: "/bin/false".into(),
@@ -6966,6 +7897,7 @@ mod tests {
         std::fs::create_dir(&root)?;
         let mut state = State::open(temp.path().join("state"))?;
         let share = state.init_share(&root)?;
+        state.set_peer(&share, &test_connector("peer-live"))?;
         state.set_initial_complete(&share)?;
         state.set_watch_enabled(&share, true)?;
         let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));

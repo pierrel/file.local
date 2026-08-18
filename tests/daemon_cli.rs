@@ -63,7 +63,7 @@ fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
     stop_daemon(&mut daemon)?;
     assert!(output.status.success(), "{:?}", output);
     let listing: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(listing["schema"], 1);
+    assert_eq!(listing["schema"], 2);
     assert_eq!(listing["syncs"], serde_json::json!([]));
     Ok(())
 }
@@ -117,11 +117,21 @@ fn daemon_cli_follows_paginated_sync_lists() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let temporary = tempfile::Builder::new().prefix("f").tempdir_in("/tmp")?;
     let state_dir = temporary.path().join("state");
-    let state = State::open(&state_dir)?;
+    let mut state = State::open(&state_dir)?;
     for index in 0..20 {
         let root = temporary.path().join(format!("root-{index}"));
         std::fs::create_dir(&root)?;
         let share = state.init_share(&root)?;
+        state.set_peer(
+            &share,
+            &flocal::model::PeerConfig {
+                peer_id: Some(flocal::model::PeerId(format!("peer-{index}"))),
+                relationship: None,
+                host: "test-peer".into(),
+                remote_path: b"/remote".to_vec(),
+                executable: "/bin/false".into(),
+            },
+        )?;
         state.set_blocked(&share, &"x".repeat(4096))?;
     }
     drop(state);
@@ -245,12 +255,13 @@ exec sleep 600
     std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755))?;
 
     let binary = env!("CARGO_BIN_EXE_flocal");
-    let state = State::open(&state_dir)?;
+    let mut state = State::open(&state_dir)?;
     let share = state.init_share(&root)?;
     state.set_peer(
         &share,
         &flocal::model::PeerConfig {
-            peer_id: flocal::model::PeerId("peer-test".into()),
+            peer_id: Some(flocal::model::PeerId("peer-test".into())),
+            relationship: None,
             host: "test-peer".into(),
             remote_path: b"/remote".to_vec(),
             executable: binary.into(),
@@ -311,19 +322,20 @@ fn sync_add_pairs_then_starts_and_stops_a_managed_watch() -> Result<()> {
     std::fs::create_dir_all(&remote_root)?;
     std::fs::create_dir(&bin_dir)?;
     let fake_ssh = bin_dir.join("ssh");
-    std::fs::write(
-        &fake_ssh,
-        r#"#!/bin/sh
+    let fake_ssh_script = r#"#!/bin/sh
 for arg do last=$arg; done
 case "$last" in
 *"command -v flocal"*)
   printf '%s\n' "$FLOCAL_BIN"
   exit 0
   ;;
+*"protocol relationship"*)
+  exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLOCAL_BIN" protocol relationship
+  ;;
 esac
-exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLOCAL_BIN" protocol serve
-"#,
-    )?;
+exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLOCAL_BIN" protocol serve
+"#;
+    std::fs::write(&fake_ssh, fake_ssh_script)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -422,6 +434,7 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLOCAL_BIN" protocol serve
     assert_eq!(syncs["syncs"].as_array().map(Vec::len), Some(1));
     assert_eq!(syncs["syncs"][0]["enabled"], true);
     assert_eq!(syncs["syncs"][0]["initial_complete"], true);
+    assert_eq!(syncs["syncs"][0]["role"], "connector");
     let share = syncs["syncs"][0]["share"]
         .as_str()
         .context("managed share has an id")?
@@ -498,6 +511,52 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLOCAL_BIN" protocol serve
             anyhow::bail!("restored root did not resume synchronization");
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+    std::fs::write(&fake_ssh, "#!/bin/sh\nexit 1\n")?;
+    let offline_remove = invoke(&[
+        "sync",
+        "remove",
+        local_root.to_str().context("test root is utf-8")?,
+        "--yes",
+    ])?;
+    assert!(!offline_remove.status.success());
+    let pending_status = invoke(&[
+        "status",
+        local_root.to_str().context("test root is utf-8")?,
+        "--json",
+    ])?;
+    assert!(pending_status.status.success(), "{:?}", pending_status);
+    let pending_status: serde_json::Value = serde_json::from_slice(&pending_status.stdout)?;
+    assert_eq!(pending_status["relationship_state"], "removing");
+    assert_eq!(pending_status["removal_pending"], true);
+    std::fs::write(&fake_ssh, fake_ssh_script)?;
+    let removed = invoke(&[
+        "sync",
+        "remove",
+        local_root.to_str().context("test root is utf-8")?,
+        "--yes",
+    ])?;
+    assert!(removed.status.success(), "{:?}", removed);
+    let listing = invoke(&["sync", "list", "--json"])?;
+    assert!(listing.status.success(), "{:?}", listing);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&listing.stdout)?["syncs"],
+        serde_json::json!([])
+    );
+    for (state_dir, root) in [(&local_state, &local_root), (&remote_state, &remote_root)] {
+        let status = Command::new(binary)
+            .args([
+                "status",
+                root.to_str().context("test root is utf-8")?,
+                "--json",
+            ])
+            .env("FLOCAL_STATE_DIR", state_dir)
+            .output()?;
+        assert!(status.status.success(), "{:?}", status);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        assert_eq!(status["schema"], 5);
+        assert_eq!(status["relationship_state"], "unpaired");
+        assert_eq!(status["removal_pending"], false);
     }
     stop_daemon(&mut daemon)
 }

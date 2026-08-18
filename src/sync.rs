@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::model::{Entry, ObjectHash, PeerId, Record, RelativePath, ShareId};
+use crate::model::{Entry, ObjectHash, PeerId, Record, RelationshipId, RelativePath, ShareId};
 use crate::reconcile::{MergeCandidate, Plan, reconcile};
 use crate::scan::{IgnoreMatcher, preview_cap_with_ignores, scan_cap, scan_cap_with_ignores};
 pub use crate::state::RootIdentityChanged;
@@ -15,6 +15,11 @@ use crate::state::{InstallTempPhase, RootIdentity, State};
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
 pub const SYNC_PROTOCOL_VERSION: u32 = 3;
 pub const WATCH_PROTOCOL_VERSION: u32 = 5;
+pub const RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION: u32 = 1;
+pub const RELATIONSHIP_REMOVAL_PROTOCOL_VERSION: u32 = 1;
+pub const MAX_RELATIONSHIP_ID_BYTES: usize = 128;
+pub const MAX_RELATIONSHIP_ROOT_BYTES: usize = 16 * 1024;
+pub const MAX_RELATIONSHIP_ERROR_BYTES: usize = 4096;
 /// Compatibility name for the existing one-shot synchronization protocol.
 pub const PROTOCOL_VERSION: u32 = SYNC_PROTOCOL_VERSION;
 pub const MAX_RECORDS_PER_SESSION: usize = 1_000_000;
@@ -240,6 +245,161 @@ pub enum InitialMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RelationshipRequest {
+    RegisterRelationship {
+        registration_protocol: u32,
+        share: ShareId,
+        peer: PeerId,
+        root: Vec<u8>,
+        relationship: RelationshipId,
+    },
+    RemoveRelationship {
+        removal_protocol: u32,
+        share: ShareId,
+        peer: PeerId,
+        expected_peer: PeerId,
+        relationship: RelationshipId,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RegisterRelationshipResponse {
+    Registered {
+        registration_protocol: u32,
+        share: ShareId,
+        peer: PeerId,
+        relationship: RelationshipId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior_share: Option<ShareId>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoveRelationshipResponse {
+    Absent {
+        removal_protocol: u32,
+        share: ShareId,
+        peer: PeerId,
+        relationship: RelationshipId,
+    },
+    Error {
+        message: String,
+    },
+}
+
+pub fn validate_relationship_request(request: &RelationshipRequest) -> Result<()> {
+    match request {
+        RelationshipRequest::RegisterRelationship {
+            share,
+            peer,
+            root,
+            relationship,
+            ..
+        } => {
+            validate_relationship_wire_id("share", &share.0)?;
+            validate_relationship_wire_id("peer", &peer.0)?;
+            validate_relationship_wire_id("relationship", &relationship.0)?;
+            validate_relationship_root(root)
+        }
+        RelationshipRequest::RemoveRelationship {
+            share,
+            peer,
+            expected_peer,
+            relationship,
+            ..
+        } => {
+            validate_relationship_wire_id("share", &share.0)?;
+            validate_relationship_wire_id("peer", &peer.0)?;
+            validate_relationship_wire_id("expected peer", &expected_peer.0)?;
+            validate_relationship_wire_id("relationship", &relationship.0)
+        }
+    }
+}
+
+pub fn validate_register_relationship_response(
+    response: &RegisterRelationshipResponse,
+) -> Result<()> {
+    match response {
+        RegisterRelationshipResponse::Registered {
+            share,
+            peer,
+            relationship,
+            prior_share,
+            ..
+        } => {
+            validate_relationship_wire_id("share", &share.0)?;
+            validate_relationship_wire_id("peer", &peer.0)?;
+            validate_relationship_wire_id("relationship", &relationship.0)?;
+            if let Some(prior_share) = prior_share {
+                validate_relationship_wire_id("prior share", &prior_share.0)?;
+            }
+            Ok(())
+        }
+        RegisterRelationshipResponse::Error { message } => validate_relationship_error(message),
+    }
+}
+
+pub fn validate_remove_relationship_response(response: &RemoveRelationshipResponse) -> Result<()> {
+    match response {
+        RemoveRelationshipResponse::Absent {
+            share,
+            peer,
+            relationship,
+            ..
+        } => {
+            validate_relationship_wire_id("share", &share.0)?;
+            validate_relationship_wire_id("peer", &peer.0)?;
+            validate_relationship_wire_id("relationship", &relationship.0)
+        }
+        RemoveRelationshipResponse::Error { message } => validate_relationship_error(message),
+    }
+}
+
+fn validate_relationship_wire_id(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_RELATIONSHIP_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!(
+            "{kind} ID must be 1 to {MAX_RELATIONSHIP_ID_BYTES} ASCII letters, digits, '-' or '_'"
+        );
+    }
+    Ok(())
+}
+
+fn validate_relationship_root(root: &[u8]) -> Result<()> {
+    if root.len() > MAX_RELATIONSHIP_ROOT_BYTES {
+        bail!("relationship root exceeds {MAX_RELATIONSHIP_ROOT_BYTES} bytes");
+    }
+    if root.is_empty() || root.contains(&0) {
+        bail!("relationship root must be non-empty and contain no NUL byte");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if !Path::new(std::ffi::OsStr::from_bytes(root)).is_absolute() {
+            bail!("relationship root must be absolute");
+        }
+    }
+    Ok(())
+}
+
+fn validate_relationship_error(message: &str) -> Result<()> {
+    if message.len() > MAX_RELATIONSHIP_ERROR_BYTES {
+        bail!("relationship error exceeds {MAX_RELATIONSHIP_ERROR_BYTES} UTF-8 bytes");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum V2Envelope {
     Session { frame: V2SessionFrame },
@@ -344,6 +504,27 @@ fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     let mut bytes = vec![0u8; length];
     reader.read_exact(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_frame_until<T: DeserializeOwned>(reader: &impl AsFd, deadline: Instant) -> Result<T> {
+    let mut length = [0u8; 4];
+    read_exact_until(reader, &mut length, deadline)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_FRAME {
+        bail!("protocol frame too large");
+    }
+    let mut bytes = vec![0u8; length];
+    read_exact_until(reader, &mut bytes, deadline)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_frame_until(writer: &impl AsFd, frame: &impl Serialize, deadline: Instant) -> Result<()> {
+    let bytes = serde_json::to_vec(frame)?;
+    if bytes.len() > MAX_FRAME {
+        bail!("protocol frame too large");
+    }
+    write_all_until(writer, &(bytes.len() as u32).to_be_bytes(), deadline)?;
+    write_all_until(writer, &bytes, deadline)
 }
 
 pub fn read_v2_envelope_until(reader: &impl AsFd, deadline: Instant) -> Result<V2Envelope> {
@@ -516,6 +697,106 @@ pub fn write_initial_message(writer: &mut impl Write, message: &InitialMessage) 
 
 pub fn read_initial_message(reader: &mut impl Read) -> Result<InitialMessage> {
     read_frame(reader)
+}
+
+pub fn write_relationship_request(
+    writer: &mut impl Write,
+    request: &RelationshipRequest,
+) -> Result<()> {
+    validate_relationship_request(request)?;
+    write_frame(writer, request)
+}
+
+pub fn read_relationship_request(reader: &mut impl Read) -> Result<RelationshipRequest> {
+    let request = read_frame(reader)?;
+    validate_relationship_request(&request)?;
+    Ok(request)
+}
+
+pub fn write_relationship_request_until(
+    writer: &impl AsFd,
+    request: &RelationshipRequest,
+    deadline: Instant,
+) -> Result<()> {
+    validate_relationship_request(request)?;
+    write_frame_until(writer, request, deadline)
+}
+
+pub fn read_relationship_request_until(
+    reader: &impl AsFd,
+    deadline: Instant,
+) -> Result<RelationshipRequest> {
+    let request = read_frame_until(reader, deadline)?;
+    validate_relationship_request(&request)?;
+    Ok(request)
+}
+
+pub fn write_register_relationship_response(
+    writer: &mut impl Write,
+    response: &RegisterRelationshipResponse,
+) -> Result<()> {
+    validate_register_relationship_response(response)?;
+    write_frame(writer, response)
+}
+
+pub fn read_register_relationship_response(
+    reader: &mut impl Read,
+) -> Result<RegisterRelationshipResponse> {
+    let response = read_frame(reader)?;
+    validate_register_relationship_response(&response)?;
+    Ok(response)
+}
+
+pub fn write_register_relationship_response_until(
+    writer: &impl AsFd,
+    response: &RegisterRelationshipResponse,
+    deadline: Instant,
+) -> Result<()> {
+    validate_register_relationship_response(response)?;
+    write_frame_until(writer, response, deadline)
+}
+
+pub fn read_register_relationship_response_until(
+    reader: &impl AsFd,
+    deadline: Instant,
+) -> Result<RegisterRelationshipResponse> {
+    let response = read_frame_until(reader, deadline)?;
+    validate_register_relationship_response(&response)?;
+    Ok(response)
+}
+
+pub fn write_remove_relationship_response(
+    writer: &mut impl Write,
+    response: &RemoveRelationshipResponse,
+) -> Result<()> {
+    validate_remove_relationship_response(response)?;
+    write_frame(writer, response)
+}
+
+pub fn read_remove_relationship_response(
+    reader: &mut impl Read,
+) -> Result<RemoveRelationshipResponse> {
+    let response = read_frame(reader)?;
+    validate_remove_relationship_response(&response)?;
+    Ok(response)
+}
+
+pub fn write_remove_relationship_response_until(
+    writer: &impl AsFd,
+    response: &RemoveRelationshipResponse,
+    deadline: Instant,
+) -> Result<()> {
+    validate_remove_relationship_response(response)?;
+    write_frame_until(writer, response, deadline)
+}
+
+pub fn read_remove_relationship_response_until(
+    reader: &impl AsFd,
+    deadline: Instant,
+) -> Result<RemoveRelationshipResponse> {
+    let response = read_frame_until(reader, deadline)?;
+    validate_remove_relationship_response(&response)?;
+    Ok(response)
 }
 
 pub fn write_v2_envelope(writer: &mut impl Write, envelope: &V2Envelope) -> Result<()> {
