@@ -119,8 +119,13 @@ fn active_foreground_watch_keeps_removal_pending_without_detaching_the_peer() ->
     let watch = a.watch_start()?;
     watch.wait_for_log("Peer connected")?;
 
-    a.sync_remove_expect_err("another sync/watch operation already owns this share")?;
+    a.sync_remove_expect_err("another sync/watch session already owns this share")?;
     a.assert_sync_removing()?;
+    anyhow::ensure!(
+        a.status()?.removal_error.is_some_and(
+            |error| error.contains("another sync/watch session already owns this share")
+        )
+    );
     b.assert_sync_role("responder")?;
 
     watch.stop()?;

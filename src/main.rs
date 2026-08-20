@@ -1773,7 +1773,9 @@ fn prepare_managed_removal(
     expected_binding: &EndpointBinding,
 ) -> Result<PreparedRemoval> {
     let prepared = state.prepare_removal(share, expected_binding)?;
-    if let Err(error) = stop_worker_and_wait(workers, share) {
+    let ownership = stop_worker_and_wait(workers, share)
+        .and_then(|()| state.lock_share_session(share).map(drop));
+    if let Err(error) = ownership {
         let _ = state.set_removal_diagnostic(share, &prepared.relationship, &format!("{error:#}"));
         return Err(error);
     }
@@ -2470,7 +2472,9 @@ fn validate_sync_binding(
     remote_peer: &PeerId,
     relationship: &RelationshipId,
 ) -> Result<ValidatedSyncBinding> {
-    let managed = state.managed_share(share)?;
+    let managed = state
+        .managed_share(share)
+        .context("peer identity mismatch")?;
     if managed.removing_relationship.is_some() {
         bail!("relationship removal is pending");
     }
@@ -3375,7 +3379,7 @@ fn run_sync_attempt(
     managed_initial_generation: Option<i64>,
 ) -> Result<SyncAttempt> {
     let (share, _) = state.find_share(path)?;
-    let _session_lock = state.lock_share_session(&share)?;
+    let session_lock = state.lock_share_session(&share)?;
     state.begin_install_intent_retry(&share)?;
     let operation = if state.initial_complete(&share)? {
         SyncOperation::Sync
@@ -3599,31 +3603,41 @@ fn run_sync_attempt(
         sync::apply_complete_plan(state, &share, &plan)?;
         None
     };
-    if let Some(request) = managed_request {
-        daemon_request(
+    let post_commit = (|| -> Result<(Option<Vec<u8>>, Result<()>)> {
+        let current = state.records(&share)?;
+        sync::validate_ack_heads(&remote_heads, &remote_heads)?;
+        let shared_heads = sync::intersect_heads(&current, &remote_heads)?;
+        state.acknowledge_shared_heads(&share, &shared_heads)?;
+        state.prune_unreferenced_objects()?;
+        let committed_report = if report == PlanReport::Watch {
+            let mut output = Vec::new();
+            write_plan_report(&mut output, &local, &remote_records, &plan, json, report)?;
+            Some(output)
+        } else {
+            None
+        };
+        let finalization = sync::write_heads(&mut remote.input, &shared_heads)
+            .and_then(|()| sync::write_message(&mut remote.input, &Message::CommitAck))
+            .and_then(|()| remote.finish());
+        Ok((committed_report, finalization))
+    })();
+    let installation = installation.finish();
+    drop(session_lock);
+    let managed_handoff = if let Some(request) = managed_request {
+        let result = daemon_request(
             state,
             DaemonRequest::Start {
                 share: share.0.clone(),
             },
-        )?;
+        );
         request.release_for_reclaim();
-    }
-    let current = state.records(&share)?;
-    sync::validate_ack_heads(&remote_heads, &remote_heads)?;
-    let shared_heads = sync::intersect_heads(&current, &remote_heads)?;
-    state.acknowledge_shared_heads(&share, &shared_heads)?;
-    state.prune_unreferenced_objects()?;
-    let committed_report = if report == PlanReport::Watch {
-        let mut output = Vec::new();
-        write_plan_report(&mut output, &local, &remote_records, &plan, json, report)?;
-        Some(output)
+        result.map(|_| ())
     } else {
-        None
+        Ok(())
     };
-    let finalization = sync::write_heads(&mut remote.input, &shared_heads)
-        .and_then(|()| sync::write_message(&mut remote.input, &Message::CommitAck))
-        .and_then(|()| remote.finish());
-    installation.finish()?;
+    let (committed_report, finalization) = post_commit?;
+    installation?;
+    managed_handoff?;
     if report == PlanReport::Watch {
         Ok(SyncAttempt::Complete(SyncCompletion {
             watch_report: committed_report,
@@ -5817,8 +5831,9 @@ fn watch(state: &mut State, path: &Path) -> Result<()> {
     if !state.initial_complete(&share)? {
         bail!("initial synchronization is incomplete; run `flocal sync PATH` and confirm it first");
     }
-    state.begin_install_intent_retry(&share)?;
     let _session_lock = state.lock_share_session(&share)?;
+    state.ensure_not_removing(&share)?;
+    state.begin_install_intent_retry(&share)?;
     watch_log(&mut io::stdout(), &format!("Watching {}", root.display()))?;
     persistent_watch_loop(state, &share, &root, &mut io::stdout(), &mut io::stderr())
 }
@@ -10075,6 +10090,27 @@ mod tests {
             Ok(_) => bail!("a removal-pending connector began another round"),
             Err(error) => error,
         };
+        assert!(
+            error
+                .to_string()
+                .contains("relationship removal is pending")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foreground_watch_rechecks_removal_after_owning_the_session() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_initial_complete(&share)?;
+        let connector = test_connector("peer-removing");
+        state.set_peer(&share, &connector)?;
+        state.prepare_removal(&share, &EndpointBinding::Connector(connector))?;
+
+        let error = watch(&mut state, &root).expect_err("removal must prevent a new watch");
         assert!(
             error
                 .to_string()

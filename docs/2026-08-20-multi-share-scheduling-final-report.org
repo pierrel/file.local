@@ -192,13 +192,15 @@ If a concurrent stop or reconfiguration changes the generation, none of those
 state changes commit.  The system cannot claim the initial sync is complete
 while silently leaving its managed watch disabled.
 
-Immediately after the atomic commit, the client asks the daemon to reclaim the
-same queue row while the client still holds its shared liveness lock.  The
-daemon worker takes a second shared lock before the client releases its own, so
-later protocol-finalization errors cannot lose the FIFO ticket.  The daemon
-also reconciles enabled durable intents once a second and at startup.  If every
-owner crashes, cleanup removes the dead row and that durable intent creates a
-replacement; an ownerless row can never strand the completed share.
+After the atomic commit, the client finishes acknowledgement and installation
+bookkeeping, then releases its share-session lock.  Only then does it ask the
+daemon to reclaim the same queue row while the client still holds its shared
+liveness lock.  The daemon worker takes a second shared lock before the client
+releases its own, so neither protocol-finalization nor daemon-request errors
+can lose the FIFO ticket.  The daemon also reconciles enabled durable intents
+once a second and at startup.  If every owner crashes, cleanup removes the dead
+row and that durable intent creates a replacement; an ownerless row can never
+strand the completed share.
 
 The daemon serializes =Start=, =Stop=, and =PrepareRemove= control requests
 through one in-process mutex.  This mutex does not serialize synchronization
@@ -522,23 +524,44 @@ before network submission.  Both real daemons stop there, direct status proves
 both rows, and only then does the test release the race.  That made the test an
 assertion about the intended invariant instead of a probability.
 
+The first complete CI E2E run exposed a different ownership handoff.  An
+initial managed sync published its durable watch request and immediately asked
+the daemon to start while the initiating process still owned the same share's
+session lock.  The daemon worker lost that nonblocking lock race once, recorded
+the share as blocked, and exited.  The fix is an ordered transfer: capture all
+fallible post-commit bookkeeping, finish the installation permit, release the
+foreground session lock, synchronously let the daemon reclaim the still-owned
+queue request, and only then propagate a saved error.  Capturing the entire
+post-commit tail matters because ordinary Rust =?= returns would otherwise
+drop =QueueRequest= and cancel the just-published FIFO row.
+
+That CI run also made the manual-watch removal boundary visible.  Removal now
+publishes its durable marker, stops a daemon-owned worker, and then checks the
+share-session lock.  A surviving foreground watch leaves removal pending with
+the ownership reason stored in status.  Conversely, a newly starting watch
+takes the session lock and rechecks the removal marker under that ownership.
+Whichever side wins first therefore excludes the other without a timing
+window, and the user never receives a successful detach while an old watch can
+retain the root.
+
 * Validation and review
 
 The local deterministic gates pass:
 
 - =make coverage COVERAGE_BASE=github/main=, including all non-Docker tests.
-- Whole-project line coverage: 17,996 of 19,577, or 91.92 percent.
-- Changed executable lines: 5,675 of 6,199, or 91.55 percent.
+- Whole-project line coverage: 18,020 of 19,605, or 91.92 percent.
+- Changed executable lines: 5,694 of 6,207, or 91.74 percent.
 - =cargo fmt --all -- --check=.
 - =cargo clippy --all-targets --all-features -- -D warnings=.
 - =git diff --check=.
-- All six =scenarios::multi_share::= Docker E2Es, serially, in 51.73 seconds.
+- All 44 Docker E2Es, serially, in 260.13 seconds.  This includes the six
+  =scenarios::multi_share::= acceptance scenarios.
 
 The local review loop has covered correctness and logic, concurrency and
 liveness, error handling and edge cases, adversarial security, simplicity and
 duplication, design adherence, cross-platform/filesystem behavior, and a
-dedicated documentation-alignment pass.  Eight rounds ran, including the
-post-CI-fix pass.  The blocker-level
+dedicated documentation-alignment pass.  Twelve rounds ran, including four
+passes driven by the complete CI E2E result.  The blocker-level
 finding was the ownerless managed row that could permanently stop the whole
 installation; overlapping shared ownership fixed it.  Important findings fixed
 during the rounds include authority-starvation ordering, detached recovery
@@ -556,9 +579,13 @@ post-CI security pass generalized that cleanup to every one-shot SSH exit and
 added an explicit final protocol acknowledgement before bounded process
 shutdown.  That prevents a malformed or hostile session from leaking a child
 or retaining the installation permit without interrupting legitimate
-post-commit database work.
+post-commit database work.  The complete CI E2E job then exposed the
+same-share client-to-daemon lock race described above.  Review of that fix
+found and closed the early-return queue cancellation path, the two-sided
+foreground-watch/removal start race, and a missing durable ownership
+diagnostic.
 Each substantive fix was followed by focused tests, the complete deterministic
-gate, and another affected review pass.  The eighth round ended with zero
+gate, and another affected review pass.  The twelfth round ended with zero
 blocker, important, or minor findings across all lenses.
 
 GitHub CI and the bridge-period Copilot review are the remaining external gates

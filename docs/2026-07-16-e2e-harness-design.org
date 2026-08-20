@@ -145,9 +145,11 @@ fn offline_deletion_propagates_and_nothing_resurrects() -> Result<()> {
     b.offline()?;
     a.remove_dir_all("dir")?;
     for _ in 0..3 {
-        a.sync_expect_offline()?; // a watch cycle: refresh, then fail to reach b
+        a.sync_expect_offline()?;
     }
-    a.assert_status(|s| s.tombstones == Some(2))?; // exactly dir and dir/child
+    // No paired reservation completed, so status remains the last completed scan.
+    a.assert_status(|s| s.entries == 2 && s.tombstones == Some(0))?;
+    a.assert_absent("dir")?;
 
     b.online()?;
     a.sync()?;
@@ -735,10 +737,10 @@ Two rules:
 
 1. *Scenarios drive =flocal sync= explicitly.* It is synchronous, so a
    scenario is deterministic end to end: act, sync, assert — no waiting.
-   The "several watch cycles while offline" element of the tombstone story is
-   modeled as repeated =sync_expect_offline()= calls, which is exactly what a
-   watch cycle does (refresh local state, fail to connect) per the loop in
-   =src/main.rs=; this keeps the headline scenario fully deterministic.
+   The repeated =sync_expect_offline()= calls prove that failures before the
+   paired installation reservation do not mutate the persisted scan.  The
+   successful round after reconnection rescans, creates the tombstones, and
+   propagates the deletion; this keeps the headline scenario deterministic.
 2. *=watch= gets a small testability hook and few scenarios.* The watch loop
    hardcodes its 30-second rescan (=rx.recv_timeout(Duration::from_secs(30))=
    in =src/main.rs=), which would make every watch scenario cost tens of
