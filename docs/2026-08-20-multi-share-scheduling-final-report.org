@@ -549,18 +549,18 @@ retain the root.
 The local deterministic gates pass:
 
 - =make coverage COVERAGE_BASE=github/main=, including all non-Docker tests.
-- Whole-project line coverage: 18,014 of 19,605, or 91.88 percent.
-- Changed executable lines: 5,709 of 6,239, or 91.51 percent.
+- Whole-project line coverage: 17,996 of 19,605, or 91.79 percent.
+- Changed executable lines: 5,689 of 6,239, or 91.18 percent.
 - =cargo fmt --all -- --check=.
 - =cargo clippy --all-targets --all-features -- -D warnings=.
 - =git diff --check=.
-- All 44 Docker E2Es, serially, in 256.53 seconds.  This includes the six
+- All 44 Docker E2Es, serially, in 247.64 seconds.  This includes the six
   =scenarios::multi_share::= acceptance scenarios.
 
 The local review loop has covered correctness and logic, concurrency and
 liveness, error handling and edge cases, adversarial security, simplicity and
 duplication, design adherence, cross-platform/filesystem behavior, and a
-dedicated documentation-alignment pass.  Fifteen rounds ran, including four
+dedicated documentation-alignment pass.  Nineteen rounds ran, including four
 passes driven by the complete CI E2E result.  The blocker-level
 finding was the ownerless managed row that could permanently stop the whole
 installation; overlapping shared ownership fixed it.  Important findings fixed
@@ -601,6 +601,20 @@ early file-visibility assertion and caught a remaining immediate status check.
 The fourteenth reviewed its bounded replacement and caught the dropped complete
 queued-state validation.  The fifteenth restored that validation and ended
 clean across all lenses.
+
+The fourth bridge-period Copilot review found a separate test-harness lifecycle
+problem: a newly added daemon test could return early and leave its daemon
+running.  Every daemon CLI test now spawns through a small owning guard.  Normal
+shutdown consumes and disarms the guard; an early =Result= return or panic runs
+the same bounded shutdown from Rust's =Drop= mechanism.  The existing
+unresponsive-SSH test now deliberately drops the guard, waits through forced
+daemon shutdown, and proves the exact remote process is gone.  Four more local
+rounds rejected an attempted process-group fix because it would let Ctrl-C or CI
+cancellation orphan the new group, then found and fixed two real harness races:
+signalling a daemon PID after it had already been reaped, and accepting an empty
+PID marker as proof of cleanup.  The nineteenth round ended clean across
+correctness, process-lifecycle, security, portability, simplicity, test-quality,
+and documentation-alignment lenses.
 
 GitHub CI and the bridge-period Copilot review run on every published candidate.
 Their head-specific dispositions live in the pull request and bridge ledger so
