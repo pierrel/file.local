@@ -208,9 +208,17 @@ removal has concluded that no worker exists.
 
 ** Reserving two installations without deadlock
 
-The one-shot protocol is version 4 and the persistent protocol is version 6.
+The one-shot protocol is version 5 and the persistent protocol is version 6.
 For a relationship round, the installation with the lower peer ID is the
 ordering authority even when the connector is on the higher-ID side.
+
+Version 5 also closes the one-shot session explicitly.  The responder sends a
+final =Done= only after processing =CommitAck= or =Cancel= and releasing the
+installation permit.  The connector uses
+the existing session deadline for that real protocol work and applies its
+short process-exit bound only afterward.  All abandoned one-shot sessions kill
+and reap their SSH child, so an error cannot leave the remote installation
+permit held by an orphaned process.
 
 The higher side first records a =pending_authority= row.  The lower authority
 assigns a =network_order= in its own namespace and publishes =ProxyIssue=.  The
@@ -519,17 +527,18 @@ assertion about the intended invariant instead of a probability.
 The local deterministic gates pass:
 
 - =make coverage COVERAGE_BASE=github/main=, including all non-Docker tests.
-- Whole-project line coverage: 17,845 of 19,481, or 91.60 percent.
-- Changed executable lines: 5,511 of 6,075, or 90.72 percent.
+- Whole-project line coverage: 17,975 of 19,577, or 91.82 percent.
+- Changed executable lines: 5,600 of 6,124, or 91.44 percent.
 - =cargo fmt --all -- --check=.
 - =cargo clippy --all-targets --all-features -- -D warnings=.
 - =git diff --check=.
-- All six =scenarios::multi_share::= Docker E2Es, serially, in 37.42 seconds.
+- All six =scenarios::multi_share::= Docker E2Es, serially, in 51.73 seconds.
 
 The local review loop has covered correctness and logic, concurrency and
 liveness, error handling and edge cases, adversarial security, simplicity and
 duplication, design adherence, cross-platform/filesystem behavior, and a
-dedicated documentation-alignment pass.  Five rounds ran.  The blocker-level
+dedicated documentation-alignment pass.  Eight rounds ran, including the
+post-CI-fix pass.  The blocker-level
 finding was the ownerless managed row that could permanently stop the whole
 installation; overlapping shared ownership fixed it.  Important findings fixed
 during the rounds include authority-starvation ordering, detached recovery
@@ -540,8 +549,16 @@ pair-reset churn, status/activation predicate drift, protocol reset recovery,
 explicit worker replacement, and two E2E ordering races.  Real minor findings
 were redundant sorts and stale prose, both removed.  One claimed duplicated
 recovery paragraph was rejected after a line-by-line check found no duplicate.
+The first external CI run exposed a macOS canonical-path expectation and an
+unreaped remote protocol child after an intentional transfer-limit failure;
+both were fixed at their cleanup boundary rather than retried as flakes.  The
+post-CI security pass generalized that cleanup to every one-shot SSH exit and
+added an explicit final protocol acknowledgement before bounded process
+shutdown.  That prevents a malformed or hostile session from leaking a child
+or retaining the installation permit without interrupting legitimate
+post-commit database work.
 Each substantive fix was followed by focused tests, the complete deterministic
-gate, and another affected review pass.  The fifth round ended with zero
+gate, and another affected review pass.  The eighth round ended with zero
 blocker, important, or minor findings across all lenses.
 
 GitHub CI and the bridge-period Copilot review are the remaining external gates

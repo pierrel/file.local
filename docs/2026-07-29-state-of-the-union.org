@@ -584,7 +584,7 @@ with =make e2e=.  GitHub CI runs Linux, macOS, changed-line coverage, and E2E.
 - This is alpha software, not a substitute for backups.
 - It is two peers per share, with SSH as the initial transport.
 - Persistent managed watch now requires protocol version 6 on both peers, while
-  explicit one-shot synchronization uses protocol version 4. During a
+  explicit one-shot synchronization uses protocol version 5. During a
   rolling upgrade the enabled watch remains reconnecting with bounded upgrade
   diagnostics until both peers are upgraded; no manual restart is required.
 - A scan/install race is recovered automatically in-session. Repeatedly changing

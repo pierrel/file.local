@@ -269,9 +269,17 @@ scheduling, not as transport failure.
 
 The one-shot synchronization protocol and persistent-watch protocol each gain
 an explicit reservation exchange.  One-shot synchronization uses protocol
-version 4 and persistent watch uses version 6.  Old and new binaries fail with
+version 5 and persistent watch uses version 6.  Old and new binaries fail with
 the existing upgrade-both-peers diagnostic rather than interpreting a new
 frame incorrectly.
+
+One-shot version 5 also makes finalization explicit.  After =CommitAck= or
+=Cancel=, the responder sends =Done= only after its durable acknowledgement
+work and installation-permit release have completed.  The connector waits for
+that frame within the existing session deadline, then allows a short bounded
+interval for the protocol-complete SSH process to exit.  This distinguishes
+legitimate post-commit database work from a stuck transport and lets every
+error path terminate and reap its child.
 
 The lower peer-ID installation is the ordering authority for every network
 round between the two peers, regardless of connector direction.  This prevents

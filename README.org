@@ -290,7 +290,7 @@ paths can finish. A later full round reports =SETTLED=. =flocal status= and
 
 Persistent watch uses protocol version 6, so install or upgrade =flocal= on both
 peers before adding a managed sync. Explicit =flocal sync= uses protocol
-version 4. A persistent protocol mismatch keeps the
+version 5. A persistent protocol mismatch keeps the
 worker reconnecting with bounded upgrade reports until both peers support
 version 6; it never silently falls back to polling. Downgrading does not change
 synchronized state, though persistent watch remains unavailable until both

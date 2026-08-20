@@ -3492,7 +3492,9 @@ fn run_sync_attempt(
                 }
                 received_bytes = received_bytes.saturating_add(size);
                 if received_bytes > transfer_limit {
-                    bail!("inbound object transfer exceeds session byte limit");
+                    return Err(remote.finish_after_error(anyhow::anyhow!(
+                        "inbound object transfer exceeds session byte limit"
+                    )));
                 }
                 if let Err(error) =
                     sync::receive_object_for_share(state, &share, hash, size, &mut remote.output)
@@ -3561,7 +3563,9 @@ fn run_sync_attempt(
         outbound_bytes =
             outbound_bytes.saturating_add(state.open_verified_object(&hash)?.metadata()?.len());
         if outbound_bytes > transfer_limit {
-            bail!("outbound object transfer exceeds session byte limit");
+            return Err(remote.finish_after_error(anyhow::anyhow!(
+                "outbound object transfer exceeds session byte limit"
+            )));
         }
         sync::send_object(state, &hash, &mut remote.input)?;
     }
@@ -4008,6 +4012,7 @@ fn serve_initial(
             sync::write_snapshot(&mut output, &records)?;
             serve_sync(state, &share, &peer, &records, &mut input, &mut output)?;
             installation.finish()?;
+            sync::write_message(&mut output, &Message::Done)?;
         }
         InitialMessage::WatchOpen { .. } => {
             bail!("persistent watch requires a descriptor-backed protocol transport")
@@ -5078,7 +5083,9 @@ fn serve_sync(
                 state.acknowledge_shared_heads(share, &acknowledged_heads)?;
                 break;
             }
-            Message::Cancel if !plan_ready => break,
+            Message::Cancel if !plan_ready => {
+                break;
+            }
             other => bail!("unexpected sync message: {other:?}"),
         }
     }
@@ -7112,7 +7119,8 @@ struct Remote {
     child: Child,
     input: ChildStdin,
     output: TimedReader<ChildStdout>,
-    stderr: std::thread::JoinHandle<Vec<u8>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    finished: bool,
 }
 
 struct RelationshipRemote {
@@ -7237,13 +7245,26 @@ impl Remote {
             child,
             input,
             output: TimedReader::new(output),
-            stderr,
+            stderr: Some(stderr),
+            finished: false,
         })
     }
     fn finish(mut self) -> Result<()> {
-        drop(self.input);
-        let status = self.child.wait()?;
-        let stderr = self.stderr.join().unwrap_or_default();
+        match sync::read_v1_message_until(&self.output, self.output.session_deadline()?)? {
+            Message::Done => {}
+            other => bail!("expected synchronization completion, got {other:?}"),
+        }
+        let status = wait_protocol_child(
+            &mut self.child,
+            std::time::Instant::now() + Duration::from_secs(10),
+            "ssh protocol process exceeded its exit deadline",
+        )?;
+        self.finished = true;
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default();
         if !status.success() {
             bail!(
                 "ssh exited with {status}: {}",
@@ -7254,14 +7275,59 @@ impl Remote {
     }
 
     fn finish_after_error(mut self, error: anyhow::Error) -> anyhow::Error {
-        drop(self.input);
+        let _ = self.child.kill();
         let status = self.child.wait();
-        let stderr = self.stderr.join().unwrap_or_default();
+        if status.is_ok() {
+            self.finished = true;
+        } else {
+            return anyhow::anyhow!("{error:#}; failed to reap remote protocol process");
+        }
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default();
         anyhow::anyhow!(
             "{error:#}; remote exited with {:?}: {}",
             status.ok(),
             escaped(&String::from_utf8_lossy(&stderr))
         )
+    }
+}
+
+impl Drop for Remote {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
+    }
+}
+
+fn wait_protocol_child(
+    child: &mut Child,
+    deadline: std::time::Instant,
+    deadline_error: &str,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("checking protocol process status");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{deadline_error}")
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -7285,8 +7351,12 @@ impl RelationshipRemote {
     fn finish(mut self) -> Result<()> {
         self.input.take();
         self.output.take();
-        let child = self.child.take().context("ssh child is unavailable")?;
-        let status = wait_relationship_child(child, self.deadline)?;
+        let mut child = self.child.take().context("ssh child is unavailable")?;
+        let status = wait_protocol_child(
+            &mut child,
+            self.deadline,
+            "relationship protocol process exceeded its deadline",
+        )?;
         let stderr = self
             .stderr
             .take()
@@ -7332,23 +7402,6 @@ impl Drop for RelationshipRemote {
         if let Some(stderr) = self.stderr.take() {
             let _ = stderr.join();
         }
-    }
-}
-
-fn wait_relationship_child(
-    mut child: Child,
-    deadline: std::time::Instant,
-) -> Result<std::process::ExitStatus> {
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("relationship protocol process exceeded its deadline")
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -7408,6 +7461,12 @@ impl<R> TimedReader<R> {
             started: std::time::Instant::now(),
         }
     }
+
+    fn session_deadline(&self) -> Result<std::time::Instant> {
+        self.started
+            .checked_add(max_peer_session_duration())
+            .context("configured peer protocol duration exceeds the supported range")
+    }
 }
 
 impl<R: AsFd> AsFd for TimedReader<R> {
@@ -7419,12 +7478,7 @@ impl<R: AsFd> AsFd for TimedReader<R> {
 impl<R: Read + AsFd> Read for TimedReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        let total = Duration::from_secs(
-            std::env::var("FLOCAL_MAX_SESSION_SECONDS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(60 * 60),
-        );
+        let total = max_peer_session_duration();
         let Some(remaining) = total.checked_sub(self.started.elapsed()) else {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -7445,6 +7499,15 @@ impl<R: Read + AsFd> Read for TimedReader<R> {
         }
         self.inner.read(buffer)
     }
+}
+
+fn max_peer_session_duration() -> Duration {
+    Duration::from_secs(
+        std::env::var("FLOCAL_MAX_SESSION_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60 * 60),
+    )
 }
 
 fn discover_executable(host: &str) -> Result<String> {
@@ -7651,6 +7714,11 @@ mod tests {
         for root in &roots {
             std::fs::create_dir(root)?;
         }
+        let roots = [
+            roots[0].canonicalize()?,
+            roots[1].canonicalize()?,
+            roots[2].canonicalize()?,
+        ];
         let first = state.init_share(&roots[0])?;
         let second = state.init_share(&roots[1])?;
         let third = state.init_share(&roots[2])?;
@@ -7690,6 +7758,47 @@ mod tests {
         let waiting = share_scheduling_view(&state, &snapshot, &third)?;
         assert!(matches!(waiting.blocker, Some(SchedulingBlocker::Peer)));
         drop(peer_wait);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_cleanup_is_bounded_and_drop_reaps_unfinished_children() -> Result<()> {
+        let mut timed = Command::new("sh").arg("-c").arg("sleep 30").spawn()?;
+        let started = std::time::Instant::now();
+        let error = wait_protocol_child(
+            &mut timed,
+            std::time::Instant::now() + Duration::from_millis(20),
+            "ssh protocol process exceeded its exit deadline",
+        )
+        .expect_err("an unresponsive protocol child must exceed its exit deadline");
+        assert!(error.to_string().contains("exit deadline"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(timed.try_wait()?.is_some());
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+        let input = child.stdin.take().context("test child stdin")?;
+        let output = child.stdout.take().context("test child stdout")?;
+        let stderr = drain_bounded_stderr(child.stderr.take().context("test child stderr")?);
+        drop(Remote {
+            child,
+            input,
+            output: TimedReader::new(output),
+            stderr: Some(stderr),
+            finished: false,
+        });
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        assert!(!status.success(), "Remote::drop left child {pid} alive");
         Ok(())
     }
 
@@ -8285,6 +8394,7 @@ mod tests {
             sync::read_message(&mut messages)?,
             Message::Applied
         ));
+        assert!(messages.is_empty());
         serve_messages(&[Message::Cancel])?.0?;
         Ok(())
     }
@@ -9552,6 +9662,10 @@ mod tests {
         ));
         assert!(sync::read_snapshot(&mut client)?.is_empty());
         sync::write_message(&mut client, &Message::Cancel)?;
+        assert!(matches!(
+            sync::read_v1_message_until(&client, deadline())?,
+            Message::Done
+        ));
         server_thread.join().expect("server joins")?;
         Ok(())
     }
