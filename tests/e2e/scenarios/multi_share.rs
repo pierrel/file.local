@@ -255,7 +255,7 @@ fn simultaneous_opposite_direction_starts_serialize_and_converge() -> Result<()>
     opposite?;
 
     a.wait_for_opposite_scheduling_contention(&b)?;
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    std::thread::sleep(flocal::sync::reservation_lease() + std::time::Duration::from_secs(1));
     a.wait_for_opposite_scheduling_contention(&b)?;
     held.resume()?;
 

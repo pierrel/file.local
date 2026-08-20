@@ -527,8 +527,8 @@ assertion about the intended invariant instead of a probability.
 The local deterministic gates pass:
 
 - =make coverage COVERAGE_BASE=github/main=, including all non-Docker tests.
-- Whole-project line coverage: 17,975 of 19,577, or 91.82 percent.
-- Changed executable lines: 5,600 of 6,124, or 91.44 percent.
+- Whole-project line coverage: 17,996 of 19,577, or 91.92 percent.
+- Changed executable lines: 5,675 of 6,199, or 91.55 percent.
 - =cargo fmt --all -- --check=.
 - =cargo clippy --all-targets --all-features -- -D warnings=.
 - =git diff --check=.
