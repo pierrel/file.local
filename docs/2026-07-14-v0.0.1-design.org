@@ -10,6 +10,9 @@ The reviewed
 [[file:2026-08-17-clean-relationship-removal-design.org][2026-08-17 relationship-lifecycle design]] further supersedes the pairing,
 removal, status, and relationship-protocol portions below. It is the intended
 implementation contract, not a claim that those changes have passed validation.
+The accepted
+[[file:2026-08-20-multi-share-scheduling-design.org][2026-08-20 multi-share scheduling design]] supersedes the single-installation
+lock behavior, network-round reservation order, and queue observability below.
 
 * Summary
 

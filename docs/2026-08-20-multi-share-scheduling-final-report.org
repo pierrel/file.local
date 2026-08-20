@@ -1,0 +1,591 @@
+#+title: Multi-share synchronization scheduling: final implementation report
+#+date: 2026-08-20
+
+* What shipped
+
+file.local can now keep more than one share configured and active on the same
+installation.  Synchronization still mutates one installation at a time.  The
+difference is that a second operation waits in a durable queue instead of
+failing with =another synchronization operation already owns this
+installation=.
+
+That wait is visible.  When the blocker is local, the command names the root a
+person recognizes:
+
+#+begin_example
+Waiting for /home/alice/projects/notes sync to finish (queue position 2)
+#+end_example
+
+When the wait is on the other installation, the output says that it is waiting
+for the peer without disclosing the peer's unrelated path or internal share ID.
+The same scheduling state appears in =flocal status --json= and =flocal sync
+list --json=.  Managed starts return after their intent is safely queued.  A
+queued =sync stop= cancels that exact generation.  Persistent watches rejoin
+the tail after every round, so a busy share cannot permanently starve another
+one.
+
+The implementation also handles the harder case where two installations start
+different relationships in opposite directions at the same time.  Both sides
+agree on one order before either acquires its installation mutation permit.
+This removes the distributed deadlock in which each side could otherwise hold
+one installation while waiting for the other.
+
+* The final design
+
+** One durable local scheduler
+
+Every operation that can change installation-wide state first creates a row in
+the installation's SQLite =sync_queue=.  That includes one-shot sync, initial
+sync, each persistent-watch round, install recovery, relationship registration
+and removal, and maintenance operations.  A monotonically increasing local
+=ticket= supplies FIFO order.  A partial unique index makes a second active row
+impossible in the database itself.
+
+Each row has a private liveness file at =scheduler/<token>=.  Every live owner
+keeps a shared lock on that file.  A managed handoff overlaps the initiating
+client's and daemon worker's shared locks.  If every owner crashes, the kernel
+releases the locks and a bounded cleanup pass can take an exclusive lock, remove
+the stale row, and allow the queue to advance.  Publication
+uses a separate private lock so a cleaner cannot mistake a row or owner file
+that is only halfway through creation for an orphan.
+
+Each pass checks at most 32 rows and stores its last ticket as a cleanup cursor.
+The next pass wraps from that point, so a long live prefix cannot permanently
+hide stale rows later in the queue while cleanup work remains bounded.
+
+The scheduler separates a queued request from an active permit.  The request
+may wait, report its position, be canceled, or die without owning the global
+installation lock.  Only the selected head takes the existing OS lock and then
+marks its row active in a conditional SQLite transaction.  The conditional
+update rechecks the token, share, managed generation, cancellation state, and
+head position.  This makes the bad state where =sync stop= has canceled a row
+but the same row activates anyway unreachable.
+
+The core ordering code is intentionally shared by activation, reservation
+predecessor checks, queue progress, and the human status view:
+
+#+begin_src rust
+impl SchedulingSnapshot {
+    pub fn eligible_candidates(&self) -> Vec<&ScheduledRequestSnapshot> {
+        eligible_candidates(&self.queued)
+    }
+
+    pub fn eligible_predecessors(
+        &self,
+        target: &ScheduledRequestSnapshot,
+    ) -> Vec<&ScheduledRequestSnapshot> {
+        eligible_predecessors(&self.queued, target)
+    }
+}
+
+fn eligible_candidates(queued: &[ScheduledRequestSnapshot])
+    -> Vec<&ScheduledRequestSnapshot>
+{
+    let mut authority_heads = std::collections::HashMap::new();
+    for request in queued.iter().filter(|request| {
+        request.paired_state == Some(PairedQueueState::Eligible)
+            && request.network_authority.is_some()
+    }) {
+        let authority = request
+            .network_authority
+            .as_ref()
+            .expect("filtered paired request has an authority");
+        authority_heads.entry(authority)
+            .and_modify(|head| {
+                if (request.network_order, request.ticket)
+                    < (head.network_order, head.ticket)
+                {
+                    *head = request;
+                }
+            })
+            .or_insert(request);
+    }
+    queued.iter().filter(|request| {
+        if request.paired_state.is_none() {
+            return true;
+        }
+        if request.paired_state != Some(PairedQueueState::Eligible) {
+            return false;
+        }
+        let Some(authority) = request.network_authority.as_ref() else {
+            return false;
+        };
+        authority_heads.get(authority)
+            .is_some_and(|head| head.ticket == request.ticket)
+    }).collect()
+}
+#+end_src
+
+Ordinary local rows are candidates immediately.  Paired network rows remain
+parked until both installations are ready.  For ready paired work, the lowest
+network order from each authority becomes that authority's candidate; those
+authority heads then compete with ordinary work by local ticket.  This
+preserves the shared order within one peer relationship without letting a
+lexicographically smaller peer ID starve an older local request from another
+relationship.
+
+** Recovery is part of permit acquisition
+
+A durable install journal means a killed process may have changed the visible
+filesystem without finishing the metadata commit.  Recovery therefore cannot
+be a daemon-startup convenience.  Before a queued operation becomes active,
+the scheduler recovers every unclassified install journal.  If the journal's
+share session is busy, recovery releases its installation position and rejoins
+the tail rather than holding the global permit while waiting for a longer-lived
+share lock.
+
+A recovery failure is classified against the exact install intent.  The
+affected share or pending removal receives its diagnostic, while unrelated
+shares can continue.  A later explicit retry clears only a matching
+classification.  The daemon queues recovery at startup and notices new
+unclassified journals during its periodic reconciliation, while every permit
+also rechecks the invariant, so correctness does not depend on thread timing.
+
+During a two-peer reservation, recovery runs in a worker thread so the protocol
+can send a bounded =SyncQueued= progress frame every ten seconds.  If that send
+discovers a broken wire, the parent cancels and joins the recovery worker before
+returning the transport error.  A reconnect cannot accumulate detached workers
+or live queue rows.
+
+** Managed start, stop, and initial confirmation
+
+An already-confirmed =sync start= validates the root and peer binding, enables
+the expected generation and inserts its durable watch row in one transaction,
+starts a worker with ownership of that row, and returns.  If the daemon dies
+after the transaction, restart reconstructs the enabled intent.
+
+=sync stop= increments the intent generation and deletes the queued watch row
+for the old generation in the same transaction.  The worker treats the missing
+row or changed generation as cancellation, not a connection failure.
+
+Initial sync keeps the user's plan confirmation meaningful.  It first reserves
+both installations, computes and prints a preview, releases both, and asks for
+confirmation without blocking unrelated work.  It reserves again and compares
+a canonical plan fingerprint.  A changed plan is shown and confirmed again.
+At the final filesystem commit, one generation-checked SQLite transaction
+publishes the applied records, clears the install intent, marks the initial
+sync complete, enables the watch, advances the generation, and inserts the
+queue row:
+
+#+begin_src rust
+let changed = tx.execute(
+    "UPDATE shares
+     SET initial_complete=1,watch_enabled=1,
+         intent_generation=?3,blocked_diagnostic=NULL
+     WHERE share_id=?1 AND intent_generation=?2
+       AND initial_complete=0 AND removing_relationship IS NULL",
+    params![share.0, expected_generation, generation],
+)?;
+if changed == 0 {
+    bail!("sync was stopped, removed, or reconfigured while its initial plan was applying");
+}
+tx.execute(
+    "INSERT INTO sync_queue(token,share_id,operation,generation)
+     VALUES(?1,?2,'watch',?3)",
+    params![token, share.0, generation],
+)?;
+tx.execute("DELETE FROM install_intents WHERE share_id=?1", [&share.0])?;
+tx.commit()?;
+#+end_src
+
+If a concurrent stop or reconfiguration changes the generation, none of those
+state changes commit.  The system cannot claim the initial sync is complete
+while silently leaving its managed watch disabled.
+
+Immediately after the atomic commit, the client asks the daemon to reclaim the
+same queue row while the client still holds its shared liveness lock.  The
+daemon worker takes a second shared lock before the client releases its own, so
+later protocol-finalization errors cannot lose the FIFO ticket.  The daemon
+also reconciles enabled durable intents once a second and at startup.  If every
+owner crashes, cleanup removes the dead row and that durable intent creates a
+replacement; an ownerless row can never strand the completed share.
+
+The daemon serializes =Start=, =Stop=, and =PrepareRemove= control requests
+through one in-process mutex.  This mutex does not serialize synchronization
+rounds.  It only keeps the durable lifecycle transition and its worker-map
+change together, preventing a start from publishing a worker after a concurrent
+removal has concluded that no worker exists.
+
+** Reserving two installations without deadlock
+
+The one-shot protocol is version 4 and the persistent protocol is version 6.
+For a relationship round, the installation with the lower peer ID is the
+ordering authority even when the connector is on the higher-ID side.
+
+The higher side first records a =pending_authority= row.  The lower authority
+assigns a =network_order= in its own namespace and publishes =ProxyIssue=.  The
+higher side durably converts its row to the exact parked proxy before replying
+=ProxyAck=.  Both installations then prepare nonce-bound rows and exchange a
+fingerprint of all requests that must precede them.  Neither parked nor prepared
+rows can take the local queue head.
+
+After recovery, each side rechecks its predecessor set.  A change uses the
+exact =PairReset=/=PairResetAck= exchange and retains the network order.  One
+reservation permits at most eight resets, bounding work an authenticated but
+misbehaving peer can cause.  Once both sides commit the pair, the lower side
+takes its installation permit and sends =SyncReserved=; the higher side takes
+its permit, sends =SyncStart=, and receives =SyncAccepted=.  The final committed
+phase has a five-second lease.  A failure after commit records a temporary
+relationship yield, allowing at least one other local operation or a bounded
+timer to make progress before that relationship retries.
+
+The protocol exposes only a coarse peer queue position.  It never sends the
+unrelated share ID or root path across the relationship.
+
+** Honest scheduling feedback
+
+=status=, =sync list=, foreground =sync=, and =watch= distinguish scheduling
+from transport state.  A queued operation is not reported as a failed peer
+connection merely because another healthy share owns the installation.
+
+For local contention, the view resolves the active or predecessor share back
+to its root.  For a peer-side parked reservation, it reports a generic peer
+wait.  Both use the same =eligible_predecessors= function as activation:
+
+#+begin_src rust
+let predecessor_root = snapshot
+    .eligible_predecessors(request)
+    .first()
+    .and_then(|candidate| candidate.share.as_ref())
+    .map(|candidate| state.root_for(candidate))
+    .transpose()?;
+SchedulingBlocker::Local(predecessor_root)
+#+end_src
+
+Peer progress is deduplicated and limited to eight frames per second.  A valid
+parked reservation may therefore report an indefinite queued wait, while
+silence and every non-progress reservation phase retain absolute deadlines.
+
+* What changed in the code
+
+** =src/state.rs=
+
+This is the durable scheduler and most of the correctness machinery.  It adds
+the queue schema and migrations, closed operation and paired-state enums,
+=QueueRequest= and =InstallationPermit=, owner-file publication and cleanup,
+activation and cancellation transactions, managed-generation operations,
+relationship yields, paired prepare/commit/reset state, scheduling snapshots,
+recovery classification, and the managed-generation marker carried by an
+interrupted install journal.
+
+=QueueRequest= owns its liveness descriptor.  Dropping it cancels a still-queued
+row.  Activating it moves that ownership into =InstallationPermit=, which owns
+the global OS lock and active row.  =finish()= removes the active row and
+advances the completion sequence.  A permit dropped during unwinding removes
+the row without claiming successful completion.  This ownership layout means
+cleanup follows Rust values rather than a collection of manually paired
+release calls.
+
+The install journal now carries the managed-start disposition across process
+death while remaining backward-compatible with older journal JSON:
+
+#+begin_src rust
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct InstallIntent {
+    pub records: Vec<Record>,
+    #[serde(default)]
+    pub conflicts: Vec<Conflict>,
+    pub temps: Vec<InstallTemp>,
+    #[serde(default)]
+    pub managed_generation: Option<i64>,
+}
+#+end_src
+
+Here =Option<i64>= distinguishes an ordinary install from a managed initial
+install, and =#[serde(default)]= decodes journals written before the field
+existed as =None=.
+
+** =src/main.rs=
+
+The CLI and daemon now route every installation mutation through the scheduler.
+The daemon accepts paginated list requests and durable start, stop, and removal
+requests; restores enabled queued work after restart; discovers install
+journals created after startup; replaces an
+exact failed worker instead of accumulating retries; and publishes scheduling
+state separately from connection state.
+
+The same file contains the versioned reservation adapters for one-shot and
+persistent protocols, lower-authority and higher-peer reservation flows,
+recovery-before-pair coordination, progress reporting, and the bounded reset
+and final-lease rules.  The persistent watch creates a fresh queue row per
+round.  Foreground watch and one-shot sync keep a distinct share-session lock,
+so the same share still cannot be driven by two user sessions at once.
+
+** =src/sync.rs=
+
+The wire model gains closed scheduling frames and validated newtypes for
+scheduling IDs, nonces, network order, predecessor fingerprints, coarse queue
+positions, and wait reason.  The one-shot and persistent frame families remain
+separate, versioned enums; an unexpected frame is rejected instead of being
+silently ignored.  Frame and phase deadlines remain absolute, and cumulative
+metadata and transfer budgets continue to apply.
+
+** Tests and harness
+
+=tests/e2e/scenarios/multi_share.rs= contains six Docker scenarios that use
+real processes, SSH, two filesystems, and the installed daemon path:
+
+1. =sync add --yes= waits behind an active sibling and completes once.
+2. A confirmed =sync start= returns queued and later converges.
+3. =sync stop= cancels queued work before release.
+4. A new persistent-watch round rejoins behind an older sibling request.
+5. Daemon death reconstructs an enabled queued start.
+6. Opposite-direction starts are both durable before either proxy submission;
+   the higher-ID connector receives the earlier intent, and an unrelated
+   installation holder keeps the queue busy beyond the former lease before
+   both rounds serialize and converge.
+
+The last test uses a barrier at the actual boundary, not just simultaneous CLI
+invocation:
+
+#+begin_src rust
+if a_id > b_id {
+    let first = scope.spawn(|| a.sync_start_observed());
+    let first_worker = a.wait_for_stopped_reservation_worker()?;
+    let opposite = scope.spawn(|| b.sync_start_second_observed());
+    let opposite_worker = b.wait_for_stopped_reservation_worker()?;
+}
+#+end_src
+
+The symmetric branch starts B first when B has the higher peer ID.
+
+The hook exists only under =e2e-test-hooks=.  It stops each daemon after the
+managed queue transaction and before peer submission.  The test reads durable
+status directly while the daemons are stopped, then resumes both.  Separate
+unit tests verify that its marker and PID files are one-shot, private-state
+children that reject symlinks.  A separate E2E-only maintenance process holds
+the installation permit for more than five seconds without taking either
+share session; resuming it proves progress after the former lease boundary.
+
+Unit and process-boundary tests cover queue ordering, one-active-only,
+cancellation/activation races, stale-owner cleanup, caps and deduplication,
+authority namespaces, predecessor invalidation, recovery rejoin, worker
+replacement, atomic initial completion, lifecycle start/removal races,
+progress limits, protocol codecs, daemon restart, and legacy one-shot command
+compatibility.
+
+Documentation changes reconcile =README.org=, =ROADMAP.org=, the original
+v0.0.1 and persistent-watch designs, and the E2E harness design with the
+shipped scheduler and protocol.
+
+* Rust features used here
+
+** Ownership and =Drop=
+
+Rust values can own operating-system resources.  =QueueRequest= owns the
+locked liveness file, and =InstallationPermit= owns both that request and the
+global lock.  Their =Drop= implementations are a recovery net: every normal
+return, =?= error return, and panic unwind drops owned values.  The explicit
+=finish()= method distinguishes successful completion from abandonment.
+
+This is RAII, "resource acquisition is initialization."  The important part
+for this feature is not the name but the construction: code cannot copy these
+owners, and moving a request into a permit leaves one owner rather than two
+release responsibilities.
+
+** =Result=, =?=, and error context
+
+Fallible functions return =anyhow::Result<T>=.  The =?= operator either unwraps
+the successful =T= or returns the error after local owned values have been
+dropped.  =Context= adds the operation being attempted without discarding the
+underlying SQLite, I/O, or protocol error.  =bail!= returns an intentional
+contract violation such as a stale generation or invalid protocol transition.
+
+** =Option= and =let ... else=
+
+=Option<T>= makes absence explicit.  A local request may have no share, a
+request may have no peer authority, and a status view may have no blocker.
+The expression:
+
+#+begin_src rust
+let Some(authority) = request.network_authority.as_ref() else {
+    return false;
+};
+#+end_src
+
+handles the absent case immediately and leaves =authority= as a borrowed
+=&PeerId= on the remaining path.  It avoids a null pointer and keeps the
+eligibility predicate readable.
+
+** Enums and exhaustive matching
+
+=SyncOperation=, =PairedQueueState=, =ReservationFrame=, and the versioned
+protocol frames are enums.  A =match= must account for every variant unless it
+uses an explicit catch-all.  Serde's tagged encoding turns those variants into
+a closed JSON or binary wire vocabulary.  This is why an out-of-phase
+=PairCommit= becomes an error rather than a loosely parsed message with an
+ambiguous meaning.
+
+** Borrowing and lifetimes
+
+=eligible_candidates= returns references into the existing snapshot instead
+of copying every row.  The compiler ties those references to the input slice's
+lifetime, so callers cannot retain a candidate after the snapshot has been
+dropped.  =as_ref()= borrows the contents of an =Option= without consuming it.
+
+** Closures and generic callbacks
+
+Queue waiting accepts closures for cancellation, position reporting, and
+pre-activation recovery.  The scheduler owns the polling and activation
+algorithm while each caller supplies only its policy.  Rust monomorphizes
+these generic closures, so this narrow interface does not require a heap-
+allocated callback or runtime dispatch.
+
+** =Arc=, =Mutex=, and atomics
+
+Daemon worker metadata is shared across request threads with =Arc=, an atomic
+reference-counted owner.  =Mutex<HashMap<...>>= protects compound worker-map
+changes.  =AtomicBool= and small atomics carry stop, finished, and connection
+state flags where one independent value is enough.  The memory ordering is
+=Relaxed= because the mutexes, channels, durable SQLite transactions, and
+process waits establish the real sequencing; the flags are observations and
+wake/stop signals, not publication of unrelated memory.
+
+** SQLite transactions as compare-and-swap
+
+The scheduler uses =TransactionBehavior::Immediate= when it must decide and
+write against one stable queue state.  SQL predicates such as
+=intent_generation=?= are compare-and-swap operations: a changed row count of
+zero means the expected state lost a race.  The transaction then rolls back as
+a unit.  This is stronger and simpler than checking in Rust, doing work, and
+hoping the state did not change between those steps.
+
+* What was hard
+
+** Local FIFO was not enough
+
+The original visible symptom happened on one machine, but simply replacing a
+failing =flock= with a local queue would have left the two-installation
+deadlock.  The difficult part was defining a shared order that works when
+relationship connectors point in opposite directions, while never holding one
+OS mutation permit during network negotiation.
+
+The first implementation also made the peer authority part of one global
+lexicographic sort.  Review found that a stream from a smaller authority could
+overtake or starve an older request from a larger authority.  The final rule is
+two-level: preserve network order only within its authority, then compare each
+authority head by the ordinary local ticket.  One shared function now drives
+both behavior and explanation.
+
+** Crash durability spans SQLite and the filesystem
+
+SQLite can atomically publish a row, and the kernel can release a liveness lock
+on process death, but those are different systems.  File creation can succeed
+before database commit; a process can die after either step; and a concurrent
+cleaner can observe the gap.  The publication lock, no-follow owner-file
+validation, bounded orphan scan, commit ordering, and retained descriptor are
+the small protocol that joins those two durability domains.
+
+The client-to-daemon transition added a subtler version of the same problem.
+Simply dropping the client's lock before asking the daemon to reclaim the row
+left an ownerless cleanup window.  Preserving every enabled ownerless row fixed
+that window but could make a crashed row block the installation forever.  The
+final construction gives both live processes a shared liveness lock during the
+handoff; cleanup requires an exclusive lock.  There is always a live owner or a
+row cleanup can prove dead, with no timing assumption between those states.
+
+** Recovery participates in locking
+
+Install recovery must happen before later mutation, but it may need a share
+session already held by the operation whose journal it is recovering.  Waiting
+for that session while owning the installation permit deadlocks the queue.  The
+solution was a typed =QueueRejoin= outcome: release, move the recovery request
+to the tail, and let the share owner advance.  Disconnect cleanup required an
+additional cancellation path so the helper thread could not outlive its wire.
+
+** Confirmation creates a long race window
+
+The initial plan must be reviewed without holding two installations hostage.
+Releasing them during the prompt is the right experience, but files may change
+before the user answers.  The preview/apply fingerprint loop makes a changed
+plan visible.  Review then found a smaller post-apply race: marking
+=initial_complete= before the initiating process's generation-checked enable
+could leave a completed but disabled share.  Moving completion, enablement,
+generation advance, and enqueue into one SQLite transaction removed that
+state.  The install journal also persists the managed generation, so daemon
+recovery after a crash during filesystem apply performs the same publication.
+
+** A concurrency test needs the real boundary
+
+Starting two CLI threads at a barrier did not prove that both durable intents
+existed before either peer proxy arrived; process scheduling could let one
+finish the reservation first.  The final E2E hook is after durable enqueue and
+before network submission.  Both real daemons stop there, direct status proves
+both rows, and only then does the test release the race.  That made the test an
+assertion about the intended invariant instead of a probability.
+
+* Validation and review
+
+The local deterministic gates pass:
+
+- =make coverage COVERAGE_BASE=github/main=, including all non-Docker tests.
+- Whole-project line coverage: 17,845 of 19,481, or 91.60 percent.
+- Changed executable lines: 5,511 of 6,075, or 90.72 percent.
+- =cargo fmt --all -- --check=.
+- =cargo clippy --all-targets --all-features -- -D warnings=.
+- =git diff --check=.
+- All six =scenarios::multi_share::= Docker E2Es, serially, in 37.42 seconds.
+
+The local review loop has covered correctness and logic, concurrency and
+liveness, error handling and edge cases, adversarial security, simplicity and
+duplication, design adherence, cross-platform/filesystem behavior, and a
+dedicated documentation-alignment pass.  Five rounds ran.  The blocker-level
+finding was the ownerless managed row that could permanently stop the whole
+installation; overlapping shared ownership fixed it.  Important findings fixed
+during the rounds include authority-starvation ordering, detached recovery
+workers after a wire failure, managed-initial crash recovery, post-commit FIFO
+handoff, non-atomic initial completion, a daemon start/removal worker race,
+quadratic authority selection, repeated schema-index rebuilds, unbounded
+pair-reset churn, status/activation predicate drift, protocol reset recovery,
+explicit worker replacement, and two E2E ordering races.  Real minor findings
+were redundant sorts and stale prose, both removed.  One claimed duplicated
+recovery paragraph was rejected after a line-by-line check found no duplicate.
+Each substantive fix was followed by focused tests, the complete deterministic
+gate, and another affected review pass.  The fifth round ended with zero
+blocker, important, or minor findings across all lenses.
+
+GitHub CI and the bridge-period Copilot review are the remaining external gates
+at the time this report was written.  Their final dispositions belong in the
+pull request and bridge ledger; they do not weaken the local gate above.
+
+* Remaining limits
+
+- The design remains exactly two peers per share.  The authority namespace
+  prevents unrelated two-peer relationships from corrupting each other's
+  order; it is not multi-peer replication.
+- One installation mutation runs at a time.  This feature queues independent
+  shares fairly; it does not make filesystem installation parallel.
+- Two active sessions for the same share are still rejected.  A managed watch
+  and a manual =flocal watch PATH= should not both drive one share.
+- A peer-side wait deliberately does not name the remote blocking root.  That
+  is a privacy boundary, not missing observability.
+- Persistent rounds still perform full reconciliation scans.  Incremental
+  dirty-path scanning remains roadmap work.
+- Protocol versions changed.  A mixed old/new pair fails explicitly rather
+  than attempting unsafe compatibility inside a scheduling round.
+
+* Upgrade and testing note
+
+Install this build on both endpoints before judging multi-share behavior.
+Stop or upgrade existing manual watches and daemons so no old process retains
+the prior protocol.  Then start the daemon-managed shares normally; no queue
+or state reset should be necessary.
+
+A useful manual test is:
+
+1. Configure and complete two shares between the same installations.
+2. Start both with =flocal sync start PATH=.
+3. Make a large change on the first share, then immediately change the second.
+4. Run =flocal sync list= and =flocal status SECOND --json= while the first is
+   applying.  The second should be enabled and queued.  Local contention should
+   name the first root path; peer contention should use generic peer wording.
+5. Confirm that both converge without rerunning =sync start=.
+6. Repeat while stopping the queued second share.  Its pending change must not
+   cross until it is deliberately started again.
+7. Restart the daemon while the second share is queued.  It should reconstruct
+   the enabled request and converge after the older operation releases.
+
+The upgrade does not require deleting shares, clearing =pending_install=, or
+manually removing scheduler files.  If an old process is still running, stop
+that process and restart with the upgraded binary rather than altering durable
+state by hand.

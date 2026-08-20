@@ -7,6 +7,12 @@ design for implementation without integrating Automerge or p2panda. All
 required design-review lenses converged with no blocker or important finding;
 section 14 records the findings resolved during review.
 
+The accepted
+[[file:2026-08-20-multi-share-scheduling-design.org][2026-08-20 multi-share scheduling design]] supersedes this document's
+single-installation lock acquisition and extends persistent rounds with the
+two-endpoint reservation protocol.  The event, heartbeat, audit, and
+reconnection behavior below remains the baseline.
+
 This document deliberately specifies a bounded alpha slice suitable for one
 pull request: one persistent SSH session, watchers on both peers, coalesced
 change notifications, serialized event-triggered reconciliation, heartbeat,

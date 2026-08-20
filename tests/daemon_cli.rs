@@ -26,6 +26,17 @@ fn stop_daemon(daemon: &mut std::process::Child) -> Result<()> {
     }
 }
 
+fn wait_until(mut condition: impl FnMut() -> Result<bool>, description: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if condition()? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    anyhow::bail!("timed out waiting for {description}")
+}
+
 #[test]
 fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
     let temporary = tempdir()?;
@@ -63,9 +74,79 @@ fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
     stop_daemon(&mut daemon)?;
     assert!(output.status.success(), "{:?}", output);
     let listing: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(listing["schema"], 2);
+    assert_eq!(listing["schema"], 3);
     assert_eq!(listing["syncs"], serde_json::json!([]));
     Ok(())
+}
+
+#[test]
+fn running_daemon_recovers_a_managed_install_created_after_startup() -> Result<()> {
+    let temporary = tempdir()?;
+    let state_dir = temporary.path().join("state");
+    let startup_root = temporary.path().join("startup-root");
+    let late_root = temporary.path().join("late-root");
+    std::fs::create_dir(&startup_root)?;
+    std::fs::create_dir(&late_root)?;
+    let mut state = State::open(&state_dir)?;
+    let startup_share = state.init_share(&startup_root)?;
+    state.set_install_intent(&startup_share, &[])?;
+    let late_share = state.init_share(&late_root)?;
+    state.set_peer(
+        &late_share,
+        &flocal::model::PeerConfig {
+            peer_id: Some(flocal::model::PeerId("peer-late".into())),
+            relationship: None,
+            host: "127.0.0.1".into(),
+            remote_path: b"/remote".to_vec(),
+            executable: "/bin/false".into(),
+        },
+    )?;
+    let recovery_baseline = state.scheduling_snapshot()?.completion_sequence;
+    drop(state);
+
+    let binary = env!("CARGO_BIN_EXE_flocal");
+    let mut daemon = Command::new(binary)
+        .args(["daemon", "run"])
+        .env("FLOCAL_STATE_DIR", &state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let socket = state_dir.join("run/daemon.sock");
+    wait_until(|| Ok(socket.exists()), "daemon control socket")?;
+    wait_until(
+        || {
+            Ok(State::open(&state_dir)?
+                .install_intent(&startup_share)?
+                .is_none())
+        },
+        "startup install recovery",
+    )?;
+    wait_until(
+        || {
+            Ok(State::open(&state_dir)?
+                .scheduling_snapshot()?
+                .completion_sequence
+                > recovery_baseline)
+        },
+        "startup recovery permit completion",
+    )?;
+
+    State::open(&state_dir)?.set_managed_plan_install_intent(&late_share, &[], &[], 0)?;
+    wait_until(
+        || {
+            Ok(State::open(&state_dir)?
+                .install_intent(&late_share)?
+                .is_none())
+        },
+        "post-startup managed install recovery",
+    )?;
+
+    let state = State::open(&state_dir)?;
+    let managed = state.managed_share(&late_share)?;
+    assert!(managed.initial_complete);
+    assert!(managed.watch_enabled);
+    stop_daemon(&mut daemon)
 }
 
 #[test]
@@ -261,7 +342,7 @@ exec sleep 600
         &share,
         &flocal::model::PeerConfig {
             peer_id: Some(flocal::model::PeerId("peer-test".into())),
-            relationship: None,
+            relationship: Some(flocal::model::RelationshipId::generate()),
             host: "test-peer".into(),
             remote_path: b"/remote".to_vec(),
             executable: binary.into(),
@@ -554,7 +635,7 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
             .output()?;
         assert!(status.status.success(), "{:?}", status);
         let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-        assert_eq!(status["schema"], 5);
+        assert_eq!(status["schema"], 6);
         assert_eq!(status["relationship_state"], "unpaired");
         assert_eq!(status["removal_pending"], false);
     }

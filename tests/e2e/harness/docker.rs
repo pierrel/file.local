@@ -6,6 +6,7 @@ use std::time::Instant;
 use anyhow::{Context as _, Result, bail};
 
 pub const SHARE: &str = "/home/peer/share";
+pub const SECOND_SHARE: &str = "/home/peer/second-share";
 pub const LABEL: &str = "flocal-e2e=1";
 const IMAGE_TAG: &str = "flocal-e2e";
 

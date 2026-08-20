@@ -1,4 +1,4 @@
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -13,10 +13,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use flocal::model::{Entry, PeerConfig, ShareId};
+use flocal::model::{Entry, PeerConfig, PeerId, RelationshipId, ShareId};
 use flocal::state::{
-    EndpointBinding, IncomingRemoval, PreparedRemoval, RegistrationOutcome, RemovalFailureState,
-    State,
+    EndpointBinding, IncomingRemoval, InstallationPermit, PairedQueueState, PreparedRemoval,
+    QueuePosition, QueueRequest, RegistrationOutcome, RemovalFailureState, SchedulingSnapshot,
+    State, SyncOperation,
 };
 use flocal::sync::{
     self, InitialMessage, Message, RegisterRelationshipResponse, RelationshipRequest,
@@ -206,6 +207,11 @@ enum PeerCommand {
 enum ProtocolCommand {
     Serve,
     Relationship,
+    #[cfg(feature = "e2e-test-hooks")]
+    #[command(hide = true)]
+    E2eHoldInstallation {
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -298,13 +304,22 @@ fn run() -> Result<()> {
             Some(command) => sync_command(&mut state, command)?,
             None => {
                 let path = path.context("sync requires a subcommand or PATH")?;
-                if !dry_run {
-                    recover_installs(&mut state)?;
+                let completion = run_sync(
+                    &mut state,
+                    &path,
+                    dry_run,
+                    yes,
+                    json,
+                    PlanReport::Full,
+                    None,
+                )?;
+                if completion.initial_applied {
+                    let (share, _) = state.find_share(&path)?;
+                    state.set_initial_complete(&share)?;
                 }
-                run_sync(&mut state, &path, dry_run, yes, json, PlanReport::Full)?;
             }
         },
-        Commands::Status { path, json } => status(&state, &path, json)?,
+        Commands::Status { path, json } => status(&mut state, &path, json)?,
         Commands::Conflicts { command } => conflicts(&mut state, command)?,
         Commands::Restore {
             path,
@@ -319,10 +334,7 @@ fn run() -> Result<()> {
             let selector = RestoreSelector::new(version, input, base, merged)?;
             restore(&state, &path, &conflict_id, selector, &destination, force)?
         }
-        Commands::Watch { path } => {
-            recover_installs(&mut state)?;
-            watch(&mut state, &path)?
-        }
+        Commands::Watch { path } => watch(&mut state, &path)?,
         Commands::Daemon {
             command: DaemonCommand::Run,
         } => daemon_run(state)?,
@@ -334,13 +346,14 @@ fn run() -> Result<()> {
         } => install_daemon_service(&state)?,
         Commands::Protocol {
             command: ProtocolCommand::Serve,
-        } => {
-            recover_installs(&mut state)?;
-            serve(&mut state)?
-        }
+        } => serve(&mut state)?,
         Commands::Protocol {
             command: ProtocolCommand::Relationship,
         } => unreachable!("relationship protocol returns before state is opened"),
+        #[cfg(feature = "e2e-test-hooks")]
+        Commands::Protocol {
+            command: ProtocolCommand::E2eHoldInstallation { path },
+        } => e2e_hold_installation(&mut state, &path)?,
     }
     Ok(())
 }
@@ -367,7 +380,6 @@ enum DaemonRequest {
     },
     Start {
         share: String,
-        generation: Option<i64>,
     },
     Stop {
         share: String,
@@ -403,6 +415,15 @@ struct DaemonSync {
     enabled: bool,
     initial_complete: bool,
     state: String,
+    connection_state: String,
+    scheduling: String,
+    waiting_on: Option<String>,
+    operation: Option<SyncOperation>,
+    queue_position: Option<usize>,
+    waiting_root: Option<DaemonPath>,
+    active_share: Option<String>,
+    active_root: Option<DaemonPath>,
+    active_operation: Option<SyncOperation>,
     diagnostic: Option<String>,
     unsettled: usize,
     role: String,
@@ -414,6 +435,82 @@ struct DaemonSync {
 struct DaemonPath {
     encoding: String,
     data: String,
+}
+
+enum SchedulingBlocker {
+    Local(Option<PathBuf>),
+    Peer,
+}
+
+struct ShareSchedulingView {
+    state: &'static str,
+    blocker: Option<SchedulingBlocker>,
+    operation: Option<SyncOperation>,
+    queue_position: Option<usize>,
+    active_share: Option<ShareId>,
+    active_root: Option<PathBuf>,
+    active_operation: Option<SyncOperation>,
+}
+
+fn share_scheduling_view(
+    state: &State,
+    snapshot: &SchedulingSnapshot,
+    share: &ShareId,
+) -> Result<ShareSchedulingView> {
+    let queued = snapshot
+        .queued
+        .iter()
+        .enumerate()
+        .find(|(_, request)| request.share.as_ref() == Some(share));
+    let active_for_share = snapshot
+        .active
+        .as_ref()
+        .filter(|request| request.share.as_ref() == Some(share));
+    let active_share = snapshot
+        .active
+        .as_ref()
+        .and_then(|request| request.share.clone());
+    let active_root = active_share
+        .as_ref()
+        .map(|active| state.root_for(active))
+        .transpose()?;
+    let blocker = queued
+        .map(|(_, request)| -> Result<SchedulingBlocker> {
+            Ok(if snapshot.active.is_some() {
+                SchedulingBlocker::Local(active_root.clone())
+            } else if request
+                .paired_state
+                .is_some_and(|paired| paired != PairedQueueState::Eligible)
+            {
+                SchedulingBlocker::Peer
+            } else {
+                let predecessor_root = snapshot
+                    .eligible_predecessors(request)
+                    .first()
+                    .and_then(|candidate| candidate.share.as_ref())
+                    .map(|candidate| state.root_for(candidate))
+                    .transpose()?;
+                SchedulingBlocker::Local(predecessor_root)
+            })
+        })
+        .transpose()?;
+    Ok(ShareSchedulingView {
+        state: if queued.is_some() {
+            "queued"
+        } else if active_for_share.is_some() {
+            "active"
+        } else {
+            "idle"
+        },
+        blocker,
+        operation: queued
+            .map(|(_, request)| request.operation)
+            .or_else(|| active_for_share.map(|request| request.operation)),
+        queue_position: queued.and_then(|(_, request)| snapshot.queue_position(request)),
+        active_share,
+        active_root,
+        active_operation: snapshot.active.as_ref().map(|active| active.operation),
+    })
 }
 
 fn daemon_path(bytes: &[u8]) -> DaemonPath {
@@ -490,21 +587,19 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                 }
             };
             ensure_daemon(state)?;
-            let generation = if state.initial_complete(&share)? {
-                None
-            } else {
-                match complete_initial_and_enable(state, &share, yes)? {
-                    Some(generation) => Some(generation),
-                    None => return Ok(()),
+            if !state.initial_complete(&share)? {
+                if !complete_initial_and_enable(state, &share, yes)? {
+                    return Ok(());
                 }
-            };
-            daemon_request(
-                state,
-                DaemonRequest::Start {
-                    share: share.0,
-                    generation,
-                },
-            )?;
+            } else {
+                daemon_request(
+                    state,
+                    DaemonRequest::Start {
+                        share: share.0.clone(),
+                    },
+                )?;
+            }
+            report_managed_queue(state, &share)?;
         }
         SyncCommand::List { json } => {
             ensure_daemon(state)?;
@@ -531,7 +626,7 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"schema": 2, "syncs": syncs})
+                        &serde_json::json!({"schema": 3, "syncs": syncs})
                     )?
                 );
             } else {
@@ -568,15 +663,38 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                     } else {
                         String::new()
                     };
+                    let scheduling = if sync.scheduling == "queued" {
+                        match (sync.waiting_on.as_deref(), sync.waiting_root.as_ref()) {
+                            (Some("local"), Some(waiting_root)) => format!(
+                                "; waiting for {} sync to finish (queue position {})",
+                                escaped(
+                                    &bytes_path(&daemon_path_bytes(waiting_root)?)
+                                        .to_string_lossy()
+                                ),
+                                sync.queue_position.unwrap_or(1)
+                            ),
+                            (Some("peer"), _) => format!(
+                                "; waiting for the peer to finish another synchronization (queue position {})",
+                                sync.queue_position.unwrap_or(1)
+                            ),
+                            _ => format!(
+                                "; waiting for the installation synchronization slot (queue position {})",
+                                sync.queue_position.unwrap_or(1)
+                            ),
+                        }
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{}  {}  {}  {}{}{}{}",
+                        "{}  {}  {}  {}{}{}{}{}",
                         escaped(&root.to_string_lossy()),
                         escaped(&peer),
                         desired,
-                        sync.state,
+                        sync.connection_state,
                         diagnostic,
                         unsettled,
                         guidance,
+                        scheduling,
                     );
                 }
             }
@@ -585,21 +703,19 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
             ensure_daemon(state)?;
             let share = select_share(state, path.as_deref(), share.as_deref())?;
             let managed = state.managed_share(&share)?;
-            let generation = if !managed.initial_complete {
-                match complete_initial_and_enable(state, &share, yes)? {
-                    Some(generation) => Some(generation),
-                    None => return Ok(()),
+            if !managed.initial_complete {
+                if !complete_initial_and_enable(state, &share, yes)? {
+                    return Ok(());
                 }
             } else {
-                None
-            };
-            daemon_request(
-                state,
-                DaemonRequest::Start {
-                    share: share.0,
-                    generation,
-                },
-            )?;
+                daemon_request(
+                    state,
+                    DaemonRequest::Start {
+                        share: share.0.clone(),
+                    },
+                )?;
+            }
+            report_managed_queue(state, &share)?;
         }
         SyncCommand::Stop { path, share } => {
             ensure_daemon(state)?;
@@ -625,20 +741,19 @@ fn validate_sync_add_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn complete_initial_and_enable(
-    state: &mut State,
-    share: &ShareId,
-    yes: bool,
-) -> Result<Option<i64>> {
+fn complete_initial_and_enable(state: &mut State, share: &ShareId, yes: bool) -> Result<bool> {
     let generation = state.watch_intent_generation(share)?;
     let root = state.root_for(share)?;
-    recover_installs(state)?;
-    run_sync(state, &root, false, yes, false, PlanReport::Full)?;
-    if state.initial_complete(share)? {
-        state.set_initial_complete_and_watch_enabled(share, generation)?;
-        return Ok(Some(state.watch_intent_generation(share)?));
-    }
-    Ok(None)
+    let completion = run_sync(
+        state,
+        &root,
+        false,
+        yes,
+        false,
+        PlanReport::Full,
+        Some(generation),
+    )?;
+    Ok(completion.initial_applied)
 }
 
 fn select_share(state: &State, path: Option<&Path>, share: Option<&str>) -> Result<ShareId> {
@@ -649,6 +764,29 @@ fn select_share(state: &State, path: Option<&Path>, share: Option<&str>) -> Resu
             .managed_share(&ShareId(share.into()))
             .map(|share| share.id),
     }
+}
+
+fn report_managed_queue(state: &mut State, share: &ShareId) -> Result<()> {
+    let snapshot = state.scheduling_snapshot()?;
+    let view = share_scheduling_view(state, &snapshot, share)?;
+    let Some(blocker) = view.blocker else {
+        return Ok(());
+    };
+    let position = view.queue_position.unwrap_or(1);
+    match blocker {
+        SchedulingBlocker::Local(Some(root)) => println!(
+            "Waiting for {} sync to finish (queue position {})",
+            escaped(&root.to_string_lossy()),
+            position
+        ),
+        SchedulingBlocker::Local(None) => println!(
+            "Waiting for the installation synchronization slot (queue position {position})"
+        ),
+        SchedulingBlocker::Peer => println!(
+            "Waiting for the peer to finish another synchronization (queue position {position})"
+        ),
+    }
+    Ok(())
 }
 
 fn select_share_for_removal(
@@ -790,7 +928,7 @@ fn remove_sync_relationship(
 }
 
 fn report_remote_removal_failure(
-    state: &State,
+    state: &mut State,
     removal: &PreparedRemoval,
     error: &anyhow::Error,
 ) -> Result<()> {
@@ -821,7 +959,7 @@ fn report_remote_removal_failure(
 }
 
 fn report_install_recovery_failure(
-    state: &State,
+    state: &mut State,
     removal: &PreparedRemoval,
     error: &anyhow::Error,
 ) -> Result<()> {
@@ -1335,7 +1473,6 @@ fn run_manager(program: &str, arguments: &[&str]) -> Result<()> {
 }
 
 fn daemon_run(mut state: State) -> Result<()> {
-    recover_daemon_installs(&mut state)?;
     state.ensure_private_state_child("run")?;
     validate_private_file(&state.dir.join("daemon.lock"))?;
     let lock = std::fs::OpenOptions::new()
@@ -1362,15 +1499,43 @@ fn daemon_run(mut state: State) -> Result<()> {
     let workers = Arc::new(Mutex::new(
         std::collections::HashMap::<ShareId, DaemonWorker>::new(),
     ));
+    let lifecycle = Arc::new(Mutex::new(()));
     let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let mut recovery_rx = spawn_daemon_install_recovery(&mut state)?;
+    let mut recovery_complete = false;
     let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let shutdown = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())?;
-    restore_watches(&state, &workers, &events_tx)?;
+    reconcile_watches(&mut state, &workers, &events_tx)?;
+    let mut next_reconcile = std::time::Instant::now() + Duration::from_secs(1);
     let mut shutdown_started = None;
     loop {
+        if !recovery_complete {
+            match recovery_rx.try_recv() {
+                Ok(Ok(())) => {
+                    recovery_complete = true;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    bail!("daemon install recovery stopped unexpectedly")
+                }
+            }
+        }
         while let Ok(event) = events_rx.try_recv() {
             apply_worker_event(&state, &workers, event)?;
+        }
+        if recovery_complete && std::time::Instant::now() >= next_reconcile {
+            let _lifecycle = lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon lifecycle state is poisoned"))?;
+            if state.unclassified_install_intents()?.is_empty() {
+                reconcile_watches(&mut state, &workers, &events_tx)?;
+            } else {
+                recovery_rx = spawn_daemon_install_recovery(&mut state)?;
+                recovery_complete = false;
+            }
+            next_reconcile = std::time::Instant::now() + Duration::from_secs(1);
         }
         if shutdown.load(Ordering::Relaxed) {
             let started = *shutdown_started.get_or_insert_with(std::time::Instant::now);
@@ -1395,10 +1560,13 @@ fn daemon_run(mut state: State) -> Result<()> {
                 let state_dir = state.dir.clone();
                 let workers = workers.clone();
                 let events = events_tx.clone();
+                let lifecycle = lifecycle.clone();
                 let clients = clients.clone();
                 std::thread::spawn(move || {
                     if let Ok(mut state) = State::open(state_dir) {
-                        let _ = handle_daemon_request(&mut state, &workers, &events, stream);
+                        let _ = handle_daemon_request(
+                            &mut state, &workers, &events, &lifecycle, stream,
+                        );
                     }
                     clients.fetch_sub(1, Ordering::Relaxed);
                 });
@@ -1461,8 +1629,8 @@ fn set_owner_only_file(_: &Path) -> Result<()> {
     Ok(())
 }
 
-fn restore_watches(
-    state: &State,
+fn reconcile_watches(
+    state: &mut State,
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
     events: &std::sync::mpsc::Sender<WorkerEvent>,
 ) -> Result<()> {
@@ -1475,7 +1643,17 @@ fn restore_watches(
             && share.blocked_diagnostic.is_none()
             && share.removing_relationship.is_none()
         {
-            start_worker(state, workers, events, share.id)?;
+            if workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?
+                .contains_key(&share.id)
+            {
+                continue;
+            }
+            let generation = state.watch_intent_generation(&share.id)?;
+            let request =
+                state.enqueue_sync(Some(&share.id), SyncOperation::Watch, Some(generation))?;
+            start_worker(state, workers, events, share.id, Some(request))?;
         }
     }
     Ok(())
@@ -1519,6 +1697,7 @@ fn handle_daemon_request(
     state: &mut State,
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
     events: &std::sync::mpsc::Sender<WorkerEvent>,
+    lifecycle: &Arc<Mutex<()>>,
     mut stream: UnixStream,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -1532,9 +1711,12 @@ fn handle_daemon_request(
                 message: format!("{error:#}"),
             },
         },
-        Ok(DaemonRequest::Start { share, generation }) => {
+        Ok(DaemonRequest::Start { share }) => {
+            let _lifecycle = lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon lifecycle state is poisoned"));
             let share = ShareId(share);
-            match start_managed_share(state, workers, events, share, generation) {
+            match _lifecycle.and_then(|_| start_managed_share(state, workers, events, share)) {
                 Ok(()) => DaemonResponse::Ok,
                 Err(error) => DaemonResponse::Error {
                     message: format!("{error:#}"),
@@ -1542,8 +1724,11 @@ fn handle_daemon_request(
             }
         }
         Ok(DaemonRequest::Stop { share }) => {
+            let _lifecycle = lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon lifecycle state is poisoned"));
             let share = ShareId(share);
-            match stop_managed_share(state, workers, share) {
+            match _lifecycle.and_then(|_| stop_managed_share(state, workers, share)) {
                 Ok(()) => DaemonResponse::Ok,
                 Err(error) => DaemonResponse::Error {
                     message: format!("{error:#}"),
@@ -1554,8 +1739,13 @@ fn handle_daemon_request(
             share,
             expected_binding,
         }) => {
+            let _lifecycle = lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon lifecycle state is poisoned"));
             let share = ShareId(share);
-            match prepare_managed_removal(state, workers, &share, &expected_binding) {
+            match _lifecycle
+                .and_then(|_| prepare_managed_removal(state, workers, &share, &expected_binding))
+            {
                 Ok(removal) => DaemonResponse::Prepared { removal },
                 Err(error) => DaemonResponse::Error {
                     message: format!("{error:#}"),
@@ -1591,9 +1781,10 @@ fn prepare_managed_removal(
 }
 
 fn daemon_syncs(
-    state: &State,
+    state: &mut State,
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
 ) -> Result<Vec<DaemonSync>> {
+    let scheduling_snapshot = state.scheduling_snapshot()?;
     let workers = workers
         .lock()
         .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
@@ -1605,7 +1796,7 @@ fn daemon_syncs(
             EndpointBinding::Unpaired => continue,
         };
         let removal_pending = share.removing_relationship.is_some();
-        let state_name = if removal_pending {
+        let connection_state = if removal_pending {
             "removing"
         } else if registration_pending {
             "registering"
@@ -1625,6 +1816,12 @@ fn daemon_syncs(
         } else {
             "stopped"
         };
+        let scheduling = share_scheduling_view(state, &scheduling_snapshot, &share.id)?;
+        let state_name = if scheduling.state == "queued" {
+            "queued"
+        } else {
+            connection_state
+        };
         syncs.push(DaemonSync {
             share: share.id.0.clone(),
             root: daemon_path(&path_bytes(&share.root)),
@@ -1639,6 +1836,27 @@ fn daemon_syncs(
             enabled: share.watch_enabled,
             initial_complete: share.initial_complete,
             state: state_name.into(),
+            connection_state: connection_state.into(),
+            scheduling: scheduling.state.into(),
+            waiting_on: scheduling.blocker.as_ref().map(|blocker| match blocker {
+                SchedulingBlocker::Local(_) => "local".to_owned(),
+                SchedulingBlocker::Peer => "peer".to_owned(),
+            }),
+            operation: scheduling.operation,
+            queue_position: scheduling.queue_position,
+            waiting_root: scheduling
+                .blocker
+                .as_ref()
+                .and_then(|blocker| match blocker {
+                    SchedulingBlocker::Local(Some(root)) => Some(daemon_path(&path_bytes(root))),
+                    SchedulingBlocker::Local(None) | SchedulingBlocker::Peer => None,
+                }),
+            active_share: scheduling.active_share.map(|share| share.0),
+            active_root: scheduling
+                .active_root
+                .as_ref()
+                .map(|root| daemon_path(&path_bytes(root))),
+            active_operation: scheduling.active_operation,
             diagnostic: share.blocked_diagnostic,
             unsettled: state.unsettled_paths(&share.id)?.len(),
             role: role.into(),
@@ -1650,7 +1868,7 @@ fn daemon_syncs(
 }
 
 fn daemon_sync_page(
-    state: &State,
+    state: &mut State,
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
     cursor: Option<String>,
 ) -> Result<DaemonResponse> {
@@ -1692,7 +1910,6 @@ fn start_managed_share(
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
     events: &std::sync::mpsc::Sender<WorkerEvent>,
     share: ShareId,
-    generation: Option<i64>,
 ) -> Result<()> {
     let managed = state.managed_share(&share)?;
     state.ensure_not_removing(&share)?;
@@ -1703,34 +1920,46 @@ fn start_managed_share(
     if !managed.initial_complete {
         bail!("initial synchronization is incomplete; rerun `flocal sync start PATH` to review it");
     }
-    if let Some(worker) = workers
-        .lock()
-        .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?
-        .get(&share)
-    {
-        if worker.stopping.load(Ordering::Relaxed) {
-            bail!("sync is still stopping; retry once it disappears from `flocal sync list`");
+    let retrying_install = state.install_intent_failure(&share)?.is_some();
+    if retrying_install {
+        stop_worker_and_wait(workers, &share)?;
+    } else {
+        let mut workers = workers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
+        if let Some(worker) = workers.get(&share) {
+            if worker.finished.load(Ordering::Relaxed) {
+                workers.remove(&share);
+            } else {
+                if worker.stopping.load(Ordering::Relaxed) {
+                    bail!(
+                        "sync is still stopping; retry once it disappears from `flocal sync list`"
+                    );
+                }
+                return Ok(());
+            }
         }
-        return Ok(());
     }
     state.validate_root_identity(&share)?;
-    recover_daemon_share_install(state, &share)?;
+    state.begin_install_intent_retry(&share)?;
     state.clear_blocked(&share)?;
-    if let Some(generation) = generation {
-        state.set_watch_enabled_if_generation(&share, true, generation)?;
+    let request = if managed.watch_enabled {
+        let generation = state.watch_intent_generation(&share)?;
+        state.enqueue_sync(Some(&share), SyncOperation::Watch, Some(generation))?
     } else {
-        state.set_watch_enabled(&share, true)?;
-    }
-    start_worker(state, workers, events, share)
+        let generation = state.watch_intent_generation(&share)?;
+        state.enable_and_enqueue_managed_sync(&share, generation)?
+    };
+    start_worker(state, workers, events, share, Some(request))
 }
 
 fn stop_managed_share(
-    state: &State,
+    state: &mut State,
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
     share: ShareId,
 ) -> Result<()> {
     state.managed_share(&share)?;
-    state.set_watch_enabled(&share, false)?;
+    state.stop_and_cancel_managed_sync(&share)?;
     state.clear_blocked(&share)?;
     stop_worker_and_wait(workers, &share)
 }
@@ -1746,10 +1975,10 @@ fn stop_worker_and_wait(
         workers.get(share).map(|worker| {
             worker.stopping.store(true, Ordering::Relaxed);
             worker.stop.store(true, Ordering::Relaxed);
-            (worker.finished.clone(), worker.child.clone())
+            (worker.id, worker.finished.clone(), worker.child.clone())
         })
     };
-    if let Some((finished, child)) = worker {
+    if let Some((worker_id, finished, child)) = worker {
         let deadline = std::time::Instant::now() + Duration::from_secs(9);
         while !finished.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
@@ -1771,6 +2000,15 @@ fn stop_worker_and_wait(
                 bail!("sync stop could not end the active worker; it remains disabled");
             }
         }
+        let mut workers = workers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon worker state is poisoned"))?;
+        if workers
+            .get(share)
+            .is_some_and(|worker| worker.id == worker_id)
+        {
+            workers.remove(share);
+        }
     }
     Ok(())
 }
@@ -1780,6 +2018,7 @@ fn start_worker(
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
     events: &std::sync::mpsc::Sender<WorkerEvent>,
     share: ShareId,
+    initial_request: Option<flocal::state::QueueRequest>,
 ) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let live = Arc::new(std::sync::atomic::AtomicU8::new(WORKER_STARTING));
@@ -1809,7 +2048,7 @@ fn start_worker(
     let state_dir = state.dir.clone();
     let events = events.clone();
     std::thread::spawn(move || {
-        let result = run_daemon_worker(&state_dir, &share, &stop, &live, child);
+        let result = run_daemon_worker(&state_dir, &share, &stop, &live, child, initial_request);
         let error = result.err().map(|error| format!("{error:#}"));
         finished.store(true, Ordering::Relaxed);
         let _ = events.send(WorkerEvent::Exited {
@@ -1827,6 +2066,7 @@ fn run_daemon_worker(
     stop: &AtomicBool,
     live: &std::sync::atomic::AtomicU8,
     child: Arc<Mutex<Option<Child>>>,
+    mut initial_request: Option<flocal::state::QueueRequest>,
 ) -> Result<()> {
     let mut state = State::open(state_dir)?;
     if !state.managed_share(share)?.watch_enabled {
@@ -1834,8 +2074,10 @@ fn run_daemon_worker(
     }
     state.validate_root_identity(share)?;
     let root = state.root_for(share)?;
-    let _share_lock = state.lock_share(share)?;
+    let _session_lock = state.lock_share_session(share)?;
     state.ensure_not_removing(share)?;
+    #[cfg(feature = "e2e-test-hooks")]
+    e2e_stop_before_reservation(&state)?;
     live.store(WORKER_RECONNECTING, Ordering::Relaxed);
     persistent_watch_loop_control(
         &mut state,
@@ -1846,7 +2088,48 @@ fn run_daemon_worker(
         Some(stop),
         Some(live),
         child,
+        &mut initial_request,
     )
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_stop_before_reservation(state: &State) -> Result<()> {
+    if !e2e_claim_reservation_stop(state)? {
+        return Ok(());
+    }
+    e2e_publish_reservation_stop_pid(state)?;
+    signal_hook::low_level::raise(signal_hook::consts::SIGSTOP)?;
+    Ok(())
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_claim_reservation_stop(state: &State) -> Result<bool> {
+    let marker = state.dir.join(".e2e-stop-before-reservation");
+    let claimed = state.dir.join(".e2e-stop-before-reservation-claimed");
+    match std::fs::rename(&marker, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("claiming E2E reservation stop marker"),
+    }
+    let metadata = std::fs::symlink_metadata(&claimed)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("E2E reservation stop marker is not a regular file");
+    }
+    std::fs::remove_file(&claimed)?;
+    Ok(true)
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_publish_reservation_stop_pid(state: &State) -> Result<()> {
+    let pidfile = state.dir.join(".e2e-reservation-stop.pid");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(pidfile)
+        .context("publishing E2E stopped reservation pid")?;
+    write!(file, "{}", std::process::id())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn apply_worker_event(
@@ -1880,105 +2163,73 @@ fn apply_worker_event(
     Ok(())
 }
 
-fn recover_installs(state: &mut State) -> Result<()> {
-    let _global_lock = state.lock_global_sync()?;
-    for (share, intent) in state.install_intents()? {
-        let _lock = state.lock_share(&share)?;
-        recover_install_plan(state, &share, &intent)?;
-    }
-    Ok(())
+fn recover_installs_locked(state: &mut State) -> Result<()> {
+    sync::recover_installs_locked(state)
 }
 
-fn recover_daemon_installs(state: &mut State) -> Result<()> {
-    let _global_lock = state.lock_global_sync()?;
-    for (share, intent) in state.install_intents()? {
-        let recovery = recover_daemon_share_install_locked(state, &share, &intent);
-        if let Err(error) = recovery {
-            if let Some(relationship) = state.removing_relationship(&share)? {
-                state.set_removal_diagnostic(&share, &relationship, &format!("{error:#}"))?;
-            } else {
-                state.set_blocked(&share, &format!("{error:#}"))?;
-            }
-        }
-    }
-    Ok(())
+fn recover_daemon_installs_request(request: QueueRequest) -> Result<()> {
+    request
+        .wait_with_prepare(|| false, |_| Ok(()), recover_installs_locked)?
+        .finish()
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_hold_installation(state: &mut State, path: &Path) -> Result<()> {
+    let (share, _) = state.find_share(path)?;
+    let permit = state
+        .enqueue_sync(Some(&share), SyncOperation::Maintenance, None)?
+        .wait(|| false, |_| Ok(()))?;
+    signal_hook::low_level::raise(signal_hook::consts::SIGSTOP)?;
+    permit.finish()
+}
+
+fn spawn_daemon_install_recovery(
+    state: &mut State,
+) -> Result<std::sync::mpsc::Receiver<Result<()>>> {
+    let request = state.enqueue_sync(None, SyncOperation::Recovery, None)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(recover_daemon_installs_request(request));
+    });
+    Ok(receiver)
 }
 
 fn recover_daemon_share_install(state: &mut State, share: &ShareId) -> Result<()> {
-    let _global_lock = state.lock_global_sync()?;
-    let _share_lock = state.lock_share(share)?;
-    let Some(intent) = state.install_intent(share)? else {
-        return Ok(());
-    };
-    state.validate_root_identity(share)?;
-    recover_install_plan(state, share, &intent)
+    state.begin_install_intent_retry(share)?;
+    let request = state.enqueue_sync(Some(share), SyncOperation::Recovery, None)?;
+    request
+        .wait_with_prepare(
+            || false,
+            |_| Ok(()),
+            |permit_state| {
+                recover_installs_locked(permit_state)?;
+                ensure_install_recovery_ready(permit_state, share)
+            },
+        )?
+        .finish()
 }
 
-fn recover_daemon_share_install_locked(
-    state: &mut State,
-    share: &ShareId,
-    intent: &flocal::state::InstallIntent,
-) -> Result<()> {
-    state.validate_root_identity(share)?;
-    let _lock = state.lock_share(share)?;
-    recover_install_plan(state, share, intent)
+fn ensure_install_recovery_ready(state: &State, share: &ShareId) -> Result<()> {
+    if let Some(failure) = state.install_intent_failure(share)? {
+        return Err(InstallRecoveryBlocked(failure.diagnostic).into());
+    }
+    Ok(())
 }
 
-fn recover_install_plan(
-    state: &mut State,
-    share: &ShareId,
-    intent: &flocal::state::InstallIntent,
-) -> Result<()> {
-    #[cfg(feature = "e2e-test-hooks")]
-    e2e_delay_install_recovery(state)?;
-    let plan = flocal::reconcile::Plan {
-        records: intent.records.clone(),
-        conflicts: intent.conflicts.clone(),
-        merges: Vec::new(),
-    };
-    match sync::apply_complete_plan(state, share, &plan) {
-        Ok(()) => Ok(()),
-        Err(error) if error.downcast_ref::<sync::ApplyInvalidated>().is_some() => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("recovering interrupted install for {}", share.0))
-        }
+#[derive(Debug)]
+struct InstallRecoveryBlocked(String);
+
+impl std::fmt::Display for InstallRecoveryBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "install recovery is blocked: {}",
+            escaped(&self.0)
+        )
     }
 }
 
-#[cfg(feature = "e2e-test-hooks")]
-fn e2e_delay_install_recovery(state: &State) -> Result<()> {
-    let Some(claimed) = e2e_claim_install_recovery_delay(state)? else {
-        return Ok(());
-    };
-    std::thread::sleep(Duration::from_secs(35));
-    std::fs::remove_file(claimed).context("consuming E2E install recovery delay marker")
-}
-
-#[cfg(feature = "e2e-test-hooks")]
-fn e2e_claim_install_recovery_delay(state: &State) -> Result<Option<PathBuf>> {
-    let marker = state.dir.join(".e2e-delay-install-recovery");
-    let claimed = state.dir.join(".e2e-delay-install-recovery-claimed");
-    match std::fs::rename(&marker, &claimed) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(&claimed) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error).context("claiming E2E install recovery delay marker"),
-    }
-    let metadata = std::fs::symlink_metadata(&claimed)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        bail!("E2E install recovery delay marker is not a regular file");
-    }
-    anyhow::ensure!(
-        metadata.len() == 0,
-        "E2E install recovery delay marker is not empty"
-    );
-    Ok(Some(claimed))
-}
+impl std::error::Error for InstallRecoveryBlocked {}
 
 fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> Result<()> {
     validate_host(host)?;
@@ -1988,13 +2239,15 @@ fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> R
     let (share, _) = state.find_share(path)?;
     let executable = discover_executable(host)?;
     let expected = state.endpoint_binding(&share)?;
-    let prepared = state.prepare_connector_registration(
+    let registration = wait_for_installation(state, &share, SyncOperation::Registration, None)?;
+    let prepared = state.prepare_connector_registration_locked(
         &share,
         &expected,
         host,
         &path_bytes(remote_path),
         &executable,
     )?;
+    registration.finish()?;
     let relationship = prepared
         .relationship
         .clone()
@@ -2065,7 +2318,9 @@ fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> R
         }
     };
     remote.finish()?;
-    state.complete_connector_registration(&share, &prepared, &peer_id)?;
+    let registration = wait_for_installation(state, &share, SyncOperation::Registration, None)?;
+    state.complete_connector_registration_locked(&share, &prepared, &peer_id)?;
+    registration.finish()?;
     state.clear_blocked(&share)?;
     println!(
         "Connected {} to {}:{}",
@@ -2124,6 +2379,932 @@ enum PlanReport {
 struct SyncCompletion {
     watch_report: Option<Vec<u8>>,
     post_commit_error: Option<anyhow::Error>,
+    initial_applied: bool,
+}
+
+fn wait_for_installation(
+    state: &mut State,
+    share: &ShareId,
+    operation: SyncOperation,
+    generation: Option<i64>,
+) -> Result<InstallationPermit> {
+    let root = state.root_for(share)?;
+    let permit = wait_for_installation_request(state, Some(share), operation, generation)?;
+    if permit.1 {
+        watch_log(
+            &mut io::stdout(),
+            &format!(
+                "Synchronization slot acquired for {}",
+                escaped(&root.to_string_lossy())
+            ),
+        )?;
+    }
+    Ok(permit.0)
+}
+
+fn wait_for_installation_request(
+    state: &mut State,
+    share: Option<&ShareId>,
+    operation: SyncOperation,
+    generation: Option<i64>,
+) -> Result<(InstallationPermit, bool)> {
+    let request = state.enqueue_sync(share, operation, generation)?;
+    let mut waited = false;
+    let mut last_position = None;
+    let permit = request.wait_with_prepare(
+        || false,
+        |position| {
+            waited = true;
+            if last_position.as_ref() != Some(&position) {
+                report_installation_wait(state, &position, &mut io::stdout())?;
+                last_position = Some(position);
+            }
+            Ok(())
+        },
+        |permit_state| {
+            recover_installs_locked(permit_state)?;
+            if let Some(share) = share {
+                ensure_install_recovery_ready(permit_state, share)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok((permit, waited))
+}
+
+fn report_installation_wait(
+    state: &State,
+    position: &QueuePosition,
+    output: &mut impl Write,
+) -> Result<()> {
+    let message = match position
+        .active
+        .as_ref()
+        .and_then(|active| active.share.as_ref())
+    {
+        Some(active) => {
+            let root = state.root_for(active)?;
+            format!(
+                "Waiting for {} sync to finish (queue position {})",
+                escaped(&root.to_string_lossy()),
+                position.position
+            )
+        }
+        None => format!(
+            "Waiting for the installation synchronization slot (queue position {})",
+            position.position
+        ),
+    };
+    watch_log(output, &message)
+}
+
+#[derive(Clone)]
+struct ValidatedSyncBinding {
+    relationship: RelationshipId,
+    order: std::cmp::Ordering,
+}
+
+fn validate_sync_binding(
+    state: &State,
+    share: &ShareId,
+    remote_peer: &PeerId,
+    relationship: &RelationshipId,
+) -> Result<ValidatedSyncBinding> {
+    let managed = state.managed_share(share)?;
+    if managed.removing_relationship.is_some() {
+        bail!("relationship removal is pending");
+    }
+    let matches = match &managed.binding {
+        EndpointBinding::Connector(peer) => {
+            peer.peer_id.as_ref() == Some(remote_peer)
+                && peer.relationship.as_ref() == Some(relationship)
+        }
+        EndpointBinding::Responder {
+            peer,
+            relationship: bound_relationship,
+        } => peer == remote_peer && bound_relationship.as_ref() == Some(relationship),
+        EndpointBinding::Unpaired => false,
+    };
+    if !matches {
+        bail!("peer or relationship binding does not match");
+    }
+    state.validate_root_identity(share)?;
+    let local_peer = state.peer_id()?;
+    let order = sync::peer_order(&local_peer, remote_peer)?;
+    Ok(ValidatedSyncBinding {
+        relationship: relationship.clone(),
+        order,
+    })
+}
+
+fn connector_sync_binding(
+    state: &State,
+    share: &ShareId,
+    peer: &PeerConfig,
+) -> Result<ValidatedSyncBinding> {
+    let remote = peer.completed_peer_id()?;
+    let relationship = peer
+        .relationship
+        .as_ref()
+        .context("connector relationship registration is incomplete")?;
+    validate_sync_binding(state, share, remote, relationship)
+}
+
+#[derive(Debug)]
+enum ReservationFrame {
+    PendingAuthority(sync::PendingAuthority),
+    ProxyIssue(sync::ProxyIssue),
+    ProxyAck(sync::ProxyAck),
+    Queued(sync::SyncQueued),
+    PairPrepare(sync::PairCheckpoint),
+    PairPrepareAck(sync::PairCheckpoint),
+    PairReset(sync::PairCheckpoint),
+    PairResetAck(sync::PairCheckpoint),
+    PairCommit(sync::PairCheckpoint),
+    PairCommitAck(sync::PairCheckpoint),
+    SyncReserved(sync::Reservation),
+    SyncStart(sync::SyncStart),
+    SyncAccepted(sync::Reservation),
+}
+
+trait ReservationWire {
+    fn send_reservation(
+        &mut self,
+        frame: ReservationFrame,
+        deadline: std::time::Instant,
+    ) -> Result<()>;
+    fn recv_reservation(&mut self, deadline: std::time::Instant) -> Result<ReservationFrame>;
+}
+
+fn reservation_from_v1(frame: Message) -> Result<ReservationFrame> {
+    match frame {
+        Message::PendingAuthority(value) => Ok(ReservationFrame::PendingAuthority(value)),
+        Message::ProxyIssue(value) => Ok(ReservationFrame::ProxyIssue(value)),
+        Message::ProxyAck(value) => Ok(ReservationFrame::ProxyAck(value)),
+        Message::SyncQueued(value) => Ok(ReservationFrame::Queued(value)),
+        Message::PairPrepare(value) => Ok(ReservationFrame::PairPrepare(value)),
+        Message::PairPrepareAck(value) => Ok(ReservationFrame::PairPrepareAck(value)),
+        Message::PairReset(value) => Ok(ReservationFrame::PairReset(value)),
+        Message::PairResetAck(value) => Ok(ReservationFrame::PairResetAck(value)),
+        Message::PairCommit(value) => Ok(ReservationFrame::PairCommit(value)),
+        Message::PairCommitAck(value) => Ok(ReservationFrame::PairCommitAck(value)),
+        Message::SyncReserved(value) => Ok(ReservationFrame::SyncReserved(value)),
+        Message::SyncStart(value) => Ok(ReservationFrame::SyncStart(value)),
+        Message::SyncAccepted(value) => Ok(ReservationFrame::SyncAccepted(value)),
+        Message::Error { message } => bail!("remote rejected sync: {}", escaped(&message)),
+        other => bail!("unexpected synchronization reservation frame: {other:?}"),
+    }
+}
+
+fn reservation_into_v1(frame: ReservationFrame) -> Message {
+    match frame {
+        ReservationFrame::PendingAuthority(value) => Message::PendingAuthority(value),
+        ReservationFrame::ProxyIssue(value) => Message::ProxyIssue(value),
+        ReservationFrame::ProxyAck(value) => Message::ProxyAck(value),
+        ReservationFrame::Queued(value) => Message::SyncQueued(value),
+        ReservationFrame::PairPrepare(value) => Message::PairPrepare(value),
+        ReservationFrame::PairPrepareAck(value) => Message::PairPrepareAck(value),
+        ReservationFrame::PairReset(value) => Message::PairReset(value),
+        ReservationFrame::PairResetAck(value) => Message::PairResetAck(value),
+        ReservationFrame::PairCommit(value) => Message::PairCommit(value),
+        ReservationFrame::PairCommitAck(value) => Message::PairCommitAck(value),
+        ReservationFrame::SyncReserved(value) => Message::SyncReserved(value),
+        ReservationFrame::SyncStart(value) => Message::SyncStart(value),
+        ReservationFrame::SyncAccepted(value) => Message::SyncAccepted(value),
+    }
+}
+
+struct V1ReservationWire<'a, I, O> {
+    input: &'a I,
+    output: &'a O,
+}
+
+impl<I: AsFd, O: AsFd> ReservationWire for V1ReservationWire<'_, I, O> {
+    fn send_reservation(
+        &mut self,
+        frame: ReservationFrame,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        sync::write_v1_message_until(self.output, &reservation_into_v1(frame), deadline)
+    }
+
+    fn recv_reservation(&mut self, deadline: std::time::Instant) -> Result<ReservationFrame> {
+        reservation_from_v1(sync::read_v1_message_until(self.input, deadline)?)
+    }
+}
+
+fn reservation_from_v2(frame: V2RoundFrame) -> Result<ReservationFrame> {
+    match frame {
+        V2RoundFrame::PendingAuthority(value) => Ok(ReservationFrame::PendingAuthority(value)),
+        V2RoundFrame::ProxyIssue(value) => Ok(ReservationFrame::ProxyIssue(value)),
+        V2RoundFrame::ProxyAck(value) => Ok(ReservationFrame::ProxyAck(value)),
+        V2RoundFrame::SyncQueued(value) => Ok(ReservationFrame::Queued(value)),
+        V2RoundFrame::PairPrepare(value) => Ok(ReservationFrame::PairPrepare(value)),
+        V2RoundFrame::PairPrepareAck(value) => Ok(ReservationFrame::PairPrepareAck(value)),
+        V2RoundFrame::PairReset(value) => Ok(ReservationFrame::PairReset(value)),
+        V2RoundFrame::PairResetAck(value) => Ok(ReservationFrame::PairResetAck(value)),
+        V2RoundFrame::PairCommit(value) => Ok(ReservationFrame::PairCommit(value)),
+        V2RoundFrame::PairCommitAck(value) => Ok(ReservationFrame::PairCommitAck(value)),
+        V2RoundFrame::SyncReserved(value) => Ok(ReservationFrame::SyncReserved(value)),
+        V2RoundFrame::SyncStart(value) => Ok(ReservationFrame::SyncStart(value)),
+        V2RoundFrame::SyncAccepted(value) => Ok(ReservationFrame::SyncAccepted(value)),
+        V2RoundFrame::SyncFailed { retryable, message } => {
+            Err(RemoteWatchError { retryable, message }.into())
+        }
+        other => bail!("unexpected persistent reservation frame: {other:?}"),
+    }
+}
+
+fn reservation_into_v2(frame: ReservationFrame) -> V2RoundFrame {
+    match frame {
+        ReservationFrame::PendingAuthority(value) => V2RoundFrame::PendingAuthority(value),
+        ReservationFrame::ProxyIssue(value) => V2RoundFrame::ProxyIssue(value),
+        ReservationFrame::ProxyAck(value) => V2RoundFrame::ProxyAck(value),
+        ReservationFrame::Queued(value) => V2RoundFrame::SyncQueued(value),
+        ReservationFrame::PairPrepare(value) => V2RoundFrame::PairPrepare(value),
+        ReservationFrame::PairPrepareAck(value) => V2RoundFrame::PairPrepareAck(value),
+        ReservationFrame::PairReset(value) => V2RoundFrame::PairReset(value),
+        ReservationFrame::PairResetAck(value) => V2RoundFrame::PairResetAck(value),
+        ReservationFrame::PairCommit(value) => V2RoundFrame::PairCommit(value),
+        ReservationFrame::PairCommitAck(value) => V2RoundFrame::PairCommitAck(value),
+        ReservationFrame::SyncReserved(value) => V2RoundFrame::SyncReserved(value),
+        ReservationFrame::SyncStart(value) => V2RoundFrame::SyncStart(value),
+        ReservationFrame::SyncAccepted(value) => V2RoundFrame::SyncAccepted(value),
+    }
+}
+
+struct V2ReservationWire<'a, I, O> {
+    round: u64,
+    input: &'a I,
+    output: &'a O,
+    pending_remote_generation: Option<&'a mut u64>,
+    prefetched: Option<ReservationFrame>,
+}
+
+impl<I: AsFd, O: AsFd> ReservationWire for V2ReservationWire<'_, I, O> {
+    fn send_reservation(
+        &mut self,
+        frame: ReservationFrame,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        sync::write_v2_envelope_until(
+            self.output,
+            &V2Envelope::Round {
+                round: self.round,
+                frame: reservation_into_v2(frame),
+            },
+            deadline,
+        )
+    }
+
+    fn recv_reservation(&mut self, deadline: std::time::Instant) -> Result<ReservationFrame> {
+        if let Some(frame) = self.prefetched.take() {
+            return Ok(frame);
+        }
+        loop {
+            match sync::read_v2_envelope_until(self.input, deadline)? {
+                V2Envelope::Round { round, frame } if round == self.round => {
+                    return reservation_from_v2(frame);
+                }
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Changed { generation },
+                } if self.pending_remote_generation.is_some() => {
+                    let pending = self
+                        .pending_remote_generation
+                        .as_deref_mut()
+                        .expect("checked above");
+                    *pending = (*pending).max(generation);
+                }
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Pong { .. },
+                } if self.pending_remote_generation.is_some() => {}
+                V2Envelope::Session {
+                    frame: V2SessionFrame::Error { retryable, message },
+                } => return Err(RemoteWatchError { retryable, message }.into()),
+                other => {
+                    watch_protocol_bail!("unexpected persistent reservation envelope: {other:?}")
+                }
+            }
+        }
+    }
+}
+
+fn empty_predecessor() -> sync::PredecessorFingerprint {
+    sync::PredecessorFingerprint::from_blake3(blake3::hash(&[]))
+}
+
+fn scheduling_deadline() -> std::time::Instant {
+    std::time::Instant::now() + sync::default_frame_deadline()
+}
+
+const MAX_PAIR_RESETS: usize = 8;
+
+fn note_pair_reset(pair_resets: &mut usize) -> Result<()> {
+    *pair_resets += 1;
+    if *pair_resets > MAX_PAIR_RESETS {
+        bail!("peer synchronization reservation changed too many times");
+    }
+    Ok(())
+}
+
+fn relationship_retry_ns() -> i64 {
+    let retry = std::time::SystemTime::now()
+        .checked_add(sync::reservation_lease())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(i64::MAX as u64));
+    retry
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+
+fn report_peer_queue(queued: sync::SyncQueued, output: &mut impl Write) -> Result<()> {
+    watch_log(
+        output,
+        &format!(
+            "Waiting for the peer to finish another synchronization (queue position {})",
+            queued.position.get()
+        ),
+    )
+}
+
+fn recv_reservation_ignoring_progress(
+    wire: &mut impl ReservationWire,
+    deadline: Option<std::time::Instant>,
+    output: &mut impl Write,
+) -> Result<ReservationFrame> {
+    let mut progress_window = std::time::Instant::now();
+    let mut progress_frames = 0u8;
+    let mut last_report = None;
+    let mut last_reported_at = None;
+    loop {
+        let frame = wire.recv_reservation(deadline.unwrap_or_else(scheduling_deadline))?;
+        match frame {
+            ReservationFrame::Queued(queued) => {
+                let now = std::time::Instant::now();
+                if now.duration_since(progress_window) >= Duration::from_secs(1) {
+                    progress_window = now;
+                    progress_frames = 0;
+                }
+                progress_frames = progress_frames.saturating_add(1);
+                if progress_frames > 8 {
+                    bail!("peer sent synchronization progress too frequently");
+                }
+                let changed = last_report != Some(queued);
+                let report_allowed = last_reported_at
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10));
+                if changed && report_allowed {
+                    report_peer_queue(queued, output)?;
+                    last_report = Some(queued);
+                    last_reported_at = Some(now);
+                }
+            }
+            frame => return Ok(frame),
+        }
+    }
+}
+
+fn send_local_queue_position(
+    state: &mut State,
+    request: &QueueRequest,
+    wire: &mut impl ReservationWire,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let position = state.paired_queue_position(request.token())?;
+    wire.send_reservation(
+        ReservationFrame::Queued(sync::SyncQueued {
+            waiting_on: sync::WaitingOn::Local,
+            position: sync::CoarseQueuePosition::from_exact(position.position.max(1))?,
+        }),
+        deadline,
+    )
+}
+
+struct LocalPredecessor {
+    stored: String,
+    wire: sync::PredecessorFingerprint,
+}
+
+fn prepare_local_pair(
+    state: &mut State,
+    request: &QueueRequest,
+    relationship: &RelationshipId,
+    network_authority: &PeerId,
+    order: sync::NetworkOrder,
+    nonce: &sync::SchedulingNonce,
+    wire: &mut impl ReservationWire,
+) -> Result<LocalPredecessor> {
+    let mut next_progress = std::time::Instant::now();
+    loop {
+        if let Some(predecessor) = state.prepare_paired_sync(
+            request.token(),
+            relationship,
+            network_authority,
+            order.get() as i64,
+            nonce.as_str(),
+        )? {
+            let hash = predecessor
+                .parse::<blake3::Hash>()
+                .context("stored predecessor fingerprint is invalid")?;
+            return Ok(LocalPredecessor {
+                stored: predecessor,
+                wire: sync::PredecessorFingerprint::from_blake3(hash),
+            });
+        }
+        if std::time::Instant::now() >= next_progress {
+            send_local_queue_position(state, request, wire, scheduling_deadline())?;
+            next_progress = std::time::Instant::now() + Duration::from_secs(10);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_paired_permit(
+    request: QueueRequest,
+    share: &ShareId,
+    wire: &mut impl ReservationWire,
+    lease_deadline: Option<std::time::Instant>,
+) -> Result<InstallationPermit> {
+    request.wait_with_prepare(
+        || lease_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
+        |position| {
+            wire.send_reservation(
+                ReservationFrame::Queued(sync::SyncQueued {
+                    waiting_on: sync::WaitingOn::Local,
+                    position: sync::CoarseQueuePosition::from_exact(position.position.max(1))?,
+                }),
+                lease_deadline.unwrap_or_else(scheduling_deadline),
+            )
+        },
+        |permit_state| ensure_install_recovery_ready(permit_state, share),
+    )
+}
+
+fn recover_before_pair(state: &mut State, wire: &mut impl ReservationWire) -> Result<()> {
+    recover_before_pair_with_interval(state, wire, Duration::from_secs(10))
+}
+
+fn recover_before_pair_with_interval(
+    state: &mut State,
+    wire: &mut impl ReservationWire,
+    progress_interval: Duration,
+) -> Result<()> {
+    let request = state.enqueue_sync(None, SyncOperation::Recovery, None)?;
+    let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+    let canceled = Arc::new(AtomicBool::new(false));
+    let recovery_canceled = canceled.clone();
+    let recovery = std::thread::spawn(move || {
+        let result = request
+            .wait_with_prepare(
+                || recovery_canceled.load(Ordering::Relaxed),
+                |_| Ok(()),
+                recover_installs_locked,
+            )?
+            .finish();
+        let _ = completed_tx.send(());
+        result
+    });
+    loop {
+        match completed_rx.recv_timeout(progress_interval) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return recovery
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("install recovery thread panicked"))?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Err(wire_error) = wire.send_reservation(
+            ReservationFrame::Queued(sync::SyncQueued {
+                waiting_on: sync::WaitingOn::Local,
+                position: sync::CoarseQueuePosition::from_exact(1)?,
+            }),
+            scheduling_deadline(),
+        ) {
+            canceled.store(true, Ordering::Relaxed);
+            let _ = recovery.join();
+            return Err(wire_error);
+        }
+    }
+}
+
+fn validate_final_sync_binding(
+    state: &State,
+    share: &ShareId,
+    remote_peer: &PeerId,
+    relationship: &RelationshipId,
+    expected_intent_generation: Option<i64>,
+) -> Result<()> {
+    validate_sync_binding(state, share, remote_peer, relationship)?;
+    if let Some(generation) = expected_intent_generation
+        && state.watch_intent_generation(share)? != generation
+    {
+        bail!("synchronization intent changed while reserving both installations");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reserve_as_authority(
+    state: &mut State,
+    share: &ShareId,
+    remote_peer: &PeerId,
+    relationship: &RelationshipId,
+    operation: SyncOperation,
+    intent_generation: Option<i64>,
+    connector_generation: u64,
+    responder_generation: u64,
+    id: sync::SchedulingId,
+    existing: Option<QueueRequest>,
+    wire: &mut impl ReservationWire,
+    watch_output: &mut impl Write,
+) -> Result<(InstallationPermit, std::fs::File, sync::Reservation)> {
+    let nonce = sync::SchedulingNonce::generate();
+    let placeholder = empty_predecessor();
+    let network_authority = state.peer_id()?;
+    let (request, network_order) = match existing {
+        Some(request) => {
+            let order = state
+                .convert_managed_to_authoritative_parked(
+                    request.token(),
+                    share,
+                    relationship,
+                    operation,
+                    intent_generation,
+                    &network_authority,
+                    nonce.as_str(),
+                    placeholder.as_str(),
+                )?
+                .context("managed synchronization changed before authority reservation")?;
+            (request, order)
+        }
+        None => state.enqueue_authoritative_sync(
+            share,
+            relationship,
+            operation,
+            intent_generation,
+            &network_authority,
+            nonce.as_str(),
+            placeholder.as_str(),
+        )?,
+    };
+    let network_order = sync::NetworkOrder::new(network_order as u64)?;
+    let mut next_progress = std::time::Instant::now();
+    loop {
+        let next = state
+            .next_unacknowledged_proxy()?
+            .context("authoritative proxy issue disappeared before publication")?;
+        if next.token == request.token() {
+            break;
+        }
+        if std::time::Instant::now() >= next_progress {
+            send_local_queue_position(state, &request, wire, scheduling_deadline())?;
+            next_progress = std::time::Instant::now() + Duration::from_secs(10);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let issue = sync::ProxyIssue {
+        id: id.clone(),
+        network_order,
+        nonce: nonce.clone(),
+        connector_generation,
+        responder_generation,
+    };
+    wire.send_reservation(
+        ReservationFrame::ProxyIssue(issue.clone()),
+        scheduling_deadline(),
+    )?;
+    match recv_reservation_ignoring_progress(wire, None, watch_output)? {
+        ReservationFrame::ProxyAck(ack) if ack.id == id && ack.network_order == network_order => {}
+        other => bail!("expected exact proxy acknowledgment, got {other:?}"),
+    }
+    if !state.acknowledge_proxy_issue(
+        request.token(),
+        relationship,
+        &network_authority,
+        network_order.get() as i64,
+    )? {
+        bail!("authoritative synchronization changed before proxy acknowledgment");
+    }
+
+    let mut pair_resets = 0;
+    let local_checkpoint = loop {
+        let local_predecessor = prepare_local_pair(
+            state,
+            &request,
+            relationship,
+            &network_authority,
+            network_order,
+            &nonce,
+            wire,
+        )?;
+        let local_checkpoint = sync::PairCheckpoint {
+            id: id.clone(),
+            network_order,
+            nonce: nonce.clone(),
+            predecessor: local_predecessor.wire.clone(),
+        };
+        wire.send_reservation(
+            ReservationFrame::PairPrepare(local_checkpoint.clone()),
+            scheduling_deadline(),
+        )?;
+        match recv_reservation_ignoring_progress(wire, None, watch_output)? {
+            ReservationFrame::PairPrepareAck(remote)
+                if remote.id == id
+                    && remote.network_order == network_order
+                    && remote.nonce == nonce => {}
+            other => bail!("expected exact pair prepare acknowledgment, got {other:?}"),
+        }
+        recover_before_pair(state, wire)?;
+        if state.commit_paired_sync(
+            request.token(),
+            relationship,
+            &network_authority,
+            network_order.get() as i64,
+            nonce.as_str(),
+            &local_predecessor.stored,
+        )? {
+            break local_checkpoint;
+        }
+        note_pair_reset(&mut pair_resets)?;
+        wire.send_reservation(
+            ReservationFrame::PairReset(local_checkpoint.clone()),
+            scheduling_deadline(),
+        )?;
+        match recv_reservation_ignoring_progress(wire, None, watch_output)? {
+            ReservationFrame::PairResetAck(remote) if remote == local_checkpoint => {}
+            other => bail!("expected exact pair reset acknowledgment, got {other:?}"),
+        }
+    };
+
+    let committed = (|| -> Result<(InstallationPermit, std::fs::File, sync::Reservation)> {
+        let lease_deadline = std::time::Instant::now() + sync::reservation_lease();
+        wire.send_reservation(
+            ReservationFrame::PairCommit(local_checkpoint),
+            lease_deadline,
+        )?;
+        match recv_reservation_ignoring_progress(wire, Some(lease_deadline), watch_output)? {
+            ReservationFrame::PairCommitAck(remote)
+                if remote.id == id
+                    && remote.network_order == network_order
+                    && remote.nonce == nonce => {}
+            other => bail!("expected exact pair commit acknowledgment, got {other:?}"),
+        }
+        let installation = wait_for_paired_permit(request, share, wire, Some(lease_deadline))?;
+        let reservation = sync::Reservation {
+            id: id.clone(),
+            network_order,
+            nonce: nonce.clone(),
+        };
+        wire.send_reservation(
+            ReservationFrame::SyncReserved(reservation.clone()),
+            lease_deadline,
+        )?;
+        let start =
+            match recv_reservation_ignoring_progress(wire, Some(lease_deadline), watch_output)? {
+                ReservationFrame::SyncStart(start) => start,
+                other => bail!("expected exact synchronization start, got {other:?}"),
+            };
+        if start.reservation() != reservation
+            || start.connector_generation != connector_generation
+            || start.responder_generation != responder_generation
+        {
+            bail!("peer synchronization start does not match the committed reservation");
+        }
+        let share_lock = state.lock_share(share)?;
+        validate_final_sync_binding(state, share, remote_peer, relationship, intent_generation)?;
+        wire.send_reservation(
+            ReservationFrame::SyncAccepted(reservation.clone()),
+            lease_deadline,
+        )?;
+        Ok((installation, share_lock, reservation))
+    })();
+    if committed.is_err() {
+        state.record_relationship_yield(relationship, relationship_retry_ns())?;
+    }
+    committed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reserve_as_higher_peer(
+    state: &mut State,
+    share: &ShareId,
+    remote_peer: &PeerId,
+    relationship: &RelationshipId,
+    operation: SyncOperation,
+    intent_generation: Option<i64>,
+    connector_generation: u64,
+    responder_generation: u64,
+    connector_origin: bool,
+    existing: Option<QueueRequest>,
+    wire: &mut impl ReservationWire,
+    watch_output: &mut impl Write,
+) -> Result<(InstallationPermit, std::fs::File, sync::Reservation)> {
+    let id = sync::SchedulingId::generate();
+    let mut pending = if connector_origin {
+        let request = match existing {
+            Some(request) => {
+                if !state.convert_managed_to_pending_authority(
+                    request.token(),
+                    share,
+                    relationship,
+                    operation,
+                    intent_generation,
+                )? {
+                    bail!("managed synchronization changed before authority submission");
+                }
+                request
+            }
+            None => state.enqueue_pending_authority(
+                share,
+                relationship,
+                operation,
+                intent_generation,
+            )?,
+        };
+        wire.send_reservation(
+            ReservationFrame::PendingAuthority(sync::PendingAuthority {
+                id: id.clone(),
+                connector_generation,
+                responder_generation,
+            }),
+            scheduling_deadline(),
+        )?;
+        Some(request)
+    } else {
+        None
+    };
+    let issue = match recv_reservation_ignoring_progress(wire, None, watch_output)? {
+        ReservationFrame::ProxyIssue(issue) if !connector_origin || issue.id == id => issue,
+        other => bail!("expected authoritative proxy issue, got {other:?}"),
+    };
+    if issue.connector_generation != connector_generation
+        || issue.responder_generation != responder_generation
+    {
+        bail!("proxy issue generation does not match the submitted synchronization");
+    }
+    let placeholder = empty_predecessor();
+    let request = if let Some(request) = pending.take() {
+        if !state.convert_pending_authority_to_parked(
+            request.token(),
+            share,
+            relationship,
+            operation,
+            intent_generation,
+            remote_peer,
+            issue.network_order.get() as i64,
+            issue.nonce.as_str(),
+            placeholder.as_str(),
+        )? {
+            bail!("pending synchronization changed before proxy issue");
+        }
+        request
+    } else {
+        state.enqueue_parked_proxy(
+            share,
+            relationship,
+            operation,
+            intent_generation,
+            remote_peer,
+            issue.network_order.get() as i64,
+            issue.nonce.as_str(),
+            placeholder.as_str(),
+        )?
+    };
+    wire.send_reservation(
+        ReservationFrame::ProxyAck(sync::ProxyAck {
+            id: issue.id.clone(),
+            network_order: issue.network_order,
+        }),
+        scheduling_deadline(),
+    )?;
+    let mut pair_resets = 0;
+    let (local_predecessor, local_checkpoint) = loop {
+        let lower_prepare = match recv_reservation_ignoring_progress(wire, None, watch_output)? {
+            ReservationFrame::PairPrepare(checkpoint)
+                if checkpoint.id == issue.id
+                    && checkpoint.network_order == issue.network_order
+                    && checkpoint.nonce == issue.nonce =>
+            {
+                checkpoint
+            }
+            other => bail!("expected exact pair prepare, got {other:?}"),
+        };
+        let local_predecessor = prepare_local_pair(
+            state,
+            &request,
+            relationship,
+            remote_peer,
+            issue.network_order,
+            &issue.nonce,
+            wire,
+        )?;
+        recover_before_pair(state, wire)?;
+        let local_checkpoint = sync::PairCheckpoint {
+            id: issue.id.clone(),
+            network_order: issue.network_order,
+            nonce: issue.nonce.clone(),
+            predecessor: local_predecessor.wire.clone(),
+        };
+        wire.send_reservation(
+            ReservationFrame::PairPrepareAck(local_checkpoint.clone()),
+            scheduling_deadline(),
+        )?;
+        match recv_reservation_ignoring_progress(wire, None, watch_output)? {
+            ReservationFrame::PairCommit(checkpoint) if checkpoint == lower_prepare => {
+                break (local_predecessor, local_checkpoint);
+            }
+            ReservationFrame::PairReset(checkpoint) if checkpoint == lower_prepare => {
+                note_pair_reset(&mut pair_resets)?;
+                if !state.park_paired_sync(
+                    request.token(),
+                    relationship,
+                    remote_peer,
+                    issue.network_order.get() as i64,
+                    issue.nonce.as_str(),
+                )? {
+                    bail!("local synchronization changed before pair reset");
+                }
+                wire.send_reservation(
+                    ReservationFrame::PairResetAck(checkpoint),
+                    scheduling_deadline(),
+                )?;
+            }
+            other => bail!("expected exact pair commit or reset, got {other:?}"),
+        }
+    };
+    let local_commit = state.commit_paired_sync(
+        request.token(),
+        relationship,
+        remote_peer,
+        issue.network_order.get() as i64,
+        issue.nonce.as_str(),
+        &local_predecessor.stored,
+    );
+    match local_commit {
+        Ok(true) => {}
+        Ok(false) => {
+            state.record_relationship_yield(relationship, relationship_retry_ns())?;
+            bail!("local synchronization reservation was invalidated before commit");
+        }
+        Err(error) => {
+            state.record_relationship_yield(relationship, relationship_retry_ns())?;
+            return Err(error);
+        }
+    }
+
+    let committed = (|| -> Result<(InstallationPermit, std::fs::File, sync::Reservation)> {
+        let lease_deadline = std::time::Instant::now() + sync::reservation_lease();
+        wire.send_reservation(
+            ReservationFrame::PairCommitAck(local_checkpoint),
+            lease_deadline,
+        )?;
+        let reservation =
+            match recv_reservation_ignoring_progress(wire, Some(lease_deadline), watch_output)? {
+                ReservationFrame::SyncReserved(reservation)
+                    if reservation.id == issue.id
+                        && reservation.network_order == issue.network_order
+                        && reservation.nonce == issue.nonce =>
+                {
+                    reservation
+                }
+                other => bail!("expected exact synchronization reservation, got {other:?}"),
+            };
+        let installation = wait_for_paired_permit(request, share, wire, Some(lease_deadline))?;
+        let share_lock = state.lock_share(share)?;
+        validate_final_sync_binding(state, share, remote_peer, relationship, intent_generation)?;
+        wire.send_reservation(
+            ReservationFrame::SyncStart(sync::SyncStart {
+                id: reservation.id.clone(),
+                network_order: reservation.network_order,
+                nonce: reservation.nonce.clone(),
+                connector_generation,
+                responder_generation,
+            }),
+            lease_deadline,
+        )?;
+        match recv_reservation_ignoring_progress(wire, Some(lease_deadline), watch_output)? {
+            ReservationFrame::SyncAccepted(accepted) if accepted == reservation => {}
+            other => bail!("expected exact synchronization acceptance, got {other:?}"),
+        }
+        Ok((installation, share_lock, reservation))
+    })();
+    if committed.is_err() {
+        state.record_relationship_yield(relationship, relationship_retry_ns())?;
+    }
+    committed
+}
+
+enum SyncAttempt {
+    Complete(SyncCompletion),
+    Preview(blake3::Hash),
+}
+
+fn sync_plan_fingerprint(
+    local: &[flocal::model::Record],
+    remote: &[flocal::model::Record],
+    plan: &flocal::reconcile::Plan,
+) -> Result<blake3::Hash> {
+    Ok(blake3::hash(&serde_json::to_vec(&(local, remote, plan))?))
 }
 
 fn run_sync(
@@ -2133,21 +3314,78 @@ fn run_sync(
     yes: bool,
     json: bool,
     report: PlanReport,
+    managed_initial_generation: Option<i64>,
 ) -> Result<SyncCompletion> {
-    let _global_lock = state.lock_global_sync()?;
     let (share, _) = state.find_share(path)?;
-    let _share_lock = state.lock_share(&share)?;
-    state.ensure_not_removing(&share)?;
-    state.clear_pending_objects(&share)?;
-    state.prune_unreferenced_objects()?;
+    let requires_confirmation = !dry_run && !yes && !state.initial_complete(&share)?;
+    if !requires_confirmation {
+        return match run_sync_attempt(
+            state,
+            path,
+            dry_run,
+            None,
+            json,
+            report,
+            managed_initial_generation,
+        )? {
+            SyncAttempt::Complete(completion) => Ok(completion),
+            SyncAttempt::Preview(_) if dry_run => Ok(SyncCompletion::default()),
+            SyncAttempt::Preview(_) => unreachable!("only a dry run previews without comparison"),
+        };
+    }
+
+    let mut expected = match run_sync_attempt(
+        state,
+        path,
+        true,
+        None,
+        json,
+        report,
+        managed_initial_generation,
+    )? {
+        SyncAttempt::Preview(fingerprint) => fingerprint,
+        SyncAttempt::Complete(_) => unreachable!("initial preview must not apply"),
+    };
+    loop {
+        if !confirm("Apply this initial plan?")? {
+            return Ok(SyncCompletion::default());
+        }
+        match run_sync_attempt(
+            state,
+            path,
+            false,
+            Some(expected),
+            json,
+            report,
+            managed_initial_generation,
+        )? {
+            SyncAttempt::Complete(completion) => return Ok(completion),
+            SyncAttempt::Preview(fingerprint) => expected = fingerprint,
+        }
+    }
+}
+
+fn run_sync_attempt(
+    state: &mut State,
+    path: &Path,
+    dry_run: bool,
+    expected_plan: Option<blake3::Hash>,
+    json: bool,
+    report: PlanReport,
+    managed_initial_generation: Option<i64>,
+) -> Result<SyncAttempt> {
+    let (share, _) = state.find_share(path)?;
+    let _session_lock = state.lock_share_session(&share)?;
+    state.begin_install_intent_retry(&share)?;
+    let operation = if state.initial_complete(&share)? {
+        SyncOperation::Sync
+    } else {
+        SyncOperation::Initial
+    };
     let peer = state
         .peer(&share)?
         .context("no peer configured; run `flocal peer add`")?;
-    let local = if dry_run {
-        sync::preview_refresh(state, &share)?
-    } else {
-        sync::refresh(state, &share)?
-    };
+    let binding = connector_sync_binding(state, &share, &peer)?;
     let mut remote = Remote::spawn(&peer.host, &peer.executable)?;
     sync::write_message(
         &mut remote.input,
@@ -2155,21 +3393,68 @@ fn run_sync(
             protocol: sync::PROTOCOL_VERSION,
             share: share.clone(),
             peer: state.peer_id()?,
+            relationship: peer
+                .relationship
+                .clone()
+                .context("connector relationship registration is incomplete")?,
             dry_run,
         },
     )?;
-    match sync::read_message(&mut remote.output)? {
-        Message::Accepted {
-            protocol,
-            peer: actual,
-        } if protocol == sync::PROTOCOL_VERSION && &actual == peer.completed_peer_id()? => {}
-        Message::Accepted { .. } => bail!("remote protocol or peer identity changed"),
-        Message::Error { message } => bail!("remote rejected sync: {}", escaped(&message)),
-        other => bail!("unexpected handshake response: {other:?}"),
-    }
+    let (installation, _share_lock, _) = {
+        let mut wire = V1ReservationWire {
+            input: &remote.output,
+            output: &remote.input,
+        };
+        match binding.order {
+            std::cmp::Ordering::Less => reserve_as_authority(
+                state,
+                &share,
+                peer.completed_peer_id()?,
+                &binding.relationship,
+                operation,
+                None,
+                0,
+                0,
+                sync::SchedulingId::generate(),
+                None,
+                &mut wire,
+                &mut io::stdout(),
+            )?,
+            std::cmp::Ordering::Greater => reserve_as_higher_peer(
+                state,
+                &share,
+                peer.completed_peer_id()?,
+                &binding.relationship,
+                operation,
+                None,
+                0,
+                0,
+                true,
+                None,
+                &mut wire,
+                &mut io::stdout(),
+            )?,
+            std::cmp::Ordering::Equal => unreachable!("peer ordering rejects equality"),
+        }
+    };
+    validate_final_sync_binding(
+        state,
+        &share,
+        peer.completed_peer_id()?,
+        &binding.relationship,
+        None,
+    )?;
+    state.clear_pending_objects(&share)?;
+    state.prune_unreferenced_objects()?;
+    let local = if dry_run {
+        sync::preview_refresh(state, &share)?
+    } else {
+        sync::refresh(state, &share)?
+    };
     let remote_records = sync::read_snapshot(&mut remote.output)?;
     state.validate_remote_records(&share, &local, &remote_records)?;
     let mut plan = sync::plan(&local, &remote_records);
+    let fingerprint = sync_plan_fingerprint(&local, &remote_records, &plan)?;
     if !dry_run {
         ensure_connector_recovery_limits(state, &share, &[])?;
     }
@@ -2227,31 +3512,25 @@ fn run_sync(
         other => bail!("expected object completion, got {other:?}"),
     }
 
-    let needs_confirmation = !state.initial_complete(&share)? && !yes;
-    if dry_run || needs_confirmation {
+    let plan_changed = expected_plan.is_some_and(|expected| expected != fingerprint);
+    if dry_run || plan_changed {
         let mut preview = plan.clone();
         sync::preview_merges(state, &mut preview)?;
         if report == PlanReport::Full {
             print_plan(&local, &remote_records, &preview, json, PlanReport::Preview)?;
         }
     }
-    if dry_run {
+    if dry_run || plan_changed {
         sync::write_message(&mut remote.input, &Message::Cancel)?;
         state.clear_pending_objects(&share)?;
         state.prune_unreferenced_objects()?;
         remote.finish()?;
-        return Ok(SyncCompletion::default());
-    }
-    if needs_confirmation && !confirm("Apply this initial plan?")? {
-        sync::write_message(&mut remote.input, &Message::Cancel)?;
-        state.clear_pending_objects(&share)?;
-        state.prune_unreferenced_objects()?;
-        remote.finish()?;
-        return Ok(SyncCompletion::default());
+        installation.finish()?;
+        return Ok(SyncAttempt::Preview(fingerprint));
     }
     sync::materialize_merges(state, &share, &mut plan)?;
     ensure_connector_recovery_limits(state, &share, &plan.conflicts)?;
-    if report == PlanReport::Full && !needs_confirmation {
+    if report == PlanReport::Full {
         print_plan(&local, &remote_records, &plan, json, report)?;
     }
 
@@ -2303,8 +3582,28 @@ fn run_sync(
             bail!("peer acknowledged-head manifest exceeds record limit");
         }
     }
-    sync::apply_complete_plan(state, &share, &plan)?;
-    state.set_initial_complete(&share)?;
+    let managed_request = if operation == SyncOperation::Initial {
+        if let Some(generation) = managed_initial_generation {
+            Some(sync::apply_complete_plan_and_enable_managed(
+                state, &share, &plan, generation,
+            )?)
+        } else {
+            sync::apply_complete_plan(state, &share, &plan)?;
+            None
+        }
+    } else {
+        sync::apply_complete_plan(state, &share, &plan)?;
+        None
+    };
+    if let Some(request) = managed_request {
+        daemon_request(
+            state,
+            DaemonRequest::Start {
+                share: share.0.clone(),
+            },
+        )?;
+        request.release_for_reclaim();
+    }
     let current = state.records(&share)?;
     sync::validate_ack_heads(&remote_heads, &remote_heads)?;
     let shared_heads = sync::intersect_heads(&current, &remote_heads)?;
@@ -2320,14 +3619,19 @@ fn run_sync(
     let finalization = sync::write_heads(&mut remote.input, &shared_heads)
         .and_then(|()| sync::write_message(&mut remote.input, &Message::CommitAck))
         .and_then(|()| remote.finish());
+    installation.finish()?;
     if report == PlanReport::Watch {
-        Ok(SyncCompletion {
+        Ok(SyncAttempt::Complete(SyncCompletion {
             watch_report: committed_report,
             post_commit_error: finalization.err(),
-        })
+            initial_applied: operation == SyncOperation::Initial,
+        }))
     } else {
         finalization?;
-        Ok(SyncCompletion::default())
+        Ok(SyncAttempt::Complete(SyncCompletion {
+            initial_applied: operation == SyncOperation::Initial,
+            ..SyncCompletion::default()
+        }))
     }
 }
 
@@ -2343,10 +3647,11 @@ fn serve(state: &mut State) -> Result<()> {
             protocol,
             share,
             peer,
-        } => serve_watch_open(state, protocol, share, peer, &stdin, &stdout),
+            relationship,
+        } => serve_watch_open(state, protocol, share, peer, relationship, &stdin, &stdout),
         initial => {
-            let mut input = BufReader::new(TimedReader::new(stdin));
-            let mut output = BufWriter::new(stdout.lock());
+            let mut input = TimedReader::new(DirectReader(&stdin));
+            let mut output = DirectWriter(&stdout);
             serve_initial(state, initial, &mut input, &mut output)
         }
     }
@@ -2402,8 +3707,16 @@ fn handle_relationship_request(
                     ),
                 }
             } else {
-                match state.register_relationship(&share, &bytes_path(&root), &peer, &relationship)
-                {
+                let (permit, _) =
+                    wait_for_installation_request(state, None, SyncOperation::Registration, None)?;
+                let registration = state.register_relationship_locked(
+                    &share,
+                    &bytes_path(&root),
+                    &peer,
+                    &relationship,
+                );
+                permit.finish()?;
+                match registration {
                     Ok(RegistrationOutcome { prior_share }) => {
                         RegisterRelationshipResponse::Registered {
                             registration_protocol: sync::RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION,
@@ -2435,7 +3748,17 @@ fn handle_relationship_request(
                     message: bounded_relationship_error("relationship binding does not match"),
                 }
             } else {
-                match state.prepare_incoming_removal(&share, &peer, &relationship) {
+                let (permit, _) = wait_for_installation_request(
+                    state,
+                    Some(&share),
+                    SyncOperation::Removal,
+                    None,
+                )?;
+                let removal = match state.prepare_incoming_removal_locked(
+                    &share,
+                    &peer,
+                    &relationship,
+                ) {
                     Ok(IncomingRemoval::Absent) => RemoveRelationshipResponse::Absent {
                         removal_protocol: sync::RELATIONSHIP_REMOVAL_PROTOCOL_VERSION,
                         share,
@@ -2443,8 +3766,7 @@ fn handle_relationship_request(
                         relationship,
                     },
                     Ok(IncomingRemoval::Prepared(prepared)) => {
-                        let removal = recover_daemon_share_install(state, &share)
-                            .and_then(|()| state.detach_incoming_relationship(&prepared));
+                        let removal = state.detach_incoming_relationship_locked(&prepared);
                         match removal {
                             Ok(detached) => {
                                 if let Some(warning) = detached.cleanup_warning {
@@ -2475,7 +3797,9 @@ fn handle_relationship_request(
                     Err(_) => RemoveRelationshipResponse::Error {
                         message: bounded_relationship_error("relationship binding does not match"),
                     },
-                }
+                };
+                permit.finish()?;
+                removal
             };
             Ok(RelationshipResponse::Remove(response))
         }
@@ -2512,14 +3836,27 @@ fn serve_io(
     output: &mut impl Write,
 ) -> Result<()> {
     let initial = sync::read_initial_message(&mut input)?;
-    serve_initial(state, initial, input, output)
+    let mut remaining = Vec::new();
+    input.read_to_end(&mut remaining)?;
+    let (mut client, server) = UnixStream::pair()?;
+    client.write_all(&remaining)?;
+    client.shutdown(std::net::Shutdown::Write)?;
+    let mut server_input = server.try_clone()?;
+    let mut server_output = server;
+    let result = serve_initial(state, initial, &mut server_input, &mut server_output);
+    drop(server_input);
+    drop(server_output);
+    let mut response = Vec::new();
+    client.read_to_end(&mut response)?;
+    output.write_all(&response)?;
+    result
 }
 
 fn serve_initial(
     state: &mut State,
     initial: InitialMessage,
-    mut input: &mut impl Read,
-    mut output: &mut impl Write,
+    mut input: &mut (impl Read + AsFd),
+    mut output: &mut (impl Write + AsFd),
 ) -> Result<()> {
     match initial {
         InitialMessage::Register {
@@ -2560,6 +3897,7 @@ fn serve_initial(
             protocol,
             share,
             peer,
+            relationship,
             dry_run,
         } => {
             if protocol != sync::PROTOCOL_VERSION {
@@ -2571,7 +3909,19 @@ fn serve_initial(
                 )?;
                 return Ok(());
             }
-            let _global_lock = match state.lock_global_sync() {
+            let binding = match validate_sync_binding(state, &share, &peer, &relationship) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    sync::write_message(
+                        &mut output,
+                        &Message::Error {
+                            message: format!("{error:#}"),
+                        },
+                    )?;
+                    return Ok(());
+                }
+            };
+            let _session_lock = match state.lock_share_session(&share) {
                 Ok(lock) => lock,
                 Err(error) => {
                     sync::write_message(
@@ -2583,28 +3933,63 @@ fn serve_initial(
                     return Ok(());
                 }
             };
-            let _share_lock = match state.lock_share(&share) {
-                Ok(lock) => lock,
-                Err(error) => {
-                    sync::write_message(
-                        &mut output,
-                        &Message::Error {
-                            message: format!("{error:#}"),
-                        },
-                    )?;
-                    return Ok(());
+            let (installation, _share_lock, _) = {
+                let mut wire = V1ReservationWire {
+                    input: &*input,
+                    output: &*output,
+                };
+                match binding.order {
+                    std::cmp::Ordering::Less => {
+                        let pending = match recv_reservation_ignoring_progress(
+                            &mut wire,
+                            None,
+                            &mut io::sink(),
+                        )? {
+                            ReservationFrame::PendingAuthority(pending)
+                                if pending.connector_generation == 0
+                                    && pending.responder_generation == 0 =>
+                            {
+                                pending
+                            }
+                            other => {
+                                bail!("expected pending authority submission, got {other:?}")
+                            }
+                        };
+                        reserve_as_authority(
+                            state,
+                            &share,
+                            &peer,
+                            &binding.relationship,
+                            SyncOperation::Sync,
+                            None,
+                            0,
+                            0,
+                            pending.id,
+                            None,
+                            &mut wire,
+                            &mut io::sink(),
+                        )?
+                    }
+                    std::cmp::Ordering::Greater => reserve_as_higher_peer(
+                        state,
+                        &share,
+                        &peer,
+                        &binding.relationship,
+                        SyncOperation::Sync,
+                        None,
+                        0,
+                        0,
+                        false,
+                        None,
+                        &mut wire,
+                        &mut io::sink(),
+                    )?,
+                    std::cmp::Ordering::Equal => unreachable!("peer ordering rejects equality"),
                 }
             };
-            if state.bound_peer(&share)?.as_ref() != Some(&peer) {
-                sync::write_message(
-                    &mut output,
-                    &Message::Error {
-                        message: "peer identity mismatch".into(),
-                    },
-                )?;
-                return Ok(());
-            }
-            if let Err(error) = state.ensure_not_removing(&share) {
+            if let Err(error) =
+                validate_final_sync_binding(state, &share, &peer, &binding.relationship, None)
+            {
                 sync::write_message(
                     &mut output,
                     &Message::Error {
@@ -2615,13 +4000,6 @@ fn serve_initial(
             }
             state.clear_pending_objects(&share)?;
             state.prune_unreferenced_objects()?;
-            sync::write_message(
-                &mut output,
-                &Message::Accepted {
-                    protocol: sync::PROTOCOL_VERSION,
-                    peer: state.peer_id()?,
-                },
-            )?;
             let records = if dry_run {
                 sync::preview_refresh(state, &share)?
             } else {
@@ -2629,6 +4007,7 @@ fn serve_initial(
             };
             sync::write_snapshot(&mut output, &records)?;
             serve_sync(state, &share, &peer, &records, &mut input, &mut output)?;
+            installation.finish()?;
         }
         InitialMessage::WatchOpen { .. } => {
             bail!("persistent watch requires a descriptor-backed protocol transport")
@@ -2642,6 +4021,7 @@ fn serve_watch_open(
     protocol: u32,
     share: ShareId,
     peer: flocal::model::PeerId,
+    relationship: RelationshipId,
     input: &impl AsFd,
     output: &impl AsFd,
 ) -> Result<()> {
@@ -2657,7 +4037,19 @@ fn serve_watch_open(
             },
         );
     }
-    let _share_lock = match state.lock_share(&share) {
+    let binding = match validate_sync_binding(state, &share, &peer, &relationship) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return write_v2_session(
+                output,
+                V2SessionFrame::Error {
+                    retryable: false,
+                    message: format!("{error:#}"),
+                },
+            );
+        }
+    };
+    let _session_lock = match state.lock_share_session(&share) {
         Ok(lock) => lock,
         Err(error) => {
             return write_v2_session(
@@ -2800,19 +4192,17 @@ fn serve_watch_open(
             } => write_v2_session(output, V2SessionFrame::Pong { nonce })?,
             V2Envelope::Round {
                 round: incoming,
-                frame:
-                    V2RoundFrame::SyncStart {
-                        connector_generation: _,
-                        responder_generation: _,
-                    },
+                frame: frame @ (V2RoundFrame::PendingAuthority(_) | V2RoundFrame::ProxyIssue(_)),
             } if incoming == round + 1 => {
                 round = incoming;
                 let served = serve_v2_round(
                     state,
                     &share,
                     &peer,
+                    &binding,
                     &share_root,
                     round,
+                    frame,
                     input,
                     output,
                     &invalidation_cycle.deferred,
@@ -3280,14 +4670,70 @@ fn serve_v2_round(
     state: &mut State,
     share: &ShareId,
     connector: &flocal::model::PeerId,
+    binding: &ValidatedSyncBinding,
     root: &sync::ShareRoot,
     round: u64,
+    initial: V2RoundFrame,
     input: &impl AsFd,
     output: &impl AsFd,
     deferred: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<ServedRound> {
-    let _global_lock = state.lock_global_sync()?;
-    state.ensure_not_removing(share)?;
+    let first = reservation_from_v2(initial)?;
+    let mut wire = V2ReservationWire {
+        round,
+        input,
+        output,
+        pending_remote_generation: None,
+        prefetched: Some(first),
+    };
+    let (installation, _share_lock, _) = match binding.order {
+        std::cmp::Ordering::Less => {
+            let pending =
+                match recv_reservation_ignoring_progress(&mut wire, None, &mut io::sink())? {
+                    ReservationFrame::PendingAuthority(pending) => pending,
+                    other => bail!("expected pending authority submission, got {other:?}"),
+                };
+            reserve_as_authority(
+                state,
+                share,
+                connector,
+                &binding.relationship,
+                SyncOperation::Watch,
+                None,
+                pending.connector_generation,
+                pending.responder_generation,
+                pending.id,
+                None,
+                &mut wire,
+                &mut io::sink(),
+            )?
+        }
+        std::cmp::Ordering::Greater => {
+            let (connector_generation, responder_generation) = match &wire.prefetched {
+                Some(ReservationFrame::ProxyIssue(issue)) => {
+                    (issue.connector_generation, issue.responder_generation)
+                }
+                other => bail!("expected authoritative proxy issue, got {other:?}"),
+            };
+            reserve_as_higher_peer(
+                state,
+                share,
+                connector,
+                &binding.relationship,
+                SyncOperation::Watch,
+                None,
+                connector_generation,
+                responder_generation,
+                false,
+                None,
+                &mut wire,
+                &mut io::sink(),
+            )?
+        }
+        std::cmp::Ordering::Equal => unreachable!("peer ordering rejects equality"),
+    };
+    let mut installation = Some(installation);
+    validate_final_sync_binding(state, share, connector, &binding.relationship, None)?;
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
@@ -3295,7 +4741,6 @@ fn serve_v2_round(
     budget.check()?;
     let advertised = sync::refresh_with_root(state, share, root)?;
     budget.check()?;
-    write_v2_round(output, round, V2RoundFrame::SyncAccepted, &budget)?;
     write_v2_snapshot(output, round, &advertised, &budget)?;
 
     let requested = match recv_v2_round(input, round, &budget)? {
@@ -3382,6 +4827,10 @@ fn serve_v2_round(
                 },
                 &budget,
             )?;
+            installation
+                .take()
+                .expect("installation permit exists")
+                .finish()?;
             return Ok(ServedRound::Invalidated(invalidated.path.clone()));
         }
         return Err(error);
@@ -3413,12 +4862,20 @@ fn serve_v2_round(
                 if deferred.is_empty() {
                     state.clear_unsettled_paths(share)?;
                 }
+                installation
+                    .take()
+                    .expect("installation permit exists")
+                    .finish()?;
                 return Ok(ServedRound::Completed);
             }
             V2RoundFrame::RoundInvalidated { path }
                 if accepts_invalidation(&connector_plan, &path) =>
             {
                 state.remember_unsettled_path(share, &path)?;
+                installation
+                    .take()
+                    .expect("installation permit exists")
+                    .finish()?;
                 return Ok(ServedRound::Invalidated(path));
             }
             other => watch_protocol_bail!("expected persistent round completion, got {other:?}"),
@@ -3651,7 +5108,7 @@ fn ensure_connector_recovery_limits(
     }
 }
 
-fn status(state: &State, path: &Path, json: bool) -> Result<()> {
+fn status(state: &mut State, path: &Path, json: bool) -> Result<()> {
     let (share, root) = state.find_share(path)?;
     let managed = state.managed_share(&share)?;
     let (relationship_state, bound_peer) = if managed.removing_relationship.is_some() {
@@ -3687,6 +5144,34 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         .any(|(pending, _)| pending == &share);
     let unsettled = state.unsettled_paths(&share)?;
     let recovery = state.recovery_usage(&share)?;
+    let scheduling_snapshot = state.scheduling_snapshot()?;
+    let scheduling_view = share_scheduling_view(state, &scheduling_snapshot, &share)?;
+    let waiting_on = scheduling_view
+        .blocker
+        .as_ref()
+        .map(|blocker| match blocker {
+            SchedulingBlocker::Local(_) => "local",
+            SchedulingBlocker::Peer => "peer",
+        });
+    let waiting_root = scheduling_view
+        .blocker
+        .as_ref()
+        .and_then(|blocker| match blocker {
+            SchedulingBlocker::Local(root) => {
+                root.as_ref().map(|root| daemon_path(&path_bytes(root)))
+            }
+            SchedulingBlocker::Peer => None,
+        });
+    let scheduling = serde_json::json!({
+        "state": scheduling_view.state,
+        "waiting_on": waiting_on,
+        "waiting_root": waiting_root,
+        "operation": scheduling_view.operation,
+        "queue_position": scheduling_view.queue_position,
+        "active_share": scheduling_view.active_share.as_ref().map(|active| &active.0),
+        "active_root": scheduling_view.active_root.as_ref().map(|root| daemon_path(&path_bytes(root))),
+        "active_operation": scheduling_view.active_operation,
+    });
     let peer = match &managed.binding {
         EndpointBinding::Connector(peer) => Some(peer),
         EndpointBinding::Responder { .. } | EndpointBinding::Unpaired => None,
@@ -3694,7 +5179,7 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":5,"share":share.0,"root":root,"peer":peer,"bound_peer":bound_peer,"relationship_state":relationship_state,"removal_pending":removal_pending,"removal_error":removal_error,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install,"unsettled":unsettled,"recovery":recovery})
+            serde_json::json!({"schema":6,"share":share.0,"root":root,"peer":peer,"bound_peer":bound_peer,"relationship_state":relationship_state,"removal_pending":removal_pending,"removal_error":removal_error,"entries":entries,"tombstones":tombstones,"initial_complete":state.initial_complete(&share)?,"view":"last_persisted_scan","pending_install":pending_install,"unsettled":unsettled,"recovery":recovery,"scheduling":scheduling})
         );
     } else {
         println!("Share: {}", escaped(&share.0));
@@ -3733,6 +5218,24 @@ fn status(state: &State, path: &Path, json: bool) -> Result<()> {
         println!(
             "View:  last persisted scan (use `flocal sync PATH --dry-run` to preview this root)"
         );
+        if let Some(blocker) = &scheduling_view.blocker {
+            let position = scheduling_view.queue_position.unwrap_or(1);
+            match blocker {
+                SchedulingBlocker::Local(Some(root)) => println!(
+                    "Waiting for {} sync to finish (queue position {})",
+                    escaped(&root.to_string_lossy()),
+                    position
+                ),
+                SchedulingBlocker::Local(None) => println!(
+                    "Waiting for the installation synchronization slot (queue position {})",
+                    position
+                ),
+                SchedulingBlocker::Peer => println!(
+                    "Waiting for the peer to finish another synchronization (queue position {})",
+                    position
+                ),
+            }
+        }
         if pending_install {
             println!("Warning: an interrupted install will be recovered by the next sync/watch");
         }
@@ -3879,11 +5382,14 @@ fn conflicts(state: &mut State, command: ConflictCommand) -> Result<()> {
                 bail!("--selection is only valid with --yes");
             }
             if yes {
-                let outcome = state.prune_recovery(
+                let permit =
+                    wait_for_installation(state, &share, SyncOperation::Maintenance, None)?;
+                let outcome = state.prune_recovery_locked(
                     &share,
                     &conflict_ids,
                     selection.as_deref().expect("checked above"),
                 )?;
+                permit.finish()?;
                 if json {
                     println!(
                         "{}",
@@ -3916,7 +5422,10 @@ fn conflicts(state: &mut State, command: ConflictCommand) -> Result<()> {
                     );
                 }
             } else {
-                let plan = state.recovery_prune_plan(&share, &conflict_ids)?;
+                let permit =
+                    wait_for_installation(state, &share, SyncOperation::Maintenance, None)?;
+                let plan = state.recovery_prune_plan_locked_with_objects(&share, &conflict_ids)?;
+                permit.finish()?;
                 if json {
                     println!(
                         "{}",
@@ -4073,7 +5582,6 @@ fn restart_after_recovery(
                 state,
                 DaemonRequest::Start {
                     share: share.0.clone(),
-                    generation: None,
                 },
             )?;
             Ok(())
@@ -4302,7 +5810,8 @@ fn watch(state: &mut State, path: &Path) -> Result<()> {
     if !state.initial_complete(&share)? {
         bail!("initial synchronization is incomplete; run `flocal sync PATH` and confirm it first");
     }
-    let _share_lock = state.lock_share(&share)?;
+    state.begin_install_intent_retry(&share)?;
+    let _session_lock = state.lock_share_session(&share)?;
     watch_log(&mut io::stdout(), &format!("Watching {}", root.display()))?;
     persistent_watch_loop(state, &share, &root, &mut io::stdout(), &mut io::stderr())
 }
@@ -4315,6 +5824,7 @@ fn persistent_watch_loop(
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<()> {
+    let mut initial_request = None;
     persistent_watch_loop_control(
         state,
         share,
@@ -4324,6 +5834,7 @@ fn persistent_watch_loop(
         None,
         None,
         Arc::new(Mutex::new(None)),
+        &mut initial_request,
     )
 }
 
@@ -4337,6 +5848,7 @@ fn persistent_watch_loop_control(
     stop: Option<&AtomicBool>,
     worker_state: Option<&std::sync::atomic::AtomicU8>,
     child: Arc<Mutex<Option<Child>>>,
+    initial_request: &mut Option<flocal::state::QueueRequest>,
 ) -> Result<()> {
     let peer = state
         .peer(share)?
@@ -4398,10 +5910,21 @@ fn persistent_watch_loop_control(
             stop,
             worker_state,
             child.clone(),
+            initial_request,
         );
         match outcome {
             Ok(()) if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) => return Ok(()),
             Ok(()) => bail!("persistent watch session ended unexpectedly"),
+            Err(error)
+                if stop.is_some()
+                    && error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<flocal::state::QueueCancelled>()
+                            .is_some()
+                    }) =>
+            {
+                return Ok(());
+            }
             Err(error) => {
                 if std::mem::take(&mut connected) {
                     watch_log(err, "Peer connection lost; retrying")?;
@@ -4505,6 +6028,9 @@ fn is_terminal_watch_error(error: &anyhow::Error) -> bool {
     {
         return true;
     }
+    if error.downcast_ref::<InstallRecoveryBlocked>().is_some() {
+        return true;
+    }
     let message = format!("{error:#}");
     message.contains("root identity changed")
 }
@@ -4530,6 +6056,7 @@ fn persistent_watch_session(
     stop: Option<&AtomicBool>,
     worker_state: Option<&std::sync::atomic::AtomicU8>,
     child: Arc<Mutex<Option<Child>>>,
+    initial_request: &mut Option<flocal::state::QueueRequest>,
 ) -> Result<()> {
     while events_rx.try_recv().is_ok() {}
     if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
@@ -4556,6 +6083,7 @@ fn persistent_watch_session(
         worker_state,
         &remote.output,
         &remote.input,
+        initial_request,
     )
 }
 
@@ -4577,6 +6105,7 @@ fn persistent_watch_session_io(
     worker_state: Option<&std::sync::atomic::AtomicU8>,
     remote_input: &impl AsFd,
     remote_output: &impl AsFd,
+    initial_request: &mut Option<flocal::state::QueueRequest>,
 ) -> Result<()> {
     let startup_deadline = std::time::Instant::now() + sync::default_phase_deadline();
     sync::write_initial_message_until(
@@ -4585,6 +6114,10 @@ fn persistent_watch_session_io(
             protocol: sync::WATCH_PROTOCOL_VERSION,
             share: share.clone(),
             peer: state.peer_id()?,
+            relationship: peer
+                .relationship
+                .clone()
+                .context("connector relationship registration is incomplete")?,
         },
         std::time::Instant::now() + sync::default_frame_deadline(),
     )?;
@@ -4615,6 +6148,9 @@ fn persistent_watch_session_io(
     let mut remote_generation = 0u64;
     let mut round = 1u64;
     let mut completed_local = 0u64;
+    let intent_generation = worker_state
+        .map(|_| state.watch_intent_generation(share))
+        .transpose()?;
     let startup_local_generation = match watch_state.snapshot() {
         flocal::watch::WatchSnapshot::Healthy { generation } => generation,
         flocal::watch::WatchSnapshot::Lost(error) => bail!("filesystem watcher stopped: {error}"),
@@ -4630,6 +6166,8 @@ fn persistent_watch_session_io(
         remote_output,
         &mut remote_generation,
         out,
+        initial_request,
+        intent_generation,
     )?;
     out.write_all(&report)?;
     watch_state
@@ -4688,6 +6226,8 @@ fn persistent_watch_session_io(
                 remote_output,
                 &mut remote_generation,
                 out,
+                initial_request,
+                intent_generation,
             )?;
             out.write_all(&report)?;
             watch_state
@@ -4927,9 +6467,12 @@ fn connector_round_until_completed(
     output: &impl AsFd,
     pending_remote_generation: &mut u64,
     watch_output: &mut impl Write,
+    initial_request: &mut Option<flocal::state::QueueRequest>,
+    intent_generation: Option<i64>,
 ) -> Result<Vec<u8>> {
     let mut invalidation_cycle = InvalidationCycle::default();
     loop {
+        let request = initial_request.take();
         match connector_v2_round(
             state,
             share,
@@ -4941,6 +6484,9 @@ fn connector_round_until_completed(
             output,
             pending_remote_generation,
             &invalidation_cycle.deferred,
+            watch_output,
+            request,
+            intent_generation,
         )? {
             ConnectorRound::Completed(report) => return Ok(report),
             ConnectorRound::Invalidated(path) => {
@@ -4963,29 +6509,68 @@ fn connector_v2_round(
     output: &impl AsFd,
     pending_remote_generation: &mut u64,
     deferred: &std::collections::HashSet<Vec<u8>>,
+    watch_output: &mut impl Write,
+    existing: Option<QueueRequest>,
+    intent_generation: Option<i64>,
 ) -> Result<ConnectorRound> {
-    let _global_lock = state.lock_global_sync()?;
-    state.ensure_not_removing(share)?;
+    let peer = state
+        .peer(share)?
+        .context("no peer configured; run `flocal peer add`")?;
+    let binding = connector_sync_binding(state, share, &peer)?;
+    let mut wire = V2ReservationWire {
+        round,
+        input,
+        output,
+        pending_remote_generation: Some(pending_remote_generation),
+        prefetched: None,
+    };
+    let (installation, _share_lock, _) = match binding.order {
+        std::cmp::Ordering::Less => reserve_as_authority(
+            state,
+            share,
+            peer.completed_peer_id()?,
+            &binding.relationship,
+            SyncOperation::Watch,
+            intent_generation,
+            connector_generation,
+            responder_generation,
+            sync::SchedulingId::generate(),
+            existing,
+            &mut wire,
+            watch_output,
+        )?,
+        std::cmp::Ordering::Greater => reserve_as_higher_peer(
+            state,
+            share,
+            peer.completed_peer_id()?,
+            &binding.relationship,
+            SyncOperation::Watch,
+            intent_generation,
+            connector_generation,
+            responder_generation,
+            true,
+            existing,
+            &mut wire,
+            watch_output,
+        )?,
+        std::cmp::Ordering::Equal => unreachable!("peer ordering rejects equality"),
+    };
+    drop(wire);
+    let mut installation = Some(installation);
+    validate_final_sync_binding(
+        state,
+        share,
+        peer.completed_peer_id()?,
+        &binding.relationship,
+        intent_generation,
+    )?;
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
         sync::RoundBudget::new(std::time::Instant::now() + sync::default_phase_deadline());
-    write_v2_round(
-        output,
-        round,
-        V2RoundFrame::SyncStart {
-            connector_generation,
-            responder_generation,
-        },
-        &budget,
-    )?;
     budget.check()?;
     let local = sync::refresh_with_root(state, share, root)?;
     budget.check()?;
-    match recv_connector_round(input, round, &budget, pending_remote_generation, true)? {
-        V2RoundFrame::SyncAccepted => {}
-        other => watch_protocol_bail!("expected persistent sync acceptance, got {other:?}"),
-    }
     let remote_records =
         read_connector_snapshot(input, round, &mut budget, pending_remote_generation)?;
     state
@@ -5081,6 +6666,10 @@ fn connector_v2_round(
                 if accepts_invalidation(&responder_plan, &path) =>
             {
                 state.remember_unsettled_path(share, &path)?;
+                installation
+                    .take()
+                    .expect("installation permit exists")
+                    .finish()?;
                 return Ok(ConnectorRound::Invalidated(path));
             }
             other => watch_protocol_bail!("expected persistent apply response, got {other:?}"),
@@ -5103,6 +6692,10 @@ fn connector_v2_round(
                 },
                 &budget,
             )?;
+            installation
+                .take()
+                .expect("installation permit exists")
+                .finish()?;
             return Ok(ConnectorRound::Invalidated(invalidated.path.clone()));
         }
         return Err(error);
@@ -5151,6 +6744,10 @@ fn connector_v2_round(
     report_settled(settled, &mut report)?;
     write_v2_heads(output, round, &shared_heads, &budget)?;
     write_v2_round(output, round, V2RoundFrame::SyncFinished, &budget)?;
+    installation
+        .take()
+        .expect("installation permit exists")
+        .finish()?;
     Ok(ConnectorRound::Completed(report))
 }
 
@@ -5513,8 +7110,8 @@ fn record_hash(record: &flocal::model::Record) -> Option<flocal::model::ObjectHa
 
 struct Remote {
     child: Child,
-    input: BufWriter<ChildStdin>,
-    output: BufReader<TimedReader<ChildStdout>>,
+    input: ChildStdin,
+    output: TimedReader<ChildStdout>,
     stderr: std::thread::JoinHandle<Vec<u8>>,
 }
 
@@ -5638,8 +7235,8 @@ impl Remote {
         } = spawn_ssh_protocol(host, executable, "serve")?;
         Ok(Self {
             child,
-            input: BufWriter::new(input),
-            output: BufReader::new(TimedReader::new(output)),
+            input,
+            output: TimedReader::new(output),
             stderr,
         })
     }
@@ -5760,12 +7357,62 @@ struct TimedReader<R> {
     started: std::time::Instant,
 }
 
+struct DirectReader<'a, R: AsFd>(&'a R);
+
+impl<R: AsFd> AsFd for DirectReader<'_, R> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl<R: AsFd> Read for DirectReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match rustix::io::read(self.0, &mut *buffer) {
+                Ok(count) => return Ok(count),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(io::Error::from(error)),
+            }
+        }
+    }
+}
+
+struct DirectWriter<'a, W: AsFd>(&'a W);
+
+impl<W: AsFd> AsFd for DirectWriter<'_, W> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl<W: AsFd> Write for DirectWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        loop {
+            match rustix::io::write(self.0, buffer) {
+                Ok(count) => return Ok(count),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(io::Error::from(error)),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<R> TimedReader<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
             started: std::time::Instant::now(),
         }
+    }
+}
+
+impl<R: AsFd> AsFd for TimedReader<R> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 }
 
@@ -5864,28 +7511,53 @@ mod tests {
     fn e2e_recovery_delay_claim_survives_a_killed_process() -> Result<()> {
         let temp = tempdir()?;
         let state = State::open(temp.path().join("state"))?;
-        assert!(e2e_claim_install_recovery_delay(&state)?.is_none());
+        assert!(sync::e2e_claim_install_recovery_delay(&state)?.is_none());
 
         let marker = state.dir.join(".e2e-delay-install-recovery");
         let claimed = state.dir.join(".e2e-delay-install-recovery-claimed");
         std::fs::write(&marker, b"")?;
         assert_eq!(
-            e2e_claim_install_recovery_delay(&state)?,
+            sync::e2e_claim_install_recovery_delay(&state)?,
             Some(claimed.clone())
         );
         assert!(!marker.exists());
         assert!(claimed.exists());
         assert_eq!(
-            e2e_claim_install_recovery_delay(&state)?,
+            sync::e2e_claim_install_recovery_delay(&state)?,
             Some(claimed.clone())
         );
 
         std::fs::remove_file(&claimed)?;
         std::fs::write(&marker, b"duration")?;
-        assert!(e2e_claim_install_recovery_delay(&state).is_err());
+        assert!(sync::e2e_claim_install_recovery_delay(&state).is_err());
         std::fs::remove_file(&claimed)?;
         std::fs::create_dir(&marker)?;
-        assert!(e2e_claim_install_recovery_delay(&state).is_err());
+        assert!(sync::e2e_claim_install_recovery_delay(&state).is_err());
+        Ok(())
+    }
+
+    #[cfg(all(feature = "e2e-test-hooks", unix))]
+    #[test]
+    fn e2e_reservation_stop_files_are_one_shot_and_no_follow() -> Result<()> {
+        let temp = tempdir()?;
+        let state = State::open(temp.path().join("state"))?;
+        let marker = state.dir.join(".e2e-stop-before-reservation");
+        let pidfile = state.dir.join(".e2e-reservation-stop.pid");
+        assert!(!e2e_claim_reservation_stop(&state)?);
+
+        std::fs::write(&marker, b"")?;
+        assert!(e2e_claim_reservation_stop(&state)?);
+        assert!(!e2e_claim_reservation_stop(&state)?);
+
+        std::os::unix::fs::symlink(temp.path().join("missing"), &marker)?;
+        assert!(e2e_claim_reservation_stop(&state).is_err());
+        std::fs::remove_file(state.dir.join(".e2e-stop-before-reservation-claimed"))?;
+
+        e2e_publish_reservation_stop_pid(&state)?;
+        assert!(e2e_publish_reservation_stop_pid(&state).is_err());
+        std::fs::remove_file(&pidfile)?;
+        std::os::unix::fs::symlink(temp.path().join("pid-target"), &pidfile)?;
+        assert!(e2e_publish_reservation_stop_pid(&state).is_err());
         Ok(())
     }
 
@@ -5916,6 +7588,216 @@ mod tests {
         }
     }
 
+    fn test_state_with_peer_id(path: &Path, peer: &str) -> Result<State> {
+        let state = State::open(path)?;
+        state.peer_id()?;
+        drop(state);
+        let database = rusqlite::Connection::open(path.join("state.sqlite3"))?;
+        database.execute(
+            "UPDATE installation SET peer_id=?1 WHERE singleton=1",
+            [peer],
+        )?;
+        drop(database);
+        State::open(path)
+    }
+
+    #[derive(Default)]
+    struct TestReservationWire {
+        incoming: std::collections::VecDeque<ReservationFrame>,
+        outgoing: Vec<ReservationFrame>,
+    }
+
+    impl ReservationWire for TestReservationWire {
+        fn send_reservation(
+            &mut self,
+            frame: ReservationFrame,
+            _deadline: std::time::Instant,
+        ) -> Result<()> {
+            self.outgoing.push(frame);
+            Ok(())
+        }
+
+        fn recv_reservation(&mut self, _deadline: std::time::Instant) -> Result<ReservationFrame> {
+            self.incoming.pop_front().context("test wire is empty")
+        }
+    }
+
+    struct FailingSendWire;
+
+    impl ReservationWire for FailingSendWire {
+        fn send_reservation(
+            &mut self,
+            _frame: ReservationFrame,
+            _deadline: std::time::Instant,
+        ) -> Result<()> {
+            bail!("test wire closed")
+        }
+
+        fn recv_reservation(&mut self, _deadline: std::time::Instant) -> Result<ReservationFrame> {
+            bail!("test wire closed")
+        }
+    }
+
+    #[test]
+    fn scheduling_views_distinguish_local_predecessors_active_owners_and_peer_waits() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let roots = [
+            temp.path().join("one"),
+            temp.path().join("two"),
+            temp.path().join("three"),
+        ];
+        for root in &roots {
+            std::fs::create_dir(root)?;
+        }
+        let first = state.init_share(&roots[0])?;
+        let second = state.init_share(&roots[1])?;
+        let third = state.init_share(&roots[2])?;
+        let mut owner = state.enqueue_sync(Some(&first), SyncOperation::Sync, None)?;
+        let owner = owner
+            .try_activate()?
+            .context("first request did not activate")?;
+        let second_request = state.enqueue_sync(Some(&second), SyncOperation::Watch, None)?;
+        let snapshot = state.scheduling_snapshot()?;
+        let waiting = share_scheduling_view(&state, &snapshot, &second)?;
+        assert_eq!(waiting.state, "queued");
+        assert!(
+            matches!(waiting.blocker, Some(SchedulingBlocker::Local(Some(ref root))) if root == &roots[0])
+        );
+        assert_eq!(
+            share_scheduling_view(&state, &snapshot, &first)?.state,
+            "active"
+        );
+        owner.finish()?;
+
+        let third_request = state.enqueue_sync(Some(&third), SyncOperation::Sync, None)?;
+        let snapshot = state.scheduling_snapshot()?;
+        let waiting = share_scheduling_view(&state, &snapshot, &third)?;
+        assert!(
+            matches!(waiting.blocker, Some(SchedulingBlocker::Local(Some(ref root))) if root == &roots[1])
+        );
+        second_request.cancel()?;
+        third_request.cancel()?;
+
+        let peer_wait = state.enqueue_pending_authority(
+            &third,
+            &RelationshipId::generate(),
+            SyncOperation::Sync,
+            None,
+        )?;
+        let snapshot = state.scheduling_snapshot()?;
+        let waiting = share_scheduling_view(&state, &snapshot, &third)?;
+        assert!(matches!(waiting.blocker, Some(SchedulingBlocker::Peer)));
+        drop(peer_wait);
+        Ok(())
+    }
+
+    #[test]
+    fn reservation_helpers_bound_progress_and_activate_a_prepared_pair() -> Result<()> {
+        let mut resets = 0;
+        for _ in 0..MAX_PAIR_RESETS {
+            note_pair_reset(&mut resets)?;
+        }
+        assert!(note_pair_reset(&mut resets).is_err());
+
+        let queued = |position| {
+            ReservationFrame::Queued(sync::SyncQueued {
+                waiting_on: sync::WaitingOn::Peer,
+                position: sync::CoarseQueuePosition::from_exact(position).unwrap(),
+            })
+        };
+        let mut wire = TestReservationWire {
+            incoming: [
+                queued(1),
+                queued(1),
+                queued(2),
+                ReservationFrame::PendingAuthority(sync::PendingAuthority {
+                    id: sync::SchedulingId::generate(),
+                    connector_generation: 1,
+                    responder_generation: 2,
+                }),
+            ]
+            .into(),
+            outgoing: Vec::new(),
+        };
+        let mut output = Vec::new();
+        assert!(matches!(
+            recv_reservation_ignoring_progress(&mut wire, None, &mut output)?,
+            ReservationFrame::PendingAuthority(_)
+        ));
+        assert_eq!(
+            String::from_utf8(output)?
+                .matches("Waiting for the peer")
+                .count(),
+            1
+        );
+
+        let mut flooding = TestReservationWire {
+            incoming: (0..9).map(|_| queued(1)).collect(),
+            outgoing: Vec::new(),
+        };
+        assert!(recv_reservation_ignoring_progress(&mut flooding, None, &mut Vec::new()).is_err());
+
+        let temp = tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = ShareId::generate();
+        let relationship = RelationshipId::generate();
+        let authority = state.peer_id()?;
+        let nonce = sync::SchedulingNonce::generate();
+        let predecessor = empty_predecessor();
+        let (request, order) = state.enqueue_authoritative_sync(
+            &share,
+            &relationship,
+            SyncOperation::Sync,
+            None,
+            &authority,
+            nonce.as_str(),
+            predecessor.as_str(),
+        )?;
+        let order = sync::NetworkOrder::new(order as u64)?;
+        let mut wire = TestReservationWire::default();
+        send_local_queue_position(&mut state, &request, &mut wire, scheduling_deadline())?;
+        let prepared = prepare_local_pair(
+            &mut state,
+            &request,
+            &relationship,
+            &authority,
+            order,
+            &nonce,
+            &mut wire,
+        )?;
+        assert!(state.commit_paired_sync(
+            request.token(),
+            &relationship,
+            &authority,
+            order.get() as i64,
+            nonce.as_str(),
+            &prepared.stored,
+        )?);
+        wait_for_paired_permit(request, &share, &mut wire, None)?.finish()?;
+        recover_before_pair(&mut state, &mut wire)?;
+        assert!(matches!(
+            wire.outgoing.as_slice(),
+            [ReservationFrame::Queued(_)]
+        ));
+
+        let mut blocker = state.enqueue_sync(None, SyncOperation::Maintenance, None)?;
+        let blocker = blocker
+            .try_activate()?
+            .context("test blocker did not activate")?;
+        let error = recover_before_pair_with_interval(
+            &mut state,
+            &mut FailingSendWire,
+            Duration::from_millis(1),
+        )
+        .expect_err("wire failure must stop queued recovery");
+        assert!(error.to_string().contains("test wire closed"));
+        assert!(state.scheduling_snapshot()?.queued.is_empty());
+        blocker.finish()?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn serve_test_daemon(
         state_dir: &Path,
@@ -5937,9 +7819,10 @@ mod tests {
         Ok(std::thread::spawn(move || {
             let mut state = State::open(state_dir)?;
             let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let lifecycle = Arc::new(Mutex::new(()));
             let (events, _event_rx) = std::sync::mpsc::channel();
             for stream in listener.incoming().take(requests) {
-                handle_daemon_request(&mut state, &workers, &events, stream?)?;
+                handle_daemon_request(&mut state, &workers, &events, &lifecycle, stream?)?;
             }
             Ok(())
         }))
@@ -6053,8 +7936,8 @@ mod tests {
         std::os::unix::fs::symlink(&root, &link)?;
         assert!(select_share_for_removal(&state, Some(&link), None).is_err());
 
-        status(&state, &root, false)?;
-        status(&state, &root, true)?;
+        status(&mut state, &root, false)?;
+        status(&mut state, &root, true)?;
         remove_sync_relationship(&mut state, Some(&root), None, false, true)?;
 
         let prepared = state.prepare_connector_registration(
@@ -6064,7 +7947,7 @@ mod tests {
             b"/remote",
             "/flocal",
         )?;
-        status(&state, &root, false)?;
+        status(&mut state, &root, false)?;
         assert!(remove_sync_relationship(&mut state, Some(&root), None, false, true).is_err());
         assert!(prepared.peer_id.is_none());
         let daemon = serve_test_daemon(&state.dir, 2)?;
@@ -6078,16 +7961,16 @@ mod tests {
             &responder,
             &flocal::model::RelationshipId::generate(),
         )?;
-        status(&state, &root, false)?;
+        status(&mut state, &root, false)?;
         assert!(remove_sync_relationship(&mut state, None, Some(&share.0), false, true).is_err());
         let binding = state.endpoint_binding(&share)?;
         let removal = state.prepare_removal(&share, &binding)?;
         state.set_removal_diagnostic(&share, &removal.relationship, "offline")?;
         state.set_install_intent(&share, &[])?;
-        status(&state, &root, false)?;
-        status(&state, &root, true)?;
+        status(&mut state, &root, false)?;
+        status(&mut state, &root, true)?;
         let syncs = daemon_syncs(
-            &state,
+            &mut state,
             &Arc::new(Mutex::new(std::collections::HashMap::new())),
         )?;
         assert_eq!(syncs[0].state, "removing");
@@ -6805,12 +8688,8 @@ mod tests {
         let mut state = State::open(temp.path().join("watch-state"))?;
         let share = ShareId("share-watch-setup".into());
         let bound_peer = flocal::model::PeerId("bound-peer".into());
-        state.register_relationship(
-            &share,
-            &root,
-            &bound_peer,
-            &flocal::model::RelationshipId::generate(),
-        )?;
+        let relationship = flocal::model::RelationshipId::generate();
+        state.register_relationship(&share, &root, &bound_peer, &relationship)?;
 
         let reject = |state: &mut State, protocol, peer| -> Result<V2SessionFrame> {
             let (server_input, _client_output) = UnixStream::pair()?;
@@ -6820,6 +8699,7 @@ mod tests {
                 protocol,
                 share.clone(),
                 peer,
+                relationship.clone(),
                 &server_input,
                 &server_output,
             )?;
@@ -6856,7 +8736,7 @@ mod tests {
         ));
 
         let mut competing = State::open(temp.path().join("watch-state"))?;
-        let share_lock = state.lock_share(&share)?;
+        let share_lock = state.lock_share_session(&share)?;
         assert!(matches!(
             reject(
                 &mut competing,
@@ -7020,12 +8900,8 @@ mod tests {
         let mut state = State::open(temp.path().join("idle-state"))?;
         let share = ShareId("share-idle".into());
         let peer = flocal::model::PeerId("idle-peer".into());
-        state.register_relationship(
-            &share,
-            &root,
-            &peer,
-            &flocal::model::RelationshipId::generate(),
-        )?;
+        let relationship = flocal::model::RelationshipId::generate();
+        state.register_relationship(&share, &root, &peer, &relationship)?;
         let (client_output, server_input) = UnixStream::pair()?;
         let (server_output, client_input) = UnixStream::pair()?;
         let responder = std::thread::spawn(move || {
@@ -7034,6 +8910,7 @@ mod tests {
                 sync::WATCH_PROTOCOL_VERSION,
                 share,
                 peer,
+                relationship,
                 &server_input,
                 &server_output,
             )
@@ -7106,69 +8983,106 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let temp = tempdir()?;
-        let local_root = temp.path().join("local");
-        let remote_root = temp.path().join("remote");
-        std::fs::create_dir_all(&local_root)?;
-        std::fs::create_dir_all(&remote_root)?;
-        std::fs::write(local_root.join("from-local"), b"local")?;
-        std::fs::write(remote_root.join("from-remote"), b"remote")?;
-        let mut local_state = State::open(temp.path().join("local-state"))?;
-        let mut remote_state = State::open(temp.path().join("remote-state"))?;
-        let local_share = local_state.init_share(&local_root)?;
-        let remote_share = remote_state.init_share(&remote_root)?;
-        let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
-        let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
-        let connector_peer = local_state.peer_id()?;
-
-        let (connector_stream, responder_reader) = UnixStream::pair()?;
-        let (responder_stream, connector_reader) = UnixStream::pair()?;
-        let responder = std::thread::spawn(move || -> Result<()> {
-            let first = sync::read_v2_envelope_until(
-                &responder_reader,
-                std::time::Instant::now() + sync::default_frame_deadline(),
-            )?;
-            assert!(matches!(
-                first,
-                V2Envelope::Round {
-                    round: 1,
-                    frame: V2RoundFrame::SyncStart { .. }
-                }
-            ));
-            serve_v2_round(
-                &mut remote_state,
+        for (case, connector_id, responder_id) in [
+            ("connector-authority", "peer-a", "peer-z"),
+            ("responder-authority", "peer-z", "peer-a"),
+        ] {
+            let case_root = temp.path().join(case);
+            let local_root = case_root.join("local");
+            let remote_root = case_root.join("remote");
+            std::fs::create_dir_all(&local_root)?;
+            std::fs::create_dir_all(&remote_root)?;
+            std::fs::write(local_root.join("from-local"), b"local")?;
+            std::fs::write(remote_root.join("from-remote"), b"remote")?;
+            let mut local_state =
+                test_state_with_peer_id(&case_root.join("local-state"), connector_id)?;
+            let mut remote_state =
+                test_state_with_peer_id(&case_root.join("remote-state"), responder_id)?;
+            let local_share = local_state.init_share(&local_root)?;
+            let remote_share = local_share.clone();
+            let connector_peer = local_state.peer_id()?;
+            let remote_peer = remote_state.peer_id()?;
+            let relationship = RelationshipId::generate();
+            remote_state.register_relationship(
                 &remote_share,
+                &remote_root,
                 &connector_peer,
-                &remote_cap,
-                1,
-                &responder_reader,
-                &responder_stream,
-                &Default::default(),
+                &relationship,
             )?;
-            Ok(())
-        });
-        let mut pending_remote = 0;
-        let report = connector_v2_round(
-            &mut local_state,
-            &local_share,
-            &local_cap,
-            1,
-            0,
-            0,
-            &connector_reader,
-            &connector_stream,
-            &mut pending_remote,
-            &Default::default(),
-        )?;
-        responder.join().expect("responder joins")?;
+            let mut peer = test_connector(&remote_peer.0);
+            peer.relationship = Some(relationship.clone());
+            local_state.set_peer(&local_share, &peer)?;
+            let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
+            let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
 
-        assert_eq!(std::fs::read(local_root.join("from-remote"))?, b"remote");
-        assert_eq!(std::fs::read(remote_root.join("from-local"))?, b"local");
-        let ConnectorRound::Completed(report) = report else {
-            bail!("test round unexpectedly invalidated");
-        };
-        let report = String::from_utf8(report)?;
-        assert!(report.contains("UPLOAD from-local"), "{report}");
-        assert!(report.contains("DOWNLOAD from-remote"), "{report}");
+            let (connector_stream, responder_reader) = UnixStream::pair()?;
+            let (responder_stream, connector_reader) = UnixStream::pair()?;
+            let responder = std::thread::spawn(move || -> Result<()> {
+                let first = sync::read_v2_envelope_until(
+                    &responder_reader,
+                    std::time::Instant::now() + sync::default_frame_deadline(),
+                )?;
+                let V2Envelope::Round { round: 1, frame } = first else {
+                    bail!("expected first reservation frame");
+                };
+                let binding = validate_sync_binding(
+                    &remote_state,
+                    &remote_share,
+                    &connector_peer,
+                    &relationship,
+                )?;
+                serve_v2_round(
+                    &mut remote_state,
+                    &remote_share,
+                    &connector_peer,
+                    &binding,
+                    &remote_cap,
+                    1,
+                    frame,
+                    &responder_reader,
+                    &responder_stream,
+                    &Default::default(),
+                )?;
+                Ok(())
+            });
+            let mut pending_remote = 0;
+            let report = connector_v2_round(
+                &mut local_state,
+                &local_share,
+                &local_cap,
+                1,
+                0,
+                0,
+                &connector_reader,
+                &connector_stream,
+                &mut pending_remote,
+                &Default::default(),
+                &mut Vec::new(),
+                None,
+                None,
+            );
+            if report.is_err() {
+                drop(connector_stream);
+                drop(connector_reader);
+            }
+            let responder_result = responder.join().expect("responder joins");
+            let report = report.with_context(|| {
+                format!(
+                    "connector failed; responder result: {:?}",
+                    responder_result.as_ref().err()
+                )
+            })?;
+            responder_result?;
+
+            assert_eq!(std::fs::read(local_root.join("from-remote"))?, b"remote");
+            assert_eq!(std::fs::read(remote_root.join("from-local"))?, b"local");
+            let ConnectorRound::Completed(report) = report else {
+                bail!("test round unexpectedly invalidated");
+            };
+            let report = String::from_utf8(report)?;
+            assert!(report.contains("UPLOAD from-local"), "{report}");
+            assert!(report.contains("DOWNLOAD from-remote"), "{report}");
+        }
         Ok(())
     }
 
@@ -7181,6 +9095,10 @@ mod tests {
         std::fs::create_dir(&root)?;
         let mut state = State::open(temp.path().join("state"))?;
         let share = state.init_share(&root)?;
+        let relationship = RelationshipId::generate();
+        let mut peer = test_connector("zzzz-remote");
+        peer.relationship = Some(relationship);
+        state.set_peer(&share, &peer)?;
         let root = sync::ShareRoot::open(&state, &share)?;
         let mut first = test_record(b"duplicate", "foreign", Entry::Directory);
         let mut second = first.clone();
@@ -7191,14 +9109,78 @@ mod tests {
         let (responder_stream, connector_reader) = UnixStream::pair()?;
         let responder = std::thread::spawn(move || -> Result<()> {
             let budget = sync::RoundBudget::new(std::time::Instant::now() + Duration::from_secs(1));
+            let issue =
+                match sync::read_v2_envelope_until(&responder_reader, budget.frame_deadline()?)? {
+                    V2Envelope::Round {
+                        round: 1,
+                        frame: V2RoundFrame::ProxyIssue(issue),
+                    } => issue,
+                    other => bail!("expected proxy issue, got {other:?}"),
+                };
+            write_v2_round(
+                &responder_stream,
+                1,
+                V2RoundFrame::ProxyAck(sync::ProxyAck {
+                    id: issue.id.clone(),
+                    network_order: issue.network_order,
+                }),
+                &budget,
+            )?;
+            let prepare =
+                match sync::read_v2_envelope_until(&responder_reader, budget.frame_deadline()?)? {
+                    V2Envelope::Round {
+                        round: 1,
+                        frame: V2RoundFrame::PairPrepare(checkpoint),
+                    } => checkpoint,
+                    other => bail!("expected pair prepare, got {other:?}"),
+                };
+            write_v2_round(
+                &responder_stream,
+                1,
+                V2RoundFrame::PairPrepareAck(prepare.clone()),
+                &budget,
+            )?;
+            let commit = sync::read_v2_envelope_until(&responder_reader, budget.frame_deadline()?)?;
+            assert!(matches!(
+                commit,
+                V2Envelope::Round {
+                    round: 1,
+                    frame: V2RoundFrame::PairCommit(ref checkpoint),
+                } if checkpoint == &prepare
+            ));
+            write_v2_round(
+                &responder_stream,
+                1,
+                V2RoundFrame::PairCommitAck(prepare),
+                &budget,
+            )?;
+            let reservation =
+                match sync::read_v2_envelope_until(&responder_reader, budget.frame_deadline()?)? {
+                    V2Envelope::Round {
+                        round: 1,
+                        frame: V2RoundFrame::SyncReserved(reservation),
+                    } => reservation,
+                    other => bail!("expected sync reservation, got {other:?}"),
+                };
+            write_v2_round(
+                &responder_stream,
+                1,
+                V2RoundFrame::SyncStart(sync::SyncStart {
+                    id: reservation.id.clone(),
+                    network_order: reservation.network_order,
+                    nonce: reservation.nonce.clone(),
+                    connector_generation: 0,
+                    responder_generation: 0,
+                }),
+                &budget,
+            )?;
             assert!(matches!(
                 sync::read_v2_envelope_until(&responder_reader, budget.frame_deadline()?)?,
                 V2Envelope::Round {
                     round: 1,
-                    frame: V2RoundFrame::SyncStart { .. }
-                }
+                    frame: V2RoundFrame::SyncAccepted(accepted),
+                } if accepted == reservation
             ));
-            write_v2_round(&responder_stream, 1, V2RoundFrame::SyncAccepted, &budget)?;
             write_v2_snapshot(&responder_stream, 1, &[first, second], &budget)
         });
 
@@ -7214,6 +9196,9 @@ mod tests {
             &connector_stream,
             &mut pending_remote_generation,
             &Default::default(),
+            &mut Vec::new(),
+            None,
+            None,
         );
         let error = match result {
             Ok(_) => bail!("duplicate peer paths must terminate the persistent session"),
@@ -7239,17 +9224,28 @@ mod tests {
         let mut local_state = State::open(temp.path().join("session-local-state"))?;
         let mut remote_state = State::open(temp.path().join("session-remote-state"))?;
         let local_share = local_state.init_share(&local_root)?;
-        let remote_share = remote_state.init_share(&remote_root)?;
-        let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
-        let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
+        let remote_share = local_share.clone();
         let remote_peer = remote_state.peer_id()?;
         let connector_peer = local_state.peer_id()?;
+        let relationship = RelationshipId::generate();
+        remote_state.register_relationship(
+            &remote_share,
+            &remote_root,
+            &connector_peer,
+            &relationship,
+        )?;
+        let mut configured_peer = test_connector(&remote_peer.0);
+        configured_peer.relationship = Some(relationship.clone());
+        local_state.set_peer(&local_share, &configured_peer)?;
+        let local_cap = sync::ShareRoot::open(&local_state, &local_share)?;
+        let remote_cap = sync::ShareRoot::open(&remote_state, &remote_share)?;
         let expected_remote_peer = remote_peer.clone();
         let local_seed = flocal::model::RelativePath::from_bytes(b"local-seed".to_vec())?;
         let remote_seed = flocal::model::RelativePath::from_bytes(b"remote-seed".to_vec())?;
         local_state.remember_unsettled_path(&local_share, &local_seed)?;
         let expected_local_seed = local_seed.clone();
         let expected_remote_seed = remote_seed.clone();
+        let responder_relationship = relationship.clone();
 
         let (connector_output, responder_input) = UnixStream::pair()?;
         let (responder_output, connector_input) = UnixStream::pair()?;
@@ -7278,23 +9274,27 @@ mod tests {
             let unsettled = remote_state.unsettled_paths(&remote_share)?;
             assert!(unsettled.contains(&expected_local_seed));
             assert!(unsettled.contains(&expected_remote_seed));
-            let start = sync::read_v2_envelope_until(
+            let first = sync::read_v2_envelope_until(
                 &responder_input,
                 std::time::Instant::now() + sync::default_frame_deadline(),
             )?;
-            assert!(matches!(
-                start,
-                V2Envelope::Round {
-                    round: 1,
-                    frame: V2RoundFrame::SyncStart { .. }
-                }
-            ));
+            let V2Envelope::Round { round: 1, frame } = first else {
+                bail!("expected first reservation frame");
+            };
+            let binding = validate_sync_binding(
+                &remote_state,
+                &remote_share,
+                &connector_peer,
+                &responder_relationship,
+            )?;
             serve_v2_round(
                 &mut remote_state,
                 &remote_share,
                 &connector_peer,
+                &binding,
                 &remote_cap,
                 1,
+                frame,
                 &responder_input,
                 &responder_output,
                 &Default::default(),
@@ -7307,7 +9307,7 @@ mod tests {
             executable: "/flocal".into(),
             remote_path: path_bytes(&remote_root),
             peer_id: Some(expected_remote_peer),
-            relationship: None,
+            relationship: Some(relationship),
         };
         let watch_state = flocal::watch::WatchState::default();
         let (_events_tx, events_rx) = std::sync::mpsc::sync_channel(1);
@@ -7333,6 +9333,7 @@ mod tests {
             None,
             &connector_input,
             &connector_output,
+            &mut None,
         );
         assert!(result.is_err(), "responder EOF ends this one session");
         assert!(connected, "startup round reached connected state");
@@ -7436,6 +9437,7 @@ mod tests {
                 protocol: sync::PROTOCOL_VERSION + 1,
                 share: share.clone(),
                 peer: peer.clone(),
+                relationship: RelationshipId::generate(),
                 dry_run: true,
             },
         ] {
@@ -7450,6 +9452,7 @@ mod tests {
             protocol: sync::PROTOCOL_VERSION,
             share,
             peer,
+            relationship: RelationshipId::generate(),
             dry_run: true,
         })?;
         result?;
@@ -7463,40 +9466,93 @@ mod tests {
 
     #[test]
     fn initial_protocol_runs_bound_dry_sync() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
         let temp = tempdir()?;
         let root = temp.path().join("root");
         std::fs::create_dir_all(&root)?;
         let mut state = State::open(temp.path().join("state"))?;
         let share = ShareId("share-bound".into());
-        let peer = flocal::model::PeerId("peer-bound".into());
-        state.register_relationship(
-            &share,
-            &root,
-            &peer,
-            &flocal::model::RelationshipId::generate(),
+        let peer = flocal::model::PeerId("zzzz-peer-bound".into());
+        let relationship = flocal::model::RelationshipId::generate();
+        state.register_relationship(&share, &root, &peer, &relationship)?;
+        let (mut client, server) = UnixStream::pair()?;
+        let server_input = server.try_clone()?;
+        let server_thread = std::thread::spawn(move || {
+            let mut server_input = server_input;
+            let mut server_output = server;
+            serve_initial(
+                &mut state,
+                InitialMessage::Sync {
+                    protocol: sync::PROTOCOL_VERSION,
+                    share,
+                    peer,
+                    relationship,
+                    dry_run: true,
+                },
+                &mut server_input,
+                &mut server_output,
+            )
+        });
+        let deadline = || std::time::Instant::now() + sync::default_frame_deadline();
+        let id = sync::SchedulingId::generate();
+        sync::write_v1_message_until(
+            &client,
+            &Message::PendingAuthority(sync::PendingAuthority {
+                id: id.clone(),
+                connector_generation: 0,
+                responder_generation: 0,
+            }),
+            deadline(),
         )?;
-        let mut input = Vec::new();
-        sync::write_message(
-            &mut input,
-            &Message::Sync {
-                protocol: sync::PROTOCOL_VERSION,
-                share,
-                peer,
-                dry_run: true,
-            },
+        let issue = match sync::read_v1_message_until(&client, deadline())? {
+            Message::ProxyIssue(issue) if issue.id == id => issue,
+            other => bail!("expected proxy issue, got {other:?}"),
+        };
+        sync::write_v1_message_until(
+            &client,
+            &Message::ProxyAck(sync::ProxyAck {
+                id: issue.id.clone(),
+                network_order: issue.network_order,
+            }),
+            deadline(),
         )?;
-        sync::write_message(&mut input, &Message::Cancel)?;
-        let mut output = Vec::new();
-        serve_io(&mut state, &mut input.as_slice(), &mut output)?;
-        let mut messages = output.as_slice();
+        let checkpoint = match sync::read_v1_message_until(&client, deadline())? {
+            Message::PairPrepare(checkpoint) => checkpoint,
+            other => bail!("expected pair prepare, got {other:?}"),
+        };
+        sync::write_v1_message_until(
+            &client,
+            &Message::PairPrepareAck(checkpoint.clone()),
+            deadline(),
+        )?;
         assert!(matches!(
-            sync::read_message(&mut messages)?,
-            Message::Accepted { .. }
+            sync::read_v1_message_until(&client, deadline())?,
+            Message::PairCommit(ref commit) if commit == &checkpoint
         ));
+        sync::write_v1_message_until(&client, &Message::PairCommitAck(checkpoint), deadline())?;
+        let reservation = match sync::read_v1_message_until(&client, deadline())? {
+            Message::SyncReserved(reservation) => reservation,
+            other => bail!("expected synchronization reservation, got {other:?}"),
+        };
+        sync::write_v1_message_until(
+            &client,
+            &Message::SyncStart(sync::SyncStart {
+                id: reservation.id.clone(),
+                network_order: reservation.network_order,
+                nonce: reservation.nonce.clone(),
+                connector_generation: 0,
+                responder_generation: 0,
+            }),
+            deadline(),
+        )?;
         assert!(matches!(
-            sync::read_message(&mut messages)?,
-            Message::SnapshotEnd
+            sync::read_v1_message_until(&client, deadline())?,
+            Message::SyncAccepted(accepted) if accepted == reservation
         ));
+        assert!(sync::read_snapshot(&mut client)?.is_empty());
+        sync::write_message(&mut client, &Message::Cancel)?;
+        server_thread.join().expect("server joins")?;
         Ok(())
     }
 
@@ -7638,10 +9694,11 @@ mod tests {
         let mut state = State::open(temp.path().join("state"))?;
         let (server, mut client) = UnixStream::pair()?;
         let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let lifecycle = Arc::new(Mutex::new(()));
         let (events, _event_rx) = std::sync::mpsc::channel();
         let worker_copy = workers.clone();
         let thread = std::thread::spawn(move || {
-            handle_daemon_request(&mut state, &worker_copy, &events, server)
+            handle_daemon_request(&mut state, &worker_copy, &events, &lifecycle, server)
         });
         serde_json::to_writer(
             &mut client,
@@ -7673,10 +9730,11 @@ mod tests {
         state.set_blocked(&share, "repair required")?;
         let (server, mut client) = UnixStream::pair()?;
         let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let lifecycle = Arc::new(Mutex::new(()));
         let (events, _event_rx) = std::sync::mpsc::channel();
         let worker_copy = workers.clone();
         let thread = std::thread::spawn(move || {
-            handle_daemon_request(&mut state, &worker_copy, &events, server)
+            handle_daemon_request(&mut state, &worker_copy, &events, &lifecycle, server)
         });
         serde_json::to_writer(&mut client, &DaemonRequest::List { cursor: None })?;
         client.write_all(b"\n")?;
@@ -7700,6 +9758,103 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn daemon_lifecycle_serializes_start_with_relationship_removal() -> Result<()> {
+        fn concurrent_request(
+            state_dir: PathBuf,
+            workers: Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
+            events: std::sync::mpsc::Sender<WorkerEvent>,
+            lifecycle: Arc<Mutex<()>>,
+            barrier: Arc<std::sync::Barrier>,
+            request: DaemonRequest,
+        ) -> Result<DaemonResponse> {
+            let mut state = State::open(state_dir)?;
+            let (server, mut client) = UnixStream::pair()?;
+            serde_json::to_writer(&mut client, &request)?;
+            client.write_all(b"\n")?;
+            barrier.wait();
+            handle_daemon_request(&mut state, &workers, &events, &lifecycle, server)?;
+            serde_json::from_slice(&read_daemon_message(&mut client)?).map_err(Into::into)
+        }
+
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("state");
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let relationship = RelationshipId::generate();
+        let mut peer = test_connector("peer-lifecycle");
+        peer.relationship = Some(relationship);
+        state.set_peer(&share, &peer)?;
+        state.set_initial_complete(&share)?;
+        let expected_binding = state.managed_share(&share)?.binding;
+
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let lifecycle = Arc::new(Mutex::new(()));
+        let held = lifecycle.lock().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (events, _event_rx) = std::sync::mpsc::channel();
+        let start = {
+            let state_dir = state_dir.clone();
+            let workers = workers.clone();
+            let lifecycle = lifecycle.clone();
+            let barrier = barrier.clone();
+            let events = events.clone();
+            let share = share.clone();
+            std::thread::spawn(move || {
+                concurrent_request(
+                    state_dir,
+                    workers,
+                    events,
+                    lifecycle,
+                    barrier,
+                    DaemonRequest::Start { share: share.0 },
+                )
+            })
+        };
+        let remove = {
+            let state_dir = state_dir.clone();
+            let workers = workers.clone();
+            let lifecycle = lifecycle.clone();
+            let barrier = barrier.clone();
+            let events = events.clone();
+            let share = share.clone();
+            std::thread::spawn(move || {
+                concurrent_request(
+                    state_dir,
+                    workers,
+                    events,
+                    lifecycle,
+                    barrier,
+                    DaemonRequest::PrepareRemove {
+                        share: share.0,
+                        expected_binding,
+                    },
+                )
+            })
+        };
+        barrier.wait();
+        drop(held);
+
+        let start = start.join().expect("start request panicked")?;
+        let remove = remove.join().expect("remove request panicked")?;
+        assert!(matches!(
+            start,
+            DaemonResponse::Ok | DaemonResponse::Error { .. }
+        ));
+        assert!(matches!(remove, DaemonResponse::Prepared { .. }));
+        assert!(workers.lock().unwrap().is_empty());
+        assert!(
+            State::open(&state_dir)?
+                .managed_share(&share)?
+                .removing_relationship
+                .is_some()
+        );
+        Ok(())
+    }
+
     #[test]
     fn daemon_list_pages_large_valid_state() -> Result<()> {
         let temp = tempdir()?;
@@ -7715,7 +9870,8 @@ mod tests {
         let mut cursor = None;
         let mut count = 0;
         loop {
-            let DaemonResponse::List { syncs, next } = daemon_sync_page(&state, &workers, cursor)?
+            let DaemonResponse::List { syncs, next } =
+                daemon_sync_page(&mut state, &workers, cursor)?
             else {
                 panic!("expected list response")
             };
@@ -7727,7 +9883,7 @@ mod tests {
             }
         }
         assert_eq!(count, 20);
-        assert!(daemon_sync_page(&state, &workers, Some("missing".into())).is_err());
+        assert!(daemon_sync_page(&mut state, &workers, Some("missing".into())).is_err());
         Ok(())
     }
 
@@ -7754,13 +9910,34 @@ mod tests {
         let state_dir = temp.path().join("state");
         let mut state = State::open(&state_dir)?;
         let share = state.init_share(&root)?;
+        state.set_install_intent(&share, &[])?;
 
         let foreground_owner = state.lock_share(&share)?;
         let mut competing = State::open(&state_dir)?;
-        assert!(recover_daemon_share_install(&mut competing, &share).is_err());
+        competing.begin_install_intent_retry(&share)?;
+        let request = competing.enqueue_sync(Some(&share), SyncOperation::Recovery, None)?;
+        let (waiting, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let recovery = std::thread::spawn(move || {
+            request
+                .wait_with_prepare(
+                    || false,
+                    |_| {
+                        let _ = waiting.try_send(());
+                        Ok(())
+                    },
+                    recover_installs_locked,
+                )?
+                .finish()
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(3))?;
+        assert!(state.install_intent_failure(&share)?.is_none());
         drop(foreground_owner);
+        recovery.join().expect("recovery thread panicked")?;
+        assert!(state.install_intent(&share)?.is_none());
 
-        state.set_peer(&share, &test_connector("peer-removing"))?;
+        let mut peer = test_connector("peer-removing");
+        peer.relationship = Some(RelationshipId::generate());
+        state.set_peer(&share, &peer)?;
         let root = sync::ShareRoot::open(&state, &share)?;
         let binding = state.endpoint_binding(&share)?;
         state.prepare_removal(&share, &binding)?;
@@ -7777,6 +9954,9 @@ mod tests {
             &local,
             &mut pending_remote_generation,
             &Default::default(),
+            &mut Vec::new(),
+            None,
+            None,
         ) {
             Ok(_) => bail!("a removal-pending connector began another round"),
             Err(error) => error,
@@ -7802,7 +9982,7 @@ mod tests {
         state.set_install_intent(&share, &[])?;
         std::fs::rename(&root, temp.path().join("root-moved"))?;
 
-        recover_daemon_installs(&mut state)?;
+        spawn_daemon_install_recovery(&mut state)?.recv_timeout(Duration::from_secs(3))??;
 
         let managed = state.managed_share(&share)?;
         assert_eq!(managed.removing_relationship, Some(removal.relationship));
@@ -7827,7 +10007,7 @@ mod tests {
         let removal = state.prepare_removal(&share, &EndpointBinding::Connector(connector))?;
         let remote_error = anyhow::anyhow!("broken pipe");
 
-        let pending = report_remote_removal_failure(&state, &removal, &remote_error)
+        let pending = report_remote_removal_failure(&mut state, &removal, &remote_error)
             .expect_err("a failed two-sided removal remains pending");
         assert!(pending.to_string().contains("pending and disabled"));
         assert_eq!(
@@ -7835,22 +10015,9 @@ mod tests {
             Some("broken pipe")
         );
 
-        let lock_owner = State::open(&state_dir)?;
-        let held_sync = lock_owner.lock_global_sync()?;
-        let unclassified = report_remote_removal_failure(&state, &removal, &remote_error)
-            .expect_err("a busy global lock prevents local-state classification");
-        let message = unclassified.to_string();
-        assert!(message.contains("could not be classified or recorded"));
-        assert!(message.contains("flocal sync list"));
-        assert!(!message.contains("local relationship changed"));
-        assert!(message.contains("test-peer"));
-        assert!(message.contains("--local-only"));
-        assert!(message.contains("broken pipe"));
-        drop(held_sync);
-
         let mut concurrent = State::open(&state_dir)?;
         concurrent.finalize_local_removal(&removal)?;
-        let finalized = report_remote_removal_failure(&state, &removal, &remote_error)
+        let finalized = report_remote_removal_failure(&mut state, &removal, &remote_error)
             .expect_err("unconfirmed remote state remains an error");
         let message = finalized.to_string();
         assert!(message.contains("local relationship was removed concurrently"));
@@ -7862,7 +10029,7 @@ mod tests {
         let mut replacement = test_connector("peer-replacement");
         replacement.host = "replacement-peer".into();
         concurrent.set_peer(&share, &replacement)?;
-        let changed = report_remote_removal_failure(&state, &removal, &remote_error)
+        let changed = report_remote_removal_failure(&mut state, &removal, &remote_error)
             .expect_err("a changed local binding cannot absorb the old failure");
         let message = changed.to_string();
         assert!(message.contains("local relationship changed"));
@@ -7886,24 +10053,13 @@ mod tests {
         let removal = state.prepare_removal(&share, &EndpointBinding::Connector(connector))?;
         let recovery_error = anyhow::anyhow!("configured root identity changed");
 
-        let pending = report_install_recovery_failure(&state, &removal, &recovery_error)
+        let pending = report_install_recovery_failure(&mut state, &removal, &recovery_error)
             .expect_err("the exact removal remains pending");
         assert!(pending.to_string().contains("pending and disabled as of"));
 
-        let lock_owner = State::open(&state_dir)?;
-        let held_sync = lock_owner.lock_global_sync()?;
-        let unclassified = report_install_recovery_failure(&state, &removal, &recovery_error)
-            .expect_err("a busy global lock prevents local-state classification");
-        let message = unclassified.to_string();
-        assert!(message.contains("could not be classified or recorded"));
-        assert!(message.contains("flocal sync list"));
-        assert!(message.contains("configured root identity changed"));
-        assert!(!message.contains("local relationship changed"));
-        drop(held_sync);
-
         let mut concurrent = State::open(&state_dir)?;
         concurrent.finalize_local_removal(&removal)?;
-        let finalized = report_install_recovery_failure(&state, &removal, &recovery_error)
+        let finalized = report_install_recovery_failure(&mut state, &removal, &recovery_error)
             .expect_err("the recovery error remains visible after concurrent finalization");
         let message = finalized.to_string();
         assert!(message.contains("local relationship was removed concurrently"));
@@ -7913,7 +10069,7 @@ mod tests {
 
         let replacement = test_connector("peer-replacement-after-recovery");
         concurrent.set_peer(&share, &replacement)?;
-        let changed = report_install_recovery_failure(&state, &removal, &recovery_error)
+        let changed = report_install_recovery_failure(&mut state, &removal, &recovery_error)
             .expect_err("a changed binding cannot absorb the old recovery failure");
         let message = changed.to_string();
         assert!(message.contains("install recovery failed"));
@@ -7934,7 +10090,7 @@ mod tests {
         let (events, _events_rx) = std::sync::mpsc::channel();
 
         assert!(
-            start_managed_share(&mut state, &workers, &events, share.clone(), None)
+            start_managed_share(&mut state, &workers, &events, share.clone())
                 .expect_err("responder-only share must not start")
                 .to_string()
                 .contains("responder-only")
@@ -7951,7 +10107,7 @@ mod tests {
             },
         )?;
         assert!(
-            start_managed_share(&mut state, &workers, &events, share.clone(), None)
+            start_managed_share(&mut state, &workers, &events, share.clone())
                 .expect_err("initial sync must be complete")
                 .to_string()
                 .contains("initial synchronization")
@@ -7973,10 +10129,157 @@ mod tests {
                 child: Arc::new(Mutex::new(None)),
             },
         );
-        stop_managed_share(&state, &workers, share.clone())?;
+        stop_managed_share(&mut state, &workers, share.clone())?;
         assert!(!state.managed_share(&share)?.watch_enabled);
         assert!(stop.load(Ordering::Relaxed));
         assert!(stopping.load(Ordering::Relaxed));
+        assert!(!workers.lock().unwrap().contains_key(&share));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_reconciliation_claims_a_durable_managed_request_after_client_handoff() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_peer(
+            &share,
+            &PeerConfig {
+                peer_id: Some(flocal::model::PeerId("peer-test".into())),
+                relationship: None,
+                host: "127.0.0.1".into(),
+                remote_path: path_bytes(Path::new("/remote")),
+                executable: "/bin/false".into(),
+            },
+        )?;
+        state.set_initial_complete(&share)?;
+        state.set_watch_enabled(&share, true)?;
+        let held = state
+            .enqueue_sync(Some(&share), SyncOperation::Maintenance, None)?
+            .wait(|| false, |_| Ok(()))?;
+        let generation = state.watch_intent_generation(&share)?;
+        let request = state.enqueue_sync(Some(&share), SyncOperation::Watch, Some(generation))?;
+        let token = request.token().to_owned();
+        let ticket = request.ticket();
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events, _events_rx) = std::sync::mpsc::channel();
+
+        reconcile_watches(&mut state, &workers, &events)?;
+        assert!(workers.lock().unwrap().contains_key(&share));
+        let snapshot = state.scheduling_snapshot()?;
+        let durable = snapshot
+            .queued
+            .iter()
+            .find(|request| request.token == token)
+            .context("managed request disappeared during handoff cleanup")?;
+        assert_eq!(durable.ticket, ticket);
+        request.release_for_reclaim();
+        let snapshot = state.scheduling_snapshot()?;
+        assert!(
+            snapshot
+                .queued
+                .iter()
+                .any(|request| request.token == token && request.ticket == ticket)
+        );
+
+        held.finish()?;
+        stop_managed_share(&mut state, &workers, share)?;
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_managed_initial_recovery_preserves_enablement_and_queue_intent() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_peer(
+            &share,
+            &PeerConfig {
+                peer_id: Some(flocal::model::PeerId("peer-test".into())),
+                relationship: None,
+                host: "127.0.0.1".into(),
+                remote_path: path_bytes(Path::new("/remote")),
+                executable: "/bin/false".into(),
+            },
+        )?;
+        state.set_managed_plan_install_intent(&share, &[], &[], 0)?;
+
+        spawn_daemon_install_recovery(&mut state)?.recv_timeout(Duration::from_secs(3))??;
+
+        let managed = state.managed_share(&share)?;
+        assert!(managed.initial_complete);
+        assert!(managed.watch_enabled);
+        assert!(state.install_intent(&share)?.is_none());
+        let held = state
+            .enqueue_sync(Some(&share), SyncOperation::Maintenance, None)?
+            .wait(|| false, |_| Ok(()))?;
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        reconcile_watches(&mut state, &workers, &events)?;
+        let queued = state.scheduling_snapshot()?.queued;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].share.as_ref(), Some(&share));
+        assert_eq!(queued[0].operation, SyncOperation::Watch);
+        held.finish()?;
+        stop_managed_share(&mut state, &workers, share)?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_start_replaces_a_worker_blocked_by_classified_install_recovery() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_peer(
+            &share,
+            &PeerConfig {
+                peer_id: Some(flocal::model::PeerId("peer-test".into())),
+                relationship: None,
+                host: "127.0.0.1".into(),
+                remote_path: path_bytes(Path::new("/remote")),
+                executable: "/bin/false".into(),
+            },
+        )?;
+        state.set_initial_complete(&share)?;
+        state.set_watch_enabled(&share, true)?;
+        state.set_install_intent(&share, &[])?;
+        let intent = state
+            .unclassified_install_intents()?
+            .into_iter()
+            .find(|intent| intent.share == share)
+            .context("missing recovery intent")?;
+        assert!(state.classify_install_intent_failure(
+            &share,
+            &intent.fingerprint,
+            "operator must explicitly retry",
+        )?);
+
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        workers.lock().unwrap().insert(
+            share.clone(),
+            DaemonWorker {
+                id: 7,
+                stop: Arc::new(AtomicBool::new(false)),
+                state: Arc::new(std::sync::atomic::AtomicU8::new(WORKER_WATCHING)),
+                stopping: Arc::new(AtomicBool::new(false)),
+                finished: Arc::new(AtomicBool::new(true)),
+                child: Arc::new(Mutex::new(None)),
+            },
+        );
+        let (events, _event_rx) = std::sync::mpsc::channel();
+
+        start_managed_share(&mut state, &workers, &events, share.clone())?;
+        assert!(state.install_intent_failure(&share)?.is_none());
+        assert_ne!(workers.lock().unwrap()[&share].id, 7);
+
+        stop_managed_share(&mut state, &workers, share.clone())?;
+        assert!(!workers.lock().unwrap().contains_key(&share));
         Ok(())
     }
 
@@ -8000,9 +10303,9 @@ mod tests {
         state.set_initial_complete(&share)?;
         let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (events, event_rx) = std::sync::mpsc::channel();
-        start_managed_share(&mut state, &workers, &events, share.clone(), None)?;
+        start_managed_share(&mut state, &workers, &events, share.clone())?;
         assert!(workers.lock().unwrap().contains_key(&share));
-        stop_managed_share(&state, &workers, share.clone())?;
+        stop_managed_share(&mut state, &workers, share.clone())?;
         let event = event_rx.recv_timeout(Duration::from_secs(3))?;
         apply_worker_event(&state, &workers, event)?;
         assert!(!state.managed_share(&share)?.watch_enabled);
@@ -8030,7 +10333,7 @@ mod tests {
         let share = state.init_share(&root)?;
         let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (events, event_rx) = std::sync::mpsc::channel();
-        start_worker(&state, &workers, &events, share.clone())?;
+        start_worker(&state, &workers, &events, share.clone(), None)?;
         let event = event_rx.recv_timeout(Duration::from_secs(2))?;
         apply_worker_event(&state, &workers, event)?;
         assert!(workers.lock().unwrap().is_empty());
@@ -8049,8 +10352,9 @@ mod tests {
             let (server, mut client) = UnixStream::pair()?;
             let workers = workers.clone();
             let events = events.clone();
+            let lifecycle = Arc::new(Mutex::new(()));
             std::thread::scope(|scope| {
-                scope.spawn(|| handle_daemon_request(state, &workers, &events, server));
+                scope.spawn(|| handle_daemon_request(state, &workers, &events, &lifecycle, server));
                 serde_json::to_writer(&mut client, &request)?;
                 client.write_all(b"\n")?;
                 serde_json::from_slice(&read_daemon_message(&mut client)?).map_err(Into::into)
@@ -8075,7 +10379,6 @@ mod tests {
                 &events,
                 DaemonRequest::Start {
                     share: "missing".into(),
-                    generation: None
                 }
             )?,
             DaemonResponse::Error { .. }

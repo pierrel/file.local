@@ -82,6 +82,48 @@ acceptance gates completed on 2026-08-17.
 Uninstalling the global per-user daemon is not an alpha-exit requirement; it may
 remain installed and idle when no sync is enabled.
 
+** TODO Schedule multiple shares without manual retries
+
+Keep the single global synchronization owner that protects the installation's
+shared database, recovery journals, and object store, but treat contention
+between otherwise healthy shares as normal scheduling rather than an operator
+error.  If one share is scanning, applying, or recovering, =sync start= for an
+already confirmed second share must durably enable and queue it, then return
+success.  The daemon must eventually run it after the current owner releases
+the installation, without the command remaining alive or being repeated.  An
+initial-incomplete share may wait for ownership, but must still show and confirm
+its initial plan before becoming enabled.
+
+Foreground =flocal watch= and one-shot =flocal sync= commands must wait with a
+visible queued state and continue automatically instead of exiting with
+“another synchronization operation already owns this installation.”  Such a
+wait must remain cancellable, =sync stop= must cancel a queued managed start,
+and a continually active share must not starve another queued share.
+
+No two mutation rounds may run concurrently.  Queueing must remain distinct
+from connecting, reconnecting, transport failure, recovery failure, and a
+blocked invariant.  =sync list= must show the installation-wide active and
+queued shares; =status= and watch output must show the selected share's state
+and the active share it is waiting for.  Linux end-to-end tests must hold one
+share inside a real round and prove both the durable =sync start= path and the
+foreground-wait path continue without a repeated command.  They must observe
+=sync start= return success while the first share still owns the installation,
+then observe the managed start as durably enabled and queued before releasing
+the first share.  They must preserve the initial-plan confirmation gate, cover
+cancellation and repeated contention, then prove both shares converge.  The
+native macOS-to-Linux safety gate must exercise the same multi-share
+contention.  This is required for leaving alpha.
+
+The Linux E2E suite now carries six ordinary acceptance scenarios for this
+item.  The original =sync add= and confirmed =sync start= reproductions are
+promoted to their success paths.  Four focused scenarios cover canceling a
+queued managed start, allowing an older queued share to run between persistent
+watch rounds, reconstructing an enabled queued start after a daemon crash, and
+barrier-starting opposite-direction relationships while an unrelated installation
+holder and typed scheduling state make their overlap deterministic.  This roadmap item remains
+TODO until the complete validation gate, including the native macOS-to-Linux
+workflow above, has passed.
+
 ** TODO Make operational state durable and visible
 
 Persist and report the last successful synchronization, last connection

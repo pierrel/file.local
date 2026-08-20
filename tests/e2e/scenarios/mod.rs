@@ -3,6 +3,7 @@
 
 mod conflicts;
 mod ignores;
+mod multi_share;
 mod offline;
 mod pairing;
 mod relationships;

@@ -49,13 +49,33 @@ flocal sync stop ~/src/example
 flocal sync start ~/src/example
 #+end_src
 
-=sync list= reports =stopped= (disabled), =starting=, =watching=,
-=reconnecting=, =stopping=, or =blocked=. A broken local root, including a
-rename, deletion, replacement, or symlink, is =blocked= with its reason and is
-not adopted automatically. Restore the original directory and run =sync start
---share SHARE= to retry it; =sync stop --share SHARE= works even while its old
-path is gone. =sync list= also shows the durable enabled setting separately
-from the current worker state.
+=sync list= reports connection state separately from installation scheduling.
+Connection state remains =stopped= (disabled), =starting=, =watching=,
+=reconnecting=, =stopping=, or =blocked=; scheduling is =idle=, =queued=, or
+=active=. A confirmed =sync start= may return successfully while its worker is
+queued behind another share. It then runs automatically without another
+command. =sync stop= cancels a queued managed start, and a daemon restart
+reconstructs an enabled queued start from durable intent.
+
+Human queue feedback names a blocking local share by its configured root, not
+its internal ID:
+
+#+begin_example
+Waiting for /Users/alice/projects/notes sync to finish (queue position 1)
+Synchronization slot acquired for /Users/alice/projects/work
+#+end_example
+
+When the wait is on the other installation, output deliberately stays generic:
+
+#+begin_example
+Waiting for the peer to finish another synchronization (queue position 1)
+#+end_example
+
+A broken local root, including a rename, deletion, replacement, or symlink, is
+=blocked= with its reason and is not adopted automatically. Restore the
+original directory and run =sync start --share SHARE= to retry it; =sync stop
+--share SHARE= works even while its old path is gone. =sync list= also shows
+the durable enabled setting separately from connection and scheduling state.
 
 ** Relationship lifecycle
 
@@ -100,22 +120,29 @@ plan. When pairing in the reverse direction, the retained root and conflicts
 may be atomically remapped to the incoming share ID; =sync list= or =status
 PATH= reports that new ID and the old =--share= selector no longer applies.
 
-The =sync list --json= schema is 2, with =role=,
-=registration_pending=, and =removal_pending=. Human output adds =disabled
-registering= and =disabled removing=; unpaired roots are omitted. The
-=status --json= schema is 5, with the bound peer, relationship state, pending
-removal, and removal error. Human status reports =registering=, =connector=,
-=responder=, =removing=, or =unpaired= and always includes recovery and pending
-install state. Unlike list, =status PATH= shows a retained unpaired root as not
-configured.
+The =sync list --json= schema is 3. In addition to =role=,
+=registration_pending=, and =removal_pending=, each entry has
+=connection_state= and the scheduling fields =scheduling=, =waiting_on=,
+=operation=, =queue_position=, =waiting_root=, =active_share=, =active_root=, and
+=active_operation=. Root paths use the byte-preserving base64 path shape;
+human output alone renders bounded escaped path labels. Human output adds
+=disabled registering= and =disabled removing=; unpaired roots are omitted.
+The =status --json= schema is 6 and adds the same scheduling object for the
+selected share to the bound peer, relationship state, pending removal, and
+removal error. Human status reports =registering=, =connector=, =responder=,
+=removing=, or =unpaired= and always includes recovery, pending install, and
+current queue state. Unlike list, =status PATH= shows a retained unpaired root
+as not configured.
 
 ** Troubleshooting a managed watch
 
 Start with =flocal sync list=. A healthy connector is =watching=;
 =reconnecting= means it is connecting or retrying the watch session; and
-=blocked= includes the reason the watch needs attention. =starting= and
-=stopping= are transitional; =stopped= means the watch is disabled. A broken
-local root is one =blocked= case; restore it and start the share again.
+=blocked= includes the reason the watch needs attention. =queued= is healthy
+installation scheduling, not a connection failure, and does not advance the
+transport retry count. =starting= and =stopping= are transitional; =stopped=
+means the watch is disabled. A broken local root is one =blocked= case;
+restore it and start the share again.
 
 On Linux, the daemon is a systemd user service. Check its state, inspect the
 current-boot logs, or follow new lines with:
@@ -213,6 +240,22 @@ LaunchAgent in a macOS graphical session. It restores enabled watches after
 login or daemon restart; =sync start= also asks the installed service manager
 to start the daemon if necessary. =sync stop= disables only that share.
 
+Every installation-wide mutation enters one persisted FIFO scheduler before
+acquiring the existing global OS lock. Requests carry owner-only liveness
+files, so a crashed process cannot leave a permanent queue head. A persistent
+watch rejoins the tail after every round; it cannot retain ownership and starve
+an older request for another share. Managed enablement and queue insertion are
+one durable operation, while managed stop disables the generation and cancels
+its queued request atomically.
+
+A network round reserves the scheduler on both peers before either side starts
+mutation. The installation with the lower peer ID assigns the shared order,
+independent of connector direction, and both endpoints prepare and commit that
+reservation before taking their OS permits. This prevents simultaneous
+opposite-direction relationships from each holding one installation while
+waiting for the other. Peer queue progress carries only a coarse position and
+never exposes an unrelated remote path or share ID.
+
 A local or
 remote filesystem event schedules synchronization after a 250-millisecond
 debounce, capped at two seconds during a continuous burst. Change-driven rounds
@@ -245,18 +288,18 @@ without reconnecting. A path that changes again is isolated so stable sibling
 paths can finish. A later full round reports =SETTLED=. =flocal status= and
 =sync list= expose durable unsettled state across daemon restarts.
 
-Persistent watch uses protocol version 5, so install or upgrade =flocal= on both
-peers before adding a managed sync. During a rolling upgrade, the first sync
-uses explicit protocol version 3. A persistent protocol mismatch keeps the
+Persistent watch uses protocol version 6, so install or upgrade =flocal= on both
+peers before adding a managed sync. Explicit =flocal sync= uses protocol
+version 4. A persistent protocol mismatch keeps the
 worker reconnecting with bounded upgrade reports until both peers support
-version 5; it never silently falls back to polling. Downgrading does not change
+version 6; it never silently falls back to polling. Downgrading does not change
 synchronized state, though persistent watch remains unavailable until both
-peers support version 5.
+peers support version 6.
 
 Relationship registration and removal capabilities each start at
 version 1 on the separate fixed =flocal protocol relationship= entrypoint.
-Explicit sync remains version 3 and persistent watch remains version 5 on
-=flocal protocol serve=. Both peers must be upgraded before a new relationship
+Both synchronization modes use =flocal protocol serve=. Both peers must be
+upgraded before a new relationship
 can be added or removed. An existing legacy relationship continues to sync;
 the legacy registration message cannot create or rebind a relationship.
 
@@ -264,7 +307,9 @@ See [[file:docs/2026-08-13-v0.0.1-design-reconciliation.org][the current design 
 its safety boundaries, [[file:docs/2026-07-14-v0.0.1-design.org][the original detailed design]] for the broader
 CLI, security, platform, and acceptance decisions,
 [[file:docs/2026-08-17-clean-relationship-removal-design.org][the implemented relationship-lifecycle design]] for the registration and
-removal contract, and [[file:ROADMAP.org][the roadmap]] for the alpha exit bar. The README is the
+removal contract,
+[[file:docs/2026-08-20-multi-share-scheduling-design.org][the accepted multi-share scheduling design]] for the installation queue and
+two-endpoint reservation contract, and [[file:ROADMAP.org][the roadmap]] for the alpha exit bar. The README is the
 durable high-level contract. Any
 implementation or design change that no longer matches it must update this file
 in the same pull request.
