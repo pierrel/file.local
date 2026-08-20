@@ -138,13 +138,13 @@ fn persistent_watch_requeues_behind_an_older_managed_start() -> Result<()> {
 
     watch.resume_for_next_apply_stop()?;
     let older = a.wait_for_stopped_apply_process()?;
-    a.assert_sync_queued_behind("/home/peer/second-share")?;
-    b.wait_for_file("round-one.txt", "first watch round")?;
+    a.wait_for_sync_queued_behind("/home/peer/second-share")?;
     b.assert_absent("round-two.txt")?;
 
     older.resume()?;
     b.wait_for_second_file("fairness.txt", "older queued share runs first")?;
     a.wait_for_second_sync_idle()?;
+    b.wait_for_file("round-one.txt", "first watch round")?;
     b.wait_for_file("round-two.txt", "second watch round")?;
     watch.stop()?;
     a.sync_stop_second()

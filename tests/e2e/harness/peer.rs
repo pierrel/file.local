@@ -1133,22 +1133,31 @@ impl Peer {
         )
     }
 
-    pub fn assert_sync_queued_behind(&self, root: &str) -> Result<()> {
-        let status = self.status()?;
-        status.scheduling.validate_queued()?;
-        anyhow::ensure!(status.scheduling.waiting_on.as_deref() == Some("local"));
-        anyhow::ensure!(
-            status
-                .scheduling
-                .waiting_root
-                .as_ref()
-                .map(DaemonPath::decode)
-                .transpose()?
-                .as_deref()
-                == Some(root.as_bytes()),
-            "queued synchronization did not name blocking root {root:?}: {status:#?}"
-        );
-        Ok(())
+    pub fn wait_for_sync_queued_behind(&self, root: &str) -> Result<()> {
+        let root = root.as_bytes().to_vec();
+        self.poll_until(
+            "persistent watch did not report its local scheduling wait",
+            DEADLINE,
+            move |peer| {
+                let scheduling = peer.status()?.scheduling;
+                if scheduling.state != "queued" {
+                    return Ok(None);
+                }
+                scheduling.validate_queued()?;
+                if scheduling.waiting_on.as_deref() != Some("local")
+                    || scheduling
+                        .waiting_root
+                        .as_ref()
+                        .map(DaemonPath::decode)
+                        .transpose()?
+                        .as_deref()
+                        != Some(root.as_slice())
+                {
+                    return Ok(None);
+                }
+                Ok(Some(()))
+            },
+        )
     }
 
     pub fn assert_sync_durably_queued(&self) -> Result<()> {

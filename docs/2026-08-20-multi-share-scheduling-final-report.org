@@ -549,18 +549,18 @@ retain the root.
 The local deterministic gates pass:
 
 - =make coverage COVERAGE_BASE=github/main=, including all non-Docker tests.
-- Whole-project line coverage: 18,020 of 19,605, or 91.92 percent.
-- Changed executable lines: 5,694 of 6,207, or 91.74 percent.
+- Whole-project line coverage: 18,014 of 19,605, or 91.88 percent.
+- Changed executable lines: 5,709 of 6,239, or 91.51 percent.
 - =cargo fmt --all -- --check=.
 - =cargo clippy --all-targets --all-features -- -D warnings=.
 - =git diff --check=.
-- All 44 Docker E2Es, serially, in 260.13 seconds.  This includes the six
+- All 44 Docker E2Es, serially, in 256.53 seconds.  This includes the six
   =scenarios::multi_share::= acceptance scenarios.
 
 The local review loop has covered correctness and logic, concurrency and
 liveness, error handling and edge cases, adversarial security, simplicity and
 duplication, design adherence, cross-platform/filesystem behavior, and a
-dedicated documentation-alignment pass.  Twelve rounds ran, including four
+dedicated documentation-alignment pass.  Fifteen rounds ran, including four
 passes driven by the complete CI E2E result.  The blocker-level
 finding was the ownerless managed row that could permanently stop the whole
 installation; overlapping shared ownership fixed it.  Important findings fixed
@@ -583,14 +583,30 @@ post-commit database work.  The complete CI E2E job then exposed the
 same-share client-to-daemon lock race described above.  Review of that fix
 found and closed the early-return queue cancellation path, the two-sided
 foreground-watch/removal start race, and a missing durable ownership
-diagnostic.
+diagnostic.  A later hosted E2E run found one more harness-only ordering
+assumption in the fairness scenario.  The apply-stop hook can legitimately
+catch a no-op watch round that was already beginning when the test wrote its
+first file.  The scheduler still put that watch behind the older managed
+request, but the test waited for the first file on the peer while deliberately
+holding the older request stopped.  The corrected scenario polls for the full,
+valid queued status naming the blocking second-share root, proves the younger
+second change cannot overtake it, proves the older share completes first, and
+then requires both watch changes to converge.  This tests the scheduling
+contract without assuming which watch round first scanned the file.
 Each substantive fix was followed by focused tests, the complete deterministic
 gate, and another affected review pass.  The twelfth round ended with zero
-blocker, important, or minor findings across all lenses.
+blocker, important, or minor findings across all lenses.  Three additional
+rounds reviewed the hosted-test correction.  The thirteenth removed the invalid
+early file-visibility assertion and caught a remaining immediate status check.
+The fourteenth reviewed its bounded replacement and caught the dropped complete
+queued-state validation.  The fifteenth restored that validation and ended
+clean across all lenses.
 
-GitHub CI and the bridge-period Copilot review are the remaining external gates
-at the time this report was written.  Their final dispositions belong in the
-pull request and bridge ledger; they do not weaken the local gate above.
+GitHub CI and the bridge-period Copilot review run on every published candidate.
+Their head-specific dispositions live in the pull request and bridge ledger so
+this report does not freeze a stale external status.  External findings are
+still treated as changes: fix, repeat the affected local review and complete
+gates, republish, and review the new head.
 
 * Remaining limits
 
