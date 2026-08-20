@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -11,6 +11,9 @@ pub struct PeerId(pub String);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ShareId(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
+pub struct RelationshipId(pub String);
 
 impl PeerId {
     pub fn generate() -> Self {
@@ -21,6 +24,37 @@ impl PeerId {
 impl ShareId {
     pub fn generate() -> Self {
         Self(random_id("share"))
+    }
+}
+
+impl RelationshipId {
+    pub fn generate() -> Self {
+        Self(random_id("relationship"))
+    }
+
+    pub fn parse(value: String) -> Result<Self> {
+        if value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("relationship ID must be 1-128 safe ASCII characters");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        Self::parse(self.0.clone()).map(|_| ())
+    }
+}
+
+impl<'de> Deserialize<'de> for RelationshipId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -245,12 +279,60 @@ pub struct Record {
     pub version: Version,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PeerConfig {
-    pub peer_id: PeerId,
+    pub peer_id: Option<PeerId>,
     pub host: String,
     pub remote_path: Vec<u8>,
     pub executable: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<RelationshipId>,
+}
+
+impl PeerConfig {
+    pub fn validate(&self) -> Result<()> {
+        match (&self.peer_id, &self.relationship) {
+            (None, Some(relationship)) => relationship.validate(),
+            (Some(_), Some(relationship)) => relationship.validate(),
+            (Some(_), None) => Ok(()),
+            (None, None) => bail!("connector has neither a peer nor a relationship identity"),
+        }
+    }
+
+    pub fn completed_peer_id(&self) -> Result<&PeerId> {
+        self.peer_id
+            .as_ref()
+            .context("connector registration is incomplete")
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WirePeerConfig {
+            #[serde(default)]
+            peer_id: Option<PeerId>,
+            host: String,
+            remote_path: Vec<u8>,
+            executable: String,
+            #[serde(default)]
+            relationship: Option<RelationshipId>,
+        }
+
+        let wire = WirePeerConfig::deserialize(deserializer)?;
+        let config = Self {
+            peer_id: wire.peer_id,
+            host: wire.host,
+            remote_path: wire.remote_path,
+            executable: wire.executable,
+            relationship: wire.relationship,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
@@ -290,5 +372,42 @@ mod tests {
         assert!(serde_json::from_str::<RelativePath>(&reserved).is_err());
         assert!(serde_json::from_str::<ObjectHash>(r#""../../secret""#).is_err());
         assert!(serde_json::from_str::<ObjectHash>(r#""ABCDEF""#).is_err());
+    }
+
+    #[test]
+    fn relationship_ids_and_peer_config_states_are_validated() {
+        assert!(RelationshipId::parse("relationship-safe_1".into()).is_ok());
+        assert!(RelationshipId::parse(String::new()).is_err());
+        assert!(RelationshipId::parse("x".repeat(129)).is_err());
+        assert!(RelationshipId::parse("bad;id".into()).is_err());
+        assert!(serde_json::from_str::<RelationshipId>(r#""bad\nid""#).is_err());
+
+        let legacy =
+            r#"{"peer_id":"peer-old","host":"host","remote_path":[47],"executable":"/flocal"}"#;
+        let legacy: PeerConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy.peer_id, Some(PeerId("peer-old".into())));
+        assert_eq!(legacy.relationship, None);
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("relationship")
+        );
+
+        let prepared = PeerConfig {
+            peer_id: None,
+            host: "host".into(),
+            remote_path: b"/root".to_vec(),
+            executable: "/flocal".into(),
+            relationship: Some(RelationshipId::generate()),
+        };
+        let round_trip: PeerConfig =
+            serde_json::from_str(&serde_json::to_string(&prepared).unwrap()).unwrap();
+        assert_eq!(round_trip, prepared);
+        assert!(
+            serde_json::from_str::<PeerConfig>(
+                r#"{"host":"host","remote_path":[47],"executable":"/flocal"}"#
+            )
+            .is_err()
+        );
     }
 }

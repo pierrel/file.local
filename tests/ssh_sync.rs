@@ -32,6 +32,9 @@ case "$last" in
 *" conflicts budget --share "*)
   exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" sh -c "$last"
   ;;
+*"protocol relationship"*)
+  exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLOCAL_BIN" protocol relationship
+  ;;
 esac
 exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_REMOTE_MAX_SESSION_BYTES" "$FLOCAL_BIN" protocol serve
 "#,

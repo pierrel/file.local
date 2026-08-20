@@ -473,9 +473,12 @@ Bump explicit synchronization from version 1 to version 2 and persistent watch
 from version 3 to version 4. The new explicit messages distinguish
 =HeadChunk=, =Applied=, and the connector's final =CommitAck=; the new
 persistent frames distinguish =HeadChunk=, =Applied=, and =SyncFinished=.
-Pairing/registration remains structurally the same. Mixed binaries receive the
-existing actionable upgrade rejection; persistent workers remain in bounded
-reconnect rather than silently dropping merge semantics.
+Pairing/registration remained structurally the same for this merge slice. The
+later
+[[file:2026-08-17-clean-relationship-removal-design.org][relationship-lifecycle design]] supersedes that structure for new pairings.
+Mixed binaries receive the existing actionable upgrade rejection; persistent
+workers remain in bounded reconnect rather than silently dropping merge
+semantics.
 
 No independent second protocol implementation is added. One-shot and
 persistent orchestration call the same candidate materialization, plan
@@ -830,6 +833,10 @@ last-success/error status, destination-local ACL/xattr preservation, first-class
 unambiguous rename operations, exact target-name representability, complete
 crash fault injection, and native Mac/Linux dogfooding remain separate roadmap
 items.
+
+Clean removal now has a reviewed implementation contract in
+[[file:2026-08-17-clean-relationship-removal-design.org][the relationship-lifecycle design]], but remains a roadmap item until its
+implementation and acceptance gates complete.
 
 It also does not add more than two peers, CRDTs, live collaborative cursors,
 semantic language merges, arbitrary history browsing, delta transfer,

@@ -59,12 +59,25 @@ Automatic acknowledged-tombstone collection is not required to leave alpha;
 tombstones may remain indefinitely in =v0.0.1= because that behavior is safe and
 visible. It is required before a broader stable release.
 
-** TODO Remove a synchronization relationship cleanly
+** DONE Remove a synchronization relationship cleanly
 
-Provide a confirmed removal command that stops the managed worker and removes
-both registrations when the peer is reachable. Preserve synchronized files and
-document the retained recovery state. Provide an explicit local-only escape
-hatch for a permanently unavailable peer.
+Implement =flocal sync remove [PATH | --share SHARE] [--local-only] [--yes]= as
+specified by the
+[[file:docs/2026-08-17-clean-relationship-removal-design.org][implemented relationship-lifecycle design]]. Normal removal runs on the connector,
+stops its worker, and detaches both endpoints. The responder directs the user
+to the connector. Confirmation defaults to no; =--yes= skips only the prompt.
+An explicit =--local-only= escape hatch works on either endpoint, always warns
+about the remaining peer state, and is never an automatic fallback.
+
+Failed registration and removal must remain disabled and visible as
+=registering= or =removing= until the user retries the same command. Removal
+must finish any committed install recovery first, never modify synchronized
+files itself, and retain the root, identity, conflicts, recovery objects, and
+budget for recovery or a fresh re-pair. Reverse-direction re-pairing may
+atomically remap that retained state to the new share ID. Ship the list/status
+schema bumps and the isolated relationship protocol with the implementation;
+both peers must be upgraded for new pairing or removal. The implementation and
+acceptance gates completed on 2026-08-17.
 
 Uninstalling the global per-user daemon is not an alpha-exit requirement; it may
 remain installed and idle when no sync is enabled.

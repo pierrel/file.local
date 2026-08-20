@@ -5,6 +5,7 @@ mod conflicts;
 mod ignores;
 mod offline;
 mod pairing;
+mod relationships;
 mod syncing;
 mod transitions;
 mod watching;

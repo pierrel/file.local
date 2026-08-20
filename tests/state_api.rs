@@ -3,12 +3,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use flocal::model::{
-    Entry, ObjectHash, PeerConfig, PeerId, Record, RelativePath, ShareId, Version,
+    Entry, ObjectHash, PeerConfig, PeerId, Record, RelationshipId, RelativePath, ShareId, Version,
 };
 use flocal::reconcile::Conflict;
+#[cfg(feature = "e2e-test-hooks")]
+use flocal::state::RecoveryLimitKind;
 use flocal::state::{
-    DEFAULT_RECOVERY_BUDGET_BYTES, InstallTempPhase, RecoveryLimitExceeded, RecoveryLimitKind,
-    State,
+    DEFAULT_RECOVERY_BUDGET_BYTES, InstallTempPhase, RecoveryLimitExceeded, State,
 };
 use tempfile::tempdir;
 
@@ -191,7 +192,8 @@ fn state_metadata_and_install_intent_lifecycle() -> Result<()> {
     assert!(state.managed_share(&share)?.initial_complete);
 
     let peer = PeerConfig {
-        peer_id: PeerId("remote".into()),
+        peer_id: Some(PeerId("remote".into())),
+        relationship: None,
         host: "host".into(),
         remote_path: b"/remote".to_vec(),
         executable: "/usr/bin/flocal".into(),
@@ -209,7 +211,12 @@ fn registered_share_conflict_and_object_lifecycle() -> Result<()> {
     let mut state = State::open(temp.path().join("state"))?;
     let share = ShareId("share-test".into());
     let bound = PeerId("bound".into());
-    state.register_share_bound(&share, &root, &bound)?;
+    state.register_relationship(
+        &share,
+        &root,
+        &bound,
+        &RelationshipId::parse("relationship-state-api".into())?,
+    )?;
     assert_eq!(state.bound_peer(&share)?, Some(bound));
     state.register_share(&share, &root)?;
 
@@ -595,15 +602,16 @@ fn state_rejects_conflicting_bindings_and_invalid_objects() -> Result<()> {
 
     let unbound = ShareId("share-unbound".into());
     state.register_share(&unbound, &second)?;
-    state.register_share_bound(&unbound, &second, &PeerId("peer-one".into()))?;
+    let relationship = RelationshipId::parse("relationship-one".into())?;
+    state.register_relationship(&unbound, &second, &PeerId("peer-one".into()), &relationship)?;
     assert!(
         state
-            .register_share_bound(&unbound, &second, &PeerId("peer-two".into()))
+            .register_relationship(&unbound, &second, &PeerId("peer-two".into()), &relationship,)
             .is_err()
     );
     assert!(
         state
-            .register_share_bound(&unbound, &first, &PeerId("peer-one".into()))
+            .register_relationship(&unbound, &first, &PeerId("peer-one".into()), &relationship,)
             .is_err()
     );
 

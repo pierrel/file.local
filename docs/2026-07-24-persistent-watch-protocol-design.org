@@ -264,7 +264,8 @@ remain the synchronization state and repair boundary.
    share names the competing sync/watch and advises stopping/waiting for it; a
    missing/replaced/mismatched root says watch stopped, identifies the configured
    path, and says to restore the original identity or deliberately
-   remove/re-init/re-pair rather than retrying; watcher-capacity exhaustion identifies inotify/FSEvents
+   run =sync remove --share SHARE_ID= before creating a new relationship rather
+   than retrying; watcher-capacity exhaustion identifies inotify/FSEvents
    setup and points Linux users to their inotify watch limit or advises reducing
    watched trees. Periodic summaries may be shorter but retain the latest cause.
 8. Every framed transport write and every frame after its first byte has a
@@ -342,9 +343,10 @@ to reconcile the possibly applied held tree. The replacement path is never
 modified. Reconnect and process restart continue requiring the stored identity,
 so a replacement held at the configured path across retries is never scanned or
 adopted. A legitimate move, filesystem restore with a new inode, or recreated
-root requires a future explicit separately reviewed rebind workflow. This PR
-instead instructs the user to restore the original root or deliberately
-remove/re-init/re-pair the share; it never silently changes the binding.
+root requires an explicit separately reviewed rebind workflow. The supported
+guidance is to restore the original root or deliberately run =sync remove
+--share SHARE_ID= before creating a new relationship; no command silently
+changes the binding.
 
 Legacy rows receive nullable columns transactionally, then the upgrade
 migration no-follow opens every configured canonical root and backfills its
@@ -663,7 +665,8 @@ The independent reviews' blocker/important findings are resolved as follows:
    legacy rows at one documented trust boundary; check around scan/apply; abort
    before unsafe state completion; and test swaps during scan, transfer, apply,
    retries, process restart, and unmount/remount. Identity mismatch is terminal;
-   explicit rebind is deferred and current guidance is restore or re-init/pair.
+   explicit rebind is deferred and current guidance is restore the original
+   root or detach with =sync remove --share SHARE_ID= before a new relationship.
 4. *Generation completion could erase a racing event:* accepted. Section 3
    specifies mutex-atomic freeze/complete rules and section 11 tests the race.
 5. *Reusing V1 frames made version and round separation porous:* accepted.
@@ -740,3 +743,29 @@ unchanged; exact-version rejection prevents an older endpoint from accepting
 recovery beyond the new local boundary. See
 [[file:2026-08-14-bounded-recovery-storage-design.org][the bounded recovery storage design]] for the accounting, pruning, and upgrade
 contract.
+
+* Update 2026-08-17: relationship lifecycle isolation
+
+The reviewed
+[[file:2026-08-17-clean-relationship-removal-design.org][relationship-lifecycle design]] leaves explicit synchronization at protocol
+version 3 and persistent watch at version 5 on =flocal protocol serve=. New
+relationship registration and removal capabilities each start at version 1 on
+the separate fixed, framed =flocal protocol relationship= entrypoint. Both
+peers must be upgraded before creating or removing a relationship. Existing
+legacy relationships continue to synchronize, but the old registration message
+may only acknowledge an exactly matching legacy binding and cannot create or
+rebind one.
+
+Registration durably records a prepared relationship ID before remote mutation.
+Removal identifies that exact ID, stops the connector worker, completes any
+committed install recovery, detaches the responder, then detaches the connector.
+A durable pending-removal marker prevents daemon start, restart restoration,
+session work, and new rounds for that relationship. Failure leaves the share
+disabled and =removing= for manual retry; it never enters an automatic retry or
+local-only fallback loop.
+
+Detach preserves files, root identity, recovery budget, conflicts, and recovery
+objects. Re-pairing the retained root uses a fresh relationship ID and initial
+union plan. Reverse-direction pairing may atomically remap the retained root
+and conflicts to the incoming share ID. Delayed traffic for the old ID cannot
+detach the new relationship.

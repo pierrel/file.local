@@ -57,6 +57,58 @@ not adopted automatically. Restore the original directory and run =sync start
 path is gone. =sync list= also shows the durable enabled setting separately
 from the current worker state.
 
+** Relationship lifecycle
+
+Clean relationship removal uses this command:
+
+#+begin_src sh
+flocal sync remove [PATH | --share SHARE] [--local-only] [--yes]
+#+end_src
+
+Normal removal runs on the connector. It stops that relationship's worker,
+asks the responder to detach the same relationship, then detaches locally. On a
+responder, the command identifies the connector on which to run it. An exact
+root path selects an available root; =--share= remains available when that root
+is missing or replaced.
+
+The command previews the root, share, known peer, and scope. Confirmation
+defaults to no. Declining, entering an empty answer, or reaching end of input
+prints =Relationship unchanged=, exits successfully, and changes nothing.
+=--yes= skips the prompt but never the preview or a local-only warning. An
+already-unpaired root is a successful no-op without a prompt.
+
+A failed normal removal remains disabled and visible as =removing=; retry the
+same =sync remove= command after correcting the reported error. Removal never
+falls back automatically. =--local-only= is the explicit escape hatch on either
+endpoint when the other endpoint is permanently unavailable. It warns that the
+other endpoint may still retain the relationship.
+
+Removal itself does not modify synchronized files. It retains the root and
+share registration, root identity, recovery budget, conflicts, and recovery
+objects. Any already-committed install recovery finishes before detach, so the
+preview warns that visible paths may still be repaired first. Path-based
+recovery commands still require an unavailable root to be restored.
+
+New pairing first records a durable relationship ID before changing the remote
+endpoint. A lost registration reply is shown as =registering=; retry =sync add=
+with the exact same target and it reuses that ID. A different target is
+rejected. If reachable, recover by retrying the add and then using normal
+removal. Local-only abandonment warns that the responder may already be
+registered and must also be detached locally before that root is reused.
+Re-pairing an unpaired root creates a fresh relationship and initial union
+plan. When pairing in the reverse direction, the retained root and conflicts
+may be atomically remapped to the incoming share ID; =sync list= or =status
+PATH= reports that new ID and the old =--share= selector no longer applies.
+
+The =sync list --json= schema is 2, with =role=,
+=registration_pending=, and =removal_pending=. Human output adds =disabled
+registering= and =disabled removing=; unpaired roots are omitted. The
+=status --json= schema is 5, with the bound peer, relationship state, pending
+removal, and removal error. Human status reports =registering=, =connector=,
+=responder=, =removing=, or =unpaired= and always includes recovery and pending
+install state. Unlike list, =status PATH= shows a retained unpaired root as not
+configured.
+
 ** Troubleshooting a managed watch
 
 Start with =flocal sync list=. A healthy connector is =watching=;
@@ -201,10 +253,19 @@ version 5; it never silently falls back to polling. Downgrading does not change
 synchronized state, though persistent watch remains unavailable until both
 peers support version 5.
 
+Relationship registration and removal capabilities each start at
+version 1 on the separate fixed =flocal protocol relationship= entrypoint.
+Explicit sync remains version 3 and persistent watch remains version 5 on
+=flocal protocol serve=. Both peers must be upgraded before a new relationship
+can be added or removed. An existing legacy relationship continues to sync;
+the legacy registration message cannot create or rebind a relationship.
+
 See [[file:docs/2026-08-13-v0.0.1-design-reconciliation.org][the current design reconciliation]] for the implemented three-way merge and
 its safety boundaries, [[file:docs/2026-07-14-v0.0.1-design.org][the original detailed design]] for the broader
-CLI, security, platform, and acceptance decisions, and [[file:ROADMAP.org][the roadmap]] for the
-alpha exit bar. The README is the durable high-level contract. Any
+CLI, security, platform, and acceptance decisions,
+[[file:docs/2026-08-17-clean-relationship-removal-design.org][the implemented relationship-lifecycle design]] for the registration and
+removal contract, and [[file:ROADMAP.org][the roadmap]] for the alpha exit bar. The README is the
+durable high-level contract. Any
 implementation or design change that no longer matches it must update this file
 in the same pull request.
 

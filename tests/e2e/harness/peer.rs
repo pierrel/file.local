@@ -28,9 +28,9 @@ const RECOVERY_CONFLICT_LIMIT_MARKER: &str =
 const RECOVERY_METADATA_LIMIT_MARKER: &str =
     "/home/peer/.local/state/file.local/.e2e-recovery-metadata-limit";
 const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
-/// The product's status JSON schema this harness is written against. Schema 4
-/// adds bounded recovery usage to schema 3's durable unsettled paths.
-const STATUS_SCHEMA: u64 = 4;
+/// The product's status JSON schema this harness is written against. Schema 5
+/// adds the durable relationship lifecycle to schema 4's recovery usage.
+const STATUS_SCHEMA: u64 = 5;
 /// Recovery records use the versioned three-way merge shape.
 const CONFLICTS_SCHEMA: u64 = 2;
 
@@ -106,12 +106,31 @@ impl std::ops::Deref for Connector {
 #[derive(Debug, serde::Deserialize)]
 pub struct Status {
     pub schema: u64,
+    pub bound_peer: Option<String>,
+    pub relationship_state: String,
+    pub removal_pending: bool,
+    pub removal_error: Option<String>,
     pub entries: u64,
     pub pending_install: bool,
     pub unsettled: Vec<Vec<u8>>,
     #[serde(default)]
     pub tombstones: Option<u64>,
     pub recovery: RecoveryStatus,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SyncListing {
+    schema: u64,
+    syncs: Vec<SyncEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SyncEntry {
+    enabled: bool,
+    state: String,
+    role: String,
+    registration_pending: bool,
+    removal_pending: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -216,14 +235,15 @@ pub fn pair() -> Result<(Connector, Peer)> {
     Ok((connector, responder))
 }
 
-/// The daemon-managed opening: start the connector daemon explicitly in the
-/// Docker test container, then use the public one-command setup flow. Docker
+/// The daemon-managed opening: start both per-user daemons explicitly in the
+/// Docker test containers, then use the public one-command setup flow. Docker
 /// has no systemd user manager, so this exercises the same installed daemon
-/// socket that a real user service owns without pretending the container has
+/// sockets that real user services own without pretending the containers have
 /// login-service integration.
 pub fn managed_pair() -> Result<(Connector, Peer)> {
     let (a, b) = containers()?;
     a.start_daemon()?;
+    b.start_daemon()?;
     let output = a.peer.flocal_ok(&[
         "sync",
         "add",
@@ -701,6 +721,104 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn sync_remove(&self) -> Result<()> {
+        self.flocal_ok(&["sync", "remove", SHARE, "--yes"])
+            .map(|_| ())
+    }
+
+    pub fn sync_remove_local_only(&self) -> Result<()> {
+        let output = self.flocal_ok(&["sync", "remove", SHARE, "--local-only", "--yes"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.contains("peer may remain registered") {
+            return Err(self.fail(format!(
+                "local-only removal omitted its asymmetric-state warning: {stdout}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn sync_remove_expect_err(&self, needle: &str) -> Result<()> {
+        let output = self.flocal_raw(&["sync", "remove", SHARE, "--yes"])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            return Err(self.fail(format!(
+                "relationship removal succeeded; expected an error containing {needle:?}"
+            )));
+        }
+        if !stderr.contains(needle) {
+            return Err(self.fail(format!(
+                "expected {needle:?} in removal stderr, got: {stderr}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn sync_add_to(&self, other: &Peer) -> Result<()> {
+        self.flocal_ok(&[
+            "sync",
+            "add",
+            SHARE,
+            "--host",
+            &other.alias,
+            "--remote-path",
+            SHARE,
+            "--yes",
+        ])?;
+        Ok(())
+    }
+
+    pub fn assert_sync_list_empty(&self) -> Result<()> {
+        let listing = self.sync_list()?;
+        if !listing.syncs.is_empty() {
+            return Err(self.fail(format!(
+                "expected no configured relationships, found {}",
+                listing.syncs.len()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn assert_sync_removing(&self) -> Result<()> {
+        let listing = self.sync_list()?;
+        match listing.syncs.as_slice() {
+            [sync]
+                if sync.role == "connector"
+                    && !sync.enabled
+                    && sync.state == "removing"
+                    && !sync.registration_pending
+                    && sync.removal_pending =>
+            {
+                Ok(())
+            }
+            syncs => Err(self.fail(format!(
+                "expected one disabled connector removal, got {syncs:#?}"
+            ))),
+        }
+    }
+
+    pub fn assert_sync_role(&self, role: &str) -> Result<()> {
+        let listing = self.sync_list()?;
+        match listing.syncs.as_slice() {
+            [sync] if sync.role == role && !sync.registration_pending && !sync.removal_pending => {
+                Ok(())
+            }
+            syncs => Err(self.fail(format!("expected one {role} relationship, got {syncs:#?}"))),
+        }
+    }
+
+    fn sync_list(&self) -> Result<SyncListing> {
+        let output = self.flocal_ok(&["sync", "list", "--json"])?;
+        let listing: SyncListing =
+            serde_json::from_slice(&output.stdout).context("parsing sync list --json")?;
+        if listing.schema != 2 {
+            return Err(self.fail(format!(
+                "sync list schema {} does not match the pinned 2",
+                listing.schema
+            )));
+        }
+        Ok(listing)
+    }
+
     pub fn arm_apply_stops(&self, count: u8) -> Result<()> {
         anyhow::ensure!(
             matches!(count, 1 | 2),

@@ -84,7 +84,7 @@ fn recovery_cli_reports_budgets_and_applies_token_bound_pruning() -> Result<()> 
     assert!(String::from_utf8_lossy(&status.stdout).contains("Recovery: 2 conflicts"));
     let status = flocal_ok(&state_dir, &["status", root_text, "--json"])?;
     let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-    assert_eq!(status["schema"], 4);
+    assert_eq!(status["schema"], 5);
     assert_eq!(status["recovery"]["conflicts"], 2);
 
     let first_id = flocal::reconcile::conflict_id(&first);
