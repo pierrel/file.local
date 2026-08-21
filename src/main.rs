@@ -1293,6 +1293,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
     if rustix::process::geteuid().is_root() {
         bail!("make install is per-user; do not run it with sudo");
     }
+    let destination = resolve_install_destination(destination)?;
     #[cfg(target_os = "macos")]
     validate_macos_install_home()?;
     let state_dir = State::default_dir()?;
@@ -1306,8 +1307,8 @@ fn install_daemon(destination: &Path) -> Result<()> {
     let inherited_pending = State::upgrade_pending_at(&state_dir)?;
 
     let candidate = std::env::current_exe()?;
-    let mut staged = StagedExecutable::prepare(&candidate, destination)?;
-    let service = prepare_daemon_service(&state_dir, destination)?;
+    let mut staged = StagedExecutable::prepare(&candidate, &destination)?;
+    let service = prepare_daemon_service(&state_dir, &destination)?;
     if service_managed(&service) {
         preflight_managed_state_marker()?;
         println!("Preflight complete; stopping managed synchronization");
@@ -1380,6 +1381,14 @@ fn install_daemon(destination: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn resolve_install_destination(destination: &Path) -> Result<PathBuf> {
+    if destination.is_absolute() {
+        Ok(destination.to_owned())
+    } else {
+        Ok(std::env::current_dir()?.join(destination))
+    }
 }
 
 fn validate_managed_state_selection(selected: &Path, managed: Option<PathBuf>) -> Result<()> {
@@ -1669,8 +1678,8 @@ fn systemd_quote(path: &Path) -> Result<String> {
         .to_str()
         .context("systemd service paths must be valid UTF-8")?;
     validate_service_path_characters(path)?;
-    if path.contains('%') {
-        bail!("systemd service paths cannot contain control characters or %")
+    if path.contains(['%', '$']) {
+        bail!("systemd service paths cannot contain control characters, %, or $")
     }
     Ok(format!(
         "\"{}\"",
@@ -10571,6 +10580,7 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/opt/with space/flocal\" daemon run"));
         assert!(unit.contains("Environment=FLOCAL_STATE_DIR=\"/var/lib/flocal state\""));
         assert!(unit.contains("WantedBy=default.target"));
+        assert!(systemd_quote(Path::new("/opt/$cache/flocal")).is_err());
         assert!(
             systemd_unit_content(Path::new("/tmp/evil%name"), Path::new("/tmp/state")).is_err()
         );
@@ -11624,6 +11634,32 @@ esac
             format!("{}\n", state_dir.display())
         );
 
+        let working_directory = std::env::current_dir()?;
+        std::fs::remove_file(state_dir.join("run/daemon.sock"))?;
+        let ready = serve_one_daemon_list(&state_dir)?;
+        std::env::set_current_dir(root)?;
+        let relative = Path::new("relative/bin/flocal");
+        let relative_destination = root.join(relative);
+        let installed = install_daemon(relative);
+        std::env::set_current_dir(working_directory)?;
+        installed?;
+        ready
+            .join()
+            .map_err(|_| anyhow::anyhow!("test daemon socket panicked"))??;
+        assert_eq!(
+            std::fs::read(&relative_destination)?,
+            std::fs::read(&executable)?
+        );
+        assert!(
+            std::fs::read_to_string(
+                manager_home.join(".config/systemd/user/flocal-daemon.service")
+            )?
+            .contains(&format!(
+                "ExecStart={} daemon run",
+                systemd_quote(&relative_destination)?
+            ))
+        );
+
         let installer = std::fs::OpenOptions::new()
             .append(true)
             .open(state_dir.join("installer.lock"))?;
@@ -11692,6 +11728,14 @@ esac
 
         let temp = tempdir()?;
         let candidate = std::env::current_exe()?.canonicalize()?;
+        assert_eq!(
+            resolve_install_destination(Path::new("relative/flocal"))?,
+            std::env::current_dir()?.join("relative/flocal")
+        );
+        assert_eq!(
+            resolve_install_destination(temp.path())?,
+            temp.path().to_owned()
+        );
         assert!(StagedExecutable::prepare(&candidate, Path::new("relative/flocal")).is_err());
         assert!(StagedExecutable::prepare(&candidate, Path::new("/")).is_err());
 
