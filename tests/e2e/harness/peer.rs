@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 
-use super::docker::{RunContext, SECOND_SHARE, SHARE, image_tag, unique_token};
+use super::docker::{
+    RunContext, SECOND_SHARE, SHARE, base_image_tag, image_tag, prepare_upgrade_base, unique_token,
+};
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -283,10 +285,47 @@ pub fn containers() -> Result<(PeerBox, PeerBox)> {
     infra(setup_containers())
 }
 
+pub fn upgrade_containers() -> Result<(PeerBox, PeerBox)> {
+    infra(setup_upgrade_containers())
+}
+
 fn setup_containers() -> Result<(PeerBox, PeerBox)> {
     let context = RunContext::new()?;
     let a = start_peer(&context, "peer-a", 0)?;
     let b = start_peer(&context, "peer-b", 1)?;
+    for peer in [&a, &b] {
+        peer.wait_sshd_ready()?;
+        peer.install_ssh_material()?;
+        peer.exec_ok(&["mkdir", "-p", SHARE])?;
+    }
+    Ok((PeerBox { peer: a }, PeerBox { peer: b }))
+}
+
+fn setup_upgrade_containers() -> Result<(PeerBox, PeerBox)> {
+    let base = prepare_upgrade_base()?;
+    let context = RunContext::new()?;
+    context.record(format!("upgrade base commit: {base}"));
+    let base_binary = context.temp.path().join("flocal-upgrade-base");
+    let exporter = format!("flocal-e2e-{}-base-export", context.run_id);
+    context.docker_ok(&[
+        "create",
+        "--label",
+        super::docker::LABEL,
+        "--name",
+        &exporter,
+        base_image_tag(),
+    ])?;
+    let source = format!("{exporter}:/usr/local/libexec/flocal-real");
+    let destination = base_binary
+        .to_str()
+        .context("upgrade base binary path is not UTF-8")?;
+    let copy = context.docker_ok(&["cp", &source, destination]);
+    let remove = context.docker_ok(&["rm", "-f", &exporter]);
+    copy?;
+    remove?;
+
+    let a = start_peer_with_installed(&context, "peer-a", 0, &base_binary)?;
+    let b = start_peer_with_installed(&context, "peer-b", 1, &base_binary)?;
     for peer in [&a, &b] {
         peer.wait_sshd_ready()?;
         peer.install_ssh_material()?;
@@ -393,9 +432,42 @@ pub fn assert_trees_equal(a: &Peer, b: &Peer) -> Result<()> {
 }
 
 fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<Peer> {
+    start_peer_inner(context, alias, volume, None)
+}
+
+fn start_peer_with_installed(
+    context: &Arc<RunContext>,
+    alias: &str,
+    volume: usize,
+    executable: &std::path::Path,
+) -> Result<Peer> {
+    let peer = start_peer_inner(context, alias, volume, Some("/home/peer/.local/bin/flocal"))?;
+    let staged = format!("{}:/tmp/flocal-upgrade-base", peer.container.name);
+    let source = executable
+        .to_str()
+        .context("upgrade base binary path is not UTF-8")?;
+    context.docker_ok(&["cp", source, &staged])?;
+    context.docker_ok(&[
+        "exec",
+        "-u",
+        "root",
+        &peer.container.name,
+        "sh",
+        "-c",
+        "install -d -m 700 -o peer -g peer /home/peer/.local /home/peer/.local/bin && install -m 755 -o peer -g peer /tmp/flocal-upgrade-base /home/peer/.local/bin/flocal && rm -f /tmp/flocal-upgrade-base",
+    ])?;
+    Ok(peer)
+}
+
+fn start_peer_inner(
+    context: &Arc<RunContext>,
+    alias: &str,
+    volume: usize,
+    installed: Option<&str>,
+) -> Result<Peer> {
     let name = format!("flocal-e2e-{}-{alias}", context.run_id);
     let volume_arg = format!("{}:/home/peer", context.volumes[volume]);
-    context.docker_ok(&[
+    let mut arguments = vec![
         "run",
         "--rm",
         "-d",
@@ -415,8 +487,13 @@ fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<P
         "256",
         "-e",
         "FLOCAL_E2E_CONTAINER_LIFETIME_SECONDS",
-        image_tag(),
-    ])?;
+    ];
+    let installed_environment = installed.map(|path| format!("FLOCAL_E2E_EXECUTABLE={path}"));
+    if let Some(installed) = &installed_environment {
+        arguments.extend_from_slice(&["-e", installed]);
+    }
+    arguments.push(image_tag());
+    context.docker_ok(&arguments)?;
     context
         .containers
         .lock()
@@ -430,6 +507,30 @@ fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<P
         },
         alias: alias.to_owned(),
     })
+}
+
+pub fn upgrade_managed_pair() -> Result<(Connector, Peer)> {
+    let (a, b) = upgrade_containers()?;
+    a.start_daemon()?;
+    b.start_daemon()?;
+    let output = a.peer.flocal_ok(&[
+        "sync",
+        "add",
+        SHARE,
+        "--host",
+        &b.peer.alias,
+        "--remote-path",
+        SHARE,
+        "--yes",
+    ])?;
+    drop(output);
+    Ok((
+        Connector {
+            peer: a.peer,
+            watch_max_session_bytes: None,
+        },
+        b.peer,
+    ))
 }
 
 impl PeerBox {
@@ -893,6 +994,15 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn install_candidate(&self) -> Result<()> {
+        self.exec_ok(&[
+            "/usr/local/libexec/flocal-real",
+            "daemon",
+            "install",
+            "/home/peer/.local/bin/flocal",
+        ])?;
+        Ok(())
+    }
     pub fn make_relationship_legacy(&self) -> Result<()> {
         self.flocal_ok(&["protocol", "e2e-make-relationship-legacy", SHARE])?;
         Ok(())

@@ -4,4 +4,4 @@
 # surfaces solely on its clean-exit path; stdout stays untouched because it
 # is the protocol stream, and exec preserves the exit status.
 exec 2> >(tee -a "${HOME:-/home/peer}/.flocal-stderr.log" >&2)
-exec /usr/local/libexec/flocal-real "$@"
+exec "${FLOCAL_E2E_EXECUTABLE:-/usr/local/libexec/flocal-real}" "$@"

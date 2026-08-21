@@ -8,6 +8,7 @@ mod peer;
 
 pub use peer::{
     Config, assert_trees_equal, containers, known_failure, managed_pair, pair, pair_with,
+    upgrade_managed_pair,
 };
 
 /// Keep the strict expected-failure wrapper's inversion and infrastructure
