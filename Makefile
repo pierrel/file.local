@@ -7,13 +7,7 @@ build:
 	cargo build --release
 
 install: build
-	@test "$$(id -u)" -ne 0 || { echo "make install is per-user; do not run it with sudo" >&2; exit 1; }
-	target/release/flocal daemon preflight-service "$(PREFIX)/bin/flocal"
-	@if [ "$$(uname -s)" = Linux ]; then state=$$(systemctl --user show --property=LoadState --value flocal-daemon.service) || exit $$?; if [ "$$state" != not-found ]; then systemctl --user stop flocal-daemon.service; fi; fi
-	@if [ "$$(uname -s)" = Darwin ] && launchctl print gui/$$(id -u)/local.file-local.flocal-daemon >/dev/null 2>&1; then launchctl bootout gui/$$(id -u) "$$HOME/Library/LaunchAgents/local.file-local.flocal-daemon.plist"; fi
-	install -d "$(PREFIX)/bin"
-	install -m 755 target/release/flocal "$(PREFIX)/bin/flocal"
-	"$(PREFIX)/bin/flocal" daemon install-service
+	target/release/flocal daemon install "$(PREFIX)/bin/flocal"
 
 test:
 	cargo test --all-targets -- --test-threads=1

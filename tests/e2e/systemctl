@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+printf '%s\n' "$*" >>/home/peer/.flocal-service-manager.log
+
+pid_is_live() {
+    pid=$1
+    if ! kill -0 "$pid" 2>/dev/null || [ ! -r "/proc/$pid/stat" ]; then
+        return 1
+    fi
+    read -r _ _ state _ <"/proc/$pid/stat"
+    [ "$state" != Z ]
+}
+
+case "${1-} ${2-}" in
+    "--user show-environment")
+        printf 'HOME=/home/peer\nXDG_CONFIG_HOME=/home/peer/.config\n'
+        ;;
+    "--user show")
+        if [ -s /home/peer/.flocal-daemon.pid ] \
+            && pid_is_live "$(cat /home/peer/.flocal-daemon.pid)"; then
+            printf 'loaded\n'
+        else
+            printf 'not-found\n'
+        fi
+        ;;
+    "--user stop")
+        if [ -s /home/peer/.flocal-daemon.pid ]; then
+            pid=$(cat /home/peer/.flocal-daemon.pid)
+            kill -TERM "$pid" 2>/dev/null || true
+            kill -CONT "$pid" 2>/dev/null || true
+            count=0
+            while pid_is_live "$pid"; do
+                count=$((count + 1))
+                if [ "$count" -ge 120 ]; then
+                    exit 1
+                fi
+                sleep 0.1
+            done
+            rm -f /home/peer/.flocal-daemon.pid
+        fi
+        ;;
+    "--user daemon-reload")
+        ;;
+    "--user enable")
+        nohup /home/peer/.local/bin/flocal daemon run \
+            >>/home/peer/.flocal-daemon.log 2>&1 </dev/null &
+        printf '%s\n' "$!" >/home/peer/.flocal-daemon.pid
+        ;;
+    *)
+        printf 'unsupported E2E systemctl invocation: %s\n' "$*" >&2
+        exit 2
+        ;;
+esac

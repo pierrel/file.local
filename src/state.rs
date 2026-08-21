@@ -10,7 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use fs2::FileExt;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::model::{
     Entry, ObjectHash, PeerConfig, PeerId, Record, RelationshipId, RelativePath, ShareId, Version,
@@ -429,7 +429,30 @@ pub enum RemovalFailureState {
 pub struct State {
     pub dir: PathBuf,
     conn: Connection,
+    _installation_barrier: File,
 }
+
+pub struct UpgradeBarrier(File);
+
+pub struct LegacyUpgradeLocks {
+    _files: Vec<File>,
+}
+
+pub enum UpgradeLockAttempt {
+    Acquired(LegacyUpgradeLocks),
+    Busy(PathBuf),
+}
+
+#[derive(Debug)]
+pub struct UpgradePending;
+
+impl std::fmt::Display for UpgradePending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "upgrade is in progress; rerun `make install`")
+    }
+}
+
+impl std::error::Error for UpgradePending {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RootIdentity {
@@ -1072,13 +1095,145 @@ fn paired_predecessor_fingerprint(
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+const INSTALLATION_BARRIER_FILE: &str = "installation.barrier";
+const UPGRADE_PENDING_FILE: &str = "upgrade.pending";
+
+fn open_installation_barrier(dir: &Path) -> Result<File> {
+    let path = dir.join(INSTALLATION_BARRIER_FILE);
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        bail!("installation barrier is not a regular file");
+    }
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    set_private_file(&path)?;
+    Ok(file)
+}
+
+fn ensure_upgrade_not_pending(dir: &Path) -> Result<()> {
+    if upgrade_pending(dir)? {
+        return Err(UpgradePending.into());
+    }
+    Ok(())
+}
+
+fn upgrade_pending(dir: &Path) -> Result<bool> {
+    let path = dir.join(UPGRADE_PENDING_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    let private =
+        metadata.uid() == rustix::process::geteuid().as_raw() && metadata.mode() & 0o077 == 0;
+    #[cfg(not(unix))]
+    let private = true;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 0 || !private {
+        bail!("upgrade marker is not a private empty regular file");
+    }
+    Ok(true)
+}
+
+#[derive(Eq, PartialEq)]
+struct LegacyUpgradeInventory {
+    shares: Vec<(String, PathBuf)>,
+    active_root: Option<PathBuf>,
+}
+
+impl LegacyUpgradeInventory {
+    fn contention_path(&self, state_dir: &Path) -> PathBuf {
+        self.active_root
+            .clone()
+            .or_else(|| (self.shares.len() == 1).then(|| self.shares[0].1.clone()))
+            .unwrap_or_else(|| state_dir.to_path_buf())
+    }
+}
+
+fn legacy_upgrade_inventory(dir: &Path) -> Result<LegacyUpgradeInventory> {
+    let database = dir.join("state.sqlite3");
+    match fs::symlink_metadata(&database) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyUpgradeInventory {
+                shares: Vec::new(),
+                active_root: None,
+            });
+        }
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            bail!("state database is not a regular file")
+        }
+        Ok(_) => {}
+    }
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let has_shares = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shares'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_shares {
+        return Ok(LegacyUpgradeInventory {
+            shares: Vec::new(),
+            active_root: None,
+        });
+    }
+    let mut statement = connection.prepare("SELECT share_id,root FROM shares ORDER BY share_id")?;
+    let shares = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, bytes_path(row.get(1)?)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let active_root = connection
+        .query_row(
+            "SELECT shares.root FROM sync_queue
+             JOIN shares ON shares.share_id=sync_queue.share_id
+             WHERE sync_queue.active=1 LIMIT 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(bytes_path);
+    Ok(LegacyUpgradeInventory {
+        shares,
+        active_root,
+    })
+}
+
+fn try_upgrade_lock(path: &Path, locks: &mut Vec<File>) -> Result<bool> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        bail!("upgrade lock is not a regular file: {}", path.display());
+    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    set_private_file(path)?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            locks.push(file);
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl State {
     pub fn open_default() -> Result<Self> {
+        Self::open(Self::default_dir()?)
+    }
+
+    pub fn default_dir() -> Result<PathBuf> {
         if let Some(path) = std::env::var_os("FLOCAL_STATE_DIR") {
-            return Self::open(path);
+            return Ok(path.into());
         }
         if let Some(path) = Self::managed_state_dir()? {
-            return Self::open(path);
+            return Ok(path);
         }
         let dirs = ProjectDirs::from("local", "file.local", "file.local")
             .context("could not determine user state directory")?;
@@ -1088,7 +1243,7 @@ impl State {
             .context("could not determine user state directory")?;
         #[cfg(not(target_os = "linux"))]
         let path = dirs.data_local_dir();
-        Self::open(path)
+        Ok(path.to_path_buf())
     }
 
     pub fn managed_state_dir() -> Result<Option<PathBuf>> {
@@ -1122,6 +1277,66 @@ impl State {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         ensure_private_directory(&dir)?;
+        let barrier = open_installation_barrier(&dir)?;
+        ensure_upgrade_not_pending(&dir)?;
+        FileExt::lock_shared(&barrier)?;
+        if let Err(error) = ensure_upgrade_not_pending(&dir) {
+            let _ = FileExt::unlock(&barrier);
+            return Err(error);
+        }
+        Self::open_with_barrier(dir, barrier)
+    }
+
+    pub fn try_acquire_upgrade_barrier(dir: impl AsRef<Path>) -> Result<Option<UpgradeBarrier>> {
+        let dir = dir.as_ref();
+        ensure_private_directory(dir)?;
+        let barrier = open_installation_barrier(dir)?;
+        match FileExt::try_lock_exclusive(&barrier) {
+            Ok(()) => Ok(Some(UpgradeBarrier(barrier))),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn try_acquire_legacy_upgrade_locks(dir: impl AsRef<Path>) -> Result<UpgradeLockAttempt> {
+        let dir = dir.as_ref();
+        let shares = legacy_upgrade_inventory(dir)?;
+        let mut locks = Vec::with_capacity(5 + shares.shares.len() * 2);
+        for name in [
+            "daemon.lock",
+            "registration.lock",
+            "objects.lock",
+            "sync.lock",
+            "scheduler.publish.lock",
+        ] {
+            if !try_upgrade_lock(&dir.join(name), &mut locks)? {
+                return Ok(UpgradeLockAttempt::Busy(shares.contention_path(dir)));
+            }
+        }
+        for (share, root) in &shares.shares {
+            let name = blake3::hash(share.as_bytes()).to_hex().to_string();
+            for directory in ["locks", "sessions"] {
+                let parent = dir.join(directory);
+                ensure_private_directory(&parent)?;
+                if !try_upgrade_lock(&parent.join(&name), &mut locks)? {
+                    return Ok(UpgradeLockAttempt::Busy(root.clone()));
+                }
+            }
+        }
+        if legacy_upgrade_inventory(dir)? != shares {
+            return Ok(UpgradeLockAttempt::Busy(shares.contention_path(dir)));
+        }
+        Ok(UpgradeLockAttempt::Acquired(LegacyUpgradeLocks {
+            _files: locks,
+        }))
+    }
+
+    pub fn open_for_upgrade(dir: impl AsRef<Path>, barrier: &UpgradeBarrier) -> Result<Self> {
+        Self::open_with_barrier(dir.as_ref().to_path_buf(), barrier.0.try_clone()?)
+    }
+
+    fn open_with_barrier(dir: PathBuf, barrier: File) -> Result<Self> {
+        ensure_private_directory(&dir)?;
         ensure_private_directory(&dir.join("objects"))?;
         ensure_private_directory(&dir.join("scheduler"))?;
         set_private_dir(&dir)?;
@@ -1138,7 +1353,8 @@ impl State {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch(
+        let transaction = conn.transaction()?;
+        transaction.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS installation (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1243,31 +1459,31 @@ impl State {
             ",
         )?;
         let columns: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(shares)")?;
+            let mut stmt = transaction.prepare("PRAGMA table_info(shares)")?;
             stmt.query_map([], |row| row.get(1))?
                 .collect::<Result<_, _>>()?
         };
         let conflict_columns: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(conflicts)")?;
+            let mut stmt = transaction.prepare("PRAGMA table_info(conflicts)")?;
             stmt.query_map([], |row| row.get(1))?
                 .collect::<Result<_, _>>()?
         };
         let installation_columns: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(installation)")?;
+            let mut stmt = transaction.prepare("PRAGMA table_info(installation)")?;
             stmt.query_map([], |row| row.get(1))?
                 .collect::<Result<_, _>>()?
         };
         let sync_queue_columns: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(sync_queue)")?;
+            let mut stmt = transaction.prepare("PRAGMA table_info(sync_queue)")?;
             stmt.query_map([], |row| row.get(1))?
                 .collect::<Result<_, _>>()?
         };
         let install_intent_columns: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(install_intents)")?;
+            let mut stmt = transaction.prepare("PRAGMA table_info(install_intents)")?;
             stmt.query_map([], |row| row.get(1))?
                 .collect::<Result<_, _>>()?
         };
-        let network_order_index_is_current = conn
+        let network_order_index_is_current = transaction
             .query_row(
                 "SELECT sql FROM sqlite_master
                  WHERE type='index' AND name='sync_queue_network_order'",
@@ -1278,7 +1494,6 @@ impl State {
             .is_some_and(|sql| {
                 sql.contains("WHERE network_authority IS NOT NULL AND network_order IS NOT NULL")
             });
-        let transaction = conn.transaction()?;
         if !conflict_columns.iter().any(|name| name == "conflict_json") {
             transaction.execute("ALTER TABLE conflicts ADD COLUMN conflict_json TEXT", [])?;
         }
@@ -1416,6 +1631,10 @@ impl State {
                 [],
             )?;
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        if dir.join(".e2e-fail-state-migration").exists() {
+            bail!("injected state migration failure");
+        }
         let legacy: Vec<(String, Vec<u8>)> = {
             let mut statement = transaction.prepare(
                 "SELECT share_id, root FROM shares
@@ -1458,7 +1677,42 @@ impl State {
             )?;
         }
         transaction.commit()?;
-        Ok(Self { dir, conn })
+        Ok(Self {
+            dir,
+            conn,
+            _installation_barrier: barrier,
+        })
+    }
+
+    pub fn upgrade_pending(&self) -> Result<bool> {
+        upgrade_pending(&self.dir)
+    }
+
+    pub fn create_upgrade_pending(dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        ensure_private_directory(dir)?;
+        let path = dir.join(UPGRADE_PENDING_FILE);
+        let file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                upgrade_pending(dir)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        set_private_file(&path)?;
+        file.sync_all()?;
+        sync_dir(dir)
+    }
+
+    pub fn remove_upgrade_pending(dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        let path = dir.join(UPGRADE_PENDING_FILE);
+        if upgrade_pending(dir)? {
+            fs::remove_file(path)?;
+            sync_dir(dir)?;
+        }
+        Ok(())
     }
 
     pub fn ensure_private_state_child(&self, name: &str) -> Result<PathBuf> {
@@ -6765,6 +7019,146 @@ mod tests {
             ),
             crate::merge::FallbackReason::AbsentBase,
         ))
+    }
+
+    #[test]
+    fn upgrade_marker_and_barrier_exclude_normal_state_users() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let state_dir = temp.path().join("state");
+        let state = State::open(&state_dir)?;
+        assert!(State::try_acquire_upgrade_barrier(&state_dir)?.is_none());
+        drop(state);
+
+        State::create_upgrade_pending(&state_dir)?;
+        State::create_upgrade_pending(&state_dir)?;
+        let error = match State::open(&state_dir) {
+            Ok(_) => bail!("pending upgrade accepted a new state user"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<UpgradePending>().is_some());
+        assert_eq!(
+            error.to_string(),
+            "upgrade is in progress; rerun `make install`"
+        );
+        State::remove_upgrade_pending(&state_dir)?;
+        State::remove_upgrade_pending(&state_dir)?;
+
+        let barrier = State::try_acquire_upgrade_barrier(&state_dir)?
+            .context("barrier remained owned after State was dropped")?;
+        let upgraded = State::open_for_upgrade(&state_dir, &barrier)?;
+        drop(upgraded);
+        drop(barrier);
+        State::open(&state_dir)?;
+
+        fs::write(state_dir.join(UPGRADE_PENDING_FILE), b"not empty")?;
+        assert!(upgrade_pending(&state_dir).is_err());
+        fs::remove_file(state_dir.join(UPGRADE_PENDING_FILE))?;
+        fs::remove_file(state_dir.join(INSTALLATION_BARRIER_FILE))?;
+        fs::create_dir(state_dir.join(INSTALLATION_BARRIER_FILE))?;
+        assert!(State::open(&state_dir).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_upgrade_lock_reports_the_busy_share_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let absent = temp.path().join("absent-state");
+        fs::create_dir(&absent)?;
+        fs::set_permissions(&absent, fs::Permissions::from_mode(0o700))?;
+        assert!(legacy_upgrade_inventory(&absent)?.shares.is_empty());
+        Connection::open(absent.join("state.sqlite3"))?;
+        assert!(legacy_upgrade_inventory(&absent)?.shares.is_empty());
+
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let session = state.lock_share_session(&share)?;
+        match State::try_acquire_legacy_upgrade_locks(&state_dir)? {
+            UpgradeLockAttempt::Busy(path) => assert_eq!(path, root.canonicalize()?),
+            UpgradeLockAttempt::Acquired(_) => bail!("upgrade ignored the active share session"),
+        }
+        drop(session);
+        assert!(matches!(
+            State::try_acquire_legacy_upgrade_locks(&state_dir)?,
+            UpgradeLockAttempt::Acquired(_)
+        ));
+        let inventory = LegacyUpgradeInventory {
+            shares: vec![(share.0, root.clone())],
+            active_root: Some(root.clone()),
+        };
+        assert_eq!(inventory.contention_path(&state_dir), root);
+
+        let invalid_locks = temp.path().join("invalid-locks");
+        fs::create_dir(&invalid_locks)?;
+        fs::set_permissions(&invalid_locks, fs::Permissions::from_mode(0o700))?;
+        std::os::unix::fs::symlink("missing", invalid_locks.join("daemon.lock"))?;
+        assert!(State::try_acquire_legacy_upgrade_locks(invalid_locks).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn injected_upgrade_migration_failure_leaves_current_schema_openable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let state_dir = temp.path().join("state");
+        drop(State::open(&state_dir)?);
+        fs::write(state_dir.join(".e2e-fail-state-migration"), b"")?;
+        let error = match State::open(&state_dir) {
+            Ok(_) => bail!("injected migration failure was ignored"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("injected state migration failure")
+        );
+        fs::remove_file(state_dir.join(".e2e-fail-state-migration"))?;
+        State::open(&state_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_changes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let state_dir = temp.path().join("state");
+        fs::create_dir(&state_dir)?;
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))?;
+        let database = state_dir.join("state.sqlite3");
+        let connection = Connection::open(&database)?;
+        connection.execute_batch(
+            "CREATE TABLE shares (
+                share_id TEXT PRIMARY KEY,
+                root BLOB NOT NULL UNIQUE,
+                sequence INTEGER NOT NULL DEFAULT 0,
+                initial_complete INTEGER NOT NULL DEFAULT 0,
+                peer_json TEXT
+            );",
+        )?;
+        connection.execute(
+            "INSERT INTO shares(share_id,root) VALUES('share-old',?1)",
+            [path_bytes(&temp.path().join("missing-root"))],
+        )?;
+        drop(connection);
+
+        assert!(State::open(&state_dir).is_err());
+        let connection = Connection::open(&database)?;
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(shares)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        assert!(!columns.contains(&"root_device".to_owned()));
+        let sync_queue_exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_queue'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        assert!(!sync_queue_exists);
+        Ok(())
     }
 
     #[test]

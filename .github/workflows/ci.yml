@@ -39,5 +39,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - run: make e2e
+        env:
+          FLOCAL_E2E_UPGRADE_FROM: ${{ github.event.pull_request.base.sha || github.event.before }}

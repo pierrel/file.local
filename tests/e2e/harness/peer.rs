@@ -43,6 +43,12 @@ const SCHEDULING_WAIT_MARKER: &str =
 const SCHEDULING_WAIT_OBSERVED: &str =
     "/home/peer/.local/state/file.local/.e2e-global-contention-observed";
 const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
+const MIGRATION_FAILURE_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-fail-state-migration";
+
+fn is_flocal_executable(executable: &[u8]) -> bool {
+    executable.ends_with(b"/flocal-real") || executable.ends_with(b"/.local/bin/flocal")
+}
 /// The product's status JSON schema this harness is written against. Schema 6
 /// adds installation scheduling to schema 5's durable relationship lifecycle.
 const STATUS_SCHEMA: u64 = 6;
@@ -533,6 +539,30 @@ pub fn upgrade_managed_pair() -> Result<(Connector, Peer)> {
     ))
 }
 
+pub fn fresh_installed_pair() -> Result<(Connector, Peer)> {
+    let (a, b) = containers()?;
+    a.install_candidate()?;
+    b.install_candidate()?;
+    let output = a.peer.flocal_ok(&[
+        "sync",
+        "add",
+        SHARE,
+        "--host",
+        &b.peer.alias,
+        "--remote-path",
+        SHARE,
+        "--yes",
+    ])?;
+    drop(output);
+    Ok((
+        Connector {
+            peer: a.peer,
+            watch_max_session_bytes: None,
+        },
+        b.peer,
+    ))
+}
+
 impl PeerBox {
     pub fn init(&self) -> Result<()> {
         self.peer
@@ -1001,6 +1031,41 @@ impl Peer {
             "install",
             "/home/peer/.local/bin/flocal",
         ])?;
+        Ok(())
+    }
+
+    pub fn install_candidate_expect_err(&self, needle: &str) -> Result<()> {
+        let output = self.exec_raw(&[
+            "/usr/local/libexec/flocal-real",
+            "daemon",
+            "install",
+            "/home/peer/.local/bin/flocal",
+        ])?;
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if output.status.success() {
+            return Err(self.fail(format!(
+                "candidate install succeeded; expected an error containing {needle:?}"
+            )));
+        }
+        if !message.contains(needle) {
+            return Err(self.fail(format!(
+                "candidate install error did not contain {needle:?}: {message}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn arm_migration_failure(&self) -> Result<()> {
+        self.exec_ok(&["touch", "--", MIGRATION_FAILURE_MARKER])?;
+        Ok(())
+    }
+
+    pub fn clear_migration_failure(&self) -> Result<()> {
+        self.exec_ok(&["rm", "-f", "--", MIGRATION_FAILURE_MARKER])?;
         Ok(())
     }
     pub fn make_relationship_legacy(&self) -> Result<()> {
@@ -2320,7 +2385,7 @@ impl Peer {
     /// be recycled (the container caps pids), so `stop`/`Drop` gate every
     /// real signal on this identity check rather than a bare `kill -0`,
     /// which cannot tell a reused pid apart from the watcher. The watcher's
-    /// argv holds both tokens for its whole life — `<…/flocal-real> watch
+    /// argv holds both tokens for its whole life — `<…/flocal> watch
     /// <share>`, stable across the `sh -c`→wrapper→real `exec` chain (same
     /// pid throughout). The processes that could recycle its pid carry at
     /// most one: the `sh -c 'kill …'` signaler and the `cat /proc/…` probe
@@ -2355,7 +2420,7 @@ impl Peer {
             .filter(|argument| !argument.is_empty())
             .collect();
         Ok(matches!(arguments.as_slice(), [executable, protocol, serve]
-            if executable.ends_with(b"/flocal-real")
+            if is_flocal_executable(executable)
                 && *protocol == b"protocol"
                 && *serve == b"serve"))
     }
@@ -2380,7 +2445,7 @@ impl Peer {
                 .stdout
                 .split(|byte| *byte == 0)
                 .next()
-                .is_some_and(|executable| executable.ends_with(b"/flocal-real"))
+                .is_some_and(is_flocal_executable)
         {
             return Ok(false);
         }

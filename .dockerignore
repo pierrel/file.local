@@ -7,3 +7,4 @@ references
 tests
 !tests/e2e/entrypoint.sh
 !tests/e2e/flocal-wrapper.sh
+!tests/e2e/systemctl

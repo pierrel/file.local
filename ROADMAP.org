@@ -82,6 +82,27 @@ acceptance gates completed on 2026-08-17.
 Uninstalling the global per-user daemon is not an alpha-exit requirement; it may
 remain installed and idle when no sync is enabled.
 
+** DONE Upgrade paired installations without rebuilding synchronization state
+
+=make install= now owns one staged, locked upgrade from service stop through
+candidate publication, transactional state migration, service replacement, and
+managed restart. Idle and in-progress managed syncs retain their enabled intent
+and recover automatically. A durable installation barrier drains compatible
+long-lived sessions and prevents commands from opening SQLite during migration;
+the immediate upgrade from an unaware binary also takes every legacy mutation
+lock before replacement. Foreground commands and responder-first legacy
+sessions receive a bounded, path-naming safe refusal rather than a partial
+upgrade.
+
+The E2E suite builds the pull request's exact base revision separately from the
+candidate, creates a real paired installation with the base binaries, and
+carries its working trees and state through the candidate. Ordinary scenarios
+cover idle restart, an apply interrupted at the service stop, compatible
+responder-first reinstall, foreground refusal and retry, and migration failure
+and retry. CI checks out full history and pins that transition to the exact
+pull-request base SHA. Downgrade and network-distributed updating remain out of
+scope.
+
 ** TODO Schedule multiple shares without manual retries
 
 Keep the single global synchronization owner that protects the installation's
