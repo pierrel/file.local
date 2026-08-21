@@ -101,8 +101,10 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
    candidate file; validate the nearest existing destination ancestor; safely
    create missing owner-controlled destination and service directories;
    retain a descriptor for the validated destination directory; resolve and
-   query the correct Linux user manager or macOS GUI domain; validate all
-   service paths; and prepare the service definition in memory. Capture the
+   query the correct Linux user manager or macOS GUI domain; require process
+   =HOME= to match the systemd manager home on Linux or the directory-service
+   account home on macOS before selecting the global lock and marker namespace;
+   validate all service paths; and prepare the service definition in memory. Capture the
    held candidate descriptor's length, copy exactly that many bytes into a
    private temporary in the held destination directory, and reject an early
    EOF. Bytes appended after the snapshot are not copied. Set the temporary's
@@ -376,6 +378,10 @@ all historical snapshots is outside this slice.
   marker provenance, binary-only retry behavior, filesystem publication, and
   migration rollback. The existing graphical-login native gate must perform
   idle and in-progress upgrades against Linux before =v0.0.1=.
+- Linux and macOS both reject an overridden =HOME= against an authority for
+  the actual per-user service namespace before service mutation. This prevents
+  two home-based lock, marker, and state namespaces from racing one systemd
+  unit or per-UID LaunchAgent label.
 - The installer never accepts a remote host, synchronized path, secret, or
   service arguments from peer input. Its only path argument is the local
   destination supplied by the build/install process.

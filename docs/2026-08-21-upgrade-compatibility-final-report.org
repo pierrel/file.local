@@ -76,7 +76,9 @@ The successful sequence is:
 2. Take the per-user service-installer lock, then the selected state
    directory's installer lock. The first serializes the one managed service
    across different state choices; the second protects that state's migration
-   and recovery.
+   and recovery. They deliberately use distinct =service-installer.lock= and
+   =installer.lock= files, so both remain independent even when the state
+   directory is the managed-marker directory itself.
 3. Validate the candidate, destination, state path, service manager, managed
    marker, and service-definition path while the old service is still live.
    Refuse an explicit state path that differs from an existing managed
@@ -283,6 +285,12 @@ acceptance is not treated as readiness: the installer waits for the daemon's
 private socket, and stops a candidate that fails to initialize before returning
 log-and-retry guidance.
 
+Before selecting the home-based global lock and marker namespace, Linux
+requires process =HOME= to equal the systemd manager's reported home. macOS
+requires it to equal the account home returned by directory services. Two
+differently overridden homes therefore cannot race the same per-user systemd
+unit or fixed per-UID LaunchAgent label.
+
 macOS preparation distinguishes the graphical domain from an already loaded
 job. A loaded job is booted out before migration and bootstrapped only after
 the pending marker is gone. An available graphical domain with no prior job is
@@ -338,7 +346,8 @@ CI checks out full history and passes the pull request's exact base SHA as
 =FLOCAL_E2E_UPGRADE_FROM=. Local runs use the merge base with =COVERAGE_BASE=.
 Equal executable hashes are allowed for documentation-only transitions, but
 equal base and candidate commits are rejected. Both commit IDs and executable
-hashes are recorded, and every successful install verifies the destination is
+hashes are retained in permanent failure diagnostics outside the rolling
+command transcript, and every successful install verifies the destination is
 the candidate. This makes every pull request carry a real transition from the
 version it proposes to replace.
 
@@ -430,6 +439,12 @@ headless SSH session with no graphical domain. Keeping that as a platform plan
 inside one shared installer avoids a second upgrade implementation while
 preserving the safe binary-only result.
 
+The global installer lock also needed an authoritative namespace. A lock under
+an arbitrary process =HOME= is not global if two invocations override =HOME=
+differently, while systemd and launchd still expose one service for the user.
+The platform provenance checks make that split-service state unreachable before
+the installer stops anything.
+
 The local review found several boundaries that were easy to state too broadly:
 marker creation had to be private in the creating syscall; a retry must not
 erase an inherited post-publication marker; headless macOS must retain that
@@ -442,13 +457,14 @@ diagnostics.
 
 ** Recovery journal compatibility follow-up
 
-An older installed executable can omit =managed_generation= from its durable
-install-intent JSON. The candidate reads that value as =None= and would once
-serialize it back as ="managed_generation":null= before using it as the
-optimistic-concurrency expected value. SQLite then correctly found no raw-byte
-match, but the diagnostic falsely claimed a competing install had changed.
+An old executable can omit =managed_generation= from its install-intent JSON.
+The candidate reads that as =None=, but serializing it back adds
+="managed_generation":null=. SQLite correctly treats the two JSON strings as
+different revisions, so using the reserialization as a CAS expectation caused
+the false changed-intent diagnostic.
 
-Recovery now retains the selected raw row beside the parsed value:
+Recovery now keeps the exact selected row for the expected side and serializes
+only the replacement:
 
 #+begin_src rust
 let (expected_json, mut intent) = self.install_intent_with_raw(share)?
@@ -457,14 +473,19 @@ intent.temps[0].phase = phase;
 self.replace_install_intent_json(share, &expected_json, &serde_json::to_string(&intent)?)
 #+end_src
 
-The replacement remains candidate JSON, while =expected_json= is exactly what
-SQLite returned. The same raw revision is hashed for a persisted recovery
-classification, so retrying an already classified old intent cannot fail from
-the same representation change. A stale writer still fails its raw predicate.
-The deployed-alpha E2E kills a real old foreground watch after its durable
-intent is written, installs both candidates, restarts the watch, and proves
-the pending intent clears and both trees converge without deleting state or
-pairing again.
+New recovery fingerprints hash that raw revision. A one-way compatibility
+check also accepts an existing classification written by the buggy candidate
+with the former canonicalized hash, allowing the retry to clear it. It never
+weakens the raw-string CAS predicate. The deployed-alpha E2E kills a real old
+foreground watch after durable intent, upgrades both endpoints, then proves
+connection, clean status, preserved relationship identity, and convergence
+without deleting state or pairing again.
+
+The timestamp-derived deployed anchor did not naturally reproduce the omitted
+member when run against the pre-fix candidate, so this report does not treat
+the E2E as historical failure evidence. The focused state test first produced
+the exact diagnostic with the raw durable shape; the E2E proves the real
+installer/watch recovery path after the repair.
 
 Completed locally before the independent review pass:
 
@@ -472,10 +493,13 @@ Completed locally before the independent review pass:
 - =cargo clippy --all-targets --all-features -- -D warnings=: pass.
 - All non-Docker unit and integration tests: pass.
 - Whole-project executable-line coverage: at least 90%.
-- Changed executable-line coverage: 635/696, 91.24%.
-- Full Docker E2E suite: 51/51 scenarios passed in 332.74 seconds.
-- Upgrade E2E subset: all six scenarios pass from exact base commit
-  =8041be30605f596683f6cc8f51a8a2dd5aabfc42= to the working candidate.
+- Changed executable-line coverage: 910/990, 91.92%.
+- Full Docker E2E suite: 52 passed, 2 filtered, in 349.64 seconds from the
+  pull-request base; the same 52 passed, 2 filtered, in 342.61 seconds from
+  deployed alpha =609e91e93eac78538ec5b7646b57da0821219a3f=.
+- The focused raw-CAS state test first failed with the reported false
+  =install intent changed while updating its recovery state= diagnostic, then
+  passed after the fix while retaining a genuine competing-writer failure.
 
 The installed macOS Rust target is present locally, but a Linux host cannot
 compile the bundled SQLite and BLAKE3 C sources for Apple without an Apple

@@ -1290,6 +1290,8 @@ fn install_daemon(destination: &Path) -> Result<()> {
     if rustix::process::geteuid().is_root() {
         bail!("make install is per-user; do not run it with sudo");
     }
+    #[cfg(target_os = "macos")]
+    validate_macos_install_home()?;
     let state_dir = State::default_dir()?;
     if !state_dir.is_absolute() {
         bail!("daemon state path must be absolute")
@@ -1772,9 +1774,45 @@ fn service_managed(service: &DaemonService) -> bool {
 
 #[cfg(target_os = "macos")]
 fn launchd_target() -> Result<String> {
-    let uid = Command::new("id").arg("-u").output()?;
+    let uid = Command::new("/usr/bin/id").arg("-u").output()?;
+    if !uid.status.success() {
+        bail!("could not determine the account uid")
+    }
     let uid = String::from_utf8(uid.stdout)?.trim().to_owned();
     Ok(format!("gui/{uid}/local.file-local.flocal-daemon"))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_install_home() -> Result<()> {
+    let user = Command::new("/usr/bin/id").arg("-un").output()?;
+    if !user.status.success() {
+        bail!("could not determine the account name")
+    }
+    let user = String::from_utf8(user.stdout)?.trim().to_owned();
+    if user.is_empty() || user.contains('/') {
+        bail!("account name is not valid for a directory-service lookup")
+    }
+    let record = Command::new("/usr/bin/dscl")
+        .args([".", "-read"])
+        .arg(format!("/Users/{user}"))
+        .arg("NFSHomeDirectory")
+        .output()?;
+    if !record.status.success() {
+        bail!("could not determine the account home directory")
+    }
+    let record = String::from_utf8(record.stdout)?;
+    let account_home = record
+        .lines()
+        .find_map(|line| line.strip_prefix("NFSHomeDirectory: "))
+        .map(Path::new)
+        .context("directory service did not report the account home directory")?;
+    let process_home = std::env::var_os("HOME").context("could not determine home directory")?;
+    if account_home != Path::new(&process_home) {
+        bail!(
+            "HOME does not match the macOS account directory; restore the account HOME before installing"
+        )
+    }
+    Ok(())
 }
 
 fn validate_service_path_characters(value: &str) -> Result<()> {
@@ -11406,6 +11444,8 @@ mod tests {
             return assert_launchd_upgrade_lifecycle(Path::new(&root));
         }
 
+        validate_macos_install_home()?;
+
         let temp = tempdir()?;
         let bin = temp.path().join("bin");
         let home = temp.path().join("home");
@@ -11464,6 +11504,9 @@ esac
     #[cfg(target_os = "macos")]
     fn assert_launchd_upgrade_lifecycle(root: &Path) -> Result<()> {
         let home = PathBuf::from(std::env::var_os("HOME").context("test HOME is missing")?);
+        let mismatch = validate_macos_install_home()
+            .expect_err("an overridden HOME must not select another LaunchAgent namespace");
+        assert!(mismatch.to_string().contains("does not match"));
         let state_dir = root.join("state");
         flocal::state::ensure_private_directory(&state_dir)?;
         std::fs::write(root.join("available"), "")?;
