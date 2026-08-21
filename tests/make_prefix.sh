@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-probe="$(mktemp)"
-rm "$probe"
-trap 'rm -f "$probe"' EXIT HUP INT TERM
+probe="$(mktemp "${TMPDIR:-/tmp}/flocal-prefix.XXXXXX")"
+rm -- "$probe"
+trap 'rm -f -- "$probe"' EXIT HUP INT TERM
 export PROBE="$probe"
 
 prefix='relative $(shell touch "$$PROBE")'
