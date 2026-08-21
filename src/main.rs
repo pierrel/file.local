@@ -1793,7 +1793,7 @@ fn validate_macos_install_home() -> Result<()> {
         bail!("account name is not valid for a directory-service lookup")
     }
     let record = Command::new("/usr/bin/dscl")
-        .args([".", "-read"])
+        .args(["/Search", "-read"])
         .arg(format!("/Users/{user}"))
         .arg("NFSHomeDirectory")
         .output()?;
