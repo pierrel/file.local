@@ -80,8 +80,12 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
    target/release/flocal daemon install "$PREFIX/bin/flocal"
    #+end_example
 
-   This remains installer plumbing rather than a second user-facing product
-   command. The documented user command is still =make install=.
+   The Rust installer resolves a relative destination against its current
+   directory as a native path before applying its absolute-path filesystem
+   safety boundary. This keeps spaces, backslashes, and non-UTF-8 path bytes out
+   of shell parsing. This remains installer plumbing rather than a second
+   user-facing product command. The documented user command is still =make
+   install=.
 
 2. Dispatch =daemon install= before the normal =State::open_default=. Add a
    path-only state-directory resolver which applies the existing environment

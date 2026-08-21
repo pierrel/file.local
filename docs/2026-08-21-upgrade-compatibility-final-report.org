@@ -140,8 +140,12 @@ install: build
 	target/release/flocal daemon install "$(PREFIX)/bin/flocal"
 #+end_src
 
-There is now one implementation of ordering and failure recovery instead of a
-shell recipe split around executable replacement.
+The Rust command resolves a relative destination against its current directory
+as a native path before enforcing the absolute-path filesystem boundary. That
+keeps spaces, backslashes, and non-UTF-8 path bytes out of extra shell parsing
+while retaining the same Make recipe on Linux and macOS. There is now one
+implementation of ordering and failure recovery instead of a shell recipe split
+around executable replacement.
 
 ** Descriptor-held staging and atomic publication
 
