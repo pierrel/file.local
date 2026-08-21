@@ -1677,6 +1677,10 @@ impl State {
         upgrade_pending(&self.dir)
     }
 
+    pub fn upgrade_pending_at(dir: impl AsRef<Path>) -> Result<bool> {
+        upgrade_pending(dir.as_ref())
+    }
+
     pub fn acquire_installer_lock(dir: impl AsRef<Path>) -> Result<File> {
         let path = dir.as_ref().join(INSTALLER_LOCK_FILE);
         let file = open_private_regular_file(&path, false)
@@ -1686,7 +1690,7 @@ impl State {
         Ok(file)
     }
 
-    pub fn create_upgrade_pending(dir: impl AsRef<Path>) -> Result<()> {
+    pub fn create_upgrade_pending(dir: impl AsRef<Path>) -> Result<bool> {
         let dir = dir.as_ref();
         ensure_private_directory(dir)?;
         let path = dir.join(UPGRADE_PENDING_FILE);
@@ -1698,12 +1702,13 @@ impl State {
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
             {
                 upgrade_pending(dir)?;
-                return Ok(());
+                return Ok(false);
             }
             Err(error) => return Err(error),
         };
         file.sync_all()?;
-        sync_dir(dir)
+        sync_dir(dir)?;
+        Ok(true)
     }
 
     pub fn remove_upgrade_pending(dir: impl AsRef<Path>) -> Result<()> {
@@ -7066,8 +7071,8 @@ mod tests {
         assert!(State::try_acquire_upgrade_barrier(&state_dir)?.is_none());
         drop(state);
 
-        State::create_upgrade_pending(&state_dir)?;
-        State::create_upgrade_pending(&state_dir)?;
+        assert!(State::create_upgrade_pending(&state_dir)?);
+        assert!(!State::create_upgrade_pending(&state_dir)?);
         let error = match State::open(&state_dir) {
             Ok(_) => bail!("pending upgrade accepted a new state user"),
             Err(error) => error,

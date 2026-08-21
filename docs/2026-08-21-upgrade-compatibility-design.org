@@ -119,20 +119,24 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
    its shared installation barrier and reports that installation is in
    progress. After acquiring the shared barrier it checks the marker again
    while holding the lock before it opens SQLite, closing a check/wait/crash
-   race. Long-lived daemon workers, foreground watches, and protocol
-   responders check it inside their existing bounded loops and exit cleanly.
-   The marker therefore drains compatible inbound sessions and prevents a
-   reconnect from replacing them while installation waits. A crash leaves the
+   race. Long-lived daemon workers and protocol responders check it inside
+   their existing bounded loops and exit cleanly. Foreground watches retain
+   their barrier and session guards until the user stops them, so installation
+   refuses instead of silently ending a terminal command. The marker drains
+   compatible inbound sessions and prevents a reconnect from replacing them
+   while installation waits. A crash leaves the
    marker in place so candidate commands fail safely with =rerun make install=
    instead of racing an abandoned migration.
 
-   One pending-marker guard owns every pre-rename exit. Before any attempt to
-   restore the old service it removes the marker and syncs its directory. If
-   cleanup fails, the installer reports that restoration is unsafe and does
-   not claim or attempt a successful restart. Successful rename disarms
-   pre-rename cleanup. It retains the marker through candidate publication and
-   migration, then disarms only after the candidate state and service assets
-   are durably complete and the marker itself is durably removed.
+   A marker created by the current attempt owns every pre-rename exit. Before
+   any attempt to restore the old service, the installer removes that marker
+   and syncs its directory. If cleanup fails, it reports that restoration is
+   unsafe and does not claim or attempt a successful restart. A marker found at
+   invocation start is inherited from an interrupted attempt and is never
+   removed by rollback, because that earlier attempt may already have
+   published its candidate. Successful rename likewise moves the current
+   marker to candidate recovery. It is removed only after candidate state and
+   service assets are durably complete.
 
 5. Before publishing or migrating, open SQLite strictly read-only, with no
    migrations or write pragmas, to enumerate existing share IDs and roots.

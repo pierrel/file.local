@@ -1283,6 +1283,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
     }
     flocal::state::ensure_private_directory(&state_dir)?;
     let _installer = State::acquire_installer_lock(&state_dir)?;
+    let inherited_pending = State::upgrade_pending_at(&state_dir)?;
 
     let candidate = std::env::current_exe()?;
     let mut staged = StagedExecutable::prepare(&candidate, destination)?;
@@ -1293,19 +1294,22 @@ fn install_daemon(destination: &Path) -> Result<()> {
     if let Err(error) =
         stop_daemon_service(&service).context("stopping the managed daemon for upgrade")
     {
-        return restore_before_upgrade(&service, &state_dir, error);
+        return fail_before_publication(&service, &state_dir, inherited_pending, error);
     }
-    if let Err(error) =
-        State::create_upgrade_pending(&state_dir).context("creating the upgrade marker")
-    {
-        return restore_before_upgrade(&service, &state_dir, error);
-    }
+    let created_pending =
+        match State::create_upgrade_pending(&state_dir).context("creating the upgrade marker") {
+            Ok(created) => created,
+            Err(error) => {
+                return fail_before_publication(&service, &state_dir, inherited_pending, error);
+            }
+        };
+    let preserve_pending = !created_pending;
 
     let quiesced = quiesce_for_upgrade(&state_dir);
     let (legacy_locks, barrier) = match quiesced {
         Ok(locks) => locks,
         Err(error) => {
-            return restore_before_upgrade(&service, &state_dir, error);
+            return fail_before_publication(&service, &state_dir, preserve_pending, error);
         }
     };
 
@@ -1313,7 +1317,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
         if !staged.published {
             drop(barrier);
             drop(legacy_locks);
-            return restore_before_upgrade(&service, &state_dir, error);
+            return fail_before_publication(&service, &state_dir, preserve_pending, error);
         }
         return Err(error.context(
             "the candidate executable was published; rerun `make install` to finish the upgrade",
@@ -1367,6 +1371,21 @@ fn restore_before_upgrade(
         )
     }
     Err(error)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fail_before_publication(
+    service: &DaemonService,
+    state_dir: &Path,
+    preserve_pending: bool,
+    error: anyhow::Error,
+) -> Result<()> {
+    if preserve_pending {
+        return Err(error.context(
+            "an earlier upgrade is still pending; the service remains stopped; rerun `make install`",
+        ));
+    }
+    restore_before_upgrade(service, state_dir, error)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -11309,6 +11328,19 @@ mod tests {
 
         State::create_upgrade_pending(&state_dir)?;
         let service = prepare_daemon_service(&state_dir, &destination)?;
+        let pending = fail_before_publication(
+            &service,
+            &state_dir,
+            true,
+            anyhow::anyhow!("synthetic retry failure"),
+        )
+        .expect_err("an inherited marker keeps the retry on the candidate path");
+        assert!(
+            pending
+                .to_string()
+                .contains("earlier upgrade is still pending")
+        );
+        assert!(State::upgrade_pending_at(&state_dir)?);
         let refused = restore_before_upgrade(
             &service,
             &state_dir,

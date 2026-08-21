@@ -50,19 +50,25 @@ copying the old executable back is neither needed nor supported.
 
 * The final design
 
-The operation has a deliberately asymmetric boundary.
+The operation has a deliberately asymmetric boundary that persists across
+retries.
 
-Before executable replacement, failure is reversible. The old executable and
-schema remain authoritative. The candidate removes its pending marker, syncs
-that removal, restores the old service when it was previously running, and
-returns the original error. If cleanup or restoration also fails, the message
-includes both failures instead of pretending recovery succeeded.
+Before the first executable replacement, failure is reversible. The old
+executable and schema remain authoritative. The candidate removes the marker
+created by that attempt, syncs the removal, restores the old service when it
+was previously running, and returns the original error. If cleanup or
+restoration also fails, the message includes both failures instead of
+pretending recovery succeeded.
 
 After executable replacement, failure is resumable but not reversible. The
 candidate never starts whatever now happens to be at the old path as though it
 were the old program. It keeps =upgrade.pending= durable, leaves the service
 stopped, and tells the user to rerun =make install=. This construction removes
-the dangerous state where a new schema and an old process run together.
+the dangerous state where a new schema and an old process run together. A
+later invocation records that inherited marker before doing anything else. If
+that retry fails before its own rename, it still preserves the marker and does
+not restore a service, because the earlier invocation may already have crossed
+the boundary.
 
 The successful sequence is:
 
