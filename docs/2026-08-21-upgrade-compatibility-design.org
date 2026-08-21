@@ -76,14 +76,21 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
 
    =make install= builds the release candidate and invokes:
 
-   #+begin_example
-   target/release/flocal daemon install "$PREFIX/bin/flocal"
-   #+end_example
+   #+begin_src makefile
+   PREFIX ?=
+   override PREFIX := $(value PREFIX)
+   export PREFIX
+   install: build
+	@prefix="$${PREFIX:-$$HOME/.local}"; \
+	target/release/flocal daemon install "$$prefix/bin/flocal"
+   #+end_src
 
    The Rust installer resolves a relative destination against its current
    directory as a native path before applying its absolute-path filesystem
    safety boundary. This keeps spaces, backslashes, and non-UTF-8 path bytes out
-   of shell parsing. This remains installer plumbing rather than a second
+   of shell parsing. Make freezes the raw override without re-evaluating Make
+   expressions, exports it as data, and applies the =$HOME/.local= default only
+   inside the shell. This remains installer plumbing rather than a second
    user-facing product command. The documented user command is still =make
    install=.
 

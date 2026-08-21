@@ -133,17 +133,27 @@ if let Commands::Daemon {
 let mut state = State::open_default()?;
 #+end_src
 
-The Makefile is correspondingly smaller:
+The Makefile keeps the install invocation simple while passing =PREFIX= as
+environment data:
 
 #+begin_src makefile
+PREFIX ?=
+override PREFIX := $(value PREFIX)
+export PREFIX
+
 install: build
-	target/release/flocal daemon install "$(PREFIX)/bin/flocal"
+	@prefix="$${PREFIX:-$$HOME/.local}"; \
+	target/release/flocal daemon install "$$prefix/bin/flocal"
 #+end_src
 
 The Rust command resolves a relative destination against its current directory
 as a native path before enforcing the absolute-path filesystem boundary. That
-keeps spaces, backslashes, and non-UTF-8 path bytes out of extra shell parsing
-while retaining the same Make recipe on Linux and macOS. There is now one
+keeps spaces, backslashes, command substitutions, and non-UTF-8 path bytes out
+of extra shell parsing: Make freezes the raw override without re-evaluating Make
+expressions, exports it as environment data, and the recipe applies the
+=$HOME/.local= default only inside the shell. Linux service paths reject
+systemd's percent and dollar expansion syntax instead of changing the path.
+There is now one
 implementation of ordering and failure recovery instead of a shell recipe split
 around executable replacement.
 

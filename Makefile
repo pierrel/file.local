@@ -1,16 +1,25 @@
-.PHONY: build install check test coverage coverage-tools e2e
+.PHONY: build install check test test-make-prefix test-make-prefix-value coverage coverage-tools e2e
 
-PREFIX ?= $(HOME)/.local
+PREFIX ?=
+override PREFIX := $(value PREFIX)
+export PREFIX
 COVERAGE_BASE ?= github/main
 
 build:
 	cargo build --release
 
 install: build
-	target/release/flocal daemon install "$(PREFIX)/bin/flocal"
+	@prefix="$${PREFIX:-$$HOME/.local}"; \
+	target/release/flocal daemon install "$$prefix/bin/flocal"
 
 test:
 	cargo test --all-targets -- --test-threads=1
+
+test-make-prefix:
+	sh tests/make_prefix.sh
+
+test-make-prefix-value:
+	@printf '%s\n' "$$PREFIX"
 
 coverage-tools:
 	@cargo llvm-cov --version 2>/dev/null | grep -q 'cargo-llvm-cov 0.8.7' || cargo install cargo-llvm-cov --version 0.8.7 --locked
@@ -22,6 +31,6 @@ coverage: coverage-tools
 e2e:
 	cargo test --test e2e -- --ignored --test-threads=1
 
-check: coverage
+check: coverage test-make-prefix
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings

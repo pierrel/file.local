@@ -220,8 +220,9 @@ On Linux, [[file:src/main.rs][src/main.rs]] writes a per-user systemd unit,
 reloads the user manager, and enables/starts it:
 
 #+begin_src rust
-let mut staged = StagedExecutable::prepare(&candidate, destination)?;
-let service = prepare_daemon_service(&state_dir, destination)?;
+let destination = resolve_install_destination(destination)?;
+let mut staged = StagedExecutable::prepare(&candidate, &destination)?;
+let service = prepare_daemon_service(&state_dir, &destination)?;
 stop_daemon_service(&service)?;
 State::create_upgrade_pending(&state_dir)?;
 let (legacy_locks, barrier) = quiesce_for_upgrade(&state_dir)?;
