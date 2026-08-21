@@ -7,6 +7,10 @@ use super::docker::{RunContext, SHARE};
 /// output alone.
 pub fn print_dump(context: &RunContext) {
     eprintln!("==== e2e failure dump (run {}) ====", context.run_id);
+    eprintln!("---- permanent diagnostics ----");
+    for line in context.diagnostics() {
+        eprintln!("{line}");
+    }
     eprintln!("---- transcript tail ----");
     for line in context.transcript_tail(50) {
         eprintln!("{line}");

@@ -363,12 +363,13 @@ all historical snapshots is outside this slice.
 - Linux E2E proves the product lifecycle with real signals and a narrow fake
   manager. Linux unit tests prove generated systemd paths and calls. Native
   Linux release evidence proves actual user-systemd behavior.
-- Native macOS CI compiles the launchd/headless paths and proves the platform's
-  SQLite =fullfsync= setting; platform-neutral tests pin marker provenance,
-  binary-only retry behavior, filesystem publication, and migration rollback.
-  The existing graphical-login native gate must perform idle and in-progress
-  upgrades against Linux before =v0.0.1=. Fake-launchctl lifecycle coverage is
-  not claimed by this slice.
+- Native macOS CI executes the launchd lifecycle against a deterministic
+  =launchctl= boundary, including loaded-job stop and restore, service-asset
+  publication, bootstrap and bootout failures, and the headless plan. It also
+  proves the platform's SQLite =fullfsync= setting. Platform-neutral tests pin
+  marker provenance, binary-only retry behavior, filesystem publication, and
+  migration rollback. The existing graphical-login native gate must perform
+  idle and in-progress upgrades against Linux before =v0.0.1=.
 - The installer never accepts a remote host, synchronized path, secret, or
   service arguments from peer input. Its only path argument is the local
   destination supplied by the build/install process.

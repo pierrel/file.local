@@ -7107,7 +7107,7 @@ mod tests {
     #[test]
     fn macos_state_enables_full_filesystem_sync() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let mut state = State::open(temp.path().join("state"))?;
+        let state = State::open(temp.path().join("state"))?;
         let enabled: i64 = state
             .conn
             .pragma_query_value(None, "fullfsync", |row| row.get(0))?;

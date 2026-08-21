@@ -20,6 +20,7 @@ pub struct RunContext {
     pub network: String,
     pub volumes: Vec<String>,
     pub temp: tempfile::TempDir,
+    diagnostics: Mutex<Vec<String>>,
     transcript: Mutex<Vec<String>>,
     dumped: AtomicBool,
     pub containers: Mutex<Vec<String>>,
@@ -45,6 +46,7 @@ impl RunContext {
             network,
             volumes,
             temp,
+            diagnostics: Mutex::new(Vec::new()),
             transcript: Mutex::new(Vec::new()),
             dumped: AtomicBool::new(false),
             containers: Mutex::new(Vec::new()),
@@ -125,6 +127,17 @@ impl RunContext {
 
     pub fn record(&self, line: String) {
         self.transcript.lock().expect("transcript lock").push(line);
+    }
+
+    pub fn record_diagnostic(&self, line: String) {
+        self.diagnostics
+            .lock()
+            .expect("diagnostics lock")
+            .push(line);
+    }
+
+    pub fn diagnostics(&self) -> Vec<String> {
+        self.diagnostics.lock().expect("diagnostics lock").clone()
     }
 
     pub fn transcript_tail(&self, count: usize) -> Vec<String> {

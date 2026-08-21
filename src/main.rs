@@ -1187,6 +1187,19 @@ struct StagedExecutable {
     published: bool,
 }
 
+fn copy_candidate_exactly(
+    source: &mut impl Read,
+    output: &mut impl Write,
+    candidate_length: u64,
+) -> Result<()> {
+    let copied = io::copy(&mut source.take(candidate_length), output)
+        .context("staging the candidate executable")?;
+    if copied != candidate_length {
+        bail!("candidate executable changed while it was being staged")
+    }
+    Ok(())
+}
+
 impl StagedExecutable {
     fn prepare(candidate: &Path, destination: &Path) -> Result<Self> {
         use cap_std::fs::{OpenOptions as CapOpenOptions, Permissions, PermissionsExt};
@@ -1198,6 +1211,7 @@ impl StagedExecutable {
         validate_trusted_executable(&candidate)?;
         let mut source = File::open(&candidate)?;
         validate_trusted_executable_file(&source)?;
+        let candidate_length = source.metadata()?.len();
         let parent = destination
             .parent()
             .context("installed executable has no parent directory")?;
@@ -1217,7 +1231,7 @@ impl StagedExecutable {
             .write(true)
             .to_owned();
         let mut output = directory.open_with(&temporary, &options)?;
-        io::copy(&mut source, &mut output).context("staging the candidate executable")?;
+        copy_candidate_exactly(&mut source, &mut output, candidate_length)?;
         directory.set_permissions(&temporary, Permissions::from_mode(0o755))?;
         flocal::durability::sync_file(&output)
             .context("syncing the staged candidate executable")?;
@@ -1280,6 +1294,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
     if !state_dir.is_absolute() {
         bail!("daemon state path must be absolute")
     }
+    let _service_installer = acquire_service_installer_lock()?;
     flocal::state::ensure_private_directory(&state_dir)?;
     let _installer = State::acquire_installer_lock(&state_dir)?;
     validate_managed_state_selection(&state_dir, State::managed_state_dir()?)?;
@@ -1856,6 +1871,19 @@ fn validate_private_install_file(directory: &cap_std::fs::Dir, path: &Path) -> R
 fn managed_state_marker_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("could not determine home directory")?;
     Ok(PathBuf::from(home).join(".config/file.local/managed-state"))
+}
+
+fn acquire_service_installer_lock() -> Result<File> {
+    acquire_service_installer_lock_at(&managed_state_marker_path()?)
+}
+
+fn acquire_service_installer_lock_at(marker: &Path) -> Result<File> {
+    let directory = marker
+        .parent()
+        .context("managed state marker has no parent directory")?;
+    flocal::state::ensure_private_directory(directory)?;
+    State::acquire_installer_lock(directory)
+        .context("another flocal service installation is already in progress")
 }
 
 fn preflight_managed_state_marker() -> Result<()> {
@@ -9051,6 +9079,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     const SYSTEMD_INSTALL_TEST_ROOT: &str = "FLOCAL_TEST_SYSTEMD_INSTALL_ROOT";
 
+    #[cfg(target_os = "macos")]
+    const LAUNCHD_INSTALL_TEST_ROOT: &str = "FLOCAL_TEST_LAUNCHD_INSTALL_ROOT";
+
     #[cfg(unix)]
     const PERMISSIVE_UMASK_SERVICE_ROOT: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_SERVICE_ROOT";
 
@@ -11364,6 +11395,112 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_upgrade_lifecycle_is_ordered_and_failure_aware() -> Result<()> {
+        if let Some(root) = std::env::var_os(LAUNCHD_INSTALL_TEST_ROOT) {
+            return assert_launchd_upgrade_lifecycle(Path::new(&root));
+        }
+
+        let temp = tempdir()?;
+        let bin = temp.path().join("bin");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&bin)?;
+        std::fs::create_dir(&home)?;
+        let launchctl = bin.join("launchctl");
+        std::fs::write(
+            &launchctl,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/launchctl.log"
+case "$1" in
+  print)
+    case "$2" in
+      */local.file-local.flocal-daemon) test -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/loaded" ;;
+      *) test -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/available" ;;
+    esac
+    ;;
+  bootout)
+    test ! -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/fail-bootout"
+    rm -f "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/loaded"
+    ;;
+  bootstrap)
+    test ! -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/fail-bootstrap"
+    : >"$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/loaded"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        )?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o700))?;
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::launchd_upgrade_lifecycle_is_ordered_and_failure_aware",
+            ])
+            .env(LAUNCHD_INSTALL_TEST_ROOT, temp.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var_os("PATH")
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ),
+            )
+            .env("HOME", &home)
+            .output()?;
+        assert!(output.status.success(), "{:?}", output);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_launchd_upgrade_lifecycle(root: &Path) -> Result<()> {
+        let home = PathBuf::from(std::env::var_os("HOME").context("test HOME is missing")?);
+        let state_dir = root.join("state");
+        flocal::state::ensure_private_directory(&state_dir)?;
+        std::fs::write(root.join("available"), "")?;
+        std::fs::write(root.join("loaded"), "")?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+
+        let service = prepare_daemon_service(&state_dir, &executable)?;
+        assert!(service.available && service.loaded && service_managed(&service));
+        stop_daemon_service(&service)?;
+        assert!(!root.join("loaded").exists());
+        publish_daemon_service(&service, &state_dir)?;
+        assert_eq!(
+            std::fs::read_to_string(home.join(".config/file.local/managed-state"))?,
+            format!("{}\n", state_dir.display())
+        );
+        assert!(service.plist.is_file());
+        restore_daemon_service(&service)?;
+        assert!(root.join("loaded").exists());
+
+        std::fs::write(root.join("fail-bootout"), "")?;
+        assert!(stop_daemon_service(&service).is_err());
+        std::fs::remove_file(root.join("fail-bootout"))?;
+        stop_daemon_service(&service)?;
+        std::fs::write(root.join("fail-bootstrap"), "")?;
+        assert!(start_daemon_service(&service).is_err());
+        assert!(restore_daemon_service(&service).is_err());
+        std::fs::remove_file(root.join("fail-bootstrap"))?;
+        start_daemon_service(&service)?;
+
+        std::fs::remove_file(root.join("available"))?;
+        std::fs::remove_file(root.join("loaded"))?;
+        let headless = prepare_daemon_service(&state_dir, &executable)?;
+        assert!(!headless.available && !headless.loaded && !service_managed(&headless));
+        stop_daemon_service(&headless)?;
+
+        let log = std::fs::read_to_string(root.join("launchctl.log"))?;
+        assert!(log.contains("bootout gui/"));
+        assert!(log.contains("bootstrap gui/"));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     fn assert_systemd_install(root: &Path) -> Result<()> {
         let manager_home = root.join("manager-home");
@@ -11508,6 +11645,45 @@ mod tests {
         std::fs::write(&untrusted, "not executable")?;
         let untrusted = File::open(untrusted)?;
         assert!(validate_trusted_executable_file(&untrusted).is_err());
+
+        let mut short_source = io::Cursor::new(b"short");
+        let mut copied = Vec::new();
+        let changed = copy_candidate_exactly(&mut short_source, &mut copied, 6)
+            .expect_err("a shortened candidate must not be published");
+        assert!(changed.to_string().contains("changed while"));
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_installers_with_different_state_dirs_share_one_service_lock() -> Result<()> {
+        let temp = tempdir()?;
+        let marker = temp.path().join("config/file.local/managed-state");
+        let state_a = temp.path().join("state-a");
+        let state_b = temp.path().join("state-b");
+        flocal::state::ensure_private_directory(&state_a)?;
+        flocal::state::ensure_private_directory(&state_b)?;
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_marker = marker.clone();
+        let first = std::thread::spawn(move || -> Result<()> {
+            let service_lock = acquire_service_installer_lock_at(&first_marker)?;
+            let state_lock = State::acquire_installer_lock(&state_a)?;
+            acquired_tx.send(())?;
+            release_rx.recv()?;
+            drop((state_lock, service_lock));
+            Ok(())
+        });
+        acquired_rx.recv()?;
+        let state_lock_b = State::acquire_installer_lock(&state_b)?;
+        let competing = acquire_service_installer_lock_at(&marker)
+            .expect_err("different state selections must not create independent installers");
+        assert!(competing.to_string().contains("already in progress"));
+        drop(state_lock_b);
+        release_tx.send(())?;
+        first
+            .join()
+            .map_err(|_| anyhow::anyhow!("first installer thread panicked"))??;
         Ok(())
     }
 

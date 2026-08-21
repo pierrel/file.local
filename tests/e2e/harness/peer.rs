@@ -311,8 +311,8 @@ fn setup_containers() -> Result<(PeerBox, PeerBox)> {
 fn setup_upgrade_containers() -> Result<(PeerBox, PeerBox)> {
     let transition = prepare_upgrade_base()?;
     let context = RunContext::new()?;
-    context.record(format!("upgrade base commit: {}", transition.base));
-    context.record(format!(
+    context.record_diagnostic(format!("upgrade base commit: {}", transition.base));
+    context.record_diagnostic(format!(
         "upgrade candidate commit: {}",
         transition.candidate
     ));
@@ -342,11 +342,11 @@ fn setup_upgrade_containers() -> Result<(PeerBox, PeerBox)> {
         peer.install_ssh_material()?;
         peer.exec_ok(&["mkdir", "-p", SHARE])?;
     }
-    context.record(format!(
+    context.record_diagnostic(format!(
         "upgrade base executable sha256: {}",
         a.executable_hash("/home/peer/.local/bin/flocal")?
     ));
-    context.record(format!(
+    context.record_diagnostic(format!(
         "upgrade candidate executable sha256: {}",
         a.executable_hash("/usr/local/libexec/flocal-real")?
     ));
