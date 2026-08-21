@@ -23,8 +23,9 @@ make install
 
 Managed sync needs a systemd user manager on Linux. On macOS, run the command
 from a graphical login so it can install the per-user LaunchAgent; a headless
-run installs the binary and asks you to run =make install= again from a
-graphical session before it migrates state or resumes managed synchronization.
+run installs the binary, retains =upgrade.pending= so ordinary commands cannot
+migrate state, and asks you to run =make install= again from a graphical
+session before it migrates state or resumes managed synchronization.
 
 Run that command from a checkout of this repository on *both* peers. Ensure
 =~/.local/bin= is in =PATH= and that non-interactive SSH can run =flocal= on
@@ -61,10 +62,15 @@ keeps its lifetime lock during later upgrades and receives the same safe
 refusal. A responder-first immediate upgrade can also refuse while an old
 inbound session is active.
 
-An interrupted upgrade leaves an owner-only =upgrade.pending= marker that
-blocks ordinary commands from opening or migrating state. Rerun =make install=
-to finish it. Do not delete the marker or copy an older executable over the
-installed candidate; downgrades are not supported.
+An upgrade interrupted after publication but before managed migration and
+service-asset publication finish leaves an owner-only =upgrade.pending= marker
+that blocks ordinary commands from opening or migrating state. A headless
+macOS binary-only install retains the same marker. Once those durable managed
+phases finish, the installer removes the marker before starting the daemon; a
+start or readiness failure leaves the fully migrated candidate stopped and
+reports the same =make install= retry guidance. Do not delete a retained marker
+or copy an older executable over the installed candidate; downgrades are not
+supported.
 
 If an older foreground =flocal watch PATH= was interrupted while applying a
 change, install the candidate on both endpoints and then rerun =flocal watch

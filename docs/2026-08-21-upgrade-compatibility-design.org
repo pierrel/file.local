@@ -242,9 +242,9 @@ binary-only behavior only after it has created or retained the pending marker
 and acquired daemon plus legacy mutation locks. If it cannot quiesce old work,
 it rolls back only a marker created by that invocation and refuses publication
 with the exact graphical-session command. Otherwise it publishes the
-   candidate. It removes a marker created by that binary-only invocation, but
-   retains an inherited marker because a previous invocation may still require
-   migration. It does not open or migrate state or change a plist or
+   candidate. It retains the pending marker, whether created by that invocation
+   or inherited, because graphical migration is still required. It does not
+   open or migrate state or change a plist or
    managed-state marker, and prints the graphical completion command. A later
    graphical invocation completes the normal sequence.
 

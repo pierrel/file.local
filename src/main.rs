@@ -1360,7 +1360,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
         drop(state);
         println!("State migration and managed service update complete");
     }
-    complete_upgrade_marker(&state_dir, service_managed(&service), preserve_pending).context(
+    complete_upgrade_marker(&state_dir, service_managed(&service)).context(
         "the candidate executable was published; rerun `make install` to finish the upgrade",
     )?;
     drop(barrier);
@@ -1482,12 +1482,8 @@ fn fail_before_publication(
     restore_before_upgrade(service, state_dir, error)
 }
 
-fn complete_upgrade_marker(
-    state_dir: &Path,
-    managed_install_complete: bool,
-    preserve_pending: bool,
-) -> Result<()> {
-    if managed_install_complete || !preserve_pending {
+fn complete_upgrade_marker(state_dir: &Path, managed_install_complete: bool) -> Result<()> {
+    if managed_install_complete {
         State::remove_upgrade_pending(state_dir)?;
     }
     Ok(())
@@ -11811,19 +11807,15 @@ esac
     }
 
     #[test]
-    fn binary_only_retry_preserves_an_inherited_upgrade_marker() -> Result<()> {
+    fn binary_only_install_preserves_upgrade_marker_until_managed_completion() -> Result<()> {
         let temp = tempdir()?;
         let state_dir = temp.path().join("state");
         State::create_upgrade_pending(&state_dir)?;
 
-        complete_upgrade_marker(&state_dir, false, false)?;
-        assert!(!State::upgrade_pending_at(&state_dir)?);
-
-        State::create_upgrade_pending(&state_dir)?;
-        complete_upgrade_marker(&state_dir, false, true)?;
+        complete_upgrade_marker(&state_dir, false)?;
         assert!(State::upgrade_pending_at(&state_dir)?);
 
-        complete_upgrade_marker(&state_dir, true, true)?;
+        complete_upgrade_marker(&state_dir, true)?;
         assert!(!State::upgrade_pending_at(&state_dir)?);
         Ok(())
     }

@@ -38,8 +38,9 @@ is restored. The first transition still requires ending every foreground
 command: the previous alpha releases its lock while an initial plan waits for
 confirmation, and a candidate cannot safely observe that idle old process.
 
-If power loss or another post-publication failure interrupts an upgrade, normal
-commands report:
+If power loss or another failure interrupts an upgrade after publication but
+before managed migration and service-asset publication finish, or after a
+headless macOS binary-only install, normal commands report:
 
 #+begin_example
 upgrade is in progress; rerun `make install`
@@ -60,15 +61,19 @@ was previously running, and returns the original error. If cleanup or
 restoration also fails, the message includes both failures instead of
 pretending recovery succeeded.
 
-After executable replacement, failure is resumable but not reversible. The
-candidate never starts whatever now happens to be at the old path as though it
-were the old program. It keeps =upgrade.pending= durable, leaves the service
-stopped, and tells the user to rerun =make install=. This construction removes
-the dangerous state where a new schema and an old process run together. A
-later invocation records that inherited marker before doing anything else. If
-that retry fails before its own rename, it still preserves the marker and does
-not restore a service, because the earlier invocation may already have crossed
-the boundary.
+After executable replacement, failure is resumable but not reversible. Until
+managed migration and service-asset publication complete, the candidate keeps
+=upgrade.pending= durable, leaves the service stopped, and tells the user to
+rerun =make install=. A headless macOS binary-only install retains it for the
+same reason. This construction removes the dangerous state where a new schema
+and an old process run together. A later invocation records that inherited
+marker before doing anything else. If that retry fails before its own rename,
+it still preserves the marker and does not restore a service, because the
+earlier invocation may already have crossed the boundary. After managed state
+and service assets are durable, the marker is removed so the candidate daemon
+can open state. A subsequent start or readiness failure leaves that fully
+migrated candidate stopped and reports retry guidance without recreating the
+marker.
 
 The successful sequence is:
 
@@ -98,15 +103,17 @@ The successful sequence is:
 9. Open state through the installer's exclusive barrier. Create and migrate the
    entire schema in one SQLite transaction.
 10. Replace and sync the managed-state marker and systemd unit or LaunchAgent.
-11. Remove and sync =upgrade.pending=, release the barriers, then start the
-    service. Wait for its private control socket to answer a real list request
-    before reporting success. Every enabled managed sync is reconstructed from
-    durable intent.
+11. For a managed install, remove and sync =upgrade.pending=, release the
+    barriers, then start the service. Wait for its private control socket to
+    answer a real list request before reporting success. Every enabled managed
+    sync is reconstructed from durable intent.
 
 On headless macOS there is no graphical LaunchAgent domain to stop or start.
 The installer still quiesces local work and safely publishes the binary, but it
-does not migrate state or service assets. It asks for =make install= again from
-a graphical session.
+does not migrate state or service assets. It retains =upgrade.pending= and asks
+for =make install= again from a graphical session; only a managed pass that
+completes migration and service-asset publication clears the marker before
+starting the daemon.
 
 Both one-shot and persistent-watch protocol versions advance once, to 6 and 7.
 This prevents the candidate connector from creating a long-lived session with
