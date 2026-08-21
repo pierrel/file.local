@@ -212,6 +212,16 @@ enum ProtocolCommand {
     E2eHoldInstallation {
         path: PathBuf,
     },
+    #[cfg(feature = "e2e-test-hooks")]
+    #[command(hide = true)]
+    E2eMakeRelationshipLegacy {
+        path: PathBuf,
+    },
+    #[cfg(feature = "e2e-test-hooks")]
+    #[command(hide = true)]
+    E2eAssertRelationshipLegacy {
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -354,6 +364,20 @@ fn run() -> Result<()> {
         Commands::Protocol {
             command: ProtocolCommand::E2eHoldInstallation { path },
         } => e2e_hold_installation(&mut state, &path)?,
+        #[cfg(feature = "e2e-test-hooks")]
+        Commands::Protocol {
+            command: ProtocolCommand::E2eMakeRelationshipLegacy { path },
+        } => {
+            let (share, _) = state.find_share(&path)?;
+            state.e2e_make_relationship_legacy(&share)?;
+        }
+        #[cfg(feature = "e2e-test-hooks")]
+        Commands::Protocol {
+            command: ProtocolCommand::E2eAssertRelationshipLegacy { path },
+        } => {
+            let (share, _) = state.find_share(&path)?;
+            state.e2e_assert_relationship_legacy(&share)?;
+        }
     }
     Ok(())
 }
@@ -2460,10 +2484,29 @@ fn report_installation_wait(
     watch_log(output, &message)
 }
 
-#[derive(Clone)]
 struct ValidatedSyncBinding {
+    remote_peer: PeerId,
     relationship: RelationshipId,
     order: std::cmp::Ordering,
+}
+
+fn legacy_relationship_id(share: &ShareId) -> Result<RelationshipId> {
+    const DOMAIN: &[u8] = b"file.local legacy relationship v1";
+    let mut hash = blake3::Hasher::new();
+    hash.update(DOMAIN);
+    hash.update(share.0.as_bytes());
+    RelationshipId::parse(format!(
+        "{}{}",
+        sync::LEGACY_RELATIONSHIP_PREFIX,
+        hash.finalize().to_hex()
+    ))
+}
+
+fn explicit_sync_relationship(relationship: &RelationshipId) -> Result<&RelationshipId> {
+    if relationship.0.starts_with(sync::LEGACY_RELATIONSHIP_PREFIX) {
+        bail!("stored relationship ID uses the reserved legacy namespace");
+    }
+    Ok(relationship)
 }
 
 fn validate_sync_binding(
@@ -2479,14 +2522,20 @@ fn validate_sync_binding(
         bail!("relationship removal is pending");
     }
     let matches = match &managed.binding {
-        EndpointBinding::Connector(peer) => {
-            peer.peer_id.as_ref() == Some(remote_peer)
-                && peer.relationship.as_ref() == Some(relationship)
+        EndpointBinding::Connector(peer) if peer.peer_id.as_ref() == Some(remote_peer) => {
+            match &peer.relationship {
+                Some(stored) => explicit_sync_relationship(stored)? == relationship,
+                None => legacy_relationship_id(share)? == *relationship,
+            }
         }
         EndpointBinding::Responder {
             peer,
             relationship: bound_relationship,
-        } => peer == remote_peer && bound_relationship.as_ref() == Some(relationship),
+        } if peer == remote_peer => match bound_relationship {
+            Some(stored) => explicit_sync_relationship(stored)? == relationship,
+            None => legacy_relationship_id(share)? == *relationship,
+        },
+        EndpointBinding::Connector(_) | EndpointBinding::Responder { .. } => false,
         EndpointBinding::Unpaired => false,
     };
     if !matches {
@@ -2496,6 +2545,7 @@ fn validate_sync_binding(
     let local_peer = state.peer_id()?;
     let order = sync::peer_order(&local_peer, remote_peer)?;
     Ok(ValidatedSyncBinding {
+        remote_peer: remote_peer.clone(),
         relationship: relationship.clone(),
         order,
     })
@@ -2507,11 +2557,11 @@ fn connector_sync_binding(
     peer: &PeerConfig,
 ) -> Result<ValidatedSyncBinding> {
     let remote = peer.completed_peer_id()?;
-    let relationship = peer
-        .relationship
-        .as_ref()
-        .context("connector relationship registration is incomplete")?;
-    validate_sync_binding(state, share, remote, relationship)
+    let relationship = match &peer.relationship {
+        Some(relationship) => relationship.clone(),
+        None => legacy_relationship_id(share)?,
+    };
+    validate_sync_binding(state, share, remote, &relationship)
 }
 
 #[derive(Debug)]
@@ -2894,11 +2944,10 @@ fn recover_before_pair_with_interval(
 fn validate_final_sync_binding(
     state: &State,
     share: &ShareId,
-    remote_peer: &PeerId,
-    relationship: &RelationshipId,
+    binding: &ValidatedSyncBinding,
     expected_intent_generation: Option<i64>,
 ) -> Result<()> {
-    validate_sync_binding(state, share, remote_peer, relationship)?;
+    validate_sync_binding(state, share, &binding.remote_peer, &binding.relationship)?;
     if let Some(generation) = expected_intent_generation
         && state.watch_intent_generation(share)? != generation
     {
@@ -2911,8 +2960,7 @@ fn validate_final_sync_binding(
 fn reserve_as_authority(
     state: &mut State,
     share: &ShareId,
-    remote_peer: &PeerId,
-    relationship: &RelationshipId,
+    binding: &ValidatedSyncBinding,
     operation: SyncOperation,
     intent_generation: Option<i64>,
     connector_generation: u64,
@@ -2922,6 +2970,7 @@ fn reserve_as_authority(
     wire: &mut impl ReservationWire,
     watch_output: &mut impl Write,
 ) -> Result<(InstallationPermit, std::fs::File, sync::Reservation)> {
+    let relationship = &binding.relationship;
     let nonce = sync::SchedulingNonce::generate();
     let placeholder = empty_predecessor();
     let network_authority = state.peer_id()?;
@@ -3075,7 +3124,7 @@ fn reserve_as_authority(
             bail!("peer synchronization start does not match the committed reservation");
         }
         let share_lock = state.lock_share(share)?;
-        validate_final_sync_binding(state, share, remote_peer, relationship, intent_generation)?;
+        validate_final_sync_binding(state, share, binding, intent_generation)?;
         wire.send_reservation(
             ReservationFrame::SyncAccepted(reservation.clone()),
             lease_deadline,
@@ -3092,8 +3141,7 @@ fn reserve_as_authority(
 fn reserve_as_higher_peer(
     state: &mut State,
     share: &ShareId,
-    remote_peer: &PeerId,
-    relationship: &RelationshipId,
+    binding: &ValidatedSyncBinding,
     operation: SyncOperation,
     intent_generation: Option<i64>,
     connector_generation: u64,
@@ -3103,6 +3151,8 @@ fn reserve_as_higher_peer(
     wire: &mut impl ReservationWire,
     watch_output: &mut impl Write,
 ) -> Result<(InstallationPermit, std::fs::File, sync::Reservation)> {
+    let remote_peer = &binding.remote_peer;
+    let relationship = &binding.relationship;
     let id = sync::SchedulingId::generate();
     let mut pending = if connector_origin {
         let request = match existing {
@@ -3275,7 +3325,7 @@ fn reserve_as_higher_peer(
             };
         let installation = wait_for_paired_permit(request, share, wire, Some(lease_deadline))?;
         let share_lock = state.lock_share(share)?;
-        validate_final_sync_binding(state, share, remote_peer, relationship, intent_generation)?;
+        validate_final_sync_binding(state, share, binding, intent_generation)?;
         wire.send_reservation(
             ReservationFrame::SyncStart(sync::SyncStart {
                 id: reservation.id.clone(),
@@ -3397,10 +3447,7 @@ fn run_sync_attempt(
             protocol: sync::PROTOCOL_VERSION,
             share: share.clone(),
             peer: state.peer_id()?,
-            relationship: peer
-                .relationship
-                .clone()
-                .context("connector relationship registration is incomplete")?,
+            relationship: binding.relationship.clone(),
             dry_run,
         },
     )?;
@@ -3413,8 +3460,7 @@ fn run_sync_attempt(
             std::cmp::Ordering::Less => reserve_as_authority(
                 state,
                 &share,
-                peer.completed_peer_id()?,
-                &binding.relationship,
+                &binding,
                 operation,
                 None,
                 0,
@@ -3427,8 +3473,7 @@ fn run_sync_attempt(
             std::cmp::Ordering::Greater => reserve_as_higher_peer(
                 state,
                 &share,
-                peer.completed_peer_id()?,
-                &binding.relationship,
+                &binding,
                 operation,
                 None,
                 0,
@@ -3441,13 +3486,7 @@ fn run_sync_attempt(
             std::cmp::Ordering::Equal => unreachable!("peer ordering rejects equality"),
         }
     };
-    validate_final_sync_binding(
-        state,
-        &share,
-        peer.completed_peer_id()?,
-        &binding.relationship,
-        None,
-    )?;
+    validate_final_sync_binding(state, &share, &binding, None)?;
     state.clear_pending_objects(&share)?;
     state.prune_unreferenced_objects()?;
     let local = if dry_run {
@@ -3976,8 +4015,7 @@ fn serve_initial(
                         reserve_as_authority(
                             state,
                             &share,
-                            &peer,
-                            &binding.relationship,
+                            &binding,
                             SyncOperation::Sync,
                             None,
                             0,
@@ -3991,8 +4029,7 @@ fn serve_initial(
                     std::cmp::Ordering::Greater => reserve_as_higher_peer(
                         state,
                         &share,
-                        &peer,
-                        &binding.relationship,
+                        &binding,
                         SyncOperation::Sync,
                         None,
                         0,
@@ -4005,9 +4042,7 @@ fn serve_initial(
                     std::cmp::Ordering::Equal => unreachable!("peer ordering rejects equality"),
                 }
             };
-            if let Err(error) =
-                validate_final_sync_binding(state, &share, &peer, &binding.relationship, None)
-            {
+            if let Err(error) = validate_final_sync_binding(state, &share, &binding, None) {
                 sync::write_message(
                     &mut output,
                     &Message::Error {
@@ -4024,7 +4059,14 @@ fn serve_initial(
                 sync::refresh(state, &share)?
             };
             sync::write_snapshot(&mut output, &records)?;
-            serve_sync(state, &share, &peer, &records, &mut input, &mut output)?;
+            serve_sync(
+                state,
+                &share,
+                &binding.remote_peer,
+                &records,
+                &mut input,
+                &mut output,
+            )?;
             installation.finish()?;
             sync::write_message(&mut output, &Message::Done)?;
         }
@@ -4080,7 +4122,7 @@ fn serve_watch_open(
             );
         }
     };
-    if state.bound_peer(&share)?.as_ref() != Some(&peer) {
+    if state.bound_peer(&share)?.as_ref() != Some(&binding.remote_peer) {
         return write_v2_session(
             output,
             V2SessionFrame::Error {
@@ -4217,7 +4259,6 @@ fn serve_watch_open(
                 let served = serve_v2_round(
                     state,
                     &share,
-                    &peer,
                     &binding,
                     &share_root,
                     round,
@@ -4688,7 +4729,6 @@ enum ServedRound {
 fn serve_v2_round(
     state: &mut State,
     share: &ShareId,
-    connector: &flocal::model::PeerId,
     binding: &ValidatedSyncBinding,
     root: &sync::ShareRoot,
     round: u64,
@@ -4715,8 +4755,7 @@ fn serve_v2_round(
             reserve_as_authority(
                 state,
                 share,
-                connector,
-                &binding.relationship,
+                binding,
                 SyncOperation::Watch,
                 None,
                 pending.connector_generation,
@@ -4737,8 +4776,7 @@ fn serve_v2_round(
             reserve_as_higher_peer(
                 state,
                 share,
-                connector,
-                &binding.relationship,
+                binding,
                 SyncOperation::Watch,
                 None,
                 connector_generation,
@@ -4752,7 +4790,7 @@ fn serve_v2_round(
         std::cmp::Ordering::Equal => unreachable!("peer ordering rejects equality"),
     };
     let mut installation = Some(installation);
-    validate_final_sync_binding(state, share, connector, &binding.relationship, None)?;
+    validate_final_sync_binding(state, share, binding, None)?;
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
@@ -4785,7 +4823,7 @@ fn serve_v2_round(
         .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let plan = read_v2_plan(input, round, &mut budget)?;
     let expected = sync::plan(&advertised, &peer_records);
-    sync::validate_materialized_plan_shape(&plan, &expected, connector)
+    sync::validate_materialized_plan_shape(&plan, &expected, &binding.remote_peer)
         .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     let applied_plan = effective_plan(&advertised, &peer_records, &plan, deferred);
     let connector_plan = effective_plan(&peer_records, &advertised, &plan, deferred);
@@ -6130,16 +6168,14 @@ fn persistent_watch_session_io(
     initial_request: &mut Option<flocal::state::QueueRequest>,
 ) -> Result<()> {
     let startup_deadline = std::time::Instant::now() + sync::default_phase_deadline();
+    let binding = connector_sync_binding(state, share, peer)?;
     sync::write_initial_message_until(
         remote_output,
         &InitialMessage::WatchOpen {
             protocol: sync::WATCH_PROTOCOL_VERSION,
             share: share.clone(),
             peer: state.peer_id()?,
-            relationship: peer
-                .relationship
-                .clone()
-                .context("connector relationship registration is incomplete")?,
+            relationship: binding.relationship.clone(),
         },
         std::time::Instant::now() + sync::default_frame_deadline(),
     )?;
@@ -6151,7 +6187,7 @@ fn persistent_watch_session_io(
                     protocol,
                     peer: actual,
                 },
-        } if protocol == sync::WATCH_PROTOCOL_VERSION && &actual == peer.completed_peer_id()? => {}
+        } if protocol == sync::WATCH_PROTOCOL_VERSION && actual == binding.remote_peer => {}
         V2Envelope::Session {
             frame: V2SessionFrame::Error { retryable, message },
         } => {
@@ -6550,8 +6586,7 @@ fn connector_v2_round(
         std::cmp::Ordering::Less => reserve_as_authority(
             state,
             share,
-            peer.completed_peer_id()?,
-            &binding.relationship,
+            &binding,
             SyncOperation::Watch,
             intent_generation,
             connector_generation,
@@ -6564,8 +6599,7 @@ fn connector_v2_round(
         std::cmp::Ordering::Greater => reserve_as_higher_peer(
             state,
             share,
-            peer.completed_peer_id()?,
-            &binding.relationship,
+            &binding,
             SyncOperation::Watch,
             intent_generation,
             connector_generation,
@@ -6579,13 +6613,7 @@ fn connector_v2_round(
     };
     drop(wire);
     let mut installation = Some(installation);
-    validate_final_sync_binding(
-        state,
-        share,
-        peer.completed_peer_id()?,
-        &binding.relationship,
-        intent_generation,
-    )?;
+    validate_final_sync_binding(state, share, &binding, intent_generation)?;
     state.clear_pending_objects(share)?;
     state.prune_unreferenced_objects()?;
     let mut budget =
@@ -7677,6 +7705,226 @@ mod tests {
         )?;
         drop(database);
         State::open(path)
+    }
+
+    #[test]
+    fn legacy_relationship_derivation_is_stable_and_valid() -> Result<()> {
+        let first = legacy_relationship_id(&ShareId("share-fixed-vector".into()))?;
+        assert_eq!(
+            first.0,
+            "legacy-77f944f03349560bdb455f84f8416400735f0c06b2b7af8e2682f1fc870066a6"
+        );
+        first.validate()?;
+        assert_eq!(
+            first,
+            legacy_relationship_id(&ShareId("share-fixed-vector".into()))?
+        );
+        assert_ne!(
+            first,
+            legacy_relationship_id(&ShareId("share-other".into()))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sync_binding_distinguishes_legacy_from_incomplete_and_reserved_state() -> Result<()> {
+        fn connector_state(
+            path: &Path,
+            relationship: Option<RelationshipId>,
+            completed: bool,
+        ) -> Result<(State, ShareId, PeerConfig)> {
+            let root = path.join("root");
+            std::fs::create_dir_all(&root)?;
+            let mut state = test_state_with_peer_id(&path.join("state"), "local")?;
+            let share = state.init_share(&root)?;
+            let mut peer = test_connector("remote");
+            peer.relationship = relationship;
+            if !completed {
+                peer.peer_id = None;
+            }
+            state.set_peer(&share, &peer)?;
+            Ok((state, share, peer))
+        }
+
+        let temp = tempdir()?;
+        let (legacy_state, legacy_share, legacy_peer) =
+            connector_state(&temp.path().join("legacy"), None, true)?;
+        let derived = legacy_relationship_id(&legacy_share)?;
+        let binding = connector_sync_binding(&legacy_state, &legacy_share, &legacy_peer)?;
+        assert_eq!(binding.remote_peer, PeerId("remote".into()));
+        assert_eq!(binding.relationship, derived);
+        assert!(
+            validate_sync_binding(
+                &legacy_state,
+                &legacy_share,
+                &PeerId("wrong".into()),
+                &derived,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_sync_binding(
+                &legacy_state,
+                &legacy_share,
+                &PeerId("remote".into()),
+                &RelationshipId::parse("legacy-arbitrary".into())?,
+            )
+            .is_err()
+        );
+
+        let explicit = RelationshipId::generate();
+        let (explicit_state, explicit_share, explicit_peer) =
+            connector_state(&temp.path().join("explicit"), Some(explicit.clone()), true)?;
+        assert_eq!(
+            connector_sync_binding(&explicit_state, &explicit_share, &explicit_peer)?.relationship,
+            explicit
+        );
+        assert!(
+            validate_sync_binding(
+                &explicit_state,
+                &explicit_share,
+                &PeerId("remote".into()),
+                &legacy_relationship_id(&explicit_share)?,
+            )
+            .is_err()
+        );
+
+        let (prepared_state, prepared_share, prepared_peer) = connector_state(
+            &temp.path().join("prepared"),
+            Some(RelationshipId::generate()),
+            false,
+        )?;
+        assert!(connector_sync_binding(&prepared_state, &prepared_share, &prepared_peer).is_err());
+
+        let (reserved_state, reserved_share, reserved_peer) = connector_state(
+            &temp.path().join("reserved"),
+            Some(RelationshipId::parse("legacy-hostile-state".into())?),
+            true,
+        )?;
+        assert!(connector_sync_binding(&reserved_state, &reserved_share, &reserved_peer).is_err());
+
+        let unpaired_root = temp.path().join("unpaired-root");
+        std::fs::create_dir(&unpaired_root)?;
+        let unpaired = State::open(temp.path().join("unpaired-state"))?;
+        let unpaired_share = unpaired.init_share(&unpaired_root)?;
+        assert!(
+            validate_sync_binding(
+                &unpaired,
+                &unpaired_share,
+                &PeerId("remote".into()),
+                &legacy_relationship_id(&unpaired_share)?,
+            )
+            .is_err()
+        );
+
+        let responder_root = temp.path().join("responder-root");
+        let responder_state_path = temp.path().join("responder-state");
+        std::fs::create_dir(&responder_root)?;
+        let mut responder = test_state_with_peer_id(&responder_state_path, "responder")?;
+        let responder_share = responder.init_share(&responder_root)?;
+        let registered = RelationshipId::generate();
+        responder.register_relationship(
+            &responder_share,
+            &responder_root,
+            &PeerId("connector".into()),
+            &registered,
+        )?;
+        assert_eq!(
+            validate_sync_binding(
+                &responder,
+                &responder_share,
+                &PeerId("connector".into()),
+                &registered,
+            )?
+            .relationship,
+            registered
+        );
+        assert!(
+            validate_sync_binding(
+                &responder,
+                &responder_share,
+                &PeerId("connector".into()),
+                &legacy_relationship_id(&responder_share)?,
+            )
+            .is_err()
+        );
+        drop(responder);
+        let database = rusqlite::Connection::open(responder_state_path.join("state.sqlite3"))?;
+        database.execute(
+            "UPDATE shares SET bound_relationship='legacy-hostile-state' WHERE share_id=?1",
+            [&responder_share.0],
+        )?;
+        drop(database);
+        let responder = State::open(&responder_state_path)?;
+        assert!(
+            validate_sync_binding(
+                &responder,
+                &responder_share,
+                &PeerId("connector".into()),
+                &RelationshipId::parse("legacy-hostile-state".into())?,
+            )
+            .is_err()
+        );
+        drop(responder);
+        let database = rusqlite::Connection::open(responder_state_path.join("state.sqlite3"))?;
+        database.execute(
+            "UPDATE shares SET bound_relationship=NULL WHERE share_id=?1",
+            [&responder_share.0],
+        )?;
+        drop(database);
+        let mut responder = State::open(&responder_state_path)?;
+        let responder_legacy = legacy_relationship_id(&responder_share)?;
+        assert!(
+            validate_sync_binding(
+                &responder,
+                &responder_share,
+                &PeerId("connector".into()),
+                &RelationshipId::parse("legacy-arbitrary".into())?,
+            )
+            .is_err()
+        );
+        let binding = validate_sync_binding(
+            &responder,
+            &responder_share,
+            &PeerId("connector".into()),
+            &responder_legacy,
+        )?;
+        assert_eq!(binding.remote_peer, PeerId("connector".into()));
+        assert_eq!(binding.relationship, responder_legacy);
+
+        let original_root = temp.path().join("responder-root-original");
+        std::fs::rename(&responder_root, &original_root)?;
+        std::fs::create_dir(&responder_root)?;
+        assert!(
+            validate_sync_binding(
+                &responder,
+                &responder_share,
+                &PeerId("connector".into()),
+                &responder_legacy,
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(&responder_root)?;
+        std::fs::rename(&original_root, &responder_root)?;
+
+        assert!(matches!(
+            responder.prepare_incoming_removal(
+                &responder_share,
+                &PeerId("connector".into()),
+                &responder_legacy,
+            )?,
+            flocal::state::IncomingRemoval::Prepared(_)
+        ));
+        assert!(
+            validate_sync_binding(
+                &responder,
+                &responder_share,
+                &PeerId("connector".into()),
+                &responder_legacy,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[derive(Default)]
@@ -9159,7 +9407,6 @@ mod tests {
                 serve_v2_round(
                     &mut remote_state,
                     &remote_share,
-                    &connector_peer,
                     &binding,
                     &remote_cap,
                     1,
@@ -9415,7 +9662,6 @@ mod tests {
             serve_v2_round(
                 &mut remote_state,
                 &remote_share,
-                &connector_peer,
                 &binding,
                 &remote_cap,
                 1,

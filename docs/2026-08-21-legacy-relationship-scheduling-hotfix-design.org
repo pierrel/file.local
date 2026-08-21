@@ -1,0 +1,225 @@
+#+title: Legacy relationship scheduling hotfix design
+#+date: 2026-08-21
+
+* 1. Outcome and failing scenario
+
+An existing relationship created before durable relationship IDs must continue
+to synchronize after both installations upgrade.  Its durable shape is valid:
+the connector has a completed =peer_id= and =relationship=None=, while the
+responder has the matching =bound_peer= and =bound_relationship=NULL=.  The user
+must not remove, pair again, or edit SQLite state.
+
+The regression introduced with multi-share scheduling rejects that connector in
+=connector_sync_binding= before SSH starts with =connector relationship
+registration is incomplete=.  The bug-first Docker scenario will reproduce the
+user flow exactly:
+
+1. Create a daemon-managed relationship through the public CLI and complete its
+   initial synchronization.
+2. Stop its managed watch, then use an E2E-only command on each endpoint to turn
+   the relationship into the exact legacy durable representation.  The hook
+   clears only the relationship-ID field; it retains peer IDs, roots, share ID,
+   records, initial-complete state, and connector configuration.
+3. Start =flocal watch PATH= in the foreground.
+4. Require =Peer connected= or surface the exact registration diagnostic, edit
+   one file on each endpoint, require both edits to arrive, compare the trees,
+   and stop the watcher normally.
+5. Make another connector edit, run foreground =flocal sync PATH --yes=, and
+   require convergence through a fresh one-shot SSH session.
+6. Start the managed sync again, take the responder offline, restart the
+   connector daemon, and edit while disconnected.  Bring the responder back
+   only after watch output reports =synchronization failed; retrying in
+   background=, then require unattended convergence.  This proves the worker
+   actually attempted and retried under the derived identity, through the reported
+   foreground command, one-shot sync, and retrying managed lifecycle rather
+   than only a clean daemon restart.
+
+Land the final desired scenario in =tests/e2e/scenarios/relationships.rs= inside
+=e2e::known_failure_matching=, which accepts only the exact =connector
+relationship registration is incomplete= diagnostic and re-raises unrelated
+scenario failures.  Current main fails at step 3.  The hotfix removes only the
+wrapper.  Add the narrow fixture vocabulary in
+=tests/e2e/harness/peer.rs= and keep the state mutation behind the existing
+=e2e-test-hooks= Cargo feature.  The hidden
+=flocal protocol e2e-make-relationship-legacy PATH= command and its state helper
+must not exist in a production build.
+
+* 2. Observable user experience
+
+After upgrading both endpoints, =flocal watch PATH=, foreground =flocal sync
+PATH --yes=, and a daemon-managed watch use a legacy relationship normally.
+Scheduling waits, connection messages, file-action reports, retry behavior, and
+status remain the same as for a relationship with a stored relationship ID.
+There is no migration notice and no durable state rewrite.
+
+A wrong peer, changed root, pending removal, incomplete connector peer ID, or a
+present but mismatched relationship ID remains an error.  The hotfix recognizes
+only the already-supported null-incarnation shape.  README.org already promises
+that existing legacy relationships continue to synchronize, so its user-facing
+contract does not change.
+
+* 3. Scheduling identity for a legacy relationship
+
+Add one pure helper near the synchronization binding code that hashes a fixed
+=file.local legacy relationship v1= domain plus the share ID with BLAKE3 and
+renders the result as a safe, bounded ASCII ID with a reserved =legacy-= prefix.
+Enforce that reservation at the untrusted relationship-registration validator,
+not only in the generator: a new explicit relationship ID beginning with
+=legacy-= is invalid.  Also reject a stored =Some= ID in that reserved namespace
+when resolving a sync binding.  Honest explicit IDs have always been generated
+with =relationship-=, so this closes scheduler confusion from hostile old state
+without rejecting any generated relationship.  Pin the prefix rule and one
+fixed derivation input/output vector in tests.  A share ID is already unique
+inside an installation and both legacy endpoints already store the same one.
+The scheduler is installation-local, while binding validation separately
+requires the exact stored peer, so adding and sorting both peer IDs would
+introduce framing machinery without creating another real separation boundary.
+
+This value is a scheduling and wire identity, not a new durable relationship
+incarnation.  Do not write it to =peer_json= or =bound_relationship=.  The null
+fields must remain distinguishable so relationship removal keeps its existing
+legacy rules and a retry cannot leave a half-migrated pair.
+
+* 4. Binding interface and protocol flow
+
+Make =ValidatedSyncBinding= the only source of the concrete remote peer and
+relationship ID used by a synchronization session.  It carries
+={ remote_peer, relationship, order }= as one validated identity bundle, so a
+caller cannot combine proof for one relationship with a raw peer from another
+configuration or frame.
+
+1. =connector_sync_binding= first requires the existing completed remote peer
+   ID.  If the connector stores a relationship ID, it uses that ID.  If the
+   relationship field is null, it derives the legacy ID from the share.
+2. =validate_sync_binding= keeps the existing removal and root checks.  A
+   connector or responder with =Some(stored)= accepts only =stored=.  A
+   connector or responder with =None= accepts only the exact derived legacy ID
+   and only when its stored peer is the claimed remote peer.  An unpaired share
+   never matches.
+3. One-shot sync and persistent watch take the peer and ID from
+   =ValidatedSyncBinding=.  Reservation, initial frame construction, peer
+   acceptance, and final revalidation consume that bundle rather than mixing
+   it with raw =PeerConfig= or inbound values.  Remove every direct
+   =peer.relationship.context("connector relationship registration is
+   incomplete")= read in these paths, including initial =Sync= and =WatchOpen=
+   frames and managed-watch setup.  This prevents a partial repair in which
+   validation succeeds but frame construction still rejects the same share.
+4. The responder receives the concrete legacy ID in the existing relationship
+   field and validates it through the same function before queueing or touching
+   files.  The validated responder bundle likewise supplies both peer and
+   relationship downstream.
+
+Keep one-shot protocol version 5, persistent-watch version 6, and their frame
+schemas unchanged.  They already carry a required =RelationshipId= and already
+require both installations to have the scheduling implementation.  A protocol
+version bump or optional wire field would add compatibility branches without
+improving rolling upgrades, because pre-scheduling binaries do not implement
+these protocol versions.
+
+Likely production files are =src/main.rs= for binding resolution and call-site
+cleanup and, only if needed for locality, =src/sync.rs= for the pure derivation
+helper.  No schema or migration change belongs in =src/state.rs= beyond the
+feature-gated E2E fixture helper.
+
+* 5. Crash, retry, and concurrency boundaries
+
+The derived ID is deterministic and has no write step.  A crash before SSH,
+during reservation, or during apply cannot leave a migration half committed.
+Restart and reconnect derive the same ID, so durable queue rows, relationship
+yields, paired reservation cleanup, and install recovery retain one stable
+namespace.
+
+Existing ownership remains unchanged: the share-session lock excludes a second
+watch for the same share, and the installation scheduler serializes mutations.
+Derivation happens before reservation and takes no lock.  A relationship
+removal marker still rejects synchronization before any reservation; the
+hotfix does not convert or clear that marker.  Retryable transport failures and
+watch backoff retain their current classification.
+
+* 6. Security and resource boundaries
+
+The derived ID grants no authority.  Acceptance still requires all of the
+following local facts: the exact share exists, its stored peer matches the
+claimed peer, both durable relationship-ID fields for that endpoint are null,
+removal is not pending, and the root identity is unchanged.  A remote cannot
+select another relationship namespace by sending an arbitrary =legacy-= value.
+
+Use the already bounded, canonical share identifier.  Never include hostnames,
+executable paths, root paths, file content, or secrets.  The output
+must pass =RelationshipId::validate= and stay within its 128-byte limit.  The
+helper performs fixed work over already-bounded metadata and creates no files,
+queue rows, or database writes.  Reserve =legacy-= at relationship-registration
+wire validation, and refuse a reserved-prefix =Some(relationship)= during sync
+binding validation.  Thus only a null durable incarnation can inhabit the
+derived scheduler namespace; a remote cannot manufacture an explicit collision
+through either a new registration or previously hostile stored state.  Valid
+explicit registered IDs always win, so a peer cannot downgrade a
+=Some(relationship)= binding by presenting the corresponding legacy derivation.
+
+The E2E mutation command is compiled only into the Docker image's
+=e2e-test-hooks= build.  It accepts a share selected by the normal local PATH
+lookup, changes only a connector =Some= relationship to =None= or a responder
+=Some= bound relationship to =NULL=, and rejects unpaired or already-legacy
+state.  It runs as the unprivileged container user and never accepts SQL or a
+raw relationship value.
+
+* 7. Linux and macOS fit
+
+The production change uses only existing Rust, SQLite state reads, peer/share
+identifiers, and BLAKE3.  It does not depend on filesystem event APIs, path-byte
+encoding, service managers, shell behavior, or platform locks.  The same
+derived bytes therefore drive foreground watch, the Linux systemd user daemon,
+and the macOS LaunchAgent.  Docker supplies the bug-first process and network
+coverage; unit tests pin the platform-independent derivation and binding
+matrix.
+
+* 8. Acceptance and regression tests
+
+1. Add the strict, exact-diagnostic known-failure Docker scenario from section
+   1.  After the fix, promote it and prove foreground watch opens a real SSH
+   session, converges edits in both directions, a subsequent one-shot sync
+   converges a fresh edit, then managed sync retries across a daemon restart
+   while the responder is offline, emits its bounded retry diagnostic, and
+   converges unattended when it returns.
+2. Add unit tests showing the legacy derivation matches a fixed vector, changes
+   when the share changes, has the reserved prefix, and passes =RelationshipId=
+   validation.  Add an adversarial wire-validation test proving an explicit
+   registration using =legacy-= is rejected while sync/watch frames can still
+   carry a derived ID.
+3. Exercise the binding matrix for both endpoint roles: matching explicit ID,
+   matching derived legacy ID, wrong peer, arbitrary legacy ID, explicit-ID
+   downgrade attempt, prepared registration (=peer_id=None= with
+   =relationship=Some=), reserved-prefix explicit old state, unpaired share,
+   pending removal, and replaced root.
+4. Exercise both frame construction paths so legacy one-shot =Sync= and
+   persistent =WatchOpen= use the resolved binding rather than reading the
+   optional stored field again.  Keep existing registered-relationship
+   protocol tests unchanged and passing.
+5. Verify the successful E2E session leaves connector =relationship= and
+   responder =bound_relationship= null; derivation must not migrate state.
+6. Run =make check= and =make e2e=.  Review every comment and design statement
+   that currently equates a null relationship with incomplete registration;
+   retain that error only for a missing connector peer ID or a genuinely
+   prepared new registration.
+
+* 9. Rejected alternatives and scope
+
+- Re-pairing or manual SQLite repair violates the compatibility promise and
+  risks carrying or losing the wrong relationship history.
+- Independently generating and persisting an ID on each endpoint cannot make
+  the values agree without a migration protocol and introduces partial-commit
+  recovery.
+- Teaching the scheduler to accept =Option<RelationshipId>= spreads a second
+  identity model through queue keys, dedupe, yields, and protocol frames.
+- Making the wire relationship optional weakens validation and requires a
+  needless protocol version and downgrade path.
+- Adding peer IDs to the derivation duplicates binding validation and requires
+  canonical multi-field framing without separating anything inside one local
+  scheduler.
+
+This hotfix does not redesign pairing or removal, migrate legacy rows, change
+queue fairness, alter SSH authentication, modify file reconciliation, or fix
+unrelated watch failures.  Its production behavior changes are to admit an
+exact, previously supported legacy binding into the existing scheduling and
+synchronization flow under a deterministic concrete identity and reserve that
+derived namespace against explicit registration or corrupt stored incarnations.

@@ -510,6 +510,10 @@ impl Connector {
         )
     }
 
+    pub fn wait_for_managed_watch_error(&self, needle: &str) -> Result<()> {
+        self.wait_for_text("/home/peer/.flocal-daemon.log", needle)
+    }
+
     pub fn raise_recovery_budget(&self, size: &str) -> Result<()> {
         self.flocal_ok(&["conflicts", "budget", SHARE, size])?;
         Ok(())
@@ -591,7 +595,8 @@ impl Connector {
     /// is in the captured flocal log).
     pub fn watch_start(&self) -> Result<Watch<'_>> {
         let start = format!(
-            ": >{WATCH_LOG} && echo \"$$\" >{WATCH_PIDFILE} && exec flocal watch {SHARE} >{WATCH_LOG}"
+            ": >{WATCH_LOG} && : >/home/peer/.flocal-stderr.log && \
+             echo \"$$\" >{WATCH_PIDFILE} && exec flocal watch {SHARE} >{WATCH_LOG}"
         );
         let max_bytes = self
             .watch_max_session_bytes
@@ -808,6 +813,27 @@ impl Watch<'_> {
         self.peer.wait_for_text(WATCH_LOG, needle)
     }
 
+    pub fn wait_for_log_or_error(&self, success: &str, failure: &str) -> Result<()> {
+        self.peer.poll_until(
+            &format!("watch output did not contain {success:?} or {failure:?}"),
+            DEADLINE,
+            |peer| {
+                let stdout = peer.exec_raw(&["cat", "--", WATCH_LOG])?;
+                let stderr = peer.exec_raw(&["cat", "--", "/home/peer/.flocal-stderr.log"])?;
+                if !stdout.status.success() || !stderr.status.success() {
+                    return Ok(None);
+                }
+                let errors = String::from_utf8_lossy(&stderr.stdout);
+                if errors.contains(failure) {
+                    bail!("watch reported {failure:?}: {errors}");
+                }
+                Ok(String::from_utf8_lossy(&stdout.stdout)
+                    .contains(success)
+                    .then_some(()))
+            },
+        )
+    }
+
     pub fn wait_for_log_within(&self, needle: &str, deadline: Duration) -> Result<()> {
         self.peer.wait_for_text_within(WATCH_LOG, needle, deadline)
     }
@@ -867,6 +893,16 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn make_relationship_legacy(&self) -> Result<()> {
+        self.flocal_ok(&["protocol", "e2e-make-relationship-legacy", SHARE])?;
+        Ok(())
+    }
+
+    pub fn assert_relationship_legacy(&self) -> Result<()> {
+        self.flocal_ok(&["protocol", "e2e-assert-relationship-legacy", SHARE])?;
+        Ok(())
+    }
+
     pub fn init_second_share(&self) -> Result<()> {
         self.exec_ok(&["mkdir", "-p", "--", SECOND_SHARE])?;
         self.flocal_ok(&["init", SECOND_SHARE]).map(|_| ())

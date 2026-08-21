@@ -4377,6 +4377,55 @@ impl State {
         Ok(())
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    pub fn e2e_make_relationship_legacy(&mut self, id: &ShareId) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        let (binding, marker) = binding_and_marker(&transaction, id)?.context("share not found")?;
+        if marker.is_some() {
+            bail!("relationship removal is pending");
+        }
+        match binding {
+            EndpointBinding::Connector(mut peer)
+                if peer.peer_id.is_some() && peer.relationship.is_some() =>
+            {
+                peer.relationship = None;
+                let changed = transaction.execute(
+                    "UPDATE shares SET peer_json=?2 WHERE share_id=?1",
+                    params![id.0, serde_json::to_string(&peer)?],
+                )?;
+                anyhow::ensure!(changed == 1, "share disappeared while making it legacy");
+            }
+            EndpointBinding::Responder {
+                relationship: Some(_),
+                ..
+            } => {
+                let changed = transaction.execute(
+                    "UPDATE shares SET bound_relationship=NULL WHERE share_id=?1",
+                    [&id.0],
+                )?;
+                anyhow::ensure!(changed == 1, "share disappeared while making it legacy");
+            }
+            _ => bail!("relationship is not a completed current relationship"),
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    pub fn e2e_assert_relationship_legacy(&self, id: &ShareId) -> Result<()> {
+        match self.endpoint_binding(id)? {
+            EndpointBinding::Connector(PeerConfig {
+                peer_id: Some(_),
+                relationship: None,
+                ..
+            })
+            | EndpointBinding::Responder {
+                relationship: None, ..
+            } => Ok(()),
+            _ => bail!("relationship is not a completed legacy relationship"),
+        }
+    }
+
     pub fn bound_peer(&self, id: &ShareId) -> Result<Option<PeerId>> {
         match binding_and_marker(&self.conn, id)? {
             Some((EndpointBinding::Responder { peer, .. }, _)) => Ok(Some(peer)),
@@ -7401,6 +7450,59 @@ mod tests {
         assert_eq!(
             state.prepare_incoming_removal(&share, &connector, &relationship)?,
             IncomingRemoval::Absent
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn e2e_legacy_fixture_changes_only_completed_relationship_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+
+        let connector_root = temp.path().join("connector-root");
+        std::fs::create_dir(&connector_root)?;
+        let connector_share = state.init_share(&connector_root)?;
+        state.set_peer(
+            &connector_share,
+            &completed_connector("responder", "relationship-connector"),
+        )?;
+        assert!(
+            state
+                .e2e_assert_relationship_legacy(&connector_share)
+                .is_err()
+        );
+        state.e2e_make_relationship_legacy(&connector_share)?;
+        state.e2e_assert_relationship_legacy(&connector_share)?;
+        assert_eq!(state.peer(&connector_share)?.unwrap().relationship, None);
+        assert!(
+            state
+                .e2e_make_relationship_legacy(&connector_share)
+                .is_err()
+        );
+
+        let responder_root = temp.path().join("responder-root");
+        std::fs::create_dir(&responder_root)?;
+        let responder_share = ShareId::generate();
+        state.register_relationship(
+            &responder_share,
+            &responder_root,
+            &PeerId("connector".into()),
+            &relationship("relationship-responder"),
+        )?;
+        state.e2e_make_relationship_legacy(&responder_share)?;
+        state.e2e_assert_relationship_legacy(&responder_share)?;
+        assert!(matches!(
+            state.endpoint_binding(&responder_share)?,
+            EndpointBinding::Responder {
+                relationship: None,
+                ..
+            }
+        ));
+        assert!(
+            state
+                .e2e_make_relationship_legacy(&ShareId("share-missing".into()))
+                .is_err()
         );
         Ok(())
     }

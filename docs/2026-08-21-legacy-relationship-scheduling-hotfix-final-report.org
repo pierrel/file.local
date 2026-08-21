@@ -1,0 +1,406 @@
+#+title: Legacy relationship scheduling hotfix final report
+#+date: 2026-08-21
+
+* 1. Result
+
+An existing relationship created before durable relationship IDs can now use
+=flocal watch PATH=, =flocal sync PATH --yes=, and daemon-managed sync after an
+upgrade.  The user does not need to remove the relationship, pair again, or
+edit either SQLite database.
+
+The fix keeps the old durable representation intact.  The connector still has
+a completed peer ID with no relationship ID, and the responder still has a
+bound peer with a null relationship ID.  At sync time, both installations
+derive the same internal scheduling identity from their already-shared share ID.
+That identity is used on the wire and in the scheduler, but it is never installed
+as the relationship's durable incarnation.  Existing scheduler queue or yield
+rows may persist the same derived value while coordinating and recovering work;
+the relationship binding fields themselves remain null.
+
+This is a compatibility repair, not a migration.  There is no schema change,
+no protocol-version change, and no new setup step.
+
+* 2. The reproduced failure
+
+The multi-share scheduler made a concrete relationship ID mandatory.  New
+relationships already had one.  Older relationships intentionally did not.
+The connector path treated that valid old null field as an incomplete modern
+registration and stopped before synchronization:
+
+#+begin_example
+synchronization failed; retrying in background:
+connector relationship registration is incomplete
+#+end_example
+
+The bug-first Docker scenario first paired two installations normally, stopped
+the managed watch, and changed only the two relationship-ID fields to their
+exact old representation.  With the production code still unfixed, the
+scenario failed for that exact diagnostic.  It did not accept an unrelated
+Docker, SSH, timeout, or assertion failure.
+
+After the fix, the same scenario became a normal passing E2E test.  It now
+proves all of these behaviors in one retained relationship:
+
+1. Foreground =flocal watch= connects.
+2. Files travel in both directions.
+3. A fresh one-shot =flocal sync --yes= succeeds.
+4. Managed sync restarts while the responder is offline.
+5. The daemon really attempts and reports a retry.
+6. Synchronization resumes without another command when the responder returns.
+7. Both durable relationship-ID fields are still null afterward.
+
+* 3. Final design
+
+** Durable identity and session identity are different concerns
+
+A current relationship has a random durable incarnation such as
+=relationship-...=.  That value distinguishes a removed relationship from a
+new relationship created later for the same directories.
+
+An old relationship has no such incarnation.  Inventing and persisting one on
+each endpoint independently would not work because the values would differ.
+Coordinating a durable migration would introduce a two-endpoint commit problem:
+a crash could leave one endpoint migrated and the other endpoint unchanged.
+
+The hotfix therefore derives a scheduling and wire identity rather than a new
+durable relationship incarnation.  Its input is the share ID that both
+endpoints already store.  The derivation has a versioned domain and a fixed
+test vector:
+
+#+begin_src rust
+fn legacy_relationship_id(share: &ShareId) -> Result<RelationshipId> {
+    const DOMAIN: &[u8] = b"file.local legacy relationship v1";
+    let mut hash = blake3::Hasher::new();
+    hash.update(DOMAIN);
+    hash.update(share.0.as_bytes());
+    RelationshipId::parse(format!(
+        "{}{}",
+        sync::LEGACY_RELATIONSHIP_PREFIX,
+        hash.finalize().to_hex()
+    ))
+}
+#+end_src
+
+For =share-fixed-vector= the result is pinned as:
+
+#+begin_example
+legacy-77f944f03349560bdb455f84f8416400735f0c06b2b7af8e2682f1fc870066a6
+#+end_example
+
+BLAKE3 gives a bounded, filesystem-independent ASCII value.  The versioned
+domain prevents this use from being confused with another future hash use.
+Because there is only one variable input after the fixed domain, no compound
+field framing or peer-ID sorting is needed.
+
+** One validated bundle carries the whole session identity
+
+The scheduler must never combine a relationship proven for one peer with a raw
+peer value from another call site.  The validated result therefore carries the
+peer, relationship, and ordering decision together:
+
+#+begin_src rust
+struct ValidatedSyncBinding {
+    remote_peer: PeerId,
+    relationship: RelationshipId,
+    order: std::cmp::Ordering,
+}
+#+end_src
+
+=validate_sync_binding= is the single authority.  It checks pending removal,
+the exact stored peer, explicit or derived relationship identity, the root's
+persisted filesystem identity, and the deterministic peer ordering:
+
+#+begin_src rust
+let matches = match &managed.binding {
+    EndpointBinding::Connector(peer)
+        if peer.peer_id.as_ref() == Some(remote_peer) =>
+    {
+        match &peer.relationship {
+            Some(stored) => explicit_sync_relationship(stored)? == relationship,
+            None => legacy_relationship_id(share)? == *relationship,
+        }
+    }
+    EndpointBinding::Responder {
+        peer,
+        relationship: bound_relationship,
+    } if peer == remote_peer => match bound_relationship {
+        Some(stored) => explicit_sync_relationship(stored)? == relationship,
+        None => legacy_relationship_id(share)? == *relationship,
+    },
+    EndpointBinding::Connector(_)
+    | EndpointBinding::Responder { .. }
+    | EndpointBinding::Unpaired => false,
+};
+#+end_src
+
+The one-shot =Sync= frame, persistent =WatchOpen= frame, peer-acceptance check,
+reservation flow, and final pre-apply revalidation all consume this bundle.
+The previous direct reads of =peer.relationship= in the frame constructors are
+gone.  This matters because fixing validation alone would still have left
+foreground watch and one-shot sync failing when they built their first frame.
+
+** The derived namespace is reserved, not merely conventional
+
+The first threat-model review found a real collision risk.  Generated explicit
+IDs begin with =relationship-=, but the wire parser historically accepted any
+safe ASCII ID.  A hostile authenticated registration could therefore submit a
+=legacy-= value chosen to collide with another share's derived scheduler
+identity.
+
+The final implementation closes both entrances:
+
+#+begin_src rust
+validate_relationship_wire_id("relationship", &relationship.0)?;
+if relationship.0.starts_with(LEGACY_RELATIONSHIP_PREFIX) {
+    bail!("relationship ID uses the reserved legacy namespace");
+}
+#+end_src
+
+New explicit registration rejects the reserved prefix.  Sync binding also
+rejects an old or corrupt stored =Some(legacy-...)= incarnation.  A derived ID
+is accepted only for the exact null legacy shape and only after the local share,
+peer, removal, and root checks pass.  Normal sync and watch frames may still
+carry the derived value because that is their intended concrete session ID.
+
+** The legacy fields remain null
+
+There is deliberately no production write that installs the derived value in
+=peer_json.relationship= or =bound_relationship=.  Existing scheduling paths
+can persist it in queue and relationship-yield bookkeeping, just as they do for
+an explicit ID.  Every retry and restart recomputes the same value, so those
+durable scheduler rows remain in one stable namespace.  A crash cannot leave a
+half-written relationship migration because there is no migration transaction
+to interrupt.
+
+This also preserves relationship-removal semantics.  Null still means the old
+relationship form.  A derived scheduler value does not masquerade as a durable
+relationship incarnation.
+
+** Linux and macOS use the same production path
+
+Derivation and binding validation use existing portable Rust, BLAKE3, typed
+identifiers, and SQLite state reads.  The change adds no filesystem-event API,
+service-manager API, path encoding, platform lock, or shell dependency.  The
+same code therefore supplies the identity for foreground sync and watch, Linux
+systemd-managed workers, and macOS LaunchAgent-managed workers.
+
+The Docker E2E suite directly exercised Linux processes, SSH, networking, and
+daemon lifecycle.  There was no macOS E2E run for this report.  The macOS claim
+comes from both platforms sharing the changed production path, not from
+pretending Docker covers LaunchAgent behavior.
+
+* 4. Code changes by component
+
+** =src/main.rs=
+
+- Adds deterministic legacy relationship derivation.
+- Expands =ValidatedSyncBinding= to include the remote peer.
+- Admits only the exact derived identity for null connector and responder
+  bindings.
+- Rejects a reserved-prefix stored explicit incarnation.
+- Uses the validated bundle for one-shot frames, persistent frames,
+  reservations, peer checks, responder rounds, and final revalidation.
+- Adds focused connector and responder matrix tests, including prepared
+  registration, arbitrary legacy-prefixed IDs, explicit downgrade attempts,
+  hostile reserved state, replaced roots, and pending removal.
+- Adds feature-only hidden protocol commands used to construct and verify the
+  real legacy E2E fixture.
+
+** =src/sync.rs=
+
+- Defines the shared =LEGACY_RELATIONSHIP_PREFIX=.
+- Reserves that namespace in explicit relationship-registration validation.
+- Tests that registration rejects it while one-shot and watch frames still
+  deserialize it.
+
+** =src/state.rs=
+
+- Adds feature-only fixture operations that transactionally clear only the
+  connector or responder relationship-ID field.
+- Rejects unpaired, already-legacy, incomplete, or removal-pending fixture
+  states.
+- Adds direct connector and responder fixture tests.  These APIs do not exist
+  in a normal production build.
+
+** E2E harness and scenario
+
+The harness now has narrow operations for making and asserting the old durable
+shape.  Foreground watch startup scopes its stdout and stderr logs so the test
+can distinguish =Peer connected= from the exact regression diagnostic without
+accepting stale output.  Managed retry evidence comes from the daemon-lifetime
+log, which is truncated on daemon restart.
+
+The final scenario uses public setup, sync, watch, daemon, network, and file
+operations.  Only the surgical conversion to old durable state uses a hidden
+feature-gated command.
+
+* 5. Rust-specific details
+
+** Newtypes keep identifiers distinct
+
+=ShareId=, =PeerId=, and =RelationshipId= are separate Rust types even though
+each contains a =String=.  The compiler therefore prevents accidentally
+passing a share ID where a peer or relationship ID is required.  The derived
+text is passed through =RelationshipId::parse= so it still obeys the existing
+length and safe-ASCII contract.
+
+** Pattern matching expresses durable states exhaustively
+
+The =match= on =EndpointBinding= separates connector, responder, and unpaired
+roles.  Match guards first require the stored peer to equal the claimed remote
+peer.  Nested matches then distinguish =Some(stored)= from =None=.  This is
+important because =None= has two meanings in nearby workflows: it is valid for
+a completed old relationship, but a connector with no completed peer ID is
+still an incomplete prepared registration.  =completed_peer_id()?= keeps those
+states distinct before derivation.
+
+** =Result= and the =?= operator preserve error context
+
+Functions return =anyhow::Result=.  The =?= operator stops the current path on
+an invalid ID, database error, replaced root, or peer mismatch.  =context(...)=
+adds operator-facing meaning where an =Option= must exist, while =bail!(...)=
+immediately returns =Err(...)= containing an =anyhow::Error= without a separate
+exception mechanism.
+
+** Borrowing limits identity drift
+
+Reservation and validation functions take =&ValidatedSyncBinding=.  They read
+one already-validated identity bundle instead of cloning independent peer and
+relationship arguments through the call graph.  The bundle itself has no
+public visibility and no unused =Clone= capability.
+
+** Feature gates remove fixture code from production
+
+The fixture commands and state methods use:
+
+#+begin_src rust
+#[cfg(feature = "e2e-test-hooks")]
+#+end_src
+
+Rust removes those items at compile time when the feature is absent.  This is
+stronger than hiding a runtime flag: a normal binary has no matching command or
+fixture method to invoke.
+
+** RAII and transactions contain failure paths
+
+The E2E fixture opens a SQLite transaction, changes one row, checks that exactly
+one row changed, and commits.  If any =?= or =bail!= path returns before commit,
+Rust drops the transaction and SQLite rolls it back.  Existing lock and permit
+guards use the same resource-acquisition-is-initialization pattern, so early
+returns release their resources.
+
+* 6. What was hard
+
+** Preserving the meaning of null
+
+The tempting fix was to generate and store a relationship ID.  That would have
+changed removal semantics and introduced a distributed migration.  The harder
+but smaller conceptual move was to keep durable identity unchanged and supply
+only the concrete identity the newer scheduler requires.
+
+** Proving every protocol path used the resolved value
+
+There were several places where the optional stored field escaped directly:
+one-shot frame construction, persistent frame construction, reservations, peer
+checks, and final validation.  A partial repair could pass unit validation and
+still fail the user's exact =flocal watch= command.  Bundling the validated
+identity made those mixed call sites visible and removable.
+
+** Closing the hostile namespace collision
+
+The =legacy-= prefix initially looked disjoint because honest IDs are generated
+with =relationship-=.  The adversarial review correctly followed the untrusted
+wire parser instead of the generator and found that an authenticated peer could
+choose arbitrary safe ASCII.  Reserving the prefix at registration and stored
+binding validation made the collision unreachable.
+
+** Making the E2E evidence truthful
+
+The first post-fix E2E run passed watch and one-shot sync but waited for
+=reconnecting= in =sync list=.  Scheduler state can intentionally display
+=queued= over the worker's internal connection state.  The correct public proof
+was the daemon's bounded retry diagnostic.
+
+Review then found two log-oracle issues: foreground errors were on stderr, not
+the stdout watch log, and the shared stderr file could contain stale output.
+The final harness scopes foreground logs at startup and reads the restarted
+daemon's own truncated log for managed retry evidence.
+
+** Meeting changed-line coverage without weakening the fixture boundary
+
+The first coverage run passed the whole-repo threshold but covered only 82.08%
+of changed executable lines.  Most misses were the feature-only fixture paths.
+A direct feature-enabled state test now exercises connector, responder,
+already-legacy, and missing-share behavior.  Final changed-line coverage is
+93.88%.
+
+* 7. Review and verification
+
+The implementation went through three local review rounds with independent
+lenses for correctness, concurrency and liveness, error and edge cases,
+adversarial security, simplicity and duplication, design adherence, interfaces,
+readability and existing patterns, filesystem behavior, and dedicated
+docstring/comment alignment.
+
+Findings fixed:
+
+- One IMPORTANT E2E liveness-oracle finding: stale global stderr could satisfy
+  the managed retry checkpoint.
+- One IMPORTANT design-coverage finding: responder-only adversarial binding
+  states were not all pinned.
+- The changed-line coverage failure at 82.08%.
+- Several real MINOR/NIT findings: foreground stderr was not inspected, one
+  explicit-prefix validation was duplicated, an unused =Clone= capability was
+  present, an unrelated harness refactor remained after promotion, and three
+  comments/design statements had drifted.
+- One threat-model IMPORTANT found during design: explicit wire IDs could enter
+  the derived namespace.  The final design and code reserve that namespace.
+
+No verified finding was declined.  The final review round was clear on every
+lens.
+
+Deterministic verification:
+
+#+begin_example
+make check COVERAGE_BASE=github/main
+  whole-repo line coverage: at least 90% (passed)
+  changed executable lines: 322/343, 93.88%
+  cargo fmt --check: passed
+  cargo clippy --all-targets --all-features -D warnings: passed
+
+make e2e
+  45 passed, 0 failed
+  269.21 seconds
+#+end_example
+
+The new regression scenario also passed alone after each harness correction.
+The complete Docker suite is the disposable deployment target for this change;
+the active user daemon was not replaced from the feature branch.
+
+* 8. Upgrade and testing guidance
+
+Both peers must run the version containing this change because both sides must
+derive and validate the same scheduling identity.  After upgrading both peers,
+restart the old =flocal watch= process or the installed daemon so it runs the
+new binary.  No re-pairing or state repair should be needed.
+
+The most valuable manual checks are:
+
+1. Start =flocal watch PATH= on the previously failing relationship and require
+   =Peer connected=.
+2. Edit a file on each endpoint and confirm both changes cross.
+3. Stop watch, run =flocal sync PATH --yes=, and confirm a new edit crosses.
+4. Start managed sync, make one peer unreachable, edit locally, then restore the
+   peer and confirm unattended catch-up.
+5. Confirm the old =connector relationship registration is incomplete= retry
+   loop does not return.
+
+* 9. Deliberate limits
+
+This change does not alter the normal generated-ID pairing workflow,
+relationship removal, queue fairness, SSH authentication, reconciliation, or
+file merge behavior.  Explicit registration now rejects the reserved
+=legacy-= namespace.  The change does not make an old relationship into a new
+durable incarnation.  It only gives the existing valid old relationship a
+deterministic concrete identity while synchronization uses the newer scheduler
+and reserves that identity namespace against explicit or corrupt incarnations.
