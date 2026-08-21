@@ -8,8 +8,8 @@ use crate::harness as e2e;
 #[ignore = "requires docker; run via `make e2e`"]
 fn idle_managed_pair_survives_a_real_candidate_install() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
-    let before_a = a.status()?;
-    let before_b = b.status()?;
+    let before_a = a.predecessor_status()?;
+    let before_b = b.predecessor_status()?;
     a.write("before-upgrade.txt", "created by the base connector")?;
     b.wait_for_file("before-upgrade.txt", "created by the base connector")?;
 
@@ -40,13 +40,13 @@ fn idle_managed_pair_survives_a_real_candidate_install() -> Result<()> {
 #[ignore = "requires docker; run via `make e2e`"]
 fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
-    let before_a = a.status()?;
-    let before_b = b.status()?;
+    let before_a = a.predecessor_status()?;
+    let before_b = b.predecessor_status()?;
     a.arm_apply_stops(1)?;
     b.write("during-upgrade.txt", "interrupted base apply")?;
     let stopped = a.wait_for_stopped_apply_process()?;
     anyhow::ensure!(
-        a.status()?.pending_install,
+        a.predecessor_status()?.pending_install,
         "base daemon stopped before apply without recording install intent"
     );
     a.kill_daemon_on_service_stop()?;
@@ -74,8 +74,8 @@ fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
 #[ignore = "requires docker; run via `make e2e`"]
 fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
-    let before_a = a.status()?;
-    let before_b = b.status()?;
+    let before_a = a.predecessor_status()?;
+    let before_b = b.predecessor_status()?;
     a.sync_stop()?;
     let watch = a.watch_start_with_apply_stop()?;
     b.write(
@@ -84,7 +84,7 @@ fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Resul
     )?;
     watch.wait_stopped()?;
     anyhow::ensure!(
-        a.status()?.pending_install,
+        a.predecessor_status()?.pending_install,
         "old foreground watch stopped before apply without recording install intent"
     );
     watch.kill()?;

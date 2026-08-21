@@ -72,6 +72,14 @@ alpha.
    classifications and returned revisions use the raw hash; this bridge never
    changes a CAS predicate or makes two raw rows equal.
 
+5. Installer preflight must also be able to inventory the deployed alpha's
+   older database. That schema predates =sync_queue=, so
+   =legacy_upgrade_inventory= first checks =sqlite_master= and queries the
+   active queue only when the table exists. It still inventories every share;
+   absence of the later scheduling table means there is no managed active root
+   to report. A focused legacy-schema test opens a database containing only the
+   old =shares= table and requires that inventory to succeed.
+
 * 3. Concurrency, recovery, and security boundary
 
 The raw read and later immediate transaction are deliberately separate. Normal
@@ -98,12 +106,12 @@ read boundary.
 1. Add a focused state test that derives a valid older =records_json= shape by
    removing =managed_generation= from a current durable fixture. It contains a
    real temporary path/token/phase and is inserted as its own raw string. The
-   test first proves candidate deserialize-reserialize is semantically equal
-   but bytewise different. It also inserts the old canonicalized fingerprint
-   and a recovery diagnostic, then requires retry to clear that classification
-   and return the raw fingerprint. It
-   drives both a phase transition and an unowned-token rotation, requiring
-   each to succeed and requiring the new row to contain the intended mutation.
+   test first proves the old row is valid to the candidate but candidate
+   reserialization is bytewise different. It also inserts the old canonicalized
+   fingerprint and a recovery diagnostic, then requires retry to clear that
+   classification and return the raw fingerprint. It drives both a phase transition and an
+   unowned-token rotation, explicitly requiring =Creating= after the first
+   mutation and a changed token plus =Pending= after the second.
 
 2. In the same focused test, simulate a genuine replacement between raw read
    and CAS. The stale transition must retain the exact changed-intent error and
@@ -141,20 +149,22 @@ The generic E2E needs two independently resolved ancestors:
 - =FLOCAL_E2E_UPGRADE_FROM= continues to name the PR base (or main's previous
   push) and catches immediate compatibility regressions.
 - The same =FLOCAL_E2E_UPGRADE_FROM= input names either predecessor. CI runs
-  the generic matrix once with the PR base and once with the deployed-alpha
-  pointer, resolves each with =git rev-parse --verify --end-of-options
-  INPUT^{commit}=, requires each to be an ancestor distinct from =HEAD=, and
-  records canonical full IDs and binary hashes in failures.
+  the complete suite with the PR base and the upgrade module with the
+  deployed-alpha pointer. It resolves each with =git rev-parse --verify
+  --end-of-options INPUT^{commit}=, requires each to be an ancestor distinct
+  from =HEAD=, and records canonical full IDs and binary hashes in failures.
 
 Make the second value durable rather than an operator memory: after each
-successful alpha deployment, create a protected immutable annotated tag
+successful alpha deployment, create a new annotated tag
 =alpha-deployed-YYYYMMDD-<short-sha>= and update the checked-in
 =docs/deployed-alpha.org= pointer with the tag name and its full 40-character
 commit. CI obtains the existing =FLOCAL_E2E_UPGRADE_FROM= value from that
-pointer and verifies the exact =refs/tags/= name, annotated-tag object type,
-its peeled commit, and the recorded full commit. The pointer may advance; its
-referenced tag and commit may never be moved. A missing or non-ancestor
-deployed anchor is a configuration error, not a fallback to the PR base.
+pointer and walks every historical version of the pointer, verifying each
+exact =refs/tags/= name, annotated-tag object type, peeled commit, and recorded
+   full commit. The pointer may advance to a new tag; deleting a previously
+   recorded tag or retargeting it to another commit makes CI fail. A missing or
+   non-ancestor deployed anchor is a configuration error, not a fallback to
+   the PR base.
 
 * 6. Acceptance criteria
 
@@ -167,8 +177,8 @@ deployed anchor is a configuration error, not a fallback to the PR base.
    The real-predecessor foreground E2E completes recovery, connects, converges
    both trees, clears =pending_install= and =unsettled=, and retains the
    existing relationship without manual repair.
-4. The complete E2E suite runs all six general upgrade scenarios from both
-   the PR base and the durable deployed anchor; failures name both commits
+4. The complete E2E suite runs from the PR base, and all seven upgrade
+   scenarios run from the durable deployed anchor; failures name both commits
    and executable hashes.
 5. The deployed-anchor pointer names an immutable annotated tag and canonical
    ancestor commit; absent, moved, equal, or non-ancestor anchors fail CI.

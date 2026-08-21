@@ -469,15 +469,27 @@ only the replacement:
 #+begin_src rust
 let (expected_json, mut intent) = self.install_intent_with_raw(share)?
     .context("install intent is missing")?;
-intent.temps[0].phase = phase;
-self.replace_install_intent_json(share, &expected_json, &serde_json::to_string(&intent)?)
+let temp_index = intent.temps.iter()
+    .position(|temp| &temp.path == path)
+    .context("install temporary is missing")?;
+let old_phase = intent.temps[temp_index].phase;
+intent.temps[temp_index].phase = phase;
+let replacement_json = serde_json::to_string(&intent)?;
+intent.temps[temp_index].phase = old_phase;
+self.replace_install_intent_json(share, &expected_json, &intent, &replacement_json)
 #+end_src
 
 New recovery fingerprints use the raw row. A narrow compatibility bridge also
 accepts a pre-fix canonicalized fingerprint only to clear an already-classified
-intent; it never broadens the raw JSON CAS predicate. The exact installed
+intent; it never broadens the raw JSON CAS predicate. Restoring the in-memory
+phase before classification validation lets a large journal keep one parsed
+intent rather than parsing the old JSON twice; legacy hashing streams directly
+into BLAKE3 rather than allocating another serialized buffer. The exact installed
 predecessor source is =5fa9c6f=: its release binary and the installed
-executable have the same SHA-256. The foreground E2E builds that exact source
+executable had the same SHA-256 when the anchor was recorded. That predecessor
+also predates the =sync_queue= table, so installer inventory detects the table
+before querying it instead of failing preflight. A focused legacy-schema test
+pins that prerequisite. The foreground E2E builds the exact predecessor source
 and checks both trees, clean status, peer/relationship identity, and recovery
 without deleting state or pairing again.
 
@@ -485,12 +497,13 @@ Completed locally after the independent review pass:
 
 - =cargo fmt --check=: pass.
 - =cargo clippy --all-targets --all-features -- -D warnings=: pass.
-- All 235 non-Docker unit and integration tests: pass.
-- Whole-project executable-line coverage: above 90%.
-- Changed executable-line coverage: 1,007/1,085, 92.81%.
-- Full Docker E2E: 52 passed, 2 filtered, in 358.30 seconds from the exact
-  pull-request base and 52 passed, 2 filtered, in 334.42 seconds from exact
-  deployed predecessor =5fa9c6fc05a4bca70b79461bccb8f973e363e968=.
+- All 236 non-Docker unit and integration tests: pass.
+- Whole-project executable-line coverage: 19,212/20,908, 91.89%.
+- Changed executable-line coverage: 1,061/1,144, 92.74%.
+- Full Docker E2E: 52 passed, 2 filtered, in 359.01 seconds from the exact
+  pull-request base. The upgrade-only pass from exact deployed predecessor
+  =5fa9c6fc05a4bca70b79461bccb8f973e363e968= passed all 7 scenarios, with
+  47 unrelated scenarios filtered, in 87.91 seconds.
 
 The installed macOS Rust target is present locally, but a Linux host cannot
 compile the bundled SQLite and BLAKE3 C sources for Apple without an Apple
@@ -502,8 +515,9 @@ compile/test result.
 The local review loop ran correctness, concurrency/liveness, error handling,
 adversarial security, simplicity/design, filesystem/platform, and dedicated
 comment/document alignment passes. It found and fixed raw-CAS representation
-drift, already-classified legacy fingerprints, incomplete E2E identity
-postconditions, schema-5 harness compatibility, private-file creation windows,
+drift, already-classified legacy fingerprints, large-journal recovery memory
+amplification, legacy inventory without a =sync_queue= table, broad schema-5
+harness acceptance, incomplete E2E identity postconditions, private-file creation windows,
 inherited-marker loss, unsafe service restoration, foreground lock ownership,
 terminal control-byte injection, service readiness, macOS durability and
 lifecycle coverage, unbounded candidate copying, scrollable transition

@@ -52,8 +52,16 @@ jobs:
           test -n "$tag" && test -n "$commit"
           [[ "$tag" =~ ^alpha-deployed-[0-9]{8}-[0-9a-f]{7,40}$ ]]
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git cat-file -t "refs/tags/$tag")" = tag
-          test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$commit"
-          git merge-base --is-ancestor "$commit" HEAD
+          while IFS= read -r pointer_revision; do
+            pointer=$(git show "$pointer_revision:docs/deployed-alpha.org")
+            historical_tag=$(sed -n 's/^tag: //p' <<<"$pointer")
+            historical_commit=$(sed -n 's/^commit: //p' <<<"$pointer")
+            [[ "$historical_tag" =~ ^alpha-deployed-[0-9]{8}-[0-9a-f]{7,40}$ ]]
+            [[ "$historical_commit" =~ ^[0-9a-f]{40}$ ]]
+            test "$(git cat-file -t "refs/tags/$historical_tag")" = tag
+            test "$(git rev-parse "refs/tags/$historical_tag^{commit}")" = "$historical_commit"
+            git merge-base --is-ancestor "$historical_commit" HEAD
+          done < <(git log --full-history --format=%H -- docs/deployed-alpha.org)
           test "$commit" != "$(git rev-parse HEAD)"
-          FLOCAL_E2E_UPGRADE_FROM="$commit" make e2e
+          FLOCAL_E2E_UPGRADE_FROM="$commit" \
+            cargo test --test e2e scenarios::upgrades:: -- --ignored --test-threads=1

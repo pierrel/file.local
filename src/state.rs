@@ -1892,8 +1892,11 @@ impl State {
                 |row| row.get(0),
             )
             .optional()?;
-        json.map(|json| Ok((json.clone(), serde_json::from_str(&json)?)))
-            .transpose()
+        json.map(|json| {
+            let intent = serde_json::from_str(&json)?;
+            Ok((json, intent))
+        })
+        .transpose()
     }
 
     fn install_intent_fingerprint(json: &str) -> String {
@@ -1901,9 +1904,9 @@ impl State {
     }
 
     fn legacy_install_intent_fingerprint(intent: &InstallIntent) -> Result<String> {
-        Ok(blake3::hash(&serde_json::to_vec(intent)?)
-            .to_hex()
-            .to_string())
+        let mut hasher = blake3::Hasher::new();
+        serde_json::to_writer(&mut hasher, intent)?;
+        Ok(hasher.finalize().to_hex().to_string())
     }
 
     pub fn install_recovery_intent(
@@ -1923,7 +1926,7 @@ impl State {
             return Ok(None);
         };
         let intent: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&json, failure_fingerprint, failure_diagnostic)?;
+        decode_install_intent_failure(&json, &intent, failure_fingerprint, failure_diagnostic)?;
         Ok(Some(InstallRecoveryIntent {
             share: share.clone(),
             fingerprint: Self::install_intent_fingerprint(&json),
@@ -1944,8 +1947,8 @@ impl State {
         let Some((json, fingerprint, diagnostic)) = row else {
             return Ok(None);
         };
-        let _: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&json, fingerprint, diagnostic)
+        let intent: InstallIntent = serde_json::from_str(&json)?;
+        decode_install_intent_failure(&json, &intent, fingerprint, diagnostic)
     }
 
     pub fn unclassified_install_intents(&self) -> Result<Vec<InstallRecoveryIntent>> {
@@ -1965,8 +1968,13 @@ impl State {
         for row in rows {
             let (share, json, failure_fingerprint, failure_diagnostic) = row?;
             let intent: InstallIntent = serde_json::from_str(&json)?;
-            if decode_install_intent_failure(&json, failure_fingerprint, failure_diagnostic)?
-                .is_none()
+            if decode_install_intent_failure(
+                &json,
+                &intent,
+                failure_fingerprint,
+                failure_diagnostic,
+            )?
+            .is_none()
             {
                 intents.push(InstallRecoveryIntent {
                     share: ShareId(share),
@@ -2001,8 +2009,8 @@ impl State {
             transaction.commit()?;
             return Ok(false);
         };
-        let _: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&json, prior_fingerprint, prior_diagnostic)?;
+        let intent: InstallIntent = serde_json::from_str(&json)?;
+        decode_install_intent_failure(&json, &intent, prior_fingerprint, prior_diagnostic)?;
         let actual_fingerprint = Self::install_intent_fingerprint(&json);
         if actual_fingerprint != expected_fingerprint {
             transaction.commit()?;
@@ -2053,7 +2061,7 @@ impl State {
         };
         let intent: InstallIntent = serde_json::from_str(&json)?;
         let failure =
-            decode_install_intent_failure(&json, failure_fingerprint, failure_diagnostic)?;
+            decode_install_intent_failure(&json, &intent, failure_fingerprint, failure_diagnostic)?;
         let fingerprint = Self::install_intent_fingerprint(&json);
         if let Some(failure) = failure {
             let changed = transaction.execute(
@@ -2530,13 +2538,16 @@ impl State {
         let (expected_json, mut intent) = self
             .install_intent_with_raw(share)?
             .context("install intent is missing")?;
-        let temp = intent
+        let temp_index = intent
             .temps
-            .iter_mut()
-            .find(|temp| &temp.path == path)
+            .iter()
+            .position(|temp| &temp.path == path)
             .context("install temporary is missing")?;
-        temp.phase = phase;
-        self.replace_install_intent_json(share, &expected_json, &serde_json::to_string(&intent)?)
+        let old_phase = intent.temps[temp_index].phase;
+        intent.temps[temp_index].phase = phase;
+        let replacement_json = serde_json::to_string(&intent)?;
+        intent.temps[temp_index].phase = old_phase;
+        self.replace_install_intent_json(share, &expected_json, &intent, &replacement_json)
     }
 
     pub fn rotate_unowned_install_temp(
@@ -2547,18 +2558,22 @@ impl State {
         let (expected_json, mut intent) = self
             .install_intent_with_raw(share)?
             .context("install intent is missing")?;
-        let temp = intent
+        let temp_index = intent
             .temps
-            .iter_mut()
-            .find(|temp| &temp.path == path)
+            .iter()
+            .position(|temp| &temp.path == path)
             .context("install temporary is missing")?;
-        if temp.phase == InstallTempPhase::Owned {
+        if intent.temps[temp_index].phase == InstallTempPhase::Owned {
             bail!("cannot rotate an owned install temporary");
         }
-        temp.token = format!(".flocal-tmp-{}", ShareId::generate().0);
-        temp.phase = InstallTempPhase::Pending;
-        let token = temp.token.clone();
-        self.replace_install_intent_json(share, &expected_json, &serde_json::to_string(&intent)?)?;
+        let token = format!(".flocal-tmp-{}", ShareId::generate().0);
+        let old_token = std::mem::replace(&mut intent.temps[temp_index].token, token.clone());
+        let old_phase = intent.temps[temp_index].phase;
+        intent.temps[temp_index].phase = InstallTempPhase::Pending;
+        let replacement_json = serde_json::to_string(&intent)?;
+        intent.temps[temp_index].token = old_token;
+        intent.temps[temp_index].phase = old_phase;
+        self.replace_install_intent_json(share, &expected_json, &intent, &replacement_json)?;
         Ok(token)
     }
 
@@ -2566,6 +2581,7 @@ impl State {
         &self,
         share: &ShareId,
         expected_json: &str,
+        expected: &InstallIntent,
         replacement_json: &str,
     ) -> Result<()> {
         let transaction = rusqlite::Transaction::new_unchecked(
@@ -2583,8 +2599,12 @@ impl State {
         let Some((failure_fingerprint, failure_diagnostic)) = classification else {
             bail!("install intent changed while updating its recovery state");
         };
-        let failure =
-            decode_install_intent_failure(expected_json, failure_fingerprint, failure_diagnostic)?;
+        let failure = decode_install_intent_failure(
+            expected_json,
+            expected,
+            failure_fingerprint,
+            failure_diagnostic,
+        )?;
         let changed = transaction.execute(
             "UPDATE install_intents
              SET records_json=?3,failure_fingerprint=NULL,failure_diagnostic=NULL
@@ -5888,6 +5908,7 @@ fn validate_install_intent_fingerprint(fingerprint: &str) -> Result<()> {
 
 fn decode_install_intent_failure(
     records_json: &str,
+    intent: &InstallIntent,
     fingerprint: Option<String>,
     diagnostic: Option<String>,
 ) -> Result<Option<InstallIntentFailure>> {
@@ -5898,9 +5919,8 @@ fn decode_install_intent_failure(
             if diagnostic.len() > 4096 {
                 bail!("stored install recovery diagnostic exceeds its limit");
             }
-            let intent: InstallIntent = serde_json::from_str(records_json)?;
             if State::install_intent_fingerprint(records_json) != fingerprint
-                && State::legacy_install_intent_fingerprint(&intent)? != fingerprint
+                && State::legacy_install_intent_fingerprint(intent)? != fingerprint
             {
                 bail!("stored install recovery classification does not match its intent");
             }
@@ -7586,18 +7606,20 @@ mod tests {
         assert_eq!(retry.fingerprint, raw_fingerprint);
         assert!(state.install_intent_failure(&share)?.is_none());
         state.mark_install_temp_creating(&share, &path)?;
-        let old_token = state.install_intent(&share)?.unwrap().temps[0]
-            .token
-            .clone();
+        let creating = state.install_intent(&share)?.unwrap();
+        assert!(creating.temps[0].phase == InstallTempPhase::Creating);
+        let old_token = creating.temps[0].token.clone();
         let new_token = state.rotate_unowned_install_temp(&share, &path)?;
         assert_ne!(old_token, new_token);
+        assert!(state.install_intent(&share)?.unwrap().temps[0].phase == InstallTempPhase::Pending);
 
         let expected_json: String = state.conn.query_row(
             "SELECT records_json FROM install_intents WHERE share_id=?1",
             [&share.0],
             |row| row.get(0),
         )?;
-        let mut replacement: InstallIntent = serde_json::from_str(&expected_json)?;
+        let expected: InstallIntent = serde_json::from_str(&expected_json)?;
+        let mut replacement = expected.clone();
         replacement.temps[0].phase = InstallTempPhase::Owned;
         let replacement_json = serde_json::to_string(&replacement)?;
         let mut competing: InstallIntent = serde_json::from_str(&expected_json)?;
@@ -7608,7 +7630,7 @@ mod tests {
             params![share.0, competing_json],
         )?;
         let error = state
-            .replace_install_intent_json(&share, &expected_json, &replacement_json)
+            .replace_install_intent_json(&share, &expected_json, &expected, &replacement_json)
             .expect_err("a genuinely replaced intent must not satisfy the CAS");
         assert!(
             error

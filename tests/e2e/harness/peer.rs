@@ -126,9 +126,8 @@ impl std::ops::Deref for Connector {
     }
 }
 
-/// The parsed candidate `status --json`, with explicit schema-5 compatibility
-/// while an upgrade scenario starts its predecessor. Fields grow with the
-/// scenarios that read them.
+/// The parsed candidate `status --json`. Fields grow with the scenarios that
+/// read them; predecessor compatibility is confined to `predecessor_status`.
 #[derive(Debug, serde::Deserialize)]
 pub struct Status {
     pub schema: u64,
@@ -2110,6 +2109,29 @@ impl Peer {
         self.status_at(SHARE)
     }
 
+    /// Reads status from the installed predecessor before an upgrade. The
+    /// deployed alpha emitted schema 5; candidate reads stay pinned to schema 6.
+    pub fn predecessor_status(&self) -> Result<Status> {
+        let output = self.flocal_ok(&["status", SHARE, "--json"])?;
+        let mut status: Status =
+            serde_json::from_slice(&output.stdout).context("parsing predecessor status --json")?;
+        if !matches!(status.schema, STATUS_SCHEMA | LEGACY_STATUS_SCHEMA) {
+            return Err(self.fail(format!(
+                "predecessor status schema {} is neither {STATUS_SCHEMA} nor {LEGACY_STATUS_SCHEMA}",
+                status.schema
+            )));
+        }
+        if status.schema == STATUS_SCHEMA && status.scheduling.is_none() {
+            return Err(self.fail(format!(
+                "status schema {STATUS_SCHEMA} is missing its required scheduling field"
+            )));
+        }
+        if status.schema == LEGACY_STATUS_SCHEMA {
+            status.scheduling.get_or_insert_default();
+        }
+        Ok(status)
+    }
+
     pub fn assert_clean_upgrade_status(&self, before: &Status) -> Result<()> {
         let after = self.status()?;
         if after.share != before.share
@@ -2166,20 +2188,17 @@ impl Peer {
     }
 
     fn parse_status(&self, output: &[u8]) -> Result<Status> {
-        let mut status: Status = serde_json::from_slice(output).context("parsing status --json")?;
-        if !matches!(status.schema, STATUS_SCHEMA | LEGACY_STATUS_SCHEMA) {
+        let status: Status = serde_json::from_slice(output).context("parsing status --json")?;
+        if status.schema != STATUS_SCHEMA {
             return Err(self.fail(format!(
-                "status schema {} is neither the pinned {STATUS_SCHEMA} nor the supported legacy {LEGACY_STATUS_SCHEMA}",
+                "status schema {} does not match the pinned {STATUS_SCHEMA}",
                 status.schema
             )));
         }
-        if status.schema == STATUS_SCHEMA && status.scheduling.is_none() {
+        if status.scheduling.is_none() {
             return Err(self.fail(format!(
                 "status schema {STATUS_SCHEMA} is missing its required scheduling field"
             )));
-        }
-        if status.schema == LEGACY_STATUS_SCHEMA {
-            status.scheduling.get_or_insert_default();
         }
         Ok(status)
     }
