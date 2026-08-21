@@ -88,20 +88,26 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
    and managed-marker selection rules but does not create directories, open
    SQLite, or run migrations.
 
-3. Acquire one validated exclusive installer-operation lock under the selected
-   private state directory. Its creation may create that private directory but
-   does not open SQLite. A second install, even with a different destination,
-   fails before either process touches the service. Preflight every
+3. Acquire a validated service-installer lock beside the per-user managed-state
+   marker, then a separate installer lock under the selected private state
+   directory. The first serializes the single daemon service even when two
+   fresh installers choose different state directories; the second serializes
+   migration and recovery for that state. Their creation may create private
+   directories but does not open SQLite. A second install, even with a
+   different destination, fails before either process touches the service.
+   Preflight every
    non-disruptive prerequisite while the old service remains live: reject
    root/sudo; open and validate the exact
    candidate file; validate the nearest existing destination ancestor; safely
    create missing owner-controlled destination and service directories;
    retain a descriptor for the validated destination directory; resolve and
    query the correct Linux user manager or macOS GUI domain; validate all
-   service paths; and prepare the service definition in memory. Copy from the
-   held candidate descriptor into a private temporary file in the held
-   destination directory, set its final mode, fully sync it, and retain it for
-   publication. A failure here does not stop the daemon or alter the installed
+   service paths; and prepare the service definition in memory. Capture the
+   held candidate descriptor's length, copy exactly that many bytes into a
+   private temporary in the held destination directory, and reject an early
+   EOF. Bytes appended after the snapshot are not copied. Set the temporary's
+   final mode, fully sync it, and retain it for publication. A failure here
+   does not stop the daemon or alter the installed
    executable, state, or service assets. Creating a previously absent private
    install directory and staged temporary file is allowed. One RAII staging
    object owns that temporary and unlinks it on every pre-rename return; only a
@@ -430,9 +436,10 @@ CI ref selection, fake-manager limits, and the upgrade scenarios.
 9. Pull-request and main CI select and report an exact base commit and both
    binary hashes, including valid equal-binary transitions.
 10. Linux deterministic tests pin lifecycle ordering, readiness, and failure
-    phases. Platform-neutral tests pin headless marker behavior; native macOS
-    CI pins full-fsync configuration and the roadmap retains the graphical
-    manager and macOS-to-Linux gates.
+    phases. Native macOS CI executes deterministic launchd loaded-job,
+    publication, restore, failure, and headless paths and pins full-fsync
+    configuration. The roadmap retains the real graphical-manager and
+    macOS-to-Linux gates.
 11. README, CLI help, E2E design, roadmap, and every touched comment agree that
     connector-first managed syncs resume automatically while foreground
     commands and the opposite-direction fallback are explicit.

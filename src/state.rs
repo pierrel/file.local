@@ -1097,6 +1097,7 @@ fn paired_predecessor_fingerprint(
 
 const INSTALLATION_BARRIER_FILE: &str = "installation.barrier";
 const INSTALLER_LOCK_FILE: &str = "installer.lock";
+const SERVICE_INSTALLER_LOCK_FILE: &str = "service-installer.lock";
 const UPGRADE_PENDING_FILE: &str = "upgrade.pending";
 
 fn open_installation_barrier(dir: &Path) -> Result<File> {
@@ -1684,7 +1685,15 @@ impl State {
     }
 
     pub fn acquire_installer_lock(dir: impl AsRef<Path>) -> Result<File> {
-        let path = dir.as_ref().join(INSTALLER_LOCK_FILE);
+        Self::acquire_named_installer_lock(dir.as_ref(), INSTALLER_LOCK_FILE)
+    }
+
+    pub fn acquire_service_installer_lock(dir: impl AsRef<Path>) -> Result<File> {
+        Self::acquire_named_installer_lock(dir.as_ref(), SERVICE_INSTALLER_LOCK_FILE)
+    }
+
+    fn acquire_named_installer_lock(dir: &Path, name: &str) -> Result<File> {
+        let path = dir.join(name);
         let file = open_private_regular_file(&path, false)
             .context("opening the private installer lock")?;
         file.try_lock_exclusive()

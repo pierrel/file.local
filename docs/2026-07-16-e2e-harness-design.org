@@ -560,8 +560,9 @@ containers. CI passes the pull request's exact base SHA through
 =FLOCAL_E2E_UPGRADE_FROM=. A local run uses the merge base of =HEAD= and
 =COVERAGE_BASE= (default =github/main=), so an advanced base ref does not
 invalidate an existing feature branch. The harness records both commit IDs and
-both executable SHA-256 hashes in its transcript; every successful install also
-verifies that the installed path hashes to the candidate.
+both executable SHA-256 hashes in permanent failure diagnostics outside the
+rolling transcript tail; every successful install also verifies that the
+installed path hashes to the candidate.
 
 The fake =systemctl= owns only the service-manager boundary absent inside a
 container. The installed base/candidate binaries, paired roots, SQLite state,
@@ -572,9 +573,10 @@ installed daemon so the installer must observe a real control socket.
 
 The ordinary upgrade scenarios cover an idle pair across an incompatible
 mixed-version reconnect, a killed pre-apply daemon with durable install-intent
-recovery, base and candidate foreground-watch refusals, transactional migration
-failure and retry, responder-first legacy refusal followed by connector-first
-success, and fresh installation through the same installer. They assert tree
+recovery, a killed pre-apply foreground watch recovered by a candidate watch,
+base and candidate foreground-watch refusals, transactional migration failure
+and retry, responder-first legacy refusal followed by connector-first success,
+and fresh installation through the same installer. They assert tree
 convergence, preserved share/peer relationship, empty unsettled and conflict
 state, enabled watching ownership, and candidate executable identity.
 

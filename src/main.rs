@@ -1555,15 +1555,19 @@ fn prepare_daemon_service(state_dir: &Path, executable: &Path) -> Result<DaemonS
         .lines()
         .filter_map(|line| line.split_once('='))
         .collect();
+    let manager_home = variables
+        .get("HOME")
+        .context("the systemd user manager did not report HOME")?;
+    let process_home = std::env::var_os("HOME").context("could not determine home directory")?;
+    if Path::new(manager_home) != Path::new(&process_home) {
+        bail!(
+            "HOME does not match the systemd user manager; restore the account HOME before installing"
+        )
+    }
     let config = variables
         .get("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            variables
-                .get("HOME")
-                .map(|home| PathBuf::from(home).join(".config"))
-        })
-        .context("could not determine the user service configuration directory")?;
+        .unwrap_or_else(|| PathBuf::from(manager_home).join(".config"));
     if !config.is_absolute() || !state_dir.is_absolute() {
         bail!("daemon service paths must be absolute")
     }
@@ -1882,7 +1886,7 @@ fn acquire_service_installer_lock_at(marker: &Path) -> Result<File> {
         .parent()
         .context("managed state marker has no parent directory")?;
     flocal::state::ensure_private_directory(directory)?;
-    State::acquire_installer_lock(directory)
+    State::acquire_service_installer_lock(directory)
         .context("another flocal service installation is already in progress")
 }
 
@@ -11389,7 +11393,7 @@ mod tests {
             )
             .env("HOME", &client_home)
             .env("FLOCAL_STATE_DIR", temp.path().join("state"))
-            .env("FLOCAL_TEST_MANAGER_HOME", &manager_home)
+            .env("FLOCAL_TEST_MANAGER_HOME", &client_home)
             .output()?;
         assert!(output.status.success(), "{:?}", output);
         Ok(())
@@ -11503,8 +11507,8 @@ esac
 
     #[cfg(target_os = "linux")]
     fn assert_systemd_install(root: &Path) -> Result<()> {
-        let manager_home = root.join("manager-home");
         let client_home = root.join("client-home");
+        let manager_home = client_home.clone();
         let state_dir = root.join("state");
         flocal::state::ensure_private_directory(&state_dir)?;
         let executable = std::env::current_exe()?.canonicalize()?;
@@ -11684,6 +11688,11 @@ esac
         first
             .join()
             .map_err(|_| anyhow::anyhow!("first installer thread panicked"))??;
+
+        let aliased_state = marker.parent().unwrap();
+        let service_lock = acquire_service_installer_lock_at(&marker)?;
+        let state_lock = State::acquire_installer_lock(aliased_state)?;
+        drop((state_lock, service_lock));
         Ok(())
     }
 

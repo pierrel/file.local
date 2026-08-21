@@ -73,7 +73,10 @@ the boundary.
 The successful sequence is:
 
 1. Resolve the state directory without opening SQLite.
-2. Take the installation-operation lock so two installs cannot overlap.
+2. Take the per-user service-installer lock, then the selected state
+   directory's installer lock. The first serializes the one managed service
+   across different state choices; the second protects that state's migration
+   and recovery.
 3. Validate the candidate, destination, state path, service manager, managed
    marker, and service-definition path while the old service is still live.
    Refuse an explicit state path that differs from an existing managed
@@ -149,11 +152,15 @@ reopening an unchecked path later.
 let sync_directory = File::open(parent)?;
 let directory = cap_std::fs::Dir::from_std_file(sync_directory.try_clone()?);
 let mut output = directory.open_with(&temporary, &options)?;
-io::copy(&mut source, &mut output)
-    .context("staging the candidate executable")?;
+let candidate_length = source.metadata()?.len();
+copy_candidate_exactly(&mut source, &mut output, candidate_length)?;
 directory.set_permissions(&temporary, Permissions::from_mode(0o755))?;
 flocal::durability::sync_file(&output)?;
 #+end_src
+
+The length snapshot makes staging bounded even if a local build process appends
+to the opened inode. An early EOF is rejected before the service is stopped,
+so a concurrent truncation cannot publish a partial executable.
 
 Publication is relative to that retained directory capability:
 
@@ -282,6 +289,12 @@ the pending marker is gone. An available graphical domain with no prior job is
 a normal fresh installation. No shell command contains an untrusted interpolated
 path; service paths are validated and encoded for systemd or XML before use.
 
+Native macOS CI runs these launchd branches against a deterministic
+=launchctl= boundary. It covers loaded-job stop and restore, service-asset
+publication, bootout and bootstrap failures, and the headless plan. The real
+graphical-login and macOS-to-Linux gate remains separate because a fake manager
+cannot prove an actual LaunchAgent session.
+
 The Docker image supplies a small fake =systemctl=. It is not a mock of
 synchronization or state. It owns only the missing container service-manager
 boundary: normal stop sends TERM and CONT, the interrupted-apply scenario kills
@@ -304,20 +317,22 @@ candidate's internal installer. The wrapper automatically follows the installed
 path, so every later local command and SSH responder changes from base to
 candidate at the actual rename boundary.
 
-Six ordinary E2E scenarios now cover:
+Seven ordinary E2E scenarios now cover:
 
 1. An idle base pair, connector-first installation, bidirectional candidate
    convergence, then a compatible responder-first reinstall.
 2. A base daemon stopped at the exact pre-apply boundary with a proven durable
    intent, killed by service shutdown before apply, followed by candidate
    recovery and convergence.
-3. A foreground base watch and a later candidate watch each causing a bounded,
+3. A foreground base watch stopped immediately before apply, killed, then
+   recovered by a candidate watch after both endpoints are installed.
+4. A foreground base watch and a later candidate watch each causing a bounded,
    root-naming refusal; after each watch ends, retry succeeds without repair.
-4. An injected failure inside the candidate migration transaction, followed by
+5. An injected failure inside the candidate migration transaction, followed by
    a successful rerun with the same paired state and files.
-5. A responder-first legacy attempt refusing safely, followed by the documented
+6. A responder-first legacy attempt refusing safely, followed by the documented
    connector-first sequence.
-6. A fresh two-peer installation through exactly the same owned installer.
+7. A fresh two-peer installation through exactly the same owned installer.
 
 CI checks out full history and passes the pull request's exact base SHA as
 =FLOCAL_E2E_UPGRADE_FROM=. Local runs use the merge base with =COVERAGE_BASE=.
@@ -424,6 +439,32 @@ Those paths now use the same bounded control-byte escaping as other untrusted
 diagnostics.
 
 * Validation and review status
+
+** Recovery journal compatibility follow-up
+
+An older installed executable can omit =managed_generation= from its durable
+install-intent JSON. The candidate reads that value as =None= and would once
+serialize it back as ="managed_generation":null= before using it as the
+optimistic-concurrency expected value. SQLite then correctly found no raw-byte
+match, but the diagnostic falsely claimed a competing install had changed.
+
+Recovery now retains the selected raw row beside the parsed value:
+
+#+begin_src rust
+let (expected_json, mut intent) = self.install_intent_with_raw(share)?
+    .context("install intent is missing")?;
+intent.temps[0].phase = phase;
+self.replace_install_intent_json(share, &expected_json, &serde_json::to_string(&intent)?)
+#+end_src
+
+The replacement remains candidate JSON, while =expected_json= is exactly what
+SQLite returned. The same raw revision is hashed for a persisted recovery
+classification, so retrying an already classified old intent cannot fail from
+the same representation change. A stale writer still fails its raw predicate.
+The deployed-alpha E2E kills a real old foreground watch after its durable
+intent is written, installs both candidates, restarts the watch, and proves
+the pending intent clears and both trees converge without deleting state or
+pairing again.
 
 Completed locally before the independent review pass:
 

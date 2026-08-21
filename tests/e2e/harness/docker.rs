@@ -12,9 +12,9 @@ const IMAGE_TAG: &str = "flocal-e2e";
 const BASE_IMAGE_TAG: &str = "flocal-e2e-upgrade-base";
 
 /// Everything one scenario run owns besides the two containers: the network,
-/// the per-peer volumes, the throwaway keys, the transcript, and the
-/// dumped-once flag. Shared by `Arc` between the peer handles; the last
-/// clone's `Drop` removes the network and volumes.
+/// the per-peer volumes, the throwaway keys, permanent diagnostics, the
+/// rolling transcript, and the dumped-once flag. Shared by `Arc` between the
+/// peer handles; the last clone's `Drop` removes the network and volumes.
 pub struct RunContext {
     pub run_id: String,
     pub network: String,
