@@ -467,6 +467,9 @@ Completed locally before the independent review pass:
   network-recovery scenario; its immediate isolated rerun passed in 43.69
   seconds. All seven base-to-candidate installer scenarios passed in the full
   run from exact base =8041be30605f596683f6cc8f51a8a2dd5aabfc42=.
+- Hosted CI passed Linux tests, native macOS tests, coverage, and all 52 Docker
+  E2E scenarios in one exact-base run. The E2E job took 11 minutes 5 seconds,
+  including cold candidate and historical-base image builds.
 
 The installed macOS Rust target is present locally, but a Linux host cannot
 compile the bundled SQLite and BLAKE3 C sources for Apple without an Apple
@@ -482,9 +485,9 @@ windows, inherited-marker loss, unsafe service restoration, foreground lock
 ownership, terminal control-byte injection, incomplete E2E postconditions,
 service readiness, macOS durability and lifecycle coverage, unbounded candidate
 copying, scrollable transition diagnostics, and the global installer namespace.
-No verified finding was declined. GitHub CI and Copilot review are added after
-the pull request opens; any resulting code change requires these examples,
-numbers, and conclusions to be reconciled again.
+No verified finding was declined. Copilot's first round reviewed all 24 changed
+files and generated zero comments. Any later code change requires these
+examples, numbers, and conclusions to be reconciled again.
 
 * Remaining limits and operational note
 
