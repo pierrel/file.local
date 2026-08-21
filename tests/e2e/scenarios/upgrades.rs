@@ -29,6 +29,8 @@ fn idle_managed_pair_survives_a_real_candidate_install() -> Result<()> {
     a.write("after-compatible-reinstall.txt", "responder drained itself")?;
     b.wait_for_file("after-compatible-reinstall.txt", "responder drained itself")?;
     a.wait_for_managed_connection("watching")?;
+    a.wait_for_recovered_install()?;
+    b.wait_for_recovered_install()?;
     a.assert_clean_upgrade_status(&before_a)?;
     b.assert_clean_upgrade_status(&before_b)?;
     a.assert_sync_role("connector")?;
@@ -63,6 +65,8 @@ fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
     a.write("after-upgrade.txt", "candidate session resumed")?;
     b.wait_for_file("after-upgrade.txt", "candidate session resumed")?;
     a.wait_for_managed_connection("watching")?;
+    a.wait_for_recovered_install()?;
+    b.wait_for_recovered_install()?;
     a.assert_clean_upgrade_status(&before_a)?;
     b.assert_clean_upgrade_status(&before_b)?;
     a.assert_sync_role("connector")?;
@@ -106,6 +110,8 @@ fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Resul
             && b.status()?.unsettled.is_empty(),
         "foreground recovery left pending or unsettled state"
     );
+    a.wait_for_recovered_install()?;
+    b.wait_for_recovered_install()?;
     a.assert_clean_upgrade_status(&before_a)?;
     b.assert_clean_upgrade_status(&before_b)?;
     a.assert_sync_role("connector")?;
