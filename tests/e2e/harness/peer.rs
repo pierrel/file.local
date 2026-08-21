@@ -2133,14 +2133,21 @@ impl Peer {
     }
 
     pub fn assert_clean_upgrade_status(&self, before: &Status) -> Result<()> {
-        let after = self.status()?;
+        let after = self.poll_until(
+            "upgrade did not settle to a clean relationship state",
+            DEADLINE,
+            |peer| {
+                let after = peer.status()?;
+                Ok((!after.pending_install
+                    && after.unsettled.is_empty()
+                    && after.recovery.conflicts == 0)
+                    .then_some(after))
+            },
+        )?;
         if after.share != before.share
             || after.peer != before.peer
             || after.bound_peer != before.bound_peer
             || after.relationship_state != before.relationship_state
-            || after.pending_install
-            || !after.unsettled.is_empty()
-            || after.recovery.conflicts != 0
         {
             return Err(self.fail(format!(
                 "upgrade did not preserve a clean relationship state:\nbefore={before:#?}\nafter={after:#?}"
