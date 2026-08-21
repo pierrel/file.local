@@ -1,0 +1,11 @@
+#+title: Deployed alpha anchor
+
+The first local deployed-alpha anchor is the exact source commit for the
+installed executable. Its release binary has SHA-256
+=111bf115cae78cc802d78a73c82d9871b5e8ed4c2f1388eeb3f5e750b47f0c23=,
+which matched =$HOME/.local/bin/flocal= byte for byte when this anchor
+was recorded. CI verifies every historical pointer's annotated-tag object and
+peeled commit, so a recorded tag cannot be retargeted later.
+
+tag: alpha-deployed-20260817-5fa9c6f
+commit: 5fa9c6fc05a4bca70b79461bccb8f973e363e968

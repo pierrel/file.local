@@ -1,0 +1,59 @@
+#!/bin/sh
+set -eu
+
+printf '%s\n' "$*" >>/home/peer/.flocal-service-manager.log
+
+start_service() {
+    /usr/sbin/start-stop-daemon --start --background --make-pidfile --oknodo \
+        --pidfile /home/peer/.flocal-daemon.pid \
+        --startas /home/peer/.local/bin/flocal \
+        --exec /home/peer/.local/bin/flocal \
+        --output /home/peer/.flocal-daemon.log -- daemon run
+}
+
+case "${1-} ${2-}" in
+    "--user show-environment")
+        printf 'HOME=/home/peer\nXDG_CONFIG_HOME=/home/peer/.config\n'
+        ;;
+    "--user list-units")
+        case "$*" in
+            *flocal-daemon.service*)
+                if /usr/sbin/start-stop-daemon --status --quiet \
+                    --pidfile /home/peer/.flocal-daemon.pid \
+                    --exec /home/peer/.local/bin/flocal; then
+                    printf 'flocal-daemon.service loaded active running file.local managed sync\n'
+                elif [ -e /home/peer/.config/systemd/user/flocal-daemon.service ]; then
+                    printf 'flocal-daemon.service loaded inactive dead file.local managed sync\n'
+                fi
+                ;;
+            *)
+                printf 'unsupported E2E systemctl list-units: %s\n' "$*" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    "--user stop")
+        if [ -e /home/peer/.flocal-kill-daemon-on-stop ]; then
+            rm -f /home/peer/.flocal-kill-daemon-on-stop
+            /usr/sbin/start-stop-daemon --stop --oknodo --remove-pidfile \
+                --retry KILL/1 --pidfile /home/peer/.flocal-daemon.pid \
+                --exec /home/peer/.local/bin/flocal
+        else
+            /usr/sbin/start-stop-daemon --stop --oknodo --remove-pidfile \
+                --retry TERM/12/KILL/1 --pidfile /home/peer/.flocal-daemon.pid \
+                --exec /home/peer/.local/bin/flocal
+        fi
+        ;;
+    "--user daemon-reload")
+        ;;
+    "--user enable")
+        start_service
+        ;;
+    "--user start")
+        start_service
+        ;;
+    *)
+        printf 'unsupported E2E systemctl invocation: %s\n' "$*" >&2
+        exit 2
+        ;;
+esac

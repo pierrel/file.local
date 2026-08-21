@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 
-use super::docker::{RunContext, SECOND_SHARE, SHARE, image_tag, unique_token};
+use super::docker::{
+    RunContext, SECOND_SHARE, SHARE, base_image_tag, image_tag, prepare_upgrade_base, unique_token,
+};
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -41,9 +43,17 @@ const SCHEDULING_WAIT_MARKER: &str =
 const SCHEDULING_WAIT_OBSERVED: &str =
     "/home/peer/.local/state/file.local/.e2e-global-contention-observed";
 const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
+const KILL_DAEMON_ON_STOP_MARKER: &str = "/home/peer/.flocal-kill-daemon-on-stop";
+const MIGRATION_FAILURE_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-fail-state-migration";
+
+fn is_flocal_executable(executable: &[u8]) -> bool {
+    executable.ends_with(b"/flocal-real") || executable.ends_with(b"/.local/bin/flocal")
+}
 /// The product's status JSON schema this harness is written against. Schema 6
 /// adds installation scheduling to schema 5's durable relationship lifecycle.
 const STATUS_SCHEMA: u64 = 6;
+const LEGACY_STATUS_SCHEMA: u64 = 5;
 /// The product's sync-list JSON schema this harness is written against.
 const SYNC_LIST_SCHEMA: u64 = 3;
 /// Recovery records use the versioned three-way merge shape.
@@ -116,12 +126,14 @@ impl std::ops::Deref for Connector {
     }
 }
 
-/// The parsed `status --json`, pinned to `STATUS_SCHEMA`. Fields grow with
-/// the scenarios that read them.
+/// The parsed candidate `status --json`. Fields grow with the scenarios that
+/// read them; predecessor compatibility is confined to `predecessor_status`.
 #[derive(Debug, serde::Deserialize)]
 pub struct Status {
     pub schema: u64,
     pub share: String,
+    #[serde(default)]
+    pub peer: Option<serde_json::Value>,
     pub bound_peer: Option<String>,
     pub relationship_state: String,
     pub removal_pending: bool,
@@ -132,10 +144,19 @@ pub struct Status {
     #[serde(default)]
     pub tombstones: Option<u64>,
     pub recovery: RecoveryStatus,
-    pub scheduling: SchedulingStatus,
+    #[serde(default)]
+    scheduling: Option<SchedulingStatus>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+impl Status {
+    fn scheduling(&self) -> &SchedulingStatus {
+        self.scheduling
+            .as_ref()
+            .expect("validated status scheduling")
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct SchedulingStatus {
     pub state: String,
     pub waiting_on: Option<String>,
@@ -283,6 +304,10 @@ pub fn containers() -> Result<(PeerBox, PeerBox)> {
     infra(setup_containers())
 }
 
+pub fn upgrade_containers() -> Result<(PeerBox, PeerBox)> {
+    infra(setup_upgrade_containers())
+}
+
 fn setup_containers() -> Result<(PeerBox, PeerBox)> {
     let context = RunContext::new()?;
     let a = start_peer(&context, "peer-a", 0)?;
@@ -292,6 +317,51 @@ fn setup_containers() -> Result<(PeerBox, PeerBox)> {
         peer.install_ssh_material()?;
         peer.exec_ok(&["mkdir", "-p", SHARE])?;
     }
+    Ok((PeerBox { peer: a }, PeerBox { peer: b }))
+}
+
+fn setup_upgrade_containers() -> Result<(PeerBox, PeerBox)> {
+    let transition = prepare_upgrade_base()?;
+    let context = RunContext::new()?;
+    context.record_diagnostic(format!("upgrade base commit: {}", transition.base));
+    context.record_diagnostic(format!(
+        "upgrade candidate commit: {}",
+        transition.candidate
+    ));
+    let base_binary = context.temp.path().join("flocal-upgrade-base");
+    let exporter = format!("flocal-e2e-{}-base-export", context.run_id);
+    context.docker_ok(&[
+        "create",
+        "--label",
+        super::docker::LABEL,
+        "--name",
+        &exporter,
+        base_image_tag(),
+    ])?;
+    let source = format!("{exporter}:/usr/local/libexec/flocal-real");
+    let destination = base_binary
+        .to_str()
+        .context("upgrade base binary path is not UTF-8")?;
+    let copy = context.docker_ok(&["cp", &source, destination]);
+    let remove = context.docker_ok(&["rm", "-f", &exporter]);
+    copy?;
+    remove?;
+
+    let a = start_peer_with_installed(&context, "peer-a", 0, &base_binary)?;
+    let b = start_peer_with_installed(&context, "peer-b", 1, &base_binary)?;
+    for peer in [&a, &b] {
+        peer.wait_sshd_ready()?;
+        peer.install_ssh_material()?;
+        peer.exec_ok(&["mkdir", "-p", SHARE])?;
+    }
+    context.record_diagnostic(format!(
+        "upgrade base executable sha256: {}",
+        a.executable_hash("/home/peer/.local/bin/flocal")?
+    ));
+    context.record_diagnostic(format!(
+        "upgrade candidate executable sha256: {}",
+        a.executable_hash("/usr/local/libexec/flocal-real")?
+    ));
     Ok((PeerBox { peer: a }, PeerBox { peer: b }))
 }
 
@@ -393,9 +463,42 @@ pub fn assert_trees_equal(a: &Peer, b: &Peer) -> Result<()> {
 }
 
 fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<Peer> {
+    start_peer_inner(context, alias, volume, None)
+}
+
+fn start_peer_with_installed(
+    context: &Arc<RunContext>,
+    alias: &str,
+    volume: usize,
+    executable: &std::path::Path,
+) -> Result<Peer> {
+    let peer = start_peer_inner(context, alias, volume, Some("/home/peer/.local/bin/flocal"))?;
+    let staged = format!("{}:/tmp/flocal-upgrade-base", peer.container.name);
+    let source = executable
+        .to_str()
+        .context("upgrade base binary path is not UTF-8")?;
+    context.docker_ok(&["cp", source, &staged])?;
+    context.docker_ok(&[
+        "exec",
+        "-u",
+        "root",
+        &peer.container.name,
+        "sh",
+        "-c",
+        "install -d -m 700 -o peer -g peer /home/peer/.local /home/peer/.local/bin && install -m 755 -o peer -g peer /tmp/flocal-upgrade-base /home/peer/.local/bin/flocal && rm -f /tmp/flocal-upgrade-base",
+    ])?;
+    Ok(peer)
+}
+
+fn start_peer_inner(
+    context: &Arc<RunContext>,
+    alias: &str,
+    volume: usize,
+    installed: Option<&str>,
+) -> Result<Peer> {
     let name = format!("flocal-e2e-{}-{alias}", context.run_id);
     let volume_arg = format!("{}:/home/peer", context.volumes[volume]);
-    context.docker_ok(&[
+    let mut arguments = vec![
         "run",
         "--rm",
         "-d",
@@ -415,8 +518,13 @@ fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<P
         "256",
         "-e",
         "FLOCAL_E2E_CONTAINER_LIFETIME_SECONDS",
-        image_tag(),
-    ])?;
+    ];
+    let installed_environment = installed.map(|path| format!("FLOCAL_E2E_EXECUTABLE={path}"));
+    if let Some(installed) = &installed_environment {
+        arguments.extend_from_slice(&["-e", installed]);
+    }
+    arguments.push(image_tag());
+    context.docker_ok(&arguments)?;
     context
         .containers
         .lock()
@@ -430,6 +538,54 @@ fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<P
         },
         alias: alias.to_owned(),
     })
+}
+
+pub fn upgrade_managed_pair() -> Result<(Connector, Peer)> {
+    let (a, b) = upgrade_containers()?;
+    a.start_daemon()?;
+    b.start_daemon()?;
+    let output = a.peer.flocal_ok(&[
+        "sync",
+        "add",
+        SHARE,
+        "--host",
+        &b.peer.alias,
+        "--remote-path",
+        SHARE,
+        "--yes",
+    ])?;
+    drop(output);
+    Ok((
+        Connector {
+            peer: a.peer,
+            watch_max_session_bytes: None,
+        },
+        b.peer,
+    ))
+}
+
+pub fn fresh_installed_pair() -> Result<(Connector, Peer)> {
+    let (a, b) = containers()?;
+    a.install_candidate()?;
+    b.install_candidate()?;
+    let output = a.peer.flocal_ok(&[
+        "sync",
+        "add",
+        SHARE,
+        "--host",
+        &b.peer.alias,
+        "--remote-path",
+        SHARE,
+        "--yes",
+    ])?;
+    drop(output);
+    Ok((
+        Connector {
+            peer: a.peer,
+            watch_max_session_bytes: None,
+        },
+        b.peer,
+    ))
 }
 
 impl PeerBox {
@@ -838,6 +994,34 @@ impl Watch<'_> {
         self.peer.wait_for_text_within(WATCH_LOG, needle, deadline)
     }
 
+    /// Abruptly stops a watcher only after proving that this guard still owns
+    /// the stopped `flocal watch` process. This models a killed old binary at
+    /// the durable install boundary after checking process identity immediately
+    /// before signaling.
+    pub fn kill(mut self) -> Result<()> {
+        let pid = self.pid;
+        anyhow::ensure!(
+            self.peer.is_watcher(pid)? && self.peer.is_stopped_flocal(pid)?,
+            "{}: flocal watch (pid {pid}) changed before killed interruption",
+            self.peer.alias
+        );
+        let killed = self.peer.signal("KILL", pid)?;
+        if !killed.status.success() && self.peer.is_watcher(pid)? {
+            return Err(self.peer.fail(format!(
+                "{}: killing stopped flocal watch (pid {pid}) failed: {}",
+                self.peer.alias,
+                String::from_utf8_lossy(&killed.stderr).trim()
+            )));
+        }
+        self.peer.poll_until(
+            &format!("flocal watch (pid {pid}) did not exit after SIGKILL"),
+            DEADLINE,
+            move |peer| Ok((!peer.is_watcher(pid)?).then_some(())),
+        )?;
+        self.stopped = true;
+        Ok(())
+    }
+
     /// Terminates the watcher inside the container — killing the `docker
     /// exec` client would not, and a surviving watcher would keep holding
     /// its share-session lock and any active round permit — and waits for it
@@ -893,6 +1077,97 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn install_candidate(&self) -> Result<()> {
+        let output = self.exec_ok(&[
+            "/usr/local/libexec/flocal-real",
+            "daemon",
+            "install",
+            "/home/peer/.local/bin/flocal",
+        ])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "Preflight complete; stopping managed synchronization",
+            "Candidate executable installed",
+            "State migration and managed service update complete",
+            "Starting enabled managed synchronization",
+            "enabled syncs are restarting automatically",
+            "Upgrade the other endpoint next",
+            "no re-pair or state reset is needed",
+        ] {
+            anyhow::ensure!(
+                stdout.contains(expected),
+                "{}: candidate install omitted {expected:?}: {stdout}",
+                self.alias
+            );
+        }
+        let installed = self.executable_hash("/home/peer/.local/bin/flocal")?;
+        let candidate = self.executable_hash("/usr/local/libexec/flocal-real")?;
+        anyhow::ensure!(
+            installed == candidate,
+            "{}: installed executable hash {installed} differs from candidate {candidate}",
+            self.alias
+        );
+        self.context.record(format!(
+            "{} installed candidate executable sha256: {installed}",
+            self.alias
+        ));
+        Ok(())
+    }
+
+    pub fn install_candidate_expect_err(&self, needle: &str) -> Result<()> {
+        let output = self.exec_raw(&[
+            "/usr/local/libexec/flocal-real",
+            "daemon",
+            "install",
+            "/home/peer/.local/bin/flocal",
+        ])?;
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if output.status.success() {
+            return Err(self.fail(format!(
+                "candidate install succeeded; expected an error containing {needle:?}"
+            )));
+        }
+        if !message.contains(needle) {
+            return Err(self.fail(format!(
+                "candidate install error did not contain {needle:?}: {message}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn kill_daemon_on_service_stop(&self) -> Result<()> {
+        self.exec_ok(&["touch", "--", KILL_DAEMON_ON_STOP_MARKER])?;
+        Ok(())
+    }
+
+    fn executable_hash(&self, path: &str) -> Result<String> {
+        let output = self.exec_ok(&["sha256sum", "--", path])?;
+        let hash = String::from_utf8(output.stdout)?
+            .split_whitespace()
+            .next()
+            .context("sha256sum omitted the executable hash")?
+            .to_owned();
+        anyhow::ensure!(
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{}: invalid executable sha256 {hash:?}",
+            self.alias
+        );
+        Ok(hash)
+    }
+
+    pub fn arm_migration_failure(&self) -> Result<()> {
+        self.exec_ok(&["touch", "--", MIGRATION_FAILURE_MARKER])?;
+        Ok(())
+    }
+
+    pub fn clear_migration_failure(&self) -> Result<()> {
+        self.exec_ok(&["rm", "-f", "--", MIGRATION_FAILURE_MARKER])?;
+        Ok(())
+    }
     pub fn make_relationship_legacy(&self) -> Result<()> {
         self.flocal_ok(&["protocol", "e2e-make-relationship-legacy", SHARE])?;
         Ok(())
@@ -999,7 +1274,7 @@ impl Peer {
     }
 
     pub fn assert_second_sync_durably_queued(&self) -> Result<()> {
-        self.second_status()?.scheduling.validate_queued()
+        self.second_status()?.scheduling().validate_queued()
     }
 
     pub fn wait_for_second_sync_queued_behind(&self, root: &str) -> Result<()> {
@@ -1157,7 +1432,7 @@ impl Peer {
             |_| {
                 let local = self.status()?;
                 let remote = other.second_status()?;
-                let queued = [&local.scheduling, &remote.scheduling]
+                let queued = [local.scheduling(), remote.scheduling()]
                     .into_iter()
                     .find(|scheduling| scheduling.state == "queued");
                 let Some(queued) = queued else {
@@ -1175,7 +1450,8 @@ impl Peer {
             "persistent watch did not report its local scheduling wait",
             DEADLINE,
             move |peer| {
-                let scheduling = peer.status()?.scheduling;
+                let status = peer.status()?;
+                let scheduling = status.scheduling().clone();
                 if scheduling.state != "queued" {
                     return Ok(None);
                 }
@@ -1197,7 +1473,7 @@ impl Peer {
     }
 
     pub fn assert_sync_durably_queued(&self) -> Result<()> {
-        self.status()?.scheduling.validate_queued()
+        self.status()?.scheduling().validate_queued()
     }
 
     pub fn arm_scheduling_wait_observation(&self) -> Result<()> {
@@ -1833,6 +2109,82 @@ impl Peer {
         self.status_at(SHARE)
     }
 
+    /// Reads status from the installed predecessor before an upgrade. The
+    /// deployed alpha emitted schema 5; candidate reads stay pinned to schema 6.
+    pub fn predecessor_status(&self) -> Result<Status> {
+        let output = self.flocal_ok(&["status", SHARE, "--json"])?;
+        let mut status: Status =
+            serde_json::from_slice(&output.stdout).context("parsing predecessor status --json")?;
+        if !matches!(status.schema, STATUS_SCHEMA | LEGACY_STATUS_SCHEMA) {
+            return Err(self.fail(format!(
+                "predecessor status schema {} is neither {STATUS_SCHEMA} nor {LEGACY_STATUS_SCHEMA}",
+                status.schema
+            )));
+        }
+        if status.schema == STATUS_SCHEMA && status.scheduling.is_none() {
+            return Err(self.fail(format!(
+                "status schema {STATUS_SCHEMA} is missing its required scheduling field"
+            )));
+        }
+        if status.schema == LEGACY_STATUS_SCHEMA {
+            status.scheduling.get_or_insert_default();
+        }
+        Ok(status)
+    }
+
+    pub fn assert_clean_upgrade_status(&self, before: &Status) -> Result<()> {
+        let after = self.poll_until(
+            "upgrade did not settle to a clean relationship state",
+            DEADLINE,
+            |peer| {
+                let after = peer.status()?;
+                Ok((!after.pending_install
+                    && after.unsettled.is_empty()
+                    && after.recovery.conflicts == 0)
+                    .then_some(after))
+            },
+        )?;
+        if after.share != before.share
+            || after.peer != before.peer
+            || after.bound_peer != before.bound_peer
+            || after.relationship_state != before.relationship_state
+        {
+            return Err(self.fail(format!(
+                "upgrade did not preserve a clean relationship state:\nbefore={before:#?}\nafter={after:#?}"
+            )));
+        }
+        self.conflicts()?.expect_none()
+    }
+
+    pub fn wait_for_recovered_install(&self) -> Result<()> {
+        self.poll_until(
+            "interrupted install did not recover to a settled state",
+            DEADLINE,
+            |peer| {
+                let status = peer.status()?;
+                Ok((!status.pending_install && status.unsettled.is_empty()).then_some(()))
+            },
+        )
+    }
+
+    pub fn wait_for_managed_connection(&self, expected: &'static str) -> Result<()> {
+        self.poll_until(
+            &format!("managed sync did not reach {expected}"),
+            DEADLINE,
+            move |peer| {
+                let listing = peer.sync_list()?;
+                Ok(matches!(
+                    listing.syncs.as_slice(),
+                    [sync]
+                        if sync.enabled
+                            && sync.role == "connector"
+                            && sync.connection_state == expected
+                )
+                .then_some(()))
+            },
+        )
+    }
+
     pub fn second_status(&self) -> Result<Status> {
         self.status_at(SECOND_SHARE)
     }
@@ -1848,6 +2200,11 @@ impl Peer {
             return Err(self.fail(format!(
                 "status schema {} does not match the pinned {STATUS_SCHEMA}",
                 status.schema
+            )));
+        }
+        if status.scheduling.is_none() {
+            return Err(self.fail(format!(
+                "status schema {STATUS_SCHEMA} is missing its required scheduling field"
             )));
         }
         Ok(status)
@@ -2210,7 +2567,7 @@ impl Peer {
     /// be recycled (the container caps pids), so `stop`/`Drop` gate every
     /// real signal on this identity check rather than a bare `kill -0`,
     /// which cannot tell a reused pid apart from the watcher. The watcher's
-    /// argv holds both tokens for its whole life — `<…/flocal-real> watch
+    /// argv holds both tokens for its whole life — `<…/flocal> watch
     /// <share>`, stable across the `sh -c`→wrapper→real `exec` chain (same
     /// pid throughout). The processes that could recycle its pid carry at
     /// most one: the `sh -c 'kill …'` signaler and the `cat /proc/…` probe
@@ -2245,7 +2602,7 @@ impl Peer {
             .filter(|argument| !argument.is_empty())
             .collect();
         Ok(matches!(arguments.as_slice(), [executable, protocol, serve]
-            if executable.ends_with(b"/flocal-real")
+            if is_flocal_executable(executable)
                 && *protocol == b"protocol"
                 && *serve == b"serve"))
     }
@@ -2270,7 +2627,7 @@ impl Peer {
                 .stdout
                 .split(|byte| *byte == 0)
                 .next()
-                .is_some_and(|executable| executable.ends_with(b"/flocal-real"))
+                .is_some_and(is_flocal_executable)
         {
             return Ok(false);
         }

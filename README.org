@@ -5,7 +5,17 @@ is named =flocal=.
 
 * Build and try the alpha
 
-Rust stable is required on both peers:
+Rust stable is required on both peers. Before upgrading an existing
+installation to this version, verify that every registered share path is the
+intended mounted directory on that machine. The installer records each legacy
+root's filesystem device and inode as its durable identity. A missing,
+symlinked, or later replaced root is rejected rather than being mistaken for
+an empty tree and propagating mass deletions.
+
+Run installation with the account's normal =HOME=, not an overridden home
+directory. The installer verifies it against the systemd user manager on Linux
+and the account directory on macOS before it can stop or rewrite the single
+per-user service.
 
 #+begin_src sh
 make install
@@ -13,8 +23,9 @@ make install
 
 Managed sync needs a systemd user manager on Linux. On macOS, run the command
 from a graphical login so it can install the per-user LaunchAgent; a headless
-run installs the binary and prints the absolute =cd ... && make install=
-command to run from that session.
+run installs the binary, retains =upgrade.pending= so ordinary commands cannot
+migrate state, and asks you to run =make install= again from a graphical
+session before it migrates state or resumes managed synchronization.
 
 Run that command from a checkout of this repository on *both* peers. Ensure
 =~/.local/bin= is in =PATH= and that non-interactive SSH can run =flocal= on
@@ -23,12 +34,48 @@ non-interactive SSH sessions often use a smaller =PATH=. The remote directory
 does not need to be initialized separately: pairing creates it when needed and
 registers it under the initiating peer's share identity.
 
-Before the first command after upgrading an existing installation to this
-version, verify that every registered share path is the intended mounted
-directory on that machine. The upgrade records each legacy root's filesystem
-device and inode as its durable identity. A missing, symlinked, or later
-replaced root is rejected rather than being mistaken for an empty tree and
-propagating mass deletions.
+** Upgrade an existing installation
+
+Use the same command for installation and upgrade:
+
+#+begin_src sh
+make install
+#+end_src
+
+For the first upgrade to the compatible installer, upgrade a relationship's
+connector before its responder. The installer stages the complete candidate,
+stops the managed daemon, waits for its idle or in-progress managed sessions to
+end safely, migrates state, replaces the service definition, and starts every
+enabled sync again. Pairing, enabled intent, pending recovery, and synchronized
+directories are retained. Later compatible upgrades can also ask an inbound
+responder session to drain itself, so endpoint order is no longer significant.
+
+Foreground =flocal watch PATH= and one-shot =flocal sync PATH= are not owned by
+the managed daemon. End all of them before the first upgrade from the previous
+alpha. The previous binary releases its session lock while an initial plan is
+waiting for confirmation, so that particular idle prompt cannot be detected by
+the candidate. Active sessions are detected: the installer reports the
+affected human-readable root while it waits, then leaves the old executable and
+state unchanged, restores only a service that was running, and tells you what
+to stop before retrying. Once this version is installed, a foreground watch
+keeps its lifetime lock during later upgrades and receives the same safe
+refusal. A responder-first immediate upgrade can also refuse while an old
+inbound session is active.
+
+An upgrade interrupted after publication but before managed migration and
+service-asset publication finish leaves an owner-only =upgrade.pending= marker
+that blocks ordinary commands from opening or migrating state. A headless
+macOS binary-only install retains the same marker. Once those durable managed
+phases finish, the installer removes the marker before starting the daemon; a
+start or readiness failure leaves the fully migrated candidate stopped and
+reports the same =make install= retry guidance. Do not delete a retained marker
+or copy an older executable over the installed candidate; downgrades are not
+supported.
+
+If an older foreground =flocal watch PATH= was interrupted while applying a
+change, install the candidate on both endpoints and then rerun =flocal watch
+PATH=. The durable install intent recovers that interrupted apply. Do not
+delete state, remove the intent, or pair the directories again.
 
 Then, on one peer only, pair an existing local directory with an absolute
 remote path:
@@ -288,13 +335,13 @@ without reconnecting. A path that changes again is isolated so stable sibling
 paths can finish. A later full round reports =SETTLED=. =flocal status= and
 =sync list= expose durable unsettled state across daemon restarts.
 
-Persistent watch uses protocol version 6, so install or upgrade =flocal= on both
+Persistent watch uses protocol version 7, so install or upgrade =flocal= on both
 peers before adding a managed sync. Explicit =flocal sync= uses protocol
-version 5. A persistent protocol mismatch keeps the
+version 6. A persistent protocol mismatch keeps the
 worker reconnecting with bounded upgrade reports until both peers support
-version 6; it never silently falls back to polling. Downgrading does not change
+version 7; it never silently falls back to polling. Downgrading does not change
 synchronized state, though persistent watch remains unavailable until both
-peers support version 6.
+peers support version 7.
 
 Relationship registration and removal capabilities each start at
 version 1 on the separate fixed =flocal protocol relationship= entrypoint.

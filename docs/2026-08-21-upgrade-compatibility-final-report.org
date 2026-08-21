@@ -1,0 +1,592 @@
+#+title: Safe installation upgrades and real migration testing
+
+* What changed for the user
+
+Installing and upgrading now use the same command:
+
+#+begin_src sh
+make install
+#+end_src
+
+That command is one owned operation. It no longer asks Make, a candidate
+binary, the shell, the platform service manager, and the newly copied binary
+to each perform a disconnected piece of the upgrade. The candidate stages
+itself completely, stops the old managed daemon, proves that local state is no
+longer in use, publishes itself, migrates state, replaces the service assets,
+and starts managed synchronization again.
+
+An idle managed sync needs no manual preparation. A managed sync in the middle
+of applying a change also needs no manual preparation: the service stop lets
+the old process finish or recover its committed work, and the candidate keeps
+the durable enabled intent that starts it again.
+
+There is one special rule for the immediate upgrade from the previous alpha:
+upgrade a relationship's connector first, then its responder. The previous
+binary does not know how to leave an inbound session for an upgrade marker. If
+the responder is attempted first while that old session is active, installation
+waits visibly, refuses before replacing anything, restarts the old service, and
+asks for connector-first ordering. Once both endpoints contain this change,
+future compatible responder-first upgrades work automatically because the
+responder notices the marker and closes its own session.
+
+A foreground =flocal watch PATH= or =flocal sync PATH= is deliberately not
+killed by an installer. It is the user's terminal process, not a managed daemon
+worker. An active session keeps its root lock while the installer waits and
+eventually refuses safely with exact stop-and-retry guidance. No executable or
+schema has changed at that point, and only a managed service that was running
+is restored. The first transition still requires ending every foreground
+command: the previous alpha releases its lock while an initial plan waits for
+confirmation, and a candidate cannot safely observe that idle old process.
+
+If power loss or another failure interrupts an upgrade after publication but
+before managed migration and service-asset publication finish, or after a
+headless macOS binary-only install, normal commands report:
+
+#+begin_example
+upgrade is in progress; rerun `make install`
+#+end_example
+
+Rerunning installation continues with the candidate. Deleting the marker or
+copying the old executable back is neither needed nor supported.
+
+* The final design
+
+The operation has a deliberately asymmetric boundary that persists across
+retries.
+
+Before the first executable replacement, failure is reversible. The old
+executable and schema remain authoritative. The candidate removes the marker
+created by that attempt, syncs the removal, restores the old service when it
+was previously running, and returns the original error. If cleanup or
+restoration also fails, the message includes both failures instead of
+pretending recovery succeeded.
+
+After executable replacement, failure is resumable but not reversible. Until
+managed migration and service-asset publication complete, the candidate keeps
+=upgrade.pending= durable, leaves the service stopped, and tells the user to
+rerun =make install=. A headless macOS binary-only install retains it for the
+same reason. This construction removes the dangerous state where a new schema
+and an old process run together. A later invocation records that inherited
+marker before doing anything else. If that retry fails before its own rename,
+it still preserves the marker and does not restore a service, because the
+earlier invocation may already have crossed the boundary. After managed state
+and service assets are durable, the marker is removed so the candidate daemon
+can open state. A subsequent start or readiness failure leaves that fully
+migrated candidate stopped and reports retry guidance without recreating the
+marker.
+
+The successful sequence is:
+
+1. Resolve the state directory without opening SQLite.
+2. Take the per-user service-installer lock, then the selected state
+   directory's installer lock. The first serializes the one managed service
+   across different state choices; the second protects that state's migration
+   and recovery. They deliberately use distinct =service-installer.lock= and
+   =installer.lock= files, so both remain independent even when the state
+   directory is the managed-marker directory itself.
+3. Validate the candidate, destination, state path, service manager, managed
+   marker, and service-definition path while the old service is still live.
+   Refuse an explicit state path that differs from an existing managed
+   installation instead of silently redirecting the global service.
+4. Copy the candidate through held file and directory descriptors into an
+   owner-controlled temporary, set its final mode, and fully sync it.
+5. Stop the managed daemon and durably create =upgrade.pending=.
+6. Read the old database strictly read-only, enumerate every share, and try to
+   own every legacy mutation lock without waiting while holding a partial set.
+   On contention, release everything, report the root, and retry until the
+   bounded deadline.
+7. Take the exclusive installation barrier. New binaries hold its shared side
+   for the lifetime of every =State=, so this is the single quiescence mechanism
+   for later upgrades.
+8. Rename the staged executable over the destination and sync its directory.
+   This rename is the irreversible boundary.
+9. Open state through the installer's exclusive barrier. Create and migrate the
+   entire schema in one SQLite transaction.
+10. Replace and sync the managed-state marker and systemd unit or LaunchAgent.
+11. For a managed install, remove and sync =upgrade.pending=, release the
+    barriers, then start the service. Wait for its private control socket to
+    answer a real list request before reporting success. Every enabled managed
+    sync is reconstructed from durable intent.
+
+On headless macOS there is no graphical LaunchAgent domain to stop or start.
+The installer still quiesces local work and safely publishes the binary, but it
+does not migrate state or service assets. It retains =upgrade.pending= and asks
+for =make install= again from a graphical session; only a managed pass that
+completes migration and service-asset publication clears the marker before
+starting the daemon.
+
+Both one-shot and persistent-watch protocol versions advance once, to 6 and 7.
+This prevents the candidate connector from creating a long-lived session with
+the one immediately preceding responder while that responder is still waiting
+to be upgraded. A protocol mismatch remains an ordinary bounded reconnect and
+resolves after the second endpoint is installed.
+
+* How the implementation works
+
+** One dispatch before state is opened
+
+The old install path had two internal commands. More importantly, command
+dispatch happened after =State::open_default()=, and that open could run a
+candidate migration before Make stopped the old daemon. The new internal
+command returns before the ordinary state open:
+
+#+begin_src rust
+if let Commands::Daemon {
+    command: DaemonCommand::Install { executable },
+} = &cli.command
+{
+    return install_daemon(executable);
+}
+let mut state = State::open_default()?;
+#+end_src
+
+The Makefile keeps the install invocation simple while passing =PREFIX= as
+environment data:
+
+#+begin_src makefile
+PREFIX ?=
+override PREFIX := $(value PREFIX)
+export PREFIX
+
+install: build
+	@prefix="$${PREFIX:-$$HOME/.local}"; \
+	target/release/flocal daemon install "$$prefix/bin/flocal"
+#+end_src
+
+The Rust command resolves a relative destination against its current directory
+as a native path before enforcing the absolute-path filesystem boundary. That
+keeps spaces, backslashes, command substitutions, and non-UTF-8 path bytes out
+of extra shell parsing: Make freezes the raw override without re-evaluating Make
+expressions, exports it as environment data, and the recipe applies the
+=$HOME/.local= default only inside the shell. Linux service paths reject
+systemd's percent and dollar expansion syntax instead of changing the path.
+There is now one
+implementation of ordering and failure recovery instead of a shell recipe split
+around executable replacement.
+
+** Descriptor-held staging and atomic publication
+
+=StagedExecutable= owns an already-open destination directory, a second
+descriptor used for directory synchronization, the temporary name, and the
+final name. It copies from an opened, revalidated candidate rather than
+reopening an unchecked path later.
+
+#+begin_src rust
+let sync_directory = File::open(parent)?;
+let directory = cap_std::fs::Dir::from_std_file(sync_directory.try_clone()?);
+let mut output = directory.open_with(&temporary, &options)?;
+let staged = Self {
+    directory,
+    sync_directory,
+    temporary,
+    destination,
+    published: false,
+};
+copy_candidate_exactly(&mut source, &mut output, candidate_length)?;
+staged.directory.set_permissions(&staged.temporary, Permissions::from_mode(0o755))?;
+flocal::durability::sync_file(&output)?;
+Ok(staged)
+#+end_src
+
+The length snapshot makes staging bounded even if a local build process appends
+to the opened inode. An early EOF is rejected before the service is stopped,
+so a concurrent truncation cannot publish a partial executable. The cleanup
+guard is constructed immediately after the temporary opens and before the next
+fallible operation; copy, permission, or sync failure therefore removes the
+partial file.
+
+Publication is relative to that retained directory capability:
+
+#+begin_src rust
+self.directory
+    .rename(&self.temporary, &self.directory, &self.destination)
+    .context("publishing the candidate executable")?;
+self.published = true;
+self.sync_directory.sync_all()?;
+#+end_src
+
+The =published= assignment intentionally occurs immediately after rename, not
+after directory sync. If directory sync fails, the executable may already have
+changed, so recovery must use the post-publication rule and must not restart the
+old service.
+
+On macOS, =sync_file= uses =F_FULLFSYNC= rather than ordinary =fsync=; SQLite
+also enables its =fullfsync= pragma before migration. Linux uses ordinary
+=fsync=. Service files and the managed-state marker use the same held-directory shape:
+create a private temporary, write and sync it, rename it relative to the open
+directory, and sync the directory. A failed pre-rename write removes its owned
+temporary.
+
+** The pending marker and installation barrier
+
+Every new =State= checks =upgrade.pending= on both sides of taking the shared
+barrier:
+
+#+begin_src rust
+let barrier = open_installation_barrier(&dir)?;
+ensure_upgrade_not_pending(&dir)?;
+FileExt::lock_shared(&barrier)?;
+if let Err(error) = ensure_upgrade_not_pending(&dir) {
+    let _ = FileExt::unlock(&barrier);
+    return Err(error);
+}
+Self::open_with_barrier(dir, barrier)
+#+end_src
+
+The first check avoids entering a known upgrade. The second closes the race
+where installation creates the marker between the first check and lock
+acquisition. The =State= struct retains the file as
+=_installation_barrier: File=, so Rust's ownership rules hold the shared lock
+for exactly the state's lifetime.
+
+The installer holds the exclusive side and uses the narrow
+=State::open_for_upgrade= entry point. Ordinary callers cannot opt out of the
+marker or barrier.
+
+Long-lived connector and responder loops check the marker inside their existing
+50-to-100 millisecond bounded control loops. A connector maps the typed
+=UpgradePending= error to a successful worker exit rather than logging it as a
+connection failure. A responder closes its persistent SSH protocol process.
+This is what makes later compatible responder-first installation possible.
+
+** Crossing the first compatibility gap
+
+The preceding executable knows neither the marker nor the barrier. The
+candidate therefore opens its database read-only and inventories share IDs,
+roots, and the active scheduling root. It then attempts all legacy mutation
+locks: daemon ownership, relationship registration, object maintenance, global
+finalization, scheduler publication, and both round and session locks for every
+share.
+
+Acquisition is nonblocking and all-or-nothing. Returning from a failed attempt
+drops the =Vec<File>= guard and therefore releases every partial lock before the
+next retry. This matters because an installer waiting on a session must not
+retain another lock that session needs in order to finish.
+
+The result type keeps user feedback explicit:
+
+#+begin_src rust
+pub enum UpgradeLockAttempt {
+    Acquired(LegacyUpgradeLocks),
+    Busy(PathBuf),
+}
+#+end_src
+
+For an active scheduled round, =Busy= uses its joined share root. For a
+per-share lock it uses that share's inventoried root directly. The public
+message therefore says =Waiting for synchronization of PATH to finish before
+upgrade= rather than exposing an internal share or lock ID.
+
+After a complete pass, the candidate repeats the read-only inventory and keeps
+the locks only if the share set and active root are unchanged. This prevents a
+registration race from hiding a newly introduced lock.
+
+** One migration transaction
+
+Previously the initial =CREATE TABLE= and =CREATE INDEX= batch committed before
+the ALTER/backfill transaction began. A failed backfill could therefore leave a
+partially advanced schema. The transaction now begins first:
+
+#+begin_src rust
+let transaction = conn.transaction()?;
+transaction.execute_batch(
+    "CREATE TABLE IF NOT EXISTS installation (...);
+     CREATE TABLE IF NOT EXISTS shares (...);
+     ...",
+)?;
+
+// Column discovery, ALTERs, trigger/index replacement, and backfills all use
+// `transaction`.
+transaction.commit()?;
+#+end_src
+
+The separate WAL and synchronous pragmas still precede the transaction because
+they configure the connection rather than mutate application schema. A unit
+fixture forces legacy root backfill to fail and verifies that neither the new
+column nor a newly created table remains afterward.
+
+** Platform service handling
+
+Linux preparation asks the systemd user manager for its own environment and
+uses that environment's config directory. It records whether the unit is
+active, stops only an active unit, writes the durable unit and marker, runs
+=daemon-reload=, and finally performs =enable --now=. A reversible failure
+starts the old unit only when it was active before installation. Manager
+acceptance is not treated as readiness: the installer waits for the daemon's
+private socket, and stops a candidate that fails to initialize before returning
+log-and-retry guidance.
+
+Linux requires process =HOME= to equal the systemd manager's reported home
+before any service mutation. macOS validates it against the account home
+returned by directory services before selecting home-based state, marker, and
+lock paths. Two differently overridden homes therefore cannot race the same
+per-user systemd unit or fixed per-UID LaunchAgent label.
+
+macOS preparation distinguishes the graphical domain from an already loaded
+job. A loaded job is booted out before migration and bootstrapped only after
+the pending marker is gone. An available graphical domain with no prior job is
+a normal fresh installation. No shell command contains an untrusted interpolated
+path; service paths are validated and encoded for systemd or XML before use.
+
+Native macOS CI runs these launchd branches against a deterministic
+=launchctl= boundary. It covers loaded-job stop and restore, service-asset
+publication, bootout and bootstrap failures, and the headless plan. The real
+graphical-login and macOS-to-Linux gate remains separate because a fake manager
+cannot prove an actual LaunchAgent session.
+
+The Docker image supplies a small fake =systemctl=. It is not a mock of
+synchronization or state. It owns only the missing container service-manager
+boundary: normal stop sends TERM, the interrupted-apply scenario kills
+the deliberately stopped old daemon before it can resume, every stop uses
+=start-stop-daemon= to match both the PID file and executable and waits with a
+bounded KILL fallback, and =enable --now= launches the installed daemon. The
+paired directories, SSH sessions, old daemon, new daemon, SQLite state, locks,
+journals, and files are real.
+
+* The base-to-candidate E2E path
+
+The upgrade harness resolves the exact base commit, requires it to be a distinct
+ancestor of the candidate, archives that source, and builds a second image. It
+extracts the base executable and installs it into two fresh candidate-image
+containers. Both peers then run the base executable for initialization,
+relationship registration, initial sync, daemon management, and the first
+persistent session.
+
+Only after the pair has synchronized a real file does the harness invoke the
+candidate's internal installer. The wrapper automatically follows the installed
+path, so every later local command and SSH responder changes from base to
+candidate at the actual rename boundary.
+
+Seven ordinary E2E scenarios now cover:
+
+1. An idle base pair, connector-first installation, bidirectional candidate
+   convergence, then a compatible responder-first reinstall.
+2. A base daemon stopped at the exact pre-apply boundary with a proven durable
+   intent, killed by service shutdown before apply, followed by candidate
+   recovery and convergence.
+3. A foreground base watch stopped immediately before apply, killed, then
+   recovered by a candidate watch after both endpoints are installed.
+4. A foreground base watch and a later candidate watch each causing a bounded,
+   root-naming refusal; after each watch ends, retry succeeds without repair.
+5. An injected failure inside the candidate migration transaction, followed by
+   a successful rerun with the same paired state and files.
+6. A responder-first legacy attempt refusing safely, followed by the documented
+   connector-first sequence.
+7. A fresh two-peer installation through exactly the same owned installer.
+
+CI checks out full history and passes the pull request's exact base SHA as
+=FLOCAL_E2E_UPGRADE_FROM=. Local runs use the merge base with =COVERAGE_BASE=.
+Equal executable hashes are allowed for documentation-only transitions, but
+equal base and candidate commits are rejected. Both commit IDs and executable
+hashes are retained in permanent failure diagnostics outside the rolling
+command transcript, and every successful install verifies the destination is
+the candidate. This makes every pull request carry a real transition from the
+version it proposes to replace.
+
+* Rust features used here
+
+** RAII guards
+
+RAII means a value's destructor owns cleanup. =StagedExecutable= implements
+=Drop=:
+
+#+begin_src rust
+impl Drop for StagedExecutable {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = self.directory.remove_file(&self.temporary);
+        }
+    }
+}
+#+end_src
+
+Every early =?= after the temporary is opened therefore drops the already-built
+guard and cleans the candidate temporary. After rename, =published= disables
+that cleanup because the old name no longer exists and the operation has
+crossed its irreversible boundary.
+
+The lock guards need no custom destructor. =File= closes on drop, and the
+operating system releases =flock= ownership with it. A
+=LegacyUpgradeLocks { _files: Vec<File> }= is therefore an all-locks lifetime
+token: retaining the value retains every lock; returning or retrying releases
+all of them.
+
+** =Result=, =?=, and error context
+
+Most functions return =anyhow::Result<T>=. The =?= operator either unwraps the
+successful value or returns the error immediately. =context= adds the phase
+that failed while keeping the underlying OS or SQLite cause. Around the rename
+boundary the code does not use a blind =?=: it inspects =staged.published= so
+the recovery policy follows what actually happened on disk.
+
+** Enums and pattern matching
+
+=UpgradeLockAttempt= makes “all locks” and “one human path is busy” the only
+successful outcomes. Pattern matching forces the installer to handle both.
+Similarly, matching the install CLI before =State::open_default= makes it
+visible in the type-level command flow that installation cannot accidentally
+fall through to normal migration.
+
+** Ownership and explicit =drop=
+
+Rust normally drops values at scope end. A few points use =drop(value)= early
+because ordering is part of correctness. The migrated =State= is dropped before
+the pending marker is removed; the exclusive barrier and legacy guards are
+dropped after marker removal but before service start. Those explicit releases
+document and enforce which process may open state at each phase.
+
+** Conditional compilation
+
+=#[cfg(target_os = "linux")]= and =#[cfg(target_os = "macos")]= select small
+service-manager implementations while the upgrade transaction remains shared.
+=#[cfg(feature = "e2e-test-hooks")]= contains only deterministic fault and pause
+boundaries. Production builds contain neither the injected migration failure
+nor the apply stop.
+
+* What was hard
+
+The hardest problem was not copying a binary. It was proving that no old code
+could mutate state while new code migrated it. There are three process owners:
+the managed connector daemon, user-owned foreground commands, and inbound SSH
+responders owned by a remote connector. Stopping the local service affects only
+the first. The final design combines durable intent, a marker-aware barrier for
+new code, and a complete legacy-lock sweep for the one old version that cannot
+cooperate.
+
+The second hard part was drawing the exact failure boundary. Rename can succeed
+and directory synchronization can fail. Treating the whole helper call as
+“rename failed” would restart through a path that may already hold the
+candidate. Recording publication immediately after rename makes that unsafe
+state unreachable.
+
+The third was making the E2E honest. A current binary with a hand-edited
+“legacy” row cannot prove executable compatibility, service restart, protocol
+transition, or real on-disk migration. Building the exact Git base in a second
+image exposed harness assumptions too: SSH responders had to follow the
+installed binary, and the service-manager replacement had to distinguish live
+processes from unreaped container zombies.
+
+The fourth was preserving macOS behavior without duplicating the transaction.
+Linux always has a user-manager decision at install time; macOS may run from a
+headless SSH session with no graphical domain. Keeping that as a platform plan
+inside one shared installer avoids a second upgrade implementation while
+preserving the safe binary-only result.
+
+The global installer lock also needed an authoritative namespace. A lock under
+an arbitrary process =HOME= is not global if two invocations override =HOME=
+differently, while systemd and launchd still expose one service for the user.
+The platform provenance checks make that split-service state unreachable before
+the installer stops anything.
+
+The local review found several boundaries that were easy to state too broadly:
+marker creation had to be private in the creating syscall; a retry must not
+erase an inherited post-publication marker; headless macOS must retain that
+marker until graphical migration; and service-manager acceptance is not daemon
+readiness. It also found that peer-controlled roots reached upgrade guidance.
+Those paths now use the same bounded control-byte escaping as other untrusted
+diagnostics.
+
+* Validation and review status
+
+** Install-intent raw JSON recovery
+
+An old executable omits =managed_generation= from its durable install-intent
+JSON. The candidate reads it as =None=, but serializing it again adds
+="managed_generation":null=. SQLite correctly treats those distinct byte
+strings as different revisions, so using the candidate serialization as the
+expected CAS value produced the false changed-intent diagnostic.
+
+Recovery now retains the raw selected row for the expected side and serializes
+only the replacement:
+
+#+begin_src rust
+let (expected_json, mut intent) = self.install_intent_with_raw(share)?
+    .context("install intent is missing")?;
+let temp_index = intent.temps.iter()
+    .position(|temp| &temp.path == path)
+    .context("install temporary is missing")?;
+let old_phase = intent.temps[temp_index].phase;
+intent.temps[temp_index].phase = phase;
+let replacement_json = serde_json::to_string(&intent)?;
+intent.temps[temp_index].phase = old_phase;
+self.replace_install_intent_json(share, &expected_json, &intent, &replacement_json)
+#+end_src
+
+New recovery fingerprints use the raw row. A narrow compatibility bridge also
+accepts a pre-fix canonicalized fingerprint only to clear an already-classified
+intent; it never broadens the raw JSON CAS predicate. Restoring the in-memory
+phase before classification validation lets a large journal keep one parsed
+intent rather than parsing the old JSON twice; legacy hashing streams directly
+into BLAKE3 rather than allocating another serialized buffer. The exact installed
+predecessor source is =5fa9c6f=: its release binary and the installed
+executable had the same SHA-256 when the anchor was recorded. That predecessor
+also predates the =sync_queue= table, so installer inventory detects the table
+before querying it instead of failing preflight. A focused legacy-schema test
+pins that prerequisite. The foreground E2E builds the exact predecessor source
+and checks both trees, clean status, peer/relationship identity, and recovery
+without deleting state or pairing again.
+
+Completed locally after the independent review pass:
+
+- =cargo fmt --check=: pass.
+- =cargo clippy --all-targets --all-features -- -D warnings=: pass.
+- All 236 non-Docker unit and integration tests: pass.
+- Whole-project executable-line coverage: 19,184/20,911, 91.74%.
+- Changed executable-line coverage: 1,065/1,148, 92.77%.
+- Full Docker E2E: 52 passed, 2 filtered, in 359.01 seconds from the exact
+  pull-request base. The upgrade-only pass from exact deployed predecessor
+  =5fa9c6fc05a4bca70b79461bccb8f973e363e968= passed all 7 scenarios, with
+  47 unrelated scenarios filtered, in 86.61 seconds. After adding the final
+  executable predicate to stale-PID start matching, a competing harness cleanup
+  removed both containers from one scenario after the other 6 passed; its
+  immediate isolated retry passed in 33.33 seconds.
+
+The installed macOS Rust target is present locally, but a Linux host cannot
+compile the bundled SQLite and BLAKE3 C sources for Apple without an Apple
+cross-C toolchain. That local cross-command stopped at the C compiler's
+unsupported =-arch= and deployment-target flags, before checking project Rust.
+Native macOS CI is therefore still required and is the authoritative macOS
+compile/test result.
+
+The local review loop ran correctness, concurrency/liveness, error handling,
+adversarial security, simplicity/design, filesystem/platform, and dedicated
+comment/document alignment passes. It found and fixed raw-CAS representation
+drift, already-classified legacy fingerprints, large-journal recovery memory
+amplification, legacy inventory without a =sync_queue= table, broad schema-5
+harness acceptance, incomplete E2E identity postconditions, private-file
+creation windows, cleanup of partially staged candidates, a fake-service-manager
+=/proc= exit race, inherited-marker loss, unsafe service restoration,
+foreground lock ownership, terminal control-byte injection, service readiness,
+macOS durability and lifecycle coverage, unbounded candidate copying,
+scrollable transition diagnostics, and the global installer namespace.
+
+Copilot's review of =5f8fbe3= posted the repeated install-intent parse and
+included two suppressed findings: pre-guard staging cleanup and the fake
+=systemctl= read race. Local verification accepted all three. The recovery path
+now parses once, staging constructs its RAII guard before its first fallible
+post-create step, and the fake manager delegates PID-file plus executable
+identity and bounded termination to =start-stop-daemon=. The subsequent local
+concurrency pass also rejected manual bare-PID signaling entirely. No verified
+finding was declined. GitHub CI and Copilot are rerun on each pushed correction;
+the pull request records the final external state.
+
+* Remaining limits and operational note
+
+The updater is intentionally local. It does not fetch releases, distribute a
+binary to a peer, choose versions, or support downgrade. Run =make install= in
+an appropriate checkout on each endpoint.
+
+For the immediate deployment of this change:
+
+1. End foreground =flocal watch= and =flocal sync= processes.
+2. Run =make install= on each relationship's connector.
+3. Run =make install= on each corresponding responder.
+4. Confirm =flocal sync list= returns to =watching= and make one change in each
+   direction.
+
+Managed daemon sessions may be idle or actively synchronizing during step 2;
+the installer handles both. If a responder-first legacy session or forgotten
+foreground command remains, follow the named-path refusal, stop that command or
+upgrade its connector, and rerun =make install=. If any command reports
+=upgrade is in progress=, rerun =make install= on that endpoint rather than
+editing state by hand.

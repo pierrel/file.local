@@ -17,8 +17,8 @@ use crate::state::{
 };
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
-pub const SYNC_PROTOCOL_VERSION: u32 = 5;
-pub const WATCH_PROTOCOL_VERSION: u32 = 6;
+pub const SYNC_PROTOCOL_VERSION: u32 = 6;
+pub const WATCH_PROTOCOL_VERSION: u32 = 7;
 pub const RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION: u32 = 1;
 pub const RELATIONSHIP_REMOVAL_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_RELATIONSHIP_ID_BYTES: usize = 128;
@@ -2141,11 +2141,7 @@ fn sync_regular_file(directory: impl AsFd, path: &Path) -> Result<()> {
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )?;
-    #[cfg(target_os = "macos")]
-    rustix::fs::fcntl_fullfsync(&fd)?;
-    #[cfg(not(target_os = "macos"))]
-    rustix::fs::fsync(&fd)?;
-    Ok(())
+    crate::durability::sync_file(&fd)
 }
 
 fn sync_directory_chain(root: &cap_std::fs::Dir, relative: &Path) -> Result<()> {
@@ -3023,8 +3019,8 @@ mod tests {
 
     #[test]
     fn scheduling_protocol_versions_are_incremented() {
-        assert_eq!(SYNC_PROTOCOL_VERSION, 5);
-        assert_eq!(WATCH_PROTOCOL_VERSION, 6);
+        assert_eq!(SYNC_PROTOCOL_VERSION, 6);
+        assert_eq!(WATCH_PROTOCOL_VERSION, 7);
         assert_eq!(PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
     }
 

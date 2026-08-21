@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 #[cfg(unix)]
@@ -17,7 +18,7 @@ use flocal::model::{Entry, PeerConfig, PeerId, RelationshipId, ShareId};
 use flocal::state::{
     EndpointBinding, IncomingRemoval, InstallationPermit, PairedQueueState, PreparedRemoval,
     QueuePosition, QueueRequest, RegistrationOutcome, RemovalFailureState, SchedulingSnapshot,
-    State, SyncOperation,
+    State, SyncOperation, UpgradeLockAttempt, UpgradePending,
 };
 use flocal::sync::{
     self, InitialMessage, Message, RegisterRelationshipResponse, RelationshipRequest,
@@ -177,8 +178,10 @@ enum SyncCommand {
 #[derive(Subcommand)]
 enum DaemonCommand {
     Run,
-    PreflightService { executable: PathBuf },
-    InstallService,
+    #[command(hide = true)]
+    Install {
+        executable: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -285,6 +288,12 @@ fn run() -> Result<()> {
     ) {
         return serve_relationship();
     }
+    if let Commands::Daemon {
+        command: DaemonCommand::Install { executable },
+    } = &cli.command
+    {
+        return install_daemon(executable);
+    }
     let mut state = State::open_default()?;
     match cli.command {
         Commands::Init { path } => {
@@ -349,11 +358,8 @@ fn run() -> Result<()> {
             command: DaemonCommand::Run,
         } => daemon_run(state)?,
         Commands::Daemon {
-            command: DaemonCommand::PreflightService { executable },
-        } => preflight_daemon_service(&state, &executable)?,
-        Commands::Daemon {
-            command: DaemonCommand::InstallService,
-        } => install_daemon_service(&state)?,
+            command: DaemonCommand::Install { .. },
+        } => unreachable!("daemon install returns before state is opened"),
         Commands::Protocol {
             command: ProtocolCommand::Serve,
         } => serve(&mut state)?,
@@ -1173,75 +1179,380 @@ fn read_daemon_message(stream: &mut impl Read) -> Result<Vec<u8>> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn install_daemon_service(state: &State) -> Result<()> {
-    if Command::new("id").arg("-u").output()?.stdout == b"0\n" {
-        bail!("make install is per-user; do not run it with sudo");
-    }
-    let executable = std::env::current_exe()?.canonicalize()?;
-    validate_trusted_executable(&executable)?;
-    install_systemd_service(state, &executable)
+struct StagedExecutable {
+    directory: cap_std::fs::Dir,
+    sync_directory: File,
+    temporary: PathBuf,
+    destination: PathBuf,
+    published: bool,
 }
 
-#[cfg(target_os = "linux")]
-fn preflight_daemon_service(state: &State, executable: &Path) -> Result<()> {
-    if Command::new("id").arg("-u").output()?.stdout == b"0\n" {
+fn copy_candidate_exactly(
+    source: &mut impl Read,
+    output: &mut impl Write,
+    candidate_length: u64,
+) -> Result<()> {
+    let copied = io::copy(&mut source.take(candidate_length), output)
+        .context("staging the candidate executable")?;
+    if copied != candidate_length {
+        bail!("candidate executable changed while it was being staged")
+    }
+    Ok(())
+}
+
+impl StagedExecutable {
+    fn prepare(candidate: &Path, destination: &Path) -> Result<Self> {
+        use cap_std::fs::{OpenOptions as CapOpenOptions, Permissions, PermissionsExt};
+
+        if !destination.is_absolute() {
+            bail!("installed executable path must be absolute")
+        }
+        let candidate = candidate.canonicalize()?;
+        validate_trusted_executable(&candidate)?;
+        let mut source = File::open(&candidate)?;
+        validate_trusted_executable_file(&source)?;
+        let candidate_length = source.metadata()?.len();
+        let parent = destination
+            .parent()
+            .context("installed executable has no parent directory")?;
+        ensure_private_service_directory(parent)?;
+        validate_service_dir_chain(parent)?;
+        let sync_directory = File::open(parent)?;
+        let directory = cap_std::fs::Dir::from_std_file(sync_directory.try_clone()?);
+        let destination = PathBuf::from(
+            destination
+                .file_name()
+                .context("installed executable has no file name")?,
+        );
+        validate_install_destination(&directory, &destination)?;
+        let temporary = PathBuf::from(format!(".flocal-install-{}", ShareId::generate().0));
+        let options = CapOpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .to_owned();
+        let mut output = directory.open_with(&temporary, &options)?;
+        let staged = Self {
+            directory,
+            sync_directory,
+            temporary,
+            destination,
+            published: false,
+        };
+        copy_candidate_exactly(&mut source, &mut output, candidate_length)?;
+        staged
+            .directory
+            .set_permissions(&staged.temporary, Permissions::from_mode(0o755))?;
+        flocal::durability::sync_file(&output)
+            .context("syncing the staged candidate executable")?;
+        Ok(staged)
+    }
+
+    fn publish(&mut self) -> Result<()> {
+        validate_install_destination(&self.directory, &self.destination)?;
+        self.directory
+            .rename(&self.temporary, &self.directory, &self.destination)
+            .context("publishing the candidate executable")?;
+        self.published = true;
+        self.sync_directory
+            .sync_all()
+            .context("syncing the executable directory")?;
+        Ok(())
+    }
+}
+
+impl Drop for StagedExecutable {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = self.directory.remove_file(&self.temporary);
+        }
+    }
+}
+
+fn validate_install_destination(directory: &cap_std::fs::Dir, path: &Path) -> Result<()> {
+    let metadata = match directory.symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || (metadata.uid() != rustix::process::geteuid().as_raw() && metadata.uid() != 0)
+            || metadata.mode() & 0o022 != 0
+        {
+            bail!("installed executable destination is not a trusted regular file")
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn install_daemon(destination: &Path) -> Result<()> {
+    if rustix::process::geteuid().is_root() {
         bail!("make install is per-user; do not run it with sudo");
     }
-    let status = Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .status()
-        .context("cannot query the systemd user manager; log in graphically and retry")?;
-    if !status.success() {
-        bail!("systemd user services are unavailable; log in graphically and retry")
-    }
-    if !state.dir.is_absolute() {
+    let destination = resolve_install_destination(destination)?;
+    #[cfg(target_os = "macos")]
+    validate_macos_install_home()?;
+    let state_dir = State::default_dir()?;
+    if !state_dir.is_absolute() {
         bail!("daemon state path must be absolute")
     }
-    ensure_private_service_directory(
-        executable
-            .parent()
-            .context("installed executable has no parent directory")?,
+    let _service_installer = acquire_service_installer_lock()?;
+    flocal::state::ensure_private_directory(&state_dir)?;
+    let _installer = State::acquire_installer_lock(&state_dir)?;
+    validate_managed_state_selection(&state_dir, State::managed_state_dir()?)?;
+    let inherited_pending = State::upgrade_pending_at(&state_dir)?;
+
+    let candidate = std::env::current_exe()?;
+    let mut staged = StagedExecutable::prepare(&candidate, &destination)?;
+    let service = prepare_daemon_service(&state_dir, &destination)?;
+    if service_managed(&service) {
+        preflight_managed_state_marker()?;
+        println!("Preflight complete; stopping managed synchronization");
+    }
+    if let Err(error) =
+        stop_daemon_service(&service).context("stopping the managed daemon for upgrade")
+    {
+        return fail_before_publication(&service, &state_dir, inherited_pending, error);
+    }
+    let created_pending =
+        match State::create_upgrade_pending(&state_dir).context("creating the upgrade marker") {
+            Ok(created) => created,
+            Err(error) => {
+                return fail_before_publication(&service, &state_dir, inherited_pending, error);
+            }
+        };
+    let preserve_pending = !created_pending;
+
+    let quiesced = quiesce_for_upgrade(&state_dir);
+    let (legacy_locks, barrier) = match quiesced {
+        Ok(locks) => locks,
+        Err(error) => {
+            return fail_before_publication(&service, &state_dir, preserve_pending, error);
+        }
+    };
+
+    if let Err(error) = staged.publish() {
+        if !staged.published {
+            drop(barrier);
+            drop(legacy_locks);
+            return fail_before_publication(&service, &state_dir, preserve_pending, error);
+        }
+        return Err(error.context(
+            "the candidate executable was published; rerun `make install` to finish the upgrade",
+        ));
+    }
+    println!("Candidate executable installed");
+    if service_managed(&service) {
+        let state = State::open_for_upgrade(&state_dir, &barrier)
+            .context("migrating local state with the candidate")
+            .context(
+                "the candidate executable was published; rerun `make install` to finish the upgrade",
+            )?;
+        publish_daemon_service(&service, &state.dir)
+            .context("publishing the managed service definition")
+            .context(
+                "the candidate executable was published; rerun `make install` to finish the upgrade",
+            )?;
+        drop(state);
+        println!("State migration and managed service update complete");
+    }
+    complete_upgrade_marker(&state_dir, service_managed(&service)).context(
+        "the candidate executable was published; rerun `make install` to finish the upgrade",
     )?;
-    systemd_quote(&state.dir)?;
+    drop(barrier);
+    drop(legacy_locks);
+    if service_managed(&service) {
+        println!("Starting enabled managed synchronization");
+        start_and_verify_daemon(
+            &service,
+            &state_dir,
+            std::time::Instant::now() + Duration::from_secs(5),
+        )?;
+        println!(
+            "Installation complete; enabled syncs are restarting automatically. Upgrade the other endpoint next. Reconnecting and local-only edits are expected until then; no re-pair or state reset is needed."
+        );
+    } else {
+        println!(
+            "Installed binary only. In a macOS graphical session, run `make install` again to migrate state and resume managed synchronization."
+        );
+    }
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn preflight_daemon_service(_: &State, executable: &Path) -> Result<()> {
-    if Command::new("id").arg("-u").output()?.stdout == b"0\n" {
-        bail!("make install is per-user; do not run it with sudo");
+fn resolve_install_destination(destination: &Path) -> Result<PathBuf> {
+    if destination.is_absolute() {
+        Ok(destination.to_owned())
+    } else {
+        Ok(std::env::current_dir()?.join(destination))
     }
-    ensure_private_service_directory(
-        executable
-            .parent()
-            .context("installed executable has no parent directory")?,
-    )?;
+}
+
+fn validate_managed_state_selection(selected: &Path, managed: Option<PathBuf>) -> Result<()> {
+    if managed
+        .as_deref()
+        .is_some_and(|managed| managed != selected)
+    {
+        bail!(
+            "FLOCAL_STATE_DIR does not match the existing managed installation; unset it or use the managed state path before upgrading"
+        )
+    }
+    Ok(())
+}
+
+fn wait_for_daemon_ready(state_dir: &Path, deadline: std::time::Instant) -> Result<()> {
+    let socket = state_dir.join("run/daemon.sock");
+    loop {
+        if matches!(
+            daemon_request_inner(&socket, &DaemonRequest::List { cursor: None }),
+            Ok(DaemonResponse::List { .. })
+        ) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("daemon control socket did not answer a list request")
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn start_and_verify_daemon(
+    service: &DaemonService,
+    state_dir: &Path,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    if let Err(error) = start_daemon_service(service) {
+        if let Err(stop) = stop_started_daemon_service(service) {
+            bail!(
+                "the managed daemon start failed: {error:#}; stopping the partially started service also failed: {stop:#}; inspect the user-service logs and rerun `make install`"
+            )
+        }
+        bail!(
+            "the managed daemon start failed: {error:#}; the service was stopped; inspect the user-service logs and rerun `make install`"
+        )
+    }
+    if let Err(error) = wait_for_daemon_ready(state_dir, deadline) {
+        if let Err(stop) = stop_started_daemon_service(service) {
+            bail!(
+                "the service manager accepted the candidate but its daemon did not become ready: {error:#}; stopping the failed service also failed: {stop:#}; inspect the user-service logs and rerun `make install`"
+            )
+        }
+        bail!(
+            "the service manager accepted the candidate but its daemon did not become ready: {error:#}; the service was stopped; inspect the user-service logs and rerun `make install`"
+        )
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restore_before_upgrade(
+    service: &DaemonService,
+    state_dir: &Path,
+    error: anyhow::Error,
+) -> Result<()> {
+    if let Err(cleanup) = State::remove_upgrade_pending(state_dir) {
+        bail!(
+            "upgrade failed before executable replacement: {error:#}; the upgrade marker could not be cleared, so the old service was not restarted: {cleanup:#}"
+        )
+    }
+    if let Err(restoration) = restore_daemon_service(service) {
+        bail!(
+            "upgrade failed before executable replacement: {error:#}; the old service could not be restarted: {restoration:#}"
+        )
+    }
+    Err(error)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fail_before_publication(
+    service: &DaemonService,
+    state_dir: &Path,
+    preserve_pending: bool,
+    error: anyhow::Error,
+) -> Result<()> {
+    if preserve_pending {
+        return Err(error.context(
+            "an earlier upgrade is still pending; the service remains stopped; rerun `make install`",
+        ));
+    }
+    restore_before_upgrade(service, state_dir, error)
+}
+
+fn complete_upgrade_marker(state_dir: &Path, managed_install_complete: bool) -> Result<()> {
+    if managed_install_complete {
+        State::remove_upgrade_pending(state_dir)?;
+    }
     Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn preflight_daemon_service(_: &State, _: &Path) -> Result<()> {
+fn install_daemon(_: &Path) -> Result<()> {
     bail!("managed sync is supported on Linux and macOS only")
 }
 
-#[cfg(target_os = "macos")]
-fn install_daemon_service(state: &State) -> Result<()> {
-    if Command::new("id").arg("-u").output()?.stdout == b"0\n" {
-        bail!("make install is per-user; do not run it with sudo");
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quiesce_for_upgrade(
+    state_dir: &Path,
+) -> Result<(
+    flocal::state::LegacyUpgradeLocks,
+    flocal::state::UpgradeBarrier,
+)> {
+    quiesce_for_upgrade_until(
+        state_dir,
+        std::time::Instant::now() + Duration::from_secs(12),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quiesce_for_upgrade_until(
+    state_dir: &Path,
+    deadline: std::time::Instant,
+) -> Result<(
+    flocal::state::LegacyUpgradeLocks,
+    flocal::state::UpgradeBarrier,
+)> {
+    let mut reported = None;
+    loop {
+        match State::try_acquire_legacy_upgrade_locks(state_dir)? {
+            UpgradeLockAttempt::Acquired(locks) => {
+                if let Some(barrier) = State::try_acquire_upgrade_barrier(state_dir)? {
+                    return Ok((locks, barrier));
+                }
+            }
+            UpgradeLockAttempt::Busy(path) => {
+                if reported.as_ref() != Some(&path) {
+                    println!(
+                        "Waiting for synchronization of {} to finish before upgrade",
+                        escaped(&path.to_string_lossy())
+                    );
+                    reported = Some(path);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let path = reported.unwrap_or_else(|| state_dir.to_path_buf());
+            bail!(
+                "could not safely stop synchronization of {} before upgrade; stop any foreground `flocal watch` or `flocal sync` using that path, upgrade the connector first, and retry `make install`",
+                escaped(&path.to_string_lossy())
+            )
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    let executable = std::env::current_exe()?.canonicalize()?;
-    validate_trusted_executable(&executable)?;
-    install_launch_agent(state, &executable)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn install_daemon_service(_: &State) -> Result<()> {
-    bail!("managed sync is supported on Linux and macOS only")
 }
 
 #[cfg(target_os = "linux")]
-fn install_systemd_service(state: &State, executable: &Path) -> Result<()> {
+struct DaemonService {
+    unit: PathBuf,
+    content: String,
+    running: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_daemon_service(state_dir: &Path, executable: &Path) -> Result<DaemonService> {
     let environment = Command::new("systemctl")
         .args(["--user", "show-environment"])
         .output()
@@ -1254,29 +1565,107 @@ fn install_systemd_service(state: &State, executable: &Path) -> Result<()> {
         .lines()
         .filter_map(|line| line.split_once('='))
         .collect();
+    let manager_home = variables
+        .get("HOME")
+        .context("the systemd user manager did not report HOME")?;
+    let process_home = std::env::var_os("HOME").context("could not determine home directory")?;
+    if Path::new(manager_home) != Path::new(&process_home) {
+        bail!(
+            "HOME does not match the systemd user manager; restore the account HOME before installing"
+        )
+    }
     let config = variables
         .get("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            variables
-                .get("HOME")
-                .map(|home| PathBuf::from(home).join(".config"))
-        })
-        .context("could not determine the user service configuration directory")?;
-    if !config.is_absolute() || !state.dir.is_absolute() {
+        .unwrap_or_else(|| PathBuf::from(manager_home).join(".config"));
+    if !config.is_absolute() || !state_dir.is_absolute() {
         bail!("daemon service paths must be absolute")
     }
     let unit = config.join("systemd/user/flocal-daemon.service");
-    let content = systemd_unit_content(executable, &state.dir)?;
-    install_managed_state_marker(state)?;
-    install_text_file(&unit, &content)?;
+    preflight_text_file(&unit)?;
+    let content = systemd_unit_content(executable, state_dir)?;
+    let service_status = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--all",
+            "--full",
+            "--plain",
+            "--no-legend",
+            "flocal-daemon.service",
+        ])
+        .output()?;
+    if !service_status.status.success() {
+        bail!("cannot query whether flocal-daemon.service is active")
+    }
+    let output = String::from_utf8(service_status.stdout)?;
+    let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+    let running = match lines.next() {
+        None => false,
+        Some(line) => {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("flocal-daemon.service") || fields.next().is_none() {
+                bail!("systemd returned an incomplete service status")
+            }
+            match fields.next() {
+                Some("active" | "activating" | "reloading" | "deactivating") => true,
+                Some("inactive" | "failed") => false,
+                Some(state) => bail!("systemd returned an unknown active state: {state}"),
+                None => bail!("systemd returned an incomplete service status"),
+            }
+        }
+    };
+    if lines.next().is_some() {
+        bail!("systemd returned more than one service status")
+    }
+    Ok(DaemonService {
+        unit,
+        content,
+        running,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn stop_daemon_service(service: &DaemonService) -> Result<()> {
+    if service.running {
+        run_manager("systemctl", &["--user", "stop", "flocal-daemon.service"])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_daemon_service(service: &DaemonService, state_dir: &Path) -> Result<()> {
+    install_managed_state_marker(state_dir)?;
+    install_text_file(&service.unit, &service.content)?;
     run_manager("systemctl", &["--user", "daemon-reload"])?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn start_daemon_service(_: &DaemonService) -> Result<()> {
     run_manager(
         "systemctl",
         &["--user", "enable", "--now", "flocal-daemon.service"],
     )?;
-    println!("Installed and started flocal-daemon.service");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stop_started_daemon_service(_: &DaemonService) -> Result<()> {
+    run_manager("systemctl", &["--user", "stop", "flocal-daemon.service"])
+}
+
+#[cfg(target_os = "linux")]
+fn restore_daemon_service(service: &DaemonService) -> Result<()> {
+    if service.running {
+        run_manager("systemctl", &["--user", "start", "flocal-daemon.service"])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn service_managed(_: &DaemonService) -> bool {
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -1285,8 +1674,8 @@ fn systemd_quote(path: &Path) -> Result<String> {
         .to_str()
         .context("systemd service paths must be valid UTF-8")?;
     validate_service_path_characters(path)?;
-    if path.contains('%') {
-        bail!("systemd service paths cannot contain control characters or %")
+    if path.contains(['%', '$']) {
+        bail!("systemd service paths cannot contain control characters, %, or $")
     }
     Ok(format!(
         "\"{}\"",
@@ -1304,7 +1693,16 @@ fn systemd_unit_content(executable: &Path, state_dir: &Path) -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_launch_agent(state: &State, executable: &Path) -> Result<()> {
+struct DaemonService {
+    domain: String,
+    plist: PathBuf,
+    content: String,
+    available: bool,
+    loaded: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_daemon_service(state_dir: &Path, executable: &Path) -> Result<DaemonService> {
     let target = launchd_target()?;
     let domain = target
         .trim_end_matches("/local.file-local.flocal-daemon")
@@ -1313,45 +1711,133 @@ fn install_launch_agent(state: &State, executable: &Path) -> Result<()> {
         .args(["print", &domain])
         .status()?
         .success();
-    if !available {
-        let checkout = std::env::current_dir()?.canonicalize()?;
-        println!(
-            "Installed binary only. In a macOS graphical session, run `cd {} && make install`.",
-            shell_quote(&checkout)?
-        );
-        return Ok(());
-    }
+    let loaded = available
+        && Command::new("launchctl")
+            .args(["print", &target])
+            .status()?
+            .success();
     let home = std::env::var_os("HOME").context("could not determine home directory")?;
     let plist =
         PathBuf::from(home).join("Library/LaunchAgents/local.file-local.flocal-daemon.plist");
+    if available {
+        preflight_text_file(&plist)?;
+    }
     let executable = executable
         .to_str()
         .context("launchd executable path must be valid UTF-8")?;
-    let state_dir = state
-        .dir
+    let state_dir = state_dir
         .to_str()
         .context("launchd state path must be valid UTF-8")?;
-    let plist = plist
+    plist
         .to_str()
-        .context("launchd service path must be valid UTF-8")?
-        .to_owned();
+        .context("launchd service path must be valid UTF-8")?;
     let content = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>local.file-local.flocal-daemon</string><key>ProgramArguments</key><array><string>{}</string><string>daemon</string><string>run</string></array><key>EnvironmentVariables</key><dict><key>FLOCAL_STATE_DIR</key><string>{}</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n",
         xml_escape(executable)?,
         xml_escape(state_dir)?,
     );
-    install_managed_state_marker(state)?;
-    install_text_file(Path::new(&plist), &content)?;
-    run_manager("launchctl", &["bootstrap", &domain, &plist])?;
-    println!("Installed and started local.file-local.flocal-daemon");
+    Ok(DaemonService {
+        domain,
+        plist,
+        content,
+        available,
+        loaded,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn stop_daemon_service(service: &DaemonService) -> Result<()> {
+    if service.loaded {
+        let plist = service
+            .plist
+            .to_str()
+            .context("launchd service path must be valid UTF-8")?;
+        run_manager("launchctl", &["bootout", &service.domain, plist])?;
+    }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
+fn publish_daemon_service(service: &DaemonService, state_dir: &Path) -> Result<()> {
+    install_managed_state_marker(state_dir)?;
+    install_text_file(&service.plist, &service.content)
+}
+
+#[cfg(target_os = "macos")]
+fn start_daemon_service(service: &DaemonService) -> Result<()> {
+    if service.available {
+        let plist = service
+            .plist
+            .to_str()
+            .context("launchd service path must be valid UTF-8")?;
+        run_manager("launchctl", &["bootstrap", &service.domain, plist])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_started_daemon_service(service: &DaemonService) -> Result<()> {
+    let plist = service
+        .plist
+        .to_str()
+        .context("launchd service path must be valid UTF-8")?;
+    run_manager("launchctl", &["bootout", &service.domain, plist])
+}
+
+#[cfg(target_os = "macos")]
+fn restore_daemon_service(service: &DaemonService) -> Result<()> {
+    if service.loaded {
+        start_daemon_service(service)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn service_managed(service: &DaemonService) -> bool {
+    service.available
+}
+
+#[cfg(target_os = "macos")]
 fn launchd_target() -> Result<String> {
-    let uid = Command::new("id").arg("-u").output()?;
+    let uid = Command::new("/usr/bin/id").arg("-u").output()?;
+    if !uid.status.success() {
+        bail!("could not determine the account uid")
+    }
     let uid = String::from_utf8(uid.stdout)?.trim().to_owned();
     Ok(format!("gui/{uid}/local.file-local.flocal-daemon"))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_install_home() -> Result<()> {
+    let user = Command::new("/usr/bin/id").arg("-un").output()?;
+    if !user.status.success() {
+        bail!("could not determine the account name")
+    }
+    let user = String::from_utf8(user.stdout)?.trim().to_owned();
+    if user.is_empty() || user.contains('/') {
+        bail!("account name is not valid for a directory-service lookup")
+    }
+    let record = Command::new("/usr/bin/dscl")
+        .args(["/Search", "-read"])
+        .arg(format!("/Users/{user}"))
+        .arg("NFSHomeDirectory")
+        .output()?;
+    if !record.status.success() {
+        bail!("could not determine the account home directory")
+    }
+    let record = String::from_utf8(record.stdout)?;
+    let account_home = record
+        .lines()
+        .find_map(|line| line.strip_prefix("NFSHomeDirectory: "))
+        .map(Path::new)
+        .context("directory service did not report the account home directory")?;
+    let process_home = std::env::var_os("HOME").context("could not determine home directory")?;
+    if account_home != Path::new(&process_home) {
+        bail!(
+            "HOME does not match the macOS account directory; restore the account HOME before installing"
+        )
+    }
+    Ok(())
 }
 
 fn validate_service_path_characters(value: &str) -> Result<()> {
@@ -1376,39 +1862,104 @@ fn xml_escape(value: &str) -> Result<String> {
         .replace('>', "&gt;"))
 }
 
-#[cfg(target_os = "macos")]
-fn shell_quote(path: &Path) -> Result<String> {
-    let path = path.to_str().context("checkout path must be valid UTF-8")?;
-    Ok(format!("'{}'", path.replace('\'', "'\\''")))
-}
-
 fn install_text_file(path: &Path, content: &str) -> Result<()> {
+    use cap_std::fs::{OpenOptions as CapOpenOptions, Permissions, PermissionsExt};
+
     let parent = path
         .parent()
         .context("service definition has no parent directory")?;
     ensure_private_service_directory(parent)?;
-    validate_private_file(path)?;
-    let temporary = parent.join(format!(
+    let sync_directory = File::open(parent)?;
+    let directory = cap_std::fs::Dir::from_std_file(sync_directory.try_clone()?);
+    let destination = Path::new(
+        path.file_name()
+            .context("service definition has no file name")?,
+    );
+    validate_private_install_file(&directory, destination)?;
+    let temporary = PathBuf::from(format!(
         ".{}-{}",
         path.file_name().unwrap().to_string_lossy(),
         ShareId::generate().0
     ));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
-    set_owner_only_file(&temporary)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(temporary, path)?;
+    let result = (|| {
+        let options = CapOpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .to_owned();
+        let mut file = directory.open_with(&temporary, &options)?;
+        directory.set_permissions(&temporary, Permissions::from_mode(0o600))?;
+        file.write_all(content.as_bytes())?;
+        flocal::durability::sync_file(&file)?;
+        directory.rename(&temporary, &directory, destination)?;
+        sync_directory.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = directory.remove_file(&temporary);
+    }
+    result
+}
+
+fn preflight_text_file(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("service definition has no parent directory")?;
+    ensure_private_service_directory(parent)?;
+    let directory = cap_std::fs::Dir::from_std_file(File::open(parent)?);
+    validate_private_install_file(
+        &directory,
+        Path::new(
+            path.file_name()
+                .context("service definition has no file name")?,
+        ),
+    )
+}
+
+fn validate_private_install_file(directory: &cap_std::fs::Dir, path: &Path) -> Result<()> {
+    let metadata = match directory.symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+        {
+            bail!("service asset is not an owner-only regular file")
+        }
+    }
     Ok(())
 }
 
-fn install_managed_state_marker(state: &State) -> Result<()> {
+fn managed_state_marker_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("could not determine home directory")?;
-    let marker = PathBuf::from(home).join(".config/file.local/managed-state");
-    let state_dir = state
-        .dir
+    Ok(PathBuf::from(home).join(".config/file.local/managed-state"))
+}
+
+fn acquire_service_installer_lock() -> Result<File> {
+    acquire_service_installer_lock_at(&managed_state_marker_path()?)
+}
+
+fn acquire_service_installer_lock_at(marker: &Path) -> Result<File> {
+    let directory = marker
+        .parent()
+        .context("managed state marker has no parent directory")?;
+    flocal::state::ensure_private_directory(directory)?;
+    State::acquire_service_installer_lock(directory)
+        .context("another flocal service installation is already in progress")
+}
+
+fn preflight_managed_state_marker() -> Result<()> {
+    preflight_text_file(&managed_state_marker_path()?)
+}
+
+fn install_managed_state_marker(state_dir: &Path) -> Result<()> {
+    let marker = managed_state_marker_path()?;
+    let state_dir = state_dir
         .to_str()
         .context("managed daemon state path must be valid UTF-8")?;
     install_text_file(&marker, &format!("{state_dir}\n"))
@@ -1435,8 +1986,29 @@ fn validate_trusted_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn validate_trusted_executable_file(file: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    let uid = rustix::process::geteuid().as_raw();
+    if !metadata.is_file()
+        || (metadata.uid() != uid && metadata.uid() != 0)
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        bail!("candidate is not a trusted executable file");
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn validate_trusted_executable(_: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_trusted_executable_file(_: &File) -> Result<()> {
     Ok(())
 }
 
@@ -4209,6 +4781,9 @@ fn serve_watch_open(
     let mut round = 0u64;
     let mut invalidation_cycle = InvalidationCycle::default();
     loop {
+        if state.upgrade_pending()? {
+            return Ok(());
+        }
         if let Err(error) = state.ensure_not_removing(&share) {
             return write_v2_session(
                 output,
@@ -5920,6 +6495,9 @@ fn persistent_watch_loop_control(
     let mut connected = false;
     let mut connecting_logged = false;
     loop {
+        if stop.is_some() && state.upgrade_pending()? {
+            return Ok(());
+        }
         if let Some(worker_state) = worker_state {
             worker_state.store(WORKER_RECONNECTING, Ordering::Relaxed);
         }
@@ -5976,12 +6554,13 @@ fn persistent_watch_loop_control(
             Ok(()) if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) => return Ok(()),
             Ok(()) => bail!("persistent watch session ended unexpectedly"),
             Err(error)
-                if stop.is_some()
-                    && error.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<flocal::state::QueueCancelled>()
-                            .is_some()
-                    }) =>
+                if (stop.is_some() && error.downcast_ref::<UpgradePending>().is_some())
+                    || (stop.is_some()
+                        && error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<flocal::state::QueueCancelled>()
+                                .is_some()
+                        })) =>
             {
                 return Ok(());
             }
@@ -6250,6 +6829,9 @@ fn persistent_watch_session_io(
     let mut scheduled_local_generation = completed_local;
     let mut scheduled_remote_generation = remote_generation;
     loop {
+        if stop.is_some() && state.upgrade_pending()? {
+            return Err(UpgradePending.into());
+        }
         if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Ok(());
         }
@@ -8564,6 +9146,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     const SYSTEMD_INSTALL_TEST_ROOT: &str = "FLOCAL_TEST_SYSTEMD_INSTALL_ROOT";
 
+    #[cfg(target_os = "macos")]
+    const LAUNCHD_INSTALL_TEST_ROOT: &str = "FLOCAL_TEST_LAUNCHD_INSTALL_ROOT";
+
     #[cfg(unix)]
     const PERMISSIVE_UMASK_SERVICE_ROOT: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_SERVICE_ROOT";
 
@@ -9991,6 +10576,7 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/opt/with space/flocal\" daemon run"));
         assert!(unit.contains("Environment=FLOCAL_STATE_DIR=\"/var/lib/flocal state\""));
         assert!(unit.contains("WantedBy=default.target"));
+        assert!(systemd_quote(Path::new("/opt/$cache/flocal")).is_err());
         assert!(
             systemd_unit_content(Path::new("/tmp/evil%name"), Path::new("/tmp/state")).is_err()
         );
@@ -10845,7 +11431,7 @@ mod tests {
         let systemctl = bin.join("systemctl");
         std::fs::write(
             &systemctl,
-            "#!/bin/sh\nif [ \"$2\" = show-environment ]; then printf 'HOME=%s\\n' \"$FLOCAL_TEST_MANAGER_HOME\"; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$2\" = show-environment ]; then printf 'HOME=%s\\n' \"$FLOCAL_TEST_MANAGER_HOME\"; elif [ \"$2\" = list-units ]; then if [ -e \"$FLOCAL_TEST_MANAGER_HOME/show-fail\" ]; then exit 1; elif [ -e \"$FLOCAL_TEST_MANAGER_HOME/active-state\" ]; then printf 'flocal-daemon.service loaded active running file.local managed sync\\n'; elif [ -e \"$FLOCAL_TEST_MANAGER_HOME/.config/systemd/user/flocal-daemon.service\" ]; then printf 'flocal-daemon.service loaded inactive dead file.local managed sync\\n'; fi; fi\nexit 0\n",
         )?;
         #[cfg(unix)]
         {
@@ -10870,23 +11456,142 @@ mod tests {
                 ),
             )
             .env("HOME", &client_home)
-            .env("FLOCAL_TEST_MANAGER_HOME", &manager_home)
+            .env("FLOCAL_STATE_DIR", temp.path().join("state"))
+            .env("FLOCAL_TEST_MANAGER_HOME", &client_home)
             .output()?;
         assert!(output.status.success(), "{:?}", output);
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_upgrade_lifecycle_is_ordered_and_failure_aware() -> Result<()> {
+        if let Some(root) = std::env::var_os(LAUNCHD_INSTALL_TEST_ROOT) {
+            return assert_launchd_upgrade_lifecycle(Path::new(&root));
+        }
+
+        validate_macos_install_home()?;
+
+        let temp = tempdir()?;
+        let bin = temp.path().join("bin");
+        let home = temp.path().join("home");
+        std::fs::create_dir(&bin)?;
+        std::fs::create_dir(&home)?;
+        let launchctl = bin.join("launchctl");
+        std::fs::write(
+            &launchctl,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/launchctl.log"
+case "$1" in
+  print)
+    case "$2" in
+      */local.file-local.flocal-daemon) test -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/loaded" ;;
+      *) test -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/available" ;;
+    esac
+    ;;
+  bootout)
+    test ! -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/fail-bootout"
+    rm -f "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/loaded"
+    ;;
+  bootstrap)
+    test ! -e "$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/fail-bootstrap"
+    : >"$FLOCAL_TEST_LAUNCHD_INSTALL_ROOT/loaded"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        )?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o700))?;
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::launchd_upgrade_lifecycle_is_ordered_and_failure_aware",
+            ])
+            .env(LAUNCHD_INSTALL_TEST_ROOT, temp.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var_os("PATH")
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ),
+            )
+            .env("HOME", &home)
+            .output()?;
+        assert!(output.status.success(), "{:?}", output);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_launchd_upgrade_lifecycle(root: &Path) -> Result<()> {
+        let home = PathBuf::from(std::env::var_os("HOME").context("test HOME is missing")?);
+        let mismatch = validate_macos_install_home()
+            .expect_err("an overridden HOME must not select another LaunchAgent namespace");
+        assert!(mismatch.to_string().contains("does not match"));
+        let state_dir = root.join("state");
+        flocal::state::ensure_private_directory(&state_dir)?;
+        std::fs::write(root.join("available"), "")?;
+        std::fs::write(root.join("loaded"), "")?;
+        let executable = std::env::current_exe()?.canonicalize()?;
+
+        let service = prepare_daemon_service(&state_dir, &executable)?;
+        assert!(service.available && service.loaded && service_managed(&service));
+        stop_daemon_service(&service)?;
+        assert!(!root.join("loaded").exists());
+        publish_daemon_service(&service, &state_dir)?;
+        assert_eq!(
+            std::fs::read_to_string(home.join(".config/file.local/managed-state"))?,
+            format!("{}\n", state_dir.display())
+        );
+        assert!(service.plist.is_file());
+        restore_daemon_service(&service)?;
+        assert!(root.join("loaded").exists());
+
+        std::fs::write(root.join("fail-bootout"), "")?;
+        assert!(stop_daemon_service(&service).is_err());
+        std::fs::remove_file(root.join("fail-bootout"))?;
+        stop_daemon_service(&service)?;
+        std::fs::write(root.join("fail-bootstrap"), "")?;
+        assert!(start_daemon_service(&service).is_err());
+        assert!(restore_daemon_service(&service).is_err());
+        std::fs::remove_file(root.join("fail-bootstrap"))?;
+        start_daemon_service(&service)?;
+
+        std::fs::remove_file(root.join("available"))?;
+        std::fs::remove_file(root.join("loaded"))?;
+        let headless = prepare_daemon_service(&state_dir, &executable)?;
+        assert!(!headless.available && !headless.loaded && !service_managed(&headless));
+        stop_daemon_service(&headless)?;
+
+        let log = std::fs::read_to_string(root.join("launchctl.log"))?;
+        assert!(log.contains("bootout gui/"));
+        assert!(log.contains("bootstrap gui/"));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     fn assert_systemd_install(root: &Path) -> Result<()> {
-        let manager_home = root.join("manager-home");
         let client_home = root.join("client-home");
-        let state = State::open(root.join("state"))?;
+        let manager_home = client_home.clone();
+        let state_dir = root.join("state");
+        flocal::state::ensure_private_directory(&state_dir)?;
         let executable = std::env::current_exe()?.canonicalize()?;
-        preflight_daemon_service(&state, &executable)?;
+        std::fs::write(manager_home.join("show-fail"), "")?;
+        assert!(prepare_daemon_service(&state_dir, &executable).is_err());
+        std::fs::remove_file(manager_home.join("show-fail"))?;
+        std::fs::write(manager_home.join("active-state"), "active\n")?;
+        let loaded_without_a_unit = prepare_daemon_service(&state_dir, &executable)?;
+        assert!(loaded_without_a_unit.running);
+        std::fs::remove_file(manager_home.join("active-state"))?;
+        prepare_daemon_service(&state_dir, &executable)?;
         use std::os::unix::ffi::OsStringExt;
-        let invalid_state =
-            State::open(root.join(std::ffi::OsString::from_vec(b"state-\xff".to_vec())))?;
-        assert!(install_systemd_service(&invalid_state, &executable).is_err());
+        let invalid_state = root.join(std::ffi::OsString::from_vec(b"state-\xff".to_vec()));
+        assert!(systemd_unit_content(&executable, &invalid_state).is_err());
         assert!(
             !manager_home
                 .join(".config/systemd/user/flocal-daemon.service")
@@ -10894,8 +11599,27 @@ mod tests {
         );
         assert!(systemd_quote(Path::new("/tmp/invalid%path")).is_err());
         assert!(run_manager("/bin/false", &[]).is_err());
+        let state = State::open(&state_dir)?;
         assert!(ensure_daemon(&state).is_err());
-        install_daemon_service(&state)?;
+        drop(state);
+        let destination = client_home.join(".local/bin/flocal");
+        let ready = serve_one_daemon_list(&state_dir)?;
+        let old_umask = rustix::process::umask(rustix::fs::Mode::empty());
+        let installed = install_daemon(&destination);
+        rustix::process::umask(old_umask);
+        installed?;
+        ready
+            .join()
+            .map_err(|_| anyhow::anyhow!("test daemon socket panicked"))??;
+        assert_eq!(std::fs::read(&destination)?, std::fs::read(&executable)?);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(state_dir.join("installer.lock"))?
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
         assert!(
             manager_home
                 .join(".config/systemd/user/flocal-daemon.service")
@@ -10903,8 +11627,247 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(client_home.join(".config/file.local/managed-state"))?,
-            format!("{}\n", state.dir.display())
+            format!("{}\n", state_dir.display())
         );
+
+        let working_directory = std::env::current_dir()?;
+        std::fs::remove_file(state_dir.join("run/daemon.sock"))?;
+        let ready = serve_one_daemon_list(&state_dir)?;
+        std::env::set_current_dir(root)?;
+        let relative = Path::new("relative/bin/flocal");
+        let relative_destination = root.join(relative);
+        let installed = install_daemon(relative);
+        std::env::set_current_dir(working_directory)?;
+        installed?;
+        ready
+            .join()
+            .map_err(|_| anyhow::anyhow!("test daemon socket panicked"))??;
+        assert_eq!(
+            std::fs::read(&relative_destination)?,
+            std::fs::read(&executable)?
+        );
+        assert!(
+            std::fs::read_to_string(
+                manager_home.join(".config/systemd/user/flocal-daemon.service")
+            )?
+            .contains(&format!(
+                "ExecStart={} daemon run",
+                systemd_quote(&relative_destination)?
+            ))
+        );
+
+        let installer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(state_dir.join("installer.lock"))?;
+        fs2::FileExt::try_lock_exclusive(&installer)?;
+        assert!(install_daemon(&client_home.join(".local/bin/other")).is_err());
+        drop(installer);
+
+        State::create_upgrade_pending(&state_dir)?;
+        let service = prepare_daemon_service(&state_dir, &destination)?;
+        let pending = fail_before_publication(
+            &service,
+            &state_dir,
+            true,
+            anyhow::anyhow!("synthetic retry failure"),
+        )
+        .expect_err("an inherited marker keeps the retry on the candidate path");
+        assert!(
+            pending
+                .to_string()
+                .contains("earlier upgrade is still pending")
+        );
+        assert!(State::upgrade_pending_at(&state_dir)?);
+        let refused = restore_before_upgrade(
+            &service,
+            &state_dir,
+            anyhow::anyhow!("synthetic safe refusal"),
+        )
+        .expect_err("restoration returns the original refusal");
+        assert!(refused.to_string().contains("synthetic safe refusal"));
+
+        std::fs::write(manager_home.join("active-state"), "active\n")?;
+        let running = prepare_daemon_service(&state_dir, &destination)?;
+        assert!(running.running);
+        stop_daemon_service(&running)?;
+        let readiness = start_and_verify_daemon(&running, &state_dir, std::time::Instant::now())
+            .expect_err("manager acceptance without a daemon socket must fail");
+        assert!(readiness.to_string().contains("did not become ready"));
+        std::fs::write(manager_home.join("show-fail"), "")?;
+        assert!(prepare_daemon_service(&state_dir, &destination).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn serve_one_daemon_list(state_dir: &Path) -> Result<std::thread::JoinHandle<Result<()>>> {
+        let run = state_dir.join("run");
+        flocal::state::ensure_private_directory(&run)?;
+        let listener = UnixListener::bind(run.join("daemon.sock"))?;
+        Ok(std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept()?;
+            let _ = read_daemon_message(&mut stream)?;
+            serde_json::to_writer(
+                &mut stream,
+                &DaemonResponse::List {
+                    syncs: Vec::new(),
+                    next: None,
+                },
+            )?;
+            stream.write_all(b"\n")?;
+            Ok(())
+        }))
+    }
+
+    #[test]
+    fn installer_filesystem_helpers_reject_unsafe_paths_and_cleanup_staging() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir()?;
+        let candidate = std::env::current_exe()?.canonicalize()?;
+        assert_eq!(
+            resolve_install_destination(Path::new("relative/flocal"))?,
+            std::env::current_dir()?.join("relative/flocal")
+        );
+        assert_eq!(
+            resolve_install_destination(temp.path())?,
+            temp.path().to_owned()
+        );
+        assert!(StagedExecutable::prepare(&candidate, Path::new("relative/flocal")).is_err());
+        assert!(StagedExecutable::prepare(&candidate, Path::new("/")).is_err());
+
+        let destination = temp.path().join("bin/flocal");
+        let staged = StagedExecutable::prepare(&candidate, &destination)?;
+        let temporary = destination.parent().unwrap().join(staged.temporary.clone());
+        assert!(temporary.is_file());
+        drop(staged);
+        assert!(!temporary.exists());
+
+        let parent = destination.parent().unwrap();
+        let directory = cap_std::fs::Dir::from_std_file(File::open(parent)?);
+        std::os::unix::fs::symlink(&candidate, &destination)?;
+        assert!(validate_install_destination(&directory, Path::new("flocal")).is_err());
+        std::fs::remove_file(&destination)?;
+
+        let service_asset = parent.join("service");
+        std::fs::write(&service_asset, "safe")?;
+        std::fs::set_permissions(&service_asset, std::fs::Permissions::from_mode(0o600))?;
+        preflight_text_file(&service_asset)?;
+        std::fs::set_permissions(&service_asset, std::fs::Permissions::from_mode(0o644))?;
+        assert!(preflight_text_file(&service_asset).is_err());
+
+        let untrusted = parent.join("untrusted");
+        std::fs::write(&untrusted, "not executable")?;
+        let untrusted = File::open(untrusted)?;
+        assert!(validate_trusted_executable_file(&untrusted).is_err());
+
+        let mut short_source = io::Cursor::new(b"short");
+        let mut copied = Vec::new();
+        let changed = copy_candidate_exactly(&mut short_source, &mut copied, 6)
+            .expect_err("a shortened candidate must not be published");
+        assert!(changed.to_string().contains("changed while"));
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_installers_with_different_state_dirs_share_one_service_lock() -> Result<()> {
+        let temp = tempdir()?;
+        let marker = temp.path().join("config/file.local/managed-state");
+        let state_a = temp.path().join("state-a");
+        let state_b = temp.path().join("state-b");
+        flocal::state::ensure_private_directory(&state_a)?;
+        flocal::state::ensure_private_directory(&state_b)?;
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_marker = marker.clone();
+        let first = std::thread::spawn(move || -> Result<()> {
+            let service_lock = acquire_service_installer_lock_at(&first_marker)?;
+            let state_lock = State::acquire_installer_lock(&state_a)?;
+            acquired_tx.send(())?;
+            release_rx.recv()?;
+            drop((state_lock, service_lock));
+            Ok(())
+        });
+        acquired_rx.recv()?;
+        let state_lock_b = State::acquire_installer_lock(&state_b)?;
+        let competing = acquire_service_installer_lock_at(&marker)
+            .expect_err("different state selections must not create independent installers");
+        assert!(competing.to_string().contains("already in progress"));
+        drop(state_lock_b);
+        release_tx.send(())?;
+        first
+            .join()
+            .map_err(|_| anyhow::anyhow!("first installer thread panicked"))??;
+
+        let aliased_state = marker.parent().unwrap();
+        let service_lock = acquire_service_installer_lock_at(&marker)?;
+        let state_lock = State::acquire_installer_lock(aliased_state)?;
+        drop((state_lock, service_lock));
+        Ok(())
+    }
+
+    #[test]
+    fn binary_only_install_preserves_upgrade_marker_until_managed_completion() -> Result<()> {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("state");
+        State::create_upgrade_pending(&state_dir)?;
+
+        complete_upgrade_marker(&state_dir, false)?;
+        assert!(State::upgrade_pending_at(&state_dir)?);
+
+        complete_upgrade_marker(&state_dir, true)?;
+        assert!(!State::upgrade_pending_at(&state_dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_install_refuses_a_different_selected_state_directory() -> Result<()> {
+        let temp = tempdir()?;
+        let selected = temp.path().join("selected");
+        let managed = temp.path().join("managed");
+        validate_managed_state_selection(&selected, Some(selected.clone()))?;
+        validate_managed_state_selection(&selected, None)?;
+        let error = validate_managed_state_selection(&selected, Some(managed))
+            .expect_err("a managed installation cannot be silently relocated");
+        assert!(error.to_string().contains("does not match"));
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_wait_names_the_busy_root_and_is_bounded() -> Result<()> {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("state");
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let _session = state.lock_share_session(&share)?;
+        let error = match quiesce_for_upgrade_until(&state_dir, std::time::Instant::now()) {
+            Ok(_) => bail!("active foreground session did not block upgrade"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(&root.display().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_wait_escapes_control_bytes_in_a_busy_root() -> Result<()> {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("state");
+        let root = temp.path().join("root\n\u{1b}[31m");
+        std::fs::create_dir(&root)?;
+        let state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let _session = state.lock_share_session(&share)?;
+        let error = match quiesce_for_upgrade_until(&state_dir, std::time::Instant::now()) {
+            Ok(_) => bail!("active foreground session did not block upgrade"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("\\n"));
+        assert!(message.contains("\\u{1b}"));
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
         Ok(())
     }
 

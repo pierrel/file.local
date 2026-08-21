@@ -39,5 +39,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - run: make e2e
+        env:
+          FLOCAL_E2E_UPGRADE_FROM: ${{ github.event.pull_request.base.sha || github.event.before }}
+      - name: Run upgrade E2E from the deployed alpha
+        run: |
+          tag=$(sed -n 's/^tag: //p' docs/deployed-alpha.org)
+          commit=$(sed -n 's/^commit: //p' docs/deployed-alpha.org)
+          test -n "$tag" && test -n "$commit"
+          [[ "$tag" =~ ^alpha-deployed-[0-9]{8}-[0-9a-f]{7,40}$ ]]
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          while IFS= read -r pointer_revision; do
+            pointer=$(git show "$pointer_revision:docs/deployed-alpha.org")
+            historical_tag=$(sed -n 's/^tag: //p' <<<"$pointer")
+            historical_commit=$(sed -n 's/^commit: //p' <<<"$pointer")
+            [[ "$historical_tag" =~ ^alpha-deployed-[0-9]{8}-[0-9a-f]{7,40}$ ]]
+            [[ "$historical_commit" =~ ^[0-9a-f]{40}$ ]]
+            test "$(git cat-file -t "refs/tags/$historical_tag")" = tag
+            test "$(git rev-parse "refs/tags/$historical_tag^{commit}")" = "$historical_commit"
+            git merge-base --is-ancestor "$historical_commit" HEAD
+          done < <(git log --full-history --format=%H -- docs/deployed-alpha.org)
+          test "$commit" != "$(git rev-parse HEAD)"
+          FLOCAL_E2E_UPGRADE_FROM="$commit" \
+            cargo test --test e2e scenarios::upgrades:: -- --ignored --test-threads=1

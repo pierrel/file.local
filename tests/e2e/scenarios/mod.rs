@@ -9,4 +9,5 @@ mod pairing;
 mod relationships;
 mod syncing;
 mod transitions;
+mod upgrades;
 mod watching;

@@ -27,6 +27,7 @@ RUN apt-get update \
     && useradd --create-home --shell /bin/bash peer
 COPY --from=builder /build/target/release/flocal /usr/local/libexec/flocal-real
 COPY tests/e2e/flocal-wrapper.sh /usr/local/bin/flocal
+COPY tests/e2e/systemctl /usr/local/bin/systemctl
 COPY tests/e2e/entrypoint.sh /usr/local/bin/e2e-entrypoint
-RUN chmod 755 /usr/local/bin/flocal /usr/local/bin/e2e-entrypoint /usr/local/libexec/flocal-real
+RUN chmod 755 /usr/local/bin/flocal /usr/local/bin/systemctl /usr/local/bin/e2e-entrypoint /usr/local/libexec/flocal-real
 ENTRYPOINT ["/usr/local/bin/e2e-entrypoint"]

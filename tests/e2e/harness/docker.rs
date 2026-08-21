@@ -9,16 +9,18 @@ pub const SHARE: &str = "/home/peer/share";
 pub const SECOND_SHARE: &str = "/home/peer/second-share";
 pub const LABEL: &str = "flocal-e2e=1";
 const IMAGE_TAG: &str = "flocal-e2e";
+const BASE_IMAGE_TAG: &str = "flocal-e2e-upgrade-base";
 
 /// Everything one scenario run owns besides the two containers: the network,
-/// the per-peer volumes, the throwaway keys, the transcript, and the
-/// dumped-once flag. Shared by `Arc` between the peer handles; the last
-/// clone's `Drop` removes the network and volumes.
+/// the per-peer volumes, the throwaway keys, permanent diagnostics, the
+/// rolling transcript, and the dumped-once flag. Shared by `Arc` between the
+/// peer handles; the last clone's `Drop` removes the network and volumes.
 pub struct RunContext {
     pub run_id: String,
     pub network: String,
     pub volumes: Vec<String>,
     pub temp: tempfile::TempDir,
+    diagnostics: Mutex<Vec<String>>,
     transcript: Mutex<Vec<String>>,
     dumped: AtomicBool,
     pub containers: Mutex<Vec<String>>,
@@ -44,6 +46,7 @@ impl RunContext {
             network,
             volumes,
             temp,
+            diagnostics: Mutex::new(Vec::new()),
             transcript: Mutex::new(Vec::new()),
             dumped: AtomicBool::new(false),
             containers: Mutex::new(Vec::new()),
@@ -124,6 +127,17 @@ impl RunContext {
 
     pub fn record(&self, line: String) {
         self.transcript.lock().expect("transcript lock").push(line);
+    }
+
+    pub fn record_diagnostic(&self, line: String) {
+        self.diagnostics
+            .lock()
+            .expect("diagnostics lock")
+            .push(line);
+    }
+
+    pub fn diagnostics(&self) -> Vec<String> {
+        self.diagnostics.lock().expect("diagnostics lock").clone()
     }
 
     pub fn transcript_tail(&self, count: usize) -> Vec<String> {
@@ -213,6 +227,112 @@ fn prepare() -> Result<()> {
     build_image()
 }
 
+#[derive(Clone)]
+pub struct UpgradeTransition {
+    pub base: String,
+    pub candidate: String,
+}
+
+pub fn prepare_upgrade_base() -> Result<UpgradeTransition> {
+    static BASE: OnceLock<std::result::Result<UpgradeTransition, String>> = OnceLock::new();
+    BASE.get_or_init(|| prepare_upgrade_base_inner().map_err(|error| format!("{error:#}")))
+        .clone()
+        .map_err(|message| anyhow::Error::new(InfraError(message)))
+}
+
+fn prepare_upgrade_base_inner() -> Result<UpgradeTransition> {
+    let candidate = canonical_commit("HEAD")?;
+    let exact = std::env::var("FLOCAL_E2E_UPGRADE_FROM").ok();
+    let exact_selected = exact.is_some();
+    let mut base = if let Some(raw) = exact.as_deref() {
+        canonical_commit(raw)?
+    } else {
+        let raw = std::env::var("COVERAGE_BASE").unwrap_or_else(|_| "github/main".into());
+        merge_base(&candidate, &canonical_commit(&raw)?)?
+    };
+    if base == candidate && !exact_selected {
+        base = canonical_commit("HEAD^1")?;
+    }
+    anyhow::ensure!(
+        base != candidate,
+        "upgrade E2E base and candidate resolve to the same commit {base}"
+    );
+    let ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &base, &candidate])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .context("checking the upgrade E2E base ancestry")?;
+    anyhow::ensure!(
+        ancestor.success(),
+        "upgrade E2E base {base} is not an ancestor of candidate {candidate}"
+    );
+
+    let mut archive = Command::new("git")
+        .args(["archive", "--format=tar", &base])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("archiving the upgrade E2E base")?;
+    let input = archive
+        .stdout
+        .take()
+        .context("upgrade E2E base archive pipe unavailable")?;
+    let output = Command::new("docker")
+        .args([
+            "build",
+            "-f",
+            "tests/e2e/Dockerfile",
+            "-t",
+            BASE_IMAGE_TAG,
+            "-",
+        ])
+        .stdin(input)
+        .output()
+        .context("building the upgrade E2E base image")?;
+    let archive_status = archive.wait()?;
+    anyhow::ensure!(archive_status.success(), "git archive failed for {base}");
+    anyhow::ensure!(
+        output.status.success(),
+        "upgrade E2E base image build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(UpgradeTransition { base, candidate })
+}
+
+fn merge_base(left: &str, right: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["merge-base", left, right])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .context("resolving the upgrade E2E merge base")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git merge-base failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    canonical_commit(String::from_utf8(output.stdout)?.trim())
+}
+
+fn canonical_commit(input: &str) -> Result<String> {
+    let expression = format!("{input}^{{commit}}");
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--end-of-options", &expression])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .context("resolving the upgrade E2E revision")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot resolve upgrade E2E revision {input:?}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let commit = String::from_utf8(output.stdout)?.trim().to_owned();
+    anyhow::ensure!(
+        commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "git returned an invalid commit ID"
+    );
+    Ok(commit)
+}
+
 /// Removes anything a previous aborted run left behind. rm-only as an
 /// invariant: the sweep never execs into or reads from swept objects, and it
 /// assumes one `make e2e` run per host at a time.
@@ -265,6 +385,10 @@ fn build_image() -> Result<()> {
 
 pub fn image_tag() -> &'static str {
     IMAGE_TAG
+}
+
+pub fn base_image_tag() -> &'static str {
+    BASE_IMAGE_TAG
 }
 
 pub fn unique_token() -> String {
