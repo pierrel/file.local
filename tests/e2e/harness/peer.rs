@@ -53,6 +53,7 @@ fn is_flocal_executable(executable: &[u8]) -> bool {
 /// The product's status JSON schema this harness is written against. Schema 6
 /// adds installation scheduling to schema 5's durable relationship lifecycle.
 const STATUS_SCHEMA: u64 = 6;
+const LEGACY_STATUS_SCHEMA: u64 = 5;
 /// The product's sync-list JSON schema this harness is written against.
 const SYNC_LIST_SCHEMA: u64 = 3;
 /// Recovery records use the versioned three-way merge shape.
@@ -125,12 +126,15 @@ impl std::ops::Deref for Connector {
     }
 }
 
-/// The parsed `status --json`, pinned to `STATUS_SCHEMA`. Fields grow with
-/// the scenarios that read them.
+/// The parsed candidate `status --json`, with explicit schema-5 compatibility
+/// while an upgrade scenario starts its predecessor. Fields grow with the
+/// scenarios that read them.
 #[derive(Debug, serde::Deserialize)]
 pub struct Status {
     pub schema: u64,
     pub share: String,
+    #[serde(default)]
+    pub peer: Option<serde_json::Value>,
     pub bound_peer: Option<String>,
     pub relationship_state: String,
     pub removal_pending: bool,
@@ -141,10 +145,19 @@ pub struct Status {
     #[serde(default)]
     pub tombstones: Option<u64>,
     pub recovery: RecoveryStatus,
-    pub scheduling: SchedulingStatus,
+    #[serde(default)]
+    scheduling: Option<SchedulingStatus>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+impl Status {
+    fn scheduling(&self) -> &SchedulingStatus {
+        self.scheduling
+            .as_ref()
+            .expect("validated status scheduling")
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct SchedulingStatus {
     pub state: String,
     pub waiting_on: Option<String>,
@@ -984,7 +997,8 @@ impl Watch<'_> {
 
     /// Abruptly stops a watcher only after proving that this guard still owns
     /// the stopped `flocal watch` process. This models a killed old binary at
-    /// the durable install boundary without ever signaling a recycled PID.
+    /// the durable install boundary after checking process identity immediately
+    /// before signaling.
     pub fn kill(mut self) -> Result<()> {
         let pid = self.pid;
         anyhow::ensure!(
@@ -1261,7 +1275,7 @@ impl Peer {
     }
 
     pub fn assert_second_sync_durably_queued(&self) -> Result<()> {
-        self.second_status()?.scheduling.validate_queued()
+        self.second_status()?.scheduling().validate_queued()
     }
 
     pub fn wait_for_second_sync_queued_behind(&self, root: &str) -> Result<()> {
@@ -1419,7 +1433,7 @@ impl Peer {
             |_| {
                 let local = self.status()?;
                 let remote = other.second_status()?;
-                let queued = [&local.scheduling, &remote.scheduling]
+                let queued = [local.scheduling(), remote.scheduling()]
                     .into_iter()
                     .find(|scheduling| scheduling.state == "queued");
                 let Some(queued) = queued else {
@@ -1437,7 +1451,8 @@ impl Peer {
             "persistent watch did not report its local scheduling wait",
             DEADLINE,
             move |peer| {
-                let scheduling = peer.status()?.scheduling;
+                let status = peer.status()?;
+                let scheduling = status.scheduling().clone();
                 if scheduling.state != "queued" {
                     return Ok(None);
                 }
@@ -1459,7 +1474,7 @@ impl Peer {
     }
 
     pub fn assert_sync_durably_queued(&self) -> Result<()> {
-        self.status()?.scheduling.validate_queued()
+        self.status()?.scheduling().validate_queued()
     }
 
     pub fn arm_scheduling_wait_observation(&self) -> Result<()> {
@@ -2098,6 +2113,7 @@ impl Peer {
     pub fn assert_clean_upgrade_status(&self, before: &Status) -> Result<()> {
         let after = self.status()?;
         if after.share != before.share
+            || after.peer != before.peer
             || after.bound_peer != before.bound_peer
             || after.relationship_state != before.relationship_state
             || after.pending_install
@@ -2150,12 +2166,20 @@ impl Peer {
     }
 
     fn parse_status(&self, output: &[u8]) -> Result<Status> {
-        let status: Status = serde_json::from_slice(output).context("parsing status --json")?;
-        if status.schema != STATUS_SCHEMA {
+        let mut status: Status = serde_json::from_slice(output).context("parsing status --json")?;
+        if !matches!(status.schema, STATUS_SCHEMA | LEGACY_STATUS_SCHEMA) {
             return Err(self.fail(format!(
-                "status schema {} does not match the pinned {STATUS_SCHEMA}",
+                "status schema {} is neither the pinned {STATUS_SCHEMA} nor the supported legacy {LEGACY_STATUS_SCHEMA}",
                 status.schema
             )));
+        }
+        if status.schema == STATUS_SCHEMA && status.scheduling.is_none() {
+            return Err(self.fail(format!(
+                "status schema {STATUS_SCHEMA} is missing its required scheduling field"
+            )));
+        }
+        if status.schema == LEGACY_STATUS_SCHEMA {
+            status.scheduling.get_or_insert_default();
         }
         Ok(status)
     }

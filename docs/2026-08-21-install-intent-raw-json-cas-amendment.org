@@ -1,0 +1,186 @@
+#+title: Install-intent raw-JSON CAS compatibility amendment
+#+date: 2026-08-21
+
+* 1. Decision and user effect
+
+The interrupted-install journal remains durable across an executable upgrade.
+Recovery must not fail merely because the candidate serializes an old valid
+=records_json= value differently. In the reported foreground =flocal watch
+PATH= flow, recovery continues, clears =pending_install= only after normal
+commit, reconnects, and converges the paired roots. It never asks the user to
+delete state, remove the intent, or re-pair.
+
+The failure is concrete: =InstallIntent::managed_generation= was added with
+=#[serde(default)]= after older alpha binaries had already written install
+intents. An older row can omit that member; candidate deserialization gives it
+=None= and candidate serialization writes ="managed_generation":null=. The
+semantic intent is unchanged but the old bytes are not equal to the candidate
+bytes. Other defaulted nested durable fields can produce the same class of
+failure. The current PR-base upgrade E2E begins at =8041be3=, which already
+has this member, and so cannot establish compatibility with an older deployed
+alpha.
+
+* 2. Exact state transition
+
+1. Add one private state helper, conceptually
+
+   #+begin_src rust
+   fn install_intent_with_raw(&self, share: &ShareId)
+       -> Result<Option<(String, InstallIntent)>>
+   #+end_src
+
+   It selects the exact =install_intents.records_json= string, parses that
+   same string into =InstallIntent=, and returns both. It is the only new
+   raw-representation interface. Public readers continue to return parsed
+   values.
+
+2. =set_install_temp_phase= and =rotate_unowned_install_temp= call that
+   helper. They mutate only the parsed =InstallIntent=, serialize only the
+   replacement, and pass the unmodified selected string as =expected_json= to
+   =replace_install_intent_json=. No normalization migration and no
+   deserialize-reserialize operation is permitted on the expected side.
+
+3. =replace_install_intent_json= keeps its =TransactionBehavior::Immediate=
+   transaction and its exact predicate:
+
+   #+begin_src sql
+   UPDATE install_intents
+      SET records_json=?replacement,
+          failure_fingerprint=NULL,
+          failure_diagnostic=NULL
+    WHERE share_id=?share AND records_json=?raw_read;
+   #+end_src
+
+   Its preliminary matching read uses the same =raw_read= value to obtain and
+   clear a matching recovery diagnostic. A zero-row result remains the exact
+   =install intent changed while updating its recovery state= error. Do not
+   replace this predicate with =WHERE share_id=?=, a semantic fingerprint, or
+   canonical JSON equality.
+
+4. Audit all =records_json= comparisons. Recovery classification fingerprints
+   name the exact stored revision, so =install_intent_fingerprint= hashes the
+   selected raw JSON bytes, not a parsed-and-reserialized =InstallIntent=.
+   Classification, retry, and diagnostic validation therefore keep accepting
+   an old row that omits a new defaulted field. Their SQL predicates continue
+   to include that same raw JSON value. Any future =WHERE records_json=...=
+   predicate or persisted revision fingerprint must receive the selected raw
+   string, not a reserialization.
+
+   A classification written by the buggy candidate has its former
+   canonicalized hash. Validation accepts that legacy hash only when it equals
+   the parsed intent's former serialization hash, so retry can clear it. New
+   classifications and returned revisions use the raw hash; this bridge never
+   changes a CAS predicate or makes two raw rows equal.
+
+* 3. Concurrency, recovery, and security boundary
+
+The raw read and later immediate transaction are deliberately separate. Normal
+per-share/session and scheduler ownership should make the recovery mutator the
+sole writer, but they are not the correctness proof. If a daemon recovery,
+foreground watch, retry, or another process replaces the intent after the raw
+read, the exact raw predicate updates zero rows. Recovery stops without
+overwriting the competing journal, filesystem recovery remains durable, and
+the existing diagnostic is truthful. SQLite's immediate transaction makes the
+diagnostic clearing and replacement one write transaction.
+
+This change accepts only SQLite data in the private, owner-validated state
+directory. The raw JSON stays local and is parsed through the existing
+durable-state validation; it is never executed, used as a filesystem path, or
+sent to the peer. Preserve existing malformed-state failure behavior. Do not
+add a JSON canonicalizer: it would enlarge attack surface and could turn two
+distinct stored revisions into an accidental match. The replacement remains
+the normal candidate serialization, so one successful recovery naturally
+upgrades the row representation while preserving exact CAS semantics at its
+read boundary.
+
+* 4. Bug-first evidence and promotion
+
+1. Add a focused state test that derives a valid older =records_json= shape by
+   removing =managed_generation= from a current durable fixture. It contains a
+   real temporary path/token/phase and is inserted as its own raw string. The
+   test first proves candidate deserialize-reserialize is semantically equal
+   but bytewise different. It also inserts the old canonicalized fingerprint
+   and a recovery diagnostic, then requires retry to clear that classification
+   and return the raw fingerprint. It
+   drives both a phase transition and an unowned-token rotation, requiring
+   each to succeed and requiring the new row to contain the intended mutation.
+
+2. In the same focused test, simulate a genuine replacement between raw read
+   and CAS. The stale transition must retain the exact changed-intent error and
+   leave the competitor's raw row untouched. This distinguishes compatibility
+   from weakening optimistic concurrency.
+
+3. The Docker E2E in =tests/e2e/scenarios/upgrades.rs= uses the recovered
+   deployed-alpha anchor, not a current database edited to look old and not
+   merely the pull-request base. It creates a real connector/responder pair
+   and initial round with that executable, interrupts the connector after it
+   has durably written the intent and before apply completes, and kills that
+   old process. It is end-to-end recovery coverage and uses the exact installed
+   predecessor, identified by a byte-for-byte release-binary SHA-256 match.
+
+4. The focused state test is the bug-first proof of the exact raw-row failure.
+   The promoted E2E installs the candidate on both endpoints through the owned installer,
+   runs the foreground watch, requires connection and exact tree convergence,
+   requires empty =unsettled= and =pending_install:false=, and verifies the
+   original share/relationship survived. It performs no state deletion,
+   journal editing, or re-pair. A consuming stopped-watch helper verifies the
+   expected stopped =flocal watch= process immediately before SIGKILL, waits
+   for exit, and disables its SIGCONT drop backstop. The failure dump records predecessor and
+   candidate full commits plus installed executable hashes.
+
+Run this scenario from the deployed predecessor and retain the six generic
+base-to-candidate scenarios. The focused raw-state test remains the
+fail-to-pass proof of the precise representation difference; the existing
+in-progress managed scenario remains valuable but is not evidence for this
+foreground, skipped-version regression.
+
+* 5. Durable deployed-version anchor
+
+The generic E2E needs two independently resolved ancestors:
+
+- =FLOCAL_E2E_UPGRADE_FROM= continues to name the PR base (or main's previous
+  push) and catches immediate compatibility regressions.
+- The same =FLOCAL_E2E_UPGRADE_FROM= input names either predecessor. CI runs
+  the generic matrix once with the PR base and once with the deployed-alpha
+  pointer, resolves each with =git rev-parse --verify --end-of-options
+  INPUT^{commit}=, requires each to be an ancestor distinct from =HEAD=, and
+  records canonical full IDs and binary hashes in failures.
+
+Make the second value durable rather than an operator memory: after each
+successful alpha deployment, create a protected immutable annotated tag
+=alpha-deployed-YYYYMMDD-<short-sha>= and update the checked-in
+=docs/deployed-alpha.org= pointer with the tag name and its full 40-character
+commit. CI obtains the existing =FLOCAL_E2E_UPGRADE_FROM= value from that
+pointer and verifies the exact =refs/tags/= name, annotated-tag object type,
+its peeled commit, and the recorded full commit. The pointer may advance; its
+referenced tag and commit may never be moved. A missing or non-ancestor
+deployed anchor is a configuration error, not a fallback to the PR base.
+
+* 6. Acceptance criteria
+
+1. A valid old raw intent that omits a candidate defaulted member advances its
+   temporary phase and rotates its unowned temporary without a false CAS
+   error; raw expected and candidate reserialization are demonstrably unequal.
+2. A real replacement after the raw read still fails the stale writer and
+   preserves the replacing row exactly.
+3. The focused state test reproduces the reported diagnostic before the fix.
+   The real-predecessor foreground E2E completes recovery, connects, converges
+   both trees, clears =pending_install= and =unsettled=, and retains the
+   existing relationship without manual repair.
+4. The complete E2E suite runs all six general upgrade scenarios from both
+   the PR base and the durable deployed anchor; failures name both commits
+   and executable hashes.
+5. The deployed-anchor pointer names an immutable annotated tag and canonical
+   ancestor commit; absent, moved, equal, or non-ancestor anchors fail CI.
+6. Documentation distinguishes stopping a live foreground watch before an
+   upgrade from retrying =flocal watch PATH= after both endpoints are upgraded
+   to recover an old interrupted install; it never recommends deleting state
+   or re-pairing.
+
+* 7. Initial anchor evidence
+
+Repository evidence establishes =8041be3= as the current PR base. The installed
+binary matches a release artifact built from =5fa9c6f= byte for byte, so
+=docs/deployed-alpha.org= records that exact predecessor and CI exercises it
+independently. Future deployments must continue recording their committed
+source and artifact hash at install time.

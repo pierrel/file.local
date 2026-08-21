@@ -66,6 +66,11 @@ blocks ordinary commands from opening or migrating state. Rerun =make install=
 to finish it. Do not delete the marker or copy an older executable over the
 installed candidate; downgrades are not supported.
 
+If an older foreground =flocal watch PATH= was interrupted while applying a
+change, install the candidate on both endpoints and then rerun =flocal watch
+PATH=. The durable install intent recovers that interrupted apply. Do not
+delete state, remove the intent, or pair the directories again.
+
 Then, on one peer only, pair an existing local directory with an absolute
 remote path:
 

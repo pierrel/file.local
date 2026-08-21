@@ -45,3 +45,15 @@ jobs:
       - run: make e2e
         env:
           FLOCAL_E2E_UPGRADE_FROM: ${{ github.event.pull_request.base.sha || github.event.before }}
+      - name: Run upgrade E2E from the deployed alpha
+        run: |
+          tag=$(sed -n 's/^tag: //p' docs/deployed-alpha.org)
+          commit=$(sed -n 's/^commit: //p' docs/deployed-alpha.org)
+          test -n "$tag" && test -n "$commit"
+          [[ "$tag" =~ ^alpha-deployed-[0-9]{8}-[0-9a-f]{7,40}$ ]]
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git cat-file -t "refs/tags/$tag")" = tag
+          test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$commit"
+          git merge-base --is-ancestor "$commit" HEAD
+          test "$commit" != "$(git rev-parse HEAD)"
+          FLOCAL_E2E_UPGRADE_FROM="$commit" make e2e

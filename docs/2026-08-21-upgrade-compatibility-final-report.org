@@ -455,21 +455,42 @@ diagnostics.
 
 * Validation and review status
 
-Completed locally before the independent review pass:
+** Install-intent raw JSON recovery
+
+An old executable omits =managed_generation= from its durable install-intent
+JSON. The candidate reads it as =None=, but serializing it again adds
+="managed_generation":null=. SQLite correctly treats those distinct byte
+strings as different revisions, so using the candidate serialization as the
+expected CAS value produced the false changed-intent diagnostic.
+
+Recovery now retains the raw selected row for the expected side and serializes
+only the replacement:
+
+#+begin_src rust
+let (expected_json, mut intent) = self.install_intent_with_raw(share)?
+    .context("install intent is missing")?;
+intent.temps[0].phase = phase;
+self.replace_install_intent_json(share, &expected_json, &serde_json::to_string(&intent)?)
+#+end_src
+
+New recovery fingerprints use the raw row. A narrow compatibility bridge also
+accepts a pre-fix canonicalized fingerprint only to clear an already-classified
+intent; it never broadens the raw JSON CAS predicate. The exact installed
+predecessor source is =5fa9c6f=: its release binary and the installed
+executable have the same SHA-256. The foreground E2E builds that exact source
+and checks both trees, clean status, peer/relationship identity, and recovery
+without deleting state or pairing again.
+
+Completed locally after the independent review pass:
 
 - =cargo fmt --check=: pass.
 - =cargo clippy --all-targets --all-features -- -D warnings=: pass.
 - All 235 non-Docker unit and integration tests: pass.
-- Whole-project executable-line coverage: 19,062/20,775, 91.75%.
-- Changed executable-line coverage: 897/974, 92.09%.
-- The full Docker run passed 51 of 52 scenarios in 410.41 seconds. A
-  competing harness cleanup removed both containers from the remaining
-  network-recovery scenario; its immediate isolated rerun passed in 43.69
-  seconds. All seven base-to-candidate installer scenarios passed in the full
-  run from exact base =8041be30605f596683f6cc8f51a8a2dd5aabfc42=.
-- Hosted CI passed Linux tests, native macOS tests, coverage, and all 52 Docker
-  E2E scenarios in one exact-base run. The E2E job took 11 minutes 5 seconds,
-  including cold candidate and historical-base image builds.
+- Whole-project executable-line coverage: above 90%.
+- Changed executable-line coverage: 1,007/1,085, 92.81%.
+- Full Docker E2E: 52 passed, 2 filtered, in 358.30 seconds from the exact
+  pull-request base and 52 passed, 2 filtered, in 334.42 seconds from exact
+  deployed predecessor =5fa9c6fc05a4bca70b79461bccb8f973e363e968=.
 
 The installed macOS Rust target is present locally, but a Linux host cannot
 compile the bundled SQLite and BLAKE3 C sources for Apple without an Apple
@@ -480,14 +501,16 @@ compile/test result.
 
 The local review loop ran correctness, concurrency/liveness, error handling,
 adversarial security, simplicity/design, filesystem/platform, and dedicated
-comment/document alignment passes. It found and fixed private-file creation
-windows, inherited-marker loss, unsafe service restoration, foreground lock
-ownership, terminal control-byte injection, incomplete E2E postconditions,
-service readiness, macOS durability and lifecycle coverage, unbounded candidate
-copying, scrollable transition diagnostics, and the global installer namespace.
-No verified finding was declined. Copilot's first round reviewed all 24 changed
-files and generated zero comments. Any later code change requires these
-examples, numbers, and conclusions to be reconciled again.
+comment/document alignment passes. It found and fixed raw-CAS representation
+drift, already-classified legacy fingerprints, incomplete E2E identity
+postconditions, schema-5 harness compatibility, private-file creation windows,
+inherited-marker loss, unsafe service restoration, foreground lock ownership,
+terminal control-byte injection, service readiness, macOS durability and
+lifecycle coverage, unbounded candidate copying, scrollable transition
+diagnostics, and the global installer namespace. No verified finding was
+declined. GitHub CI and Copilot review are added after the pull request opens;
+any resulting code change requires these examples, numbers, and conclusions to
+be reconciled again.
 
 * Remaining limits and operational note
 

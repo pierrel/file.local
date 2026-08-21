@@ -74,6 +74,8 @@ fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
 #[ignore = "requires docker; run via `make e2e`"]
 fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
+    let before_a = a.status()?;
+    let before_b = b.status()?;
     a.sync_stop()?;
     let watch = a.watch_start_with_apply_stop()?;
     b.write(
@@ -98,9 +100,16 @@ fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Resul
         "written while the old watch is stopped",
     )?;
     anyhow::ensure!(
-        !a.status()?.pending_install && a.status()?.unsettled.is_empty(),
+        !a.status()?.pending_install
+            && a.status()?.unsettled.is_empty()
+            && !b.status()?.pending_install
+            && b.status()?.unsettled.is_empty(),
         "foreground recovery left pending or unsettled state"
     );
+    a.assert_clean_upgrade_status(&before_a)?;
+    b.assert_clean_upgrade_status(&before_b)?;
+    a.assert_sync_role("connector")?;
+    b.assert_sync_role("responder")?;
     e2e::assert_trees_equal(&a, &b)
 }
 

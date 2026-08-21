@@ -94,17 +94,21 @@ lock before replacement. Foreground commands and responder-first legacy
 sessions receive a bounded, path-naming safe refusal rather than a partial
 upgrade.
 
-The E2E suite builds the pull request's exact base revision separately from the
-candidate, creates a real paired installation with the base binaries, and
-carries its working trees and state through the candidate. Ordinary scenarios
-cover an incompatible mixed-version reconnect, idle restart, an apply killed at
-the service stop, compatible endpoint reinstalls, foreground refusal and retry,
-and migration failure and retry. They record both commit IDs and executable
-hashes and require preserved relationship identity, empty unsettled/conflict
-state, candidate binary publication, and resumed watching. CI checks out full
-history and pins that transition to the exact pull-request base SHA. The native
-macOS graphical-manager upgrade remains part of the pre-=v0.0.1= platform gate.
-Downgrade and network-distributed updating remain out of scope.
+The E2E suite builds both the pull request's exact base revision and the
+recorded deployed-alpha revision separately from the candidate, creates a real
+paired installation with each predecessor, and carries its working trees and
+state through the candidate. Ordinary scenarios cover an incompatible
+mixed-version reconnect, idle restart, an apply killed at the service stop,
+compatible endpoint reinstalls, foreground refusal and retry, and migration
+failure and retry. The foreground interruption case kills the old watch after
+it durably writes its intent, then proves the candidate recovers without state
+deletion or re-pairing. They record predecessor and candidate commit IDs and
+executable hashes and require preserved relationship identity, empty
+unsettled/conflict state, candidate binary publication, and resumed watching.
+CI checks out full history and verifies the deployed-alpha annotated tag and
+the exact pull-request base transition. The native macOS graphical-manager
+upgrade remains part of the pre-=v0.0.1= platform gate. Downgrade and
+network-distributed updating remain out of scope.
 
 ** TODO Schedule multiple shares without manual retries
 

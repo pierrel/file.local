@@ -1184,16 +1184,28 @@ fn legacy_upgrade_inventory(dir: &Path) -> Result<LegacyUpgradeInventory> {
             Ok((row.get::<_, String>(0)?, bytes_path(row.get(1)?)))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let active_root = connection
+    let has_sync_queue = connection
         .query_row(
-            "SELECT shares.root FROM sync_queue
-             JOIN shares ON shares.share_id=sync_queue.share_id
-             WHERE sync_queue.active=1 LIMIT 1",
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_queue'",
             [],
-            |row| row.get::<_, Vec<u8>>(0),
+            |_| Ok(()),
         )
         .optional()?
-        .map(bytes_path);
+        .is_some();
+    let active_root = if has_sync_queue {
+        connection
+            .query_row(
+                "SELECT shares.root FROM sync_queue
+                 JOIN shares ON shares.share_id=sync_queue.share_id
+                 WHERE sync_queue.active=1 LIMIT 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(bytes_path)
+    } else {
+        None
+    };
     Ok(LegacyUpgradeInventory {
         shares,
         active_root,
@@ -1867,6 +1879,11 @@ impl State {
     }
 
     pub fn install_intent(&self, share: &ShareId) -> Result<Option<InstallIntent>> {
+        self.install_intent_with_raw(share)
+            .map(|intent| intent.map(|(_, intent)| intent))
+    }
+
+    fn install_intent_with_raw(&self, share: &ShareId) -> Result<Option<(String, InstallIntent)>> {
         let json: Option<String> = self
             .conn
             .query_row(
@@ -1875,11 +1892,15 @@ impl State {
                 |row| row.get(0),
             )
             .optional()?;
-        json.map(|value| Ok(serde_json::from_str(&value)?))
+        json.map(|json| Ok((json.clone(), serde_json::from_str(&json)?)))
             .transpose()
     }
 
-    pub fn install_intent_fingerprint(intent: &InstallIntent) -> Result<String> {
+    fn install_intent_fingerprint(json: &str) -> String {
+        blake3::hash(json.as_bytes()).to_hex().to_string()
+    }
+
+    fn legacy_install_intent_fingerprint(intent: &InstallIntent) -> Result<String> {
         Ok(blake3::hash(&serde_json::to_vec(intent)?)
             .to_hex()
             .to_string())
@@ -1902,10 +1923,10 @@ impl State {
             return Ok(None);
         };
         let intent: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&intent, failure_fingerprint, failure_diagnostic)?;
+        decode_install_intent_failure(&json, failure_fingerprint, failure_diagnostic)?;
         Ok(Some(InstallRecoveryIntent {
             share: share.clone(),
-            fingerprint: Self::install_intent_fingerprint(&intent)?,
+            fingerprint: Self::install_intent_fingerprint(&json),
             intent,
         }))
     }
@@ -1923,8 +1944,8 @@ impl State {
         let Some((json, fingerprint, diagnostic)) = row else {
             return Ok(None);
         };
-        let intent: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&intent, fingerprint, diagnostic)
+        let _: InstallIntent = serde_json::from_str(&json)?;
+        decode_install_intent_failure(&json, fingerprint, diagnostic)
     }
 
     pub fn unclassified_install_intents(&self) -> Result<Vec<InstallRecoveryIntent>> {
@@ -1944,12 +1965,12 @@ impl State {
         for row in rows {
             let (share, json, failure_fingerprint, failure_diagnostic) = row?;
             let intent: InstallIntent = serde_json::from_str(&json)?;
-            if decode_install_intent_failure(&intent, failure_fingerprint, failure_diagnostic)?
+            if decode_install_intent_failure(&json, failure_fingerprint, failure_diagnostic)?
                 .is_none()
             {
                 intents.push(InstallRecoveryIntent {
                     share: ShareId(share),
-                    fingerprint: Self::install_intent_fingerprint(&intent)?,
+                    fingerprint: Self::install_intent_fingerprint(&json),
                     intent,
                 });
             }
@@ -1980,9 +2001,9 @@ impl State {
             transaction.commit()?;
             return Ok(false);
         };
-        let intent: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&intent, prior_fingerprint, prior_diagnostic)?;
-        let actual_fingerprint = Self::install_intent_fingerprint(&intent)?;
+        let _: InstallIntent = serde_json::from_str(&json)?;
+        decode_install_intent_failure(&json, prior_fingerprint, prior_diagnostic)?;
+        let actual_fingerprint = Self::install_intent_fingerprint(&json);
         if actual_fingerprint != expected_fingerprint {
             transaction.commit()?;
             return Ok(false);
@@ -2032,8 +2053,8 @@ impl State {
         };
         let intent: InstallIntent = serde_json::from_str(&json)?;
         let failure =
-            decode_install_intent_failure(&intent, failure_fingerprint, failure_diagnostic)?;
-        let fingerprint = Self::install_intent_fingerprint(&intent)?;
+            decode_install_intent_failure(&json, failure_fingerprint, failure_diagnostic)?;
+        let fingerprint = Self::install_intent_fingerprint(&json);
         if let Some(failure) = failure {
             let changed = transaction.execute(
                 "UPDATE install_intents
@@ -2506,10 +2527,9 @@ impl State {
         path: &RelativePath,
         phase: InstallTempPhase,
     ) -> Result<()> {
-        let mut intent = self
-            .install_intent(share)?
+        let (expected_json, mut intent) = self
+            .install_intent_with_raw(share)?
             .context("install intent is missing")?;
-        let expected_json = serde_json::to_string(&intent)?;
         let temp = intent
             .temps
             .iter_mut()
@@ -2524,10 +2544,9 @@ impl State {
         share: &ShareId,
         path: &RelativePath,
     ) -> Result<String> {
-        let mut intent = self
-            .install_intent(share)?
+        let (expected_json, mut intent) = self
+            .install_intent_with_raw(share)?
             .context("install intent is missing")?;
-        let expected_json = serde_json::to_string(&intent)?;
         let temp = intent
             .temps
             .iter_mut()
@@ -2564,9 +2583,8 @@ impl State {
         let Some((failure_fingerprint, failure_diagnostic)) = classification else {
             bail!("install intent changed while updating its recovery state");
         };
-        let expected: InstallIntent = serde_json::from_str(expected_json)?;
         let failure =
-            decode_install_intent_failure(&expected, failure_fingerprint, failure_diagnostic)?;
+            decode_install_intent_failure(expected_json, failure_fingerprint, failure_diagnostic)?;
         let changed = transaction.execute(
             "UPDATE install_intents
              SET records_json=?3,failure_fingerprint=NULL,failure_diagnostic=NULL
@@ -5869,7 +5887,7 @@ fn validate_install_intent_fingerprint(fingerprint: &str) -> Result<()> {
 }
 
 fn decode_install_intent_failure(
-    intent: &InstallIntent,
+    records_json: &str,
     fingerprint: Option<String>,
     diagnostic: Option<String>,
 ) -> Result<Option<InstallIntentFailure>> {
@@ -5880,7 +5898,10 @@ fn decode_install_intent_failure(
             if diagnostic.len() > 4096 {
                 bail!("stored install recovery diagnostic exceeds its limit");
             }
-            if State::install_intent_fingerprint(intent)? != fingerprint {
+            let intent: InstallIntent = serde_json::from_str(records_json)?;
+            if State::install_intent_fingerprint(records_json) != fingerprint
+                && State::legacy_install_intent_fingerprint(&intent)? != fingerprint
+            {
                 bail!("stored install recovery classification does not match its intent");
             }
             Ok(Some(InstallIntentFailure {
@@ -7133,6 +7154,17 @@ mod tests {
         assert!(legacy_upgrade_inventory(&absent)?.shares.is_empty());
         Connection::open(absent.join("state.sqlite3"))?;
         assert!(legacy_upgrade_inventory(&absent)?.shares.is_empty());
+        let legacy = temp.path().join("legacy-state");
+        fs::create_dir(&legacy)?;
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700))?;
+        let connection = Connection::open(legacy.join("state.sqlite3"))?;
+        connection.execute_batch(
+            "CREATE TABLE shares (share_id TEXT PRIMARY KEY, root BLOB NOT NULL);\
+             INSERT INTO shares VALUES ('share-old', X'2F746D702F726F6F74');",
+        )?;
+        let inventory = legacy_upgrade_inventory(&legacy)?;
+        assert_eq!(inventory.shares.len(), 1);
+        assert!(inventory.active_root.is_none());
 
         let root = temp.path().join("root");
         fs::create_dir(&root)?;
@@ -7307,15 +7339,18 @@ mod tests {
             Vec::new(),
             Entry::Directory,
         );
-        let (intent, created) = state.set_install_intent(&share, &[record])?;
+        let (_, created) = state.set_install_intent(&share, &[record])?;
         assert!(created);
+        let (records_json, _) = state
+            .install_intent_with_raw(&share)?
+            .context("install intent is missing")?;
 
         let recovery = state
             .install_recovery_intent(&share)?
             .context("install recovery intent is missing")?;
         assert_eq!(
             recovery.fingerprint,
-            State::install_intent_fingerprint(&intent)?
+            State::install_intent_fingerprint(&records_json)
         );
         assert_eq!(state.unclassified_install_intents()?.len(), 1);
         let wrong_fingerprint = "0".repeat(64);
@@ -7494,6 +7529,98 @@ mod tests {
                 )
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_install_intent_json_uses_raw_cas_and_rejects_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let path = RelativePath::from_bytes(b"pending".to_vec())?;
+        let record = file_record(
+            path.clone(),
+            PeerId("owner".into()),
+            1,
+            1,
+            Vec::new(),
+            Entry::Directory,
+        );
+        state.set_install_intent(&share, &[record])?;
+
+        let current_json: String = state.conn.query_row(
+            "SELECT records_json FROM install_intents WHERE share_id=?1",
+            [&share.0],
+            |row| row.get(0),
+        )?;
+        let mut legacy_json: serde_json::Value = serde_json::from_str(&current_json)?;
+        legacy_json
+            .as_object_mut()
+            .context("install intent is not a JSON object")?
+            .remove("managed_generation");
+        let legacy_json = serde_json::to_string(&legacy_json)?;
+        let reserialized =
+            serde_json::to_string(&serde_json::from_str::<InstallIntent>(&legacy_json)?)?;
+        assert_ne!(legacy_json, reserialized);
+        let raw_fingerprint = State::install_intent_fingerprint(&legacy_json);
+        let legacy_intent: InstallIntent = serde_json::from_str(&legacy_json)?;
+        let legacy_fingerprint = State::legacy_install_intent_fingerprint(&legacy_intent)?;
+        assert_ne!(raw_fingerprint, legacy_fingerprint);
+        state.conn.execute(
+            "UPDATE install_intents
+             SET records_json=?2,failure_fingerprint=?3,failure_diagnostic=?4
+             WHERE share_id=?1",
+            params![
+                share.0,
+                legacy_json,
+                legacy_fingerprint,
+                "old recovery failure"
+            ],
+        )?;
+
+        let retry = state
+            .begin_install_intent_retry(&share)?
+            .context("legacy classified install intent disappeared before retry")?;
+        assert_eq!(retry.fingerprint, raw_fingerprint);
+        assert!(state.install_intent_failure(&share)?.is_none());
+        state.mark_install_temp_creating(&share, &path)?;
+        let old_token = state.install_intent(&share)?.unwrap().temps[0]
+            .token
+            .clone();
+        let new_token = state.rotate_unowned_install_temp(&share, &path)?;
+        assert_ne!(old_token, new_token);
+
+        let expected_json: String = state.conn.query_row(
+            "SELECT records_json FROM install_intents WHERE share_id=?1",
+            [&share.0],
+            |row| row.get(0),
+        )?;
+        let mut replacement: InstallIntent = serde_json::from_str(&expected_json)?;
+        replacement.temps[0].phase = InstallTempPhase::Owned;
+        let replacement_json = serde_json::to_string(&replacement)?;
+        let mut competing: InstallIntent = serde_json::from_str(&expected_json)?;
+        competing.temps[0].token = ".flocal-tmp-replaced".into();
+        let competing_json = serde_json::to_string(&competing)?;
+        state.conn.execute(
+            "UPDATE install_intents SET records_json=?2 WHERE share_id=?1",
+            params![share.0, competing_json],
+        )?;
+        let error = state
+            .replace_install_intent_json(&share, &expected_json, &replacement_json)
+            .expect_err("a genuinely replaced intent must not satisfy the CAS");
+        assert!(
+            error
+                .to_string()
+                .contains("install intent changed while updating its recovery state")
+        );
+        let after: String = state.conn.query_row(
+            "SELECT records_json FROM install_intents WHERE share_id=?1",
+            [&share.0],
+            |row| row.get(0),
+        )?;
+        assert_eq!(after, competing_json);
         Ok(())
     }
 
