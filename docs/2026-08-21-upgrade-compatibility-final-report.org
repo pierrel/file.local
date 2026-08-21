@@ -154,15 +154,25 @@ reopening an unchecked path later.
 let sync_directory = File::open(parent)?;
 let directory = cap_std::fs::Dir::from_std_file(sync_directory.try_clone()?);
 let mut output = directory.open_with(&temporary, &options)?;
-let candidate_length = source.metadata()?.len();
+let staged = Self {
+    directory,
+    sync_directory,
+    temporary,
+    destination,
+    published: false,
+};
 copy_candidate_exactly(&mut source, &mut output, candidate_length)?;
-directory.set_permissions(&temporary, Permissions::from_mode(0o755))?;
+staged.directory.set_permissions(&staged.temporary, Permissions::from_mode(0o755))?;
 flocal::durability::sync_file(&output)?;
+Ok(staged)
 #+end_src
 
 The length snapshot makes staging bounded even if a local build process appends
 to the opened inode. An early EOF is rejected before the service is stopped,
-so a concurrent truncation cannot publish a partial executable.
+so a concurrent truncation cannot publish a partial executable. The cleanup
+guard is constructed immediately after the temporary opens and before the next
+fallible operation; copy, permission, or sync failure therefore removes the
+partial file.
 
 Publication is relative to that retained directory capability:
 
@@ -305,9 +315,10 @@ cannot prove an actual LaunchAgent session.
 
 The Docker image supplies a small fake =systemctl=. It is not a mock of
 synchronization or state. It owns only the missing container service-manager
-boundary: normal stop sends TERM and CONT, the interrupted-apply scenario kills
-the deliberately stopped old daemon before it can resume, every stop waits for
-live non-zombie exit, and =enable --now= launches the installed daemon. The
+boundary: normal stop sends TERM, the interrupted-apply scenario kills
+the deliberately stopped old daemon before it can resume, every stop uses
+=start-stop-daemon= to match both the PID file and executable and waits with a
+bounded KILL fallback, and =enable --now= launches the installed daemon. The
 paired directories, SSH sessions, old daemon, new daemon, SQLite state, locks,
 journals, and files are real.
 
@@ -368,9 +379,10 @@ impl Drop for StagedExecutable {
 }
 #+end_src
 
-Every early =?= before rename therefore cleans the candidate temporary. After
-rename, =published= disables that cleanup because the old name no longer
-exists and the operation has crossed its irreversible boundary.
+Every early =?= after the temporary is opened therefore drops the already-built
+guard and cleans the candidate temporary. After rename, =published= disables
+that cleanup because the old name no longer exists and the operation has
+crossed its irreversible boundary.
 
 The lock guards need no custom destructor. =File= closes on drop, and the
 operating system releases =flock= ownership with it. A
@@ -498,12 +510,15 @@ Completed locally after the independent review pass:
 - =cargo fmt --check=: pass.
 - =cargo clippy --all-targets --all-features -- -D warnings=: pass.
 - All 236 non-Docker unit and integration tests: pass.
-- Whole-project executable-line coverage: 19,212/20,908, 91.89%.
-- Changed executable-line coverage: 1,061/1,144, 92.74%.
+- Whole-project executable-line coverage: 19,184/20,911, 91.74%.
+- Changed executable-line coverage: 1,065/1,148, 92.77%.
 - Full Docker E2E: 52 passed, 2 filtered, in 359.01 seconds from the exact
   pull-request base. The upgrade-only pass from exact deployed predecessor
   =5fa9c6fc05a4bca70b79461bccb8f973e363e968= passed all 7 scenarios, with
-  47 unrelated scenarios filtered, in 87.91 seconds.
+  47 unrelated scenarios filtered, in 86.61 seconds. After adding the final
+  executable predicate to stale-PID start matching, a competing harness cleanup
+  removed both containers from one scenario after the other 6 passed; its
+  immediate isolated retry passed in 33.33 seconds.
 
 The installed macOS Rust target is present locally, but a Linux host cannot
 compile the bundled SQLite and BLAKE3 C sources for Apple without an Apple
@@ -517,14 +532,22 @@ adversarial security, simplicity/design, filesystem/platform, and dedicated
 comment/document alignment passes. It found and fixed raw-CAS representation
 drift, already-classified legacy fingerprints, large-journal recovery memory
 amplification, legacy inventory without a =sync_queue= table, broad schema-5
-harness acceptance, incomplete E2E identity postconditions, private-file creation windows,
-inherited-marker loss, unsafe service restoration, foreground lock ownership,
-terminal control-byte injection, service readiness, macOS durability and
-lifecycle coverage, unbounded candidate copying, scrollable transition
-diagnostics, and the global installer namespace. No verified finding was
-declined. GitHub CI and Copilot review are added after the pull request opens;
-any resulting code change requires these examples, numbers, and conclusions to
-be reconciled again.
+harness acceptance, incomplete E2E identity postconditions, private-file
+creation windows, cleanup of partially staged candidates, a fake-service-manager
+=/proc= exit race, inherited-marker loss, unsafe service restoration,
+foreground lock ownership, terminal control-byte injection, service readiness,
+macOS durability and lifecycle coverage, unbounded candidate copying,
+scrollable transition diagnostics, and the global installer namespace.
+
+Copilot's review of =5f8fbe3= posted the repeated install-intent parse and
+included two suppressed findings: pre-guard staging cleanup and the fake
+=systemctl= read race. Local verification accepted all three. The recovery path
+now parses once, staging constructs its RAII guard before its first fallible
+post-create step, and the fake manager delegates PID-file plus executable
+identity and bounded termination to =start-stop-daemon=. The subsequent local
+concurrency pass also rejected manual bare-PID signaling entirely. No verified
+finding was declined. GitHub CI and Copilot are rerun on each pushed correction;
+the pull request records the final external state.
 
 * Remaining limits and operational note
 

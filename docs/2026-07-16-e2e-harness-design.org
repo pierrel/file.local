@@ -567,9 +567,10 @@ installed path hashes to the candidate.
 The fake =systemctl= owns only the service-manager boundary absent inside a
 container. The installed base/candidate binaries, paired roots, SQLite state,
 locks, SSH responders, service processes, recovery journals, and filesystem
-changes remain real. Its stop path can either perform a normal TERM/CONT drain
-or kill a process held at the pre-apply hook, and its start path launches the
-installed daemon so the installer must observe a real control socket.
+changes remain real. Its stop path uses =start-stop-daemon= to bind a PID file
+to the installed executable, then either performs a bounded TERM drain or kills
+a process held at the pre-apply hook. Its start path launches that executable,
+so the installer must observe a real control socket.
 
 The ordinary upgrade scenarios cover an idle pair across an incompatible
 mixed-version reconnect, a killed pre-apply daemon with durable install-intent

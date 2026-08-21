@@ -1231,17 +1231,20 @@ impl StagedExecutable {
             .write(true)
             .to_owned();
         let mut output = directory.open_with(&temporary, &options)?;
-        copy_candidate_exactly(&mut source, &mut output, candidate_length)?;
-        directory.set_permissions(&temporary, Permissions::from_mode(0o755))?;
-        flocal::durability::sync_file(&output)
-            .context("syncing the staged candidate executable")?;
-        Ok(Self {
+        let staged = Self {
             directory,
             sync_directory,
             temporary,
             destination,
             published: false,
-        })
+        };
+        copy_candidate_exactly(&mut source, &mut output, candidate_length)?;
+        staged
+            .directory
+            .set_permissions(&staged.temporary, Permissions::from_mode(0o755))?;
+        flocal::durability::sync_file(&output)
+            .context("syncing the staged candidate executable")?;
+        Ok(staged)
     }
 
     fn publish(&mut self) -> Result<()> {

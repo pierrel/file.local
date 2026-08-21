@@ -289,10 +289,10 @@ synchronized wall-clock timing or an operator restart.
    until =daemon install= replaces the normal path.
 
 4. Provide a fixed fake =systemctl= inside the E2E image. It implements only
-   the manager calls made by the Linux installer, records their order, sends
-   real SIGTERM to the recorded daemon, waits for its exit with a hard
-   deadline, and starts the installed daemon. It never accepts interpolated
-   shell fragments. This lets the E2E invoke the exact candidate
+   the manager calls made by the Linux installer, records their order, and uses
+   =start-stop-daemon= to match the PID file to the installed executable before
+   a bounded TERM/KILL stop. It then starts that installed executable. It never
+   accepts interpolated shell fragments. This lets the E2E invoke the exact candidate
    =daemon install= operation without claiming that a Docker container is a
    real systemd login session. Existing native/manual gates remain responsible
    for actual systemd and launchd integration.
