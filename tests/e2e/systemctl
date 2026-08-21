@@ -15,19 +15,19 @@ case "${1-} ${2-}" in
     "--user show-environment")
         printf 'HOME=/home/peer\nXDG_CONFIG_HOME=/home/peer/.config\n'
         ;;
-    "--user show")
+    "--user list-units")
         case "$*" in
-            *--property=ActiveState*)
+            *flocal-daemon.service*)
                 if /usr/sbin/start-stop-daemon --status --quiet \
                     --pidfile /home/peer/.flocal-daemon.pid \
                     --exec /home/peer/.local/bin/flocal; then
-                    printf 'active\n'
-                else
-                    printf 'inactive\n'
+                    printf 'flocal-daemon.service loaded active running file.local managed sync\n'
+                elif [ -e /home/peer/.config/systemd/user/flocal-daemon.service ]; then
+                    printf 'flocal-daemon.service loaded inactive dead file.local managed sync\n'
                 fi
                 ;;
             *)
-                printf 'unsupported E2E systemctl show: %s\n' "$*" >&2
+                printf 'unsupported E2E systemctl list-units: %s\n' "$*" >&2
                 exit 2
                 ;;
         esac

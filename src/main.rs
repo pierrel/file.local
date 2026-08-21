@@ -1577,28 +1577,42 @@ fn prepare_daemon_service(state_dir: &Path, executable: &Path) -> Result<DaemonS
         bail!("daemon service paths must be absolute")
     }
     let unit = config.join("systemd/user/flocal-daemon.service");
-    let unit_exists = preflight_text_file(&unit)?;
+    preflight_text_file(&unit)?;
     let content = systemd_unit_content(executable, state_dir)?;
-    let active_state = Command::new("systemctl")
+    let service_status = Command::new("systemctl")
         .args([
             "--user",
-            "show",
-            "--property=ActiveState",
-            "--value",
+            "list-units",
+            "--all",
+            "--full",
+            "--plain",
+            "--no-legend",
             "flocal-daemon.service",
         ])
         .output()?;
-    let running = if !active_state.status.success() && !unit_exists {
-        false
-    } else if !active_state.status.success() {
+    if !service_status.status.success() {
         bail!("cannot query whether flocal-daemon.service is active")
-    } else {
-        match String::from_utf8(active_state.stdout)?.trim() {
-            "active" | "activating" | "reloading" | "deactivating" => true,
-            "inactive" | "failed" => false,
-            state => bail!("systemd returned an unknown active state: {state}"),
+    }
+    let output = String::from_utf8(service_status.stdout)?;
+    let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+    let running = match lines.next() {
+        None => false,
+        Some(line) => {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("flocal-daemon.service") || fields.next().is_none() {
+                bail!("systemd returned an incomplete service status")
+            }
+            match fields.next() {
+                Some("active" | "activating" | "reloading" | "deactivating") => true,
+                Some("inactive" | "failed") => false,
+                Some(state) => bail!("systemd returned an unknown active state: {state}"),
+                None => bail!("systemd returned an incomplete service status"),
+            }
         }
     };
+    if lines.next().is_some() {
+        bail!("systemd returned more than one service status")
+    }
     Ok(DaemonService {
         unit,
         content,
@@ -1881,7 +1895,7 @@ fn install_text_file(path: &Path, content: &str) -> Result<()> {
     result
 }
 
-fn preflight_text_file(path: &Path) -> Result<bool> {
+fn preflight_text_file(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("service definition has no parent directory")?;
@@ -1896,10 +1910,10 @@ fn preflight_text_file(path: &Path) -> Result<bool> {
     )
 }
 
-fn validate_private_install_file(directory: &cap_std::fs::Dir, path: &Path) -> Result<bool> {
+fn validate_private_install_file(directory: &cap_std::fs::Dir, path: &Path) -> Result<()> {
     let metadata = match directory.symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
     #[cfg(unix)]
@@ -1913,7 +1927,7 @@ fn validate_private_install_file(directory: &cap_std::fs::Dir, path: &Path) -> R
             bail!("service asset is not an owner-only regular file")
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn managed_state_marker_path() -> Result<PathBuf> {
@@ -1935,7 +1949,7 @@ fn acquire_service_installer_lock_at(marker: &Path) -> Result<File> {
 }
 
 fn preflight_managed_state_marker() -> Result<()> {
-    preflight_text_file(&managed_state_marker_path()?).map(|_| ())
+    preflight_text_file(&managed_state_marker_path()?)
 }
 
 fn install_managed_state_marker(state_dir: &Path) -> Result<()> {
@@ -11411,7 +11425,7 @@ mod tests {
         let systemctl = bin.join("systemctl");
         std::fs::write(
             &systemctl,
-            "#!/bin/sh\nif [ \"$2\" = show-environment ]; then printf 'HOME=%s\\n' \"$FLOCAL_TEST_MANAGER_HOME\"; elif [ \"$2\" = show ]; then if [ -e \"$FLOCAL_TEST_MANAGER_HOME/show-fail\" ]; then exit 1; elif [ -e \"$FLOCAL_TEST_MANAGER_HOME/active-state\" ]; then cat \"$FLOCAL_TEST_MANAGER_HOME/active-state\"; elif [ ! -e \"$FLOCAL_TEST_MANAGER_HOME/.config/systemd/user/flocal-daemon.service\" ]; then exit 1; else printf 'inactive\\n'; fi; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$2\" = show-environment ]; then printf 'HOME=%s\\n' \"$FLOCAL_TEST_MANAGER_HOME\"; elif [ \"$2\" = list-units ]; then if [ -e \"$FLOCAL_TEST_MANAGER_HOME/show-fail\" ]; then exit 1; elif [ -e \"$FLOCAL_TEST_MANAGER_HOME/active-state\" ]; then printf 'flocal-daemon.service loaded active running file.local managed sync\\n'; elif [ -e \"$FLOCAL_TEST_MANAGER_HOME/.config/systemd/user/flocal-daemon.service\" ]; then printf 'flocal-daemon.service loaded inactive dead file.local managed sync\\n'; fi; fi\nexit 0\n",
         )?;
         #[cfg(unix)]
         {
@@ -11561,6 +11575,9 @@ esac
         let state_dir = root.join("state");
         flocal::state::ensure_private_directory(&state_dir)?;
         let executable = std::env::current_exe()?.canonicalize()?;
+        std::fs::write(manager_home.join("show-fail"), "")?;
+        assert!(prepare_daemon_service(&state_dir, &executable).is_err());
+        std::fs::remove_file(manager_home.join("show-fail"))?;
         std::fs::write(manager_home.join("active-state"), "active\n")?;
         let loaded_without_a_unit = prepare_daemon_service(&state_dir, &executable)?;
         assert!(loaded_without_a_unit.running);
