@@ -145,9 +145,11 @@ fn offline_deletion_propagates_and_nothing_resurrects() -> Result<()> {
     b.offline()?;
     a.remove_dir_all("dir")?;
     for _ in 0..3 {
-        a.sync_expect_offline()?; // a watch cycle: refresh, then fail to reach b
+        a.sync_expect_offline()?;
     }
-    a.assert_status(|s| s.tombstones == Some(2))?; // exactly dir and dir/child
+    // No paired reservation completed, so status remains the last completed scan.
+    a.assert_status(|s| s.entries == 2 && s.tombstones == Some(0))?;
+    a.assert_absent("dir")?;
 
     b.online()?;
     a.sync()?;
@@ -330,7 +332,8 @@ catalog #2 does with =b.assert_absent=).
 - =watch.stop()= terminates the watcher /inside/ the container: a second
   =docker exec= signals the recorded PID and waits for it to exit, because
   killing the =docker exec= client does not kill the exec'd process, and a
-  surviving watcher would keep holding the share and global locks. Even
+  surviving watcher would keep holding its share-session lock and any active
+  round permit. Even
   SIGKILL is lock-safe by the product's own construction: =flock= releases
   on process exit, SQLite WAL recovers, and =recover_installs= attempts to
   repair an interrupted install on the next command.  The stale-intent bug
@@ -734,10 +737,10 @@ Two rules:
 
 1. *Scenarios drive =flocal sync= explicitly.* It is synchronous, so a
    scenario is deterministic end to end: act, sync, assert — no waiting.
-   The "several watch cycles while offline" element of the tombstone story is
-   modeled as repeated =sync_expect_offline()= calls, which is exactly what a
-   watch cycle does (refresh local state, fail to connect) per the loop in
-   =src/main.rs=; this keeps the headline scenario fully deterministic.
+   The repeated =sync_expect_offline()= calls prove that failures before the
+   paired installation reservation do not mutate the persisted scan.  The
+   successful round after reconnection rescans, creates the tombstones, and
+   propagates the deletion; this keeps the headline scenario deterministic.
 2. *=watch= gets a small testability hook and few scenarios.* The watch loop
    hardcodes its 30-second rescan (=rx.recv_timeout(Duration::from_secs(30))=
    in =src/main.rs=), which would make every watch scenario cost tens of
@@ -864,9 +867,9 @@ tests/e2e/
   flocal-wrapper.sh  tees flocal stderr to the log the dump collects
 #+end_example
 
-The implemented public surface came out /tighter/ than designed: =mod.rs=
-re-exports exactly four names — =pair=, =containers=, =known_failure=, and
-=assert_trees_equal=. =init= and =peer_add= are methods on the returned
+At this initial dated slice the implemented public surface came out /tighter/
+than designed: =mod.rs= re-exported four names: =pair=, =containers=,
+=known_failure=, and =assert_trees_equal=. =init= and =peer_add= are methods on the returned
 =PeerBox= handles, every other verb is a method on =Connector= or =Peer=,
 and the types themselves (=PeerBox=, =Connector=, =Peer=, =Status=,
 =Conflicts=) are reachable only by inference from those entry points.
@@ -1289,11 +1292,75 @@ committed-action failure scenario.
 * Update 2026-08-17: clean relationship removal
 
 Three scenarios in =tests/e2e/scenarios/relationships.rs= exercise the reviewed
-relationship lifecycle through public commands over real SSH: reachable
+relationship lifecycle through public commands over real SSH. At the time of
+that change, reachable
 two-sided removal retains files and conflict recovery before a fresh initial
 union; an unreachable responder leaves a disabled =removing= relationship until
 the same command is retried; and local-only removal leaves visible responder
 asymmetry until that endpoint also removes locally. Both daemons run in managed
-scenarios so =sync list --json= is asserted on each endpoint. The harness pins
-list schema 2 and status schema 5, including hidden unpaired list rows and the
+scenarios so =sync list --json= is asserted on each endpoint. The harness pinned
+the then-current list schema 2 and status schema 5, including hidden unpaired list rows and the
 =registering=/=removing=/=unpaired= relationship fields.
+
+* Update 2026-08-20: multi-share scheduling acceptance
+
+Six ordinary scenarios in =tests/e2e/scenarios/multi_share.rs= exercise the
+installation scheduler through public commands, real processes, and real SSH.
+The two original reproductions retain their success-path assertions without an
+expected-failure wrapper: =sync add --yes= waits behind an active sibling and
+completes its initial plan, while a confirmed =sync start= returns promptly,
+is visible as durably enabled and queued, names the active root rather than an
+internal ID, and converges after release.
+
+Four focused scenarios extend that boundary:
+
+1. =sync stop= removes a queued managed start before the active owner releases,
+   and a later completed permit proves the canceled payload cannot run.
+2. A second watch event becomes pending while round one still owns the
+   installation.  After release, the older sibling request reaches a real
+   apply stop while list/status show the persistent watch queued behind that
+   sibling root; only then does the watch complete round two.
+3. SIGKILL of the daemon discards request liveness but preserves enabled intent;
+   restart reconstructs the still-queued managed start before release.
+4. Two connectors on opposite relationship directions each commit their local
+   managed request, then their daemon processes stop before either worker can
+   submit a proxy to the peer.  Direct status proves both requests are durable
+   at that barrier.  An unrelated maintenance request holds the higher-ID
+   connector's remote installation past the former reservation lease.  After
+   both daemons resume, status exposes the queued local or peer scheduling wait,
+   the holder releases, and both relationships converge without a manual retry.
+
+The harness retains one fixed sibling root.  The setup scenario uses the
+=.e2e-global-contention-observed= hook when enqueue commits behind a live active
+row or final OS-lock acquisition reports =WouldBlock=, because the relationship
+is not yet configured and therefore cannot appear in =sync list=.  After
+release it also asserts the command's captured human path and queue position.
+Configured-share scenarios assert scheduling through list/status instead.
+Default production builds contain no marker behavior.
+
+The opposite-direction scenario uses a hidden, E2E-only protocol command to
+hold an unrelated real maintenance permit.  Its RAII guard resumes the stopped
+holder on success or unwinding.  The command is absent from ordinary builds and
+does not bypass the scheduler.
+
+The opposite-direction scenario also uses the E2E-only
+=.e2e-stop-before-reservation= marker.  The worker reaches it only after
+=sync start= has committed the request and returned.  =SIGSTOP= pauses the
+whole daemon, which prevents any peer submission; the harness therefore reads
+durable scheduling through =status= rather than the paused daemon's =sync
+list=, validates both stopped process identities, and resumes both before the
+apply-boundary assertion.
+
+Target =sync start= commands run through the container's five-second =timeout=
+with a one-second forced-kill backstop.  Setup and convergence retain the
+normal thirty-second harness deadline.  Exit 124 or 137 is classified before
+stderr, and container teardown remains the final process/network cleanup
+backstop.  The specialized diagnostic-matching expected-failure helper was
+removed after promotion; the general bug-first =known_failure= primitive
+remains available for unrelated future reproductions.
+
+The harness pins =sync list --json= schema 3 and =status --json= schema 6.  Its
+schema-3 fields distinguish connection state from =idle=/=queued=/=active=
+scheduling, identify local versus peer waiting, preserve byte-valued blocking
+and active roots, identify both operations, and support the human
+root-path/no-internal-ID assertion.

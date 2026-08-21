@@ -6,15 +6,66 @@ use anyhow::{Context, Result};
 use flocal::state::State;
 use tempfile::tempdir;
 
+struct DaemonGuard {
+    child: Option<std::process::Child>,
+}
+
+fn spawn_daemon(command: &mut Command) -> Result<DaemonGuard> {
+    let child = command.spawn()?;
+    Ok(DaemonGuard { child: Some(child) })
+}
+
+impl DaemonGuard {
+    fn stop(mut self) -> Result<()> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let result = stop_daemon(&mut child);
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
+    }
+}
+
+impl std::ops::Deref for DaemonGuard {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().expect("daemon guard is disarmed")
+    }
+}
+
+impl std::ops::DerefMut for DaemonGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().expect("daemon guard is disarmed")
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
+    }
+}
+
 fn stop_daemon(daemon: &mut std::process::Child) -> Result<()> {
+    if let Some(status) = daemon.try_wait()? {
+        anyhow::ensure!(status.success(), "daemon exited with {status}");
+        return Ok(());
+    }
     let status = Command::new("kill")
         .args(["-TERM", &daemon.id().to_string()])
         .status()?;
-    assert!(status.success(), "kill failed with {status}");
+    anyhow::ensure!(status.success(), "kill failed with {status}");
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         if let Some(status) = daemon.try_wait()? {
-            assert!(status.success(), "daemon exited with {status}");
+            anyhow::ensure!(status.success(), "daemon exited with {status}");
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -26,25 +77,36 @@ fn stop_daemon(daemon: &mut std::process::Child) -> Result<()> {
     }
 }
 
+fn wait_until(mut condition: impl FnMut() -> Result<bool>, description: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if condition()? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    anyhow::bail!("timed out waiting for {description}")
+}
+
 #[test]
 fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
     let temporary = tempdir()?;
     let state = temporary.path().join("state");
     let binary = env!("CARGO_BIN_EXE_flocal");
-    let mut daemon = Command::new(binary)
-        .args(["daemon", "run"])
-        .env("FLOCAL_STATE_DIR", &state)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     let socket = state.join("run/daemon.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     if !socket.exists() {
-        let _ = daemon.kill();
         anyhow::bail!("daemon did not create its control socket");
     }
     #[cfg(unix)]
@@ -60,12 +122,83 @@ fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
         .env("FLOCAL_STATE_DIR", &state)
         .output()
         .context("running sync list")?;
-    stop_daemon(&mut daemon)?;
+    daemon.stop()?;
     assert!(output.status.success(), "{:?}", output);
     let listing: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(listing["schema"], 2);
+    assert_eq!(listing["schema"], 3);
     assert_eq!(listing["syncs"], serde_json::json!([]));
     Ok(())
+}
+
+#[test]
+fn running_daemon_recovers_a_managed_install_created_after_startup() -> Result<()> {
+    let temporary = tempdir()?;
+    let state_dir = temporary.path().join("state");
+    let startup_root = temporary.path().join("startup-root");
+    let late_root = temporary.path().join("late-root");
+    std::fs::create_dir(&startup_root)?;
+    std::fs::create_dir(&late_root)?;
+    let mut state = State::open(&state_dir)?;
+    let startup_share = state.init_share(&startup_root)?;
+    state.set_install_intent(&startup_share, &[])?;
+    let late_share = state.init_share(&late_root)?;
+    state.set_peer(
+        &late_share,
+        &flocal::model::PeerConfig {
+            peer_id: Some(flocal::model::PeerId("peer-late".into())),
+            relationship: None,
+            host: "127.0.0.1".into(),
+            remote_path: b"/remote".to_vec(),
+            executable: "/bin/false".into(),
+        },
+    )?;
+    let recovery_baseline = state.scheduling_snapshot()?.completion_sequence;
+    drop(state);
+
+    let binary = env!("CARGO_BIN_EXE_flocal");
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
+    let socket = state_dir.join("run/daemon.sock");
+    wait_until(|| Ok(socket.exists()), "daemon control socket")?;
+    wait_until(
+        || {
+            Ok(State::open(&state_dir)?
+                .install_intent(&startup_share)?
+                .is_none())
+        },
+        "startup install recovery",
+    )?;
+    wait_until(
+        || {
+            Ok(State::open(&state_dir)?
+                .scheduling_snapshot()?
+                .completion_sequence
+                > recovery_baseline)
+        },
+        "startup recovery permit completion",
+    )?;
+
+    State::open(&state_dir)?.set_managed_plan_install_intent(&late_share, &[], &[], 0)?;
+    wait_until(
+        || {
+            Ok(State::open(&state_dir)?
+                .install_intent(&late_share)?
+                .is_none())
+        },
+        "post-startup managed install recovery",
+    )?;
+
+    let state = State::open(&state_dir)?;
+    let managed = state.managed_share(&late_share)?;
+    assert!(managed.initial_complete);
+    assert!(managed.watch_enabled);
+    daemon.stop()
 }
 
 #[test]
@@ -81,13 +214,14 @@ fn daemon_stop_disables_a_share_durably() -> Result<()> {
     drop(state);
 
     let binary = env!("CARGO_BIN_EXE_flocal");
-    let mut daemon = Command::new(binary)
-        .args(["daemon", "run"])
-        .env("FLOCAL_STATE_DIR", &state_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     let socket = state_dir.join("run/daemon.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
@@ -97,7 +231,7 @@ fn daemon_stop_disables_a_share_durably() -> Result<()> {
         .args(["sync", "stop", root.to_str().context("test root is utf-8")?])
         .env("FLOCAL_STATE_DIR", &state_dir)
         .output()?;
-    stop_daemon(&mut daemon)?;
+    daemon.stop()?;
     assert!(output.status.success(), "{:?}", output);
     assert!(
         !State::open(&state_dir)?
@@ -137,13 +271,14 @@ fn daemon_cli_follows_paginated_sync_lists() -> Result<()> {
     drop(state);
 
     let binary = env!("CARGO_BIN_EXE_flocal");
-    let mut daemon = Command::new(binary)
-        .args(["daemon", "run"])
-        .env("FLOCAL_STATE_DIR", &state_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     let socket = state_dir.join("run/daemon.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
@@ -153,7 +288,7 @@ fn daemon_cli_follows_paginated_sync_lists() -> Result<()> {
         .args(["sync", "list", "--json"])
         .env("FLOCAL_STATE_DIR", &state_dir)
         .output()?;
-    stop_daemon(&mut daemon)?;
+    daemon.stop()?;
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout)?["syncs"]
@@ -175,13 +310,14 @@ fn daemon_control_cli_reports_missing_or_responder_only_shares() -> Result<()> {
     drop(state);
 
     let binary = env!("CARGO_BIN_EXE_flocal");
-    let mut daemon = Command::new(binary)
-        .args(["daemon", "run"])
-        .env("FLOCAL_STATE_DIR", &state_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     let socket = state_dir.join("run/daemon.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
@@ -226,7 +362,7 @@ fn daemon_control_cli_reports_missing_or_responder_only_shares() -> Result<()> {
         ])
         .env("FLOCAL_STATE_DIR", &state_dir)
         .output()?;
-    stop_daemon(&mut daemon)?;
+    daemon.stop()?;
     assert!(!responder.status.success());
     assert!(!conflicting_selector.status.success());
     assert!(!invalid_root.status.success());
@@ -235,7 +371,7 @@ fn daemon_control_cli_reports_missing_or_responder_only_shares() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn daemon_sigterm_forces_and_reaps_an_unresponsive_remote() -> Result<()> {
+fn daemon_guard_drop_forces_and_reaps_an_unresponsive_remote() -> Result<()> {
     let temporary = tempdir()?;
     let state_dir = temporary.path().join("state");
     let root = temporary.path().join("root");
@@ -247,7 +383,7 @@ fn daemon_sigterm_forces_and_reaps_an_unresponsive_remote() -> Result<()> {
     std::fs::write(
         &fake_ssh,
         r#"#!/bin/sh
-: > "$FLOCAL_TEST_REMOTE_STARTED"
+printf '%s\n' "$$" > "$FLOCAL_TEST_REMOTE_STARTED"
 exec sleep 600
 "#,
     )?;
@@ -261,7 +397,7 @@ exec sleep 600
         &share,
         &flocal::model::PeerConfig {
             peer_id: Some(flocal::model::PeerId("peer-test".into())),
-            relationship: None,
+            relationship: Some(flocal::model::RelationshipId::generate()),
             host: "test-peer".into(),
             remote_path: b"/remote".to_vec(),
             executable: binary.into(),
@@ -276,38 +412,54 @@ exec sleep 600
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut daemon = Command::new(binary)
-        .args(["daemon", "run"])
-        .env("FLOCAL_STATE_DIR", &state_dir)
-        .env("FLOCAL_TEST_REMOTE_STARTED", &started)
-        .env("PATH", path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !started.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
-    }
-    if !started.exists() {
+    let mut daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &state_dir)
+            .env("FLOCAL_TEST_REMOTE_STARTED", &started)
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
+    let mut remote_pid = None;
+    let remote_started = wait_until(
+        || {
+            remote_pid = std::fs::read_to_string(&started)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .filter(|pid| *pid > 0);
+            Ok(remote_pid.is_some())
+        },
+        "unresponsive remote",
+    );
+    if remote_started.is_err() {
         let status = daemon.try_wait()?;
         let listing = Command::new(binary)
             .args(["sync", "list", "--json"])
             .env("FLOCAL_STATE_DIR", &state_dir)
             .output()?;
-        let _ = daemon.kill();
-        let _ = daemon.wait();
         anyhow::bail!(
             "unresponsive remote did not start (socket: {}, daemon status: {status:?}, syncs: {})",
             state_dir.join("run/daemon.sock").exists(),
             String::from_utf8_lossy(&listing.stdout),
         );
     }
+    let remote_pid = remote_pid.context("unresponsive remote did not report its PID")?;
 
     let started = Instant::now();
-    stop_daemon(&mut daemon)?;
+    drop(daemon);
     assert!(started.elapsed() >= Duration::from_secs(10));
-    Ok(())
+    wait_until(
+        || {
+            Ok(!Command::new("kill")
+                .args(["-0", &remote_pid.to_string()])
+                .stderr(Stdio::null())
+                .status()?
+                .success())
+        },
+        "unresponsive remote cleanup",
+    )
 }
 
 #[test]
@@ -348,23 +500,23 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut daemon = Command::new(binary)
-        .args(["daemon", "run"])
-        .env("FLOCAL_STATE_DIR", &local_state)
-        .env("FAKE_REMOTE_STATE", &remote_state)
-        .env("FLOCAL_BIN", binary)
-        .env("PATH", &path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &local_state)
+            .env("FAKE_REMOTE_STATE", &remote_state)
+            .env("FLOCAL_BIN", binary)
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     let socket = local_state.join("run/daemon.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     if !socket.exists() {
-        let _ = daemon.kill();
         anyhow::bail!("daemon did not create its control socket");
     }
 
@@ -388,8 +540,6 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
         "--yes",
     ])?;
     if !add.status.success() {
-        let _ = daemon.kill();
-        let _ = daemon.wait();
         anyhow::bail!("sync add failed: {}", String::from_utf8_lossy(&add.stderr));
     }
     let repeat = invoke(&[
@@ -449,19 +599,20 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
     ])?;
     assert!(start.status.success(), "{:?}", start);
 
-    stop_daemon(&mut daemon)?;
+    daemon.stop()?;
     let renamed_root = temporary.path().join("renamed-local");
     std::fs::rename(&local_root, &renamed_root)?;
-    let mut daemon = Command::new(binary)
-        .args(["daemon", "run"])
-        .env("FLOCAL_STATE_DIR", &local_state)
-        .env("FAKE_REMOTE_STATE", &remote_state)
-        .env("FLOCAL_BIN", binary)
-        .env("PATH", &path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &local_state)
+            .env("FAKE_REMOTE_STATE", &remote_state)
+            .env("FLOCAL_BIN", binary)
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let blocked = loop {
         let listing = invoke(&["sync", "list", "--json"])?;
@@ -472,8 +623,6 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
             }
         }
         if Instant::now() >= deadline {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
             anyhow::bail!("renamed managed root did not become blocked");
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -488,8 +637,6 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
     assert!(!restart.status.success());
     let stop = invoke(&["sync", "stop", "--share", &share])?;
     if !stop.status.success() {
-        let _ = daemon.kill();
-        let _ = daemon.wait();
         anyhow::bail!(
             "sync stop failed: {}",
             String::from_utf8_lossy(&stop.stderr)
@@ -506,8 +653,6 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
         != Some("restored")
     {
         if Instant::now() >= deadline {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
             anyhow::bail!("restored root did not resume synchronization");
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -554,9 +699,9 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
             .output()?;
         assert!(status.status.success(), "{:?}", status);
         let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-        assert_eq!(status["schema"], 5);
+        assert_eq!(status["schema"], 6);
         assert_eq!(status["relationship_state"], "unpaired");
         assert_eq!(status["removal_pending"], false);
     }
-    stop_daemon(&mut daemon)
+    daemon.stop()
 }

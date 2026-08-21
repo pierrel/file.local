@@ -1,25 +1,34 @@
+use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::model::{Entry, ObjectHash, PeerId, Record, RelationshipId, RelativePath, ShareId};
 use crate::reconcile::{MergeCandidate, Plan, reconcile};
 use crate::scan::{IgnoreMatcher, preview_cap_with_ignores, scan_cap, scan_cap_with_ignores};
 pub use crate::state::RootIdentityChanged;
-use crate::state::{InstallTempPhase, RootIdentity, State};
+use crate::state::{
+    InstallIntent, InstallTempPhase, QueueRejoin, QueueRequest, RootIdentity, State,
+};
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
-pub const SYNC_PROTOCOL_VERSION: u32 = 3;
-pub const WATCH_PROTOCOL_VERSION: u32 = 5;
+pub const SYNC_PROTOCOL_VERSION: u32 = 5;
+pub const WATCH_PROTOCOL_VERSION: u32 = 6;
 pub const RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION: u32 = 1;
 pub const RELATIONSHIP_REMOVAL_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_RELATIONSHIP_ID_BYTES: usize = 128;
 pub const MAX_RELATIONSHIP_ROOT_BYTES: usize = 16 * 1024;
 pub const MAX_RELATIONSHIP_ERROR_BYTES: usize = 4096;
+pub const SCHEDULING_ID_BYTES: usize = 16;
+pub const SCHEDULING_NONCE_BYTES: usize = 16;
+pub const PREDECESSOR_FINGERPRINT_BYTES: usize = 32;
+pub const MAX_SCHEDULING_QUEUE_POSITION: u16 = 1024;
+pub const MAX_PEER_ID_BYTES: usize = 128;
 /// Compatibility name for the existing one-shot synchronization protocol.
 pub const PROTOCOL_VERSION: u32 = SYNC_PROTOCOL_VERSION;
 pub const MAX_RECORDS_PER_SESSION: usize = 1_000_000;
@@ -33,6 +42,281 @@ pub fn max_transfer_bytes_per_session() -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(10 * 1024 * 1024 * 1024)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SchedulingId(String);
+
+impl SchedulingId {
+    pub fn generate() -> Self {
+        Self(encode_scheduling_bytes(rand::random::<
+            [u8; SCHEDULING_ID_BYTES],
+        >()))
+    }
+
+    pub fn parse(value: String) -> Result<Self> {
+        validate_scheduling_bytes("scheduling ID", &value, SCHEDULING_ID_BYTES)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SchedulingId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SchedulingNonce(String);
+
+impl SchedulingNonce {
+    pub fn generate() -> Self {
+        Self(encode_scheduling_bytes(rand::random::<
+            [u8; SCHEDULING_NONCE_BYTES],
+        >()))
+    }
+
+    pub fn parse(value: String) -> Result<Self> {
+        validate_scheduling_bytes("scheduling nonce", &value, SCHEDULING_NONCE_BYTES)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SchedulingNonce {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct PredecessorFingerprint(String);
+
+impl PredecessorFingerprint {
+    pub fn from_blake3(hash: blake3::Hash) -> Self {
+        Self(encode_scheduling_bytes(*hash.as_bytes()))
+    }
+
+    pub fn parse(value: String) -> Result<Self> {
+        validate_scheduling_bytes(
+            "predecessor fingerprint",
+            &value,
+            PREDECESSOR_FINGERPRINT_BYTES,
+        )?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PredecessorFingerprint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn encode_scheduling_bytes<const N: usize>(bytes: [u8; N]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn validate_scheduling_bytes(kind: &str, value: &str, expected: usize) -> Result<()> {
+    let encoded_len = (expected * 4).div_ceil(3);
+    if value.len() != encoded_len {
+        bail!(
+            "{kind} must encode exactly {expected} bytes as {encoded_len} canonical URL-safe base64 characters"
+        );
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .with_context(|| format!("{kind} is not canonical URL-safe base64"))?;
+    if decoded.len() != expected
+        || base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&decoded) != value
+    {
+        bail!("{kind} is not canonical URL-safe base64");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct NetworkOrder(u64);
+
+impl NetworkOrder {
+    pub fn new(value: u64) -> Result<Self> {
+        if value == 0 || value > i64::MAX as u64 {
+            bail!("network order must be between 1 and {}", i64::MAX);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkOrder {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(u64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct CoarseQueuePosition(u16);
+
+impl CoarseQueuePosition {
+    pub fn from_exact(position: usize) -> Result<Self> {
+        if position == 0 || position > usize::from(MAX_SCHEDULING_QUEUE_POSITION) {
+            bail!("queue position must be between 1 and {MAX_SCHEDULING_QUEUE_POSITION}");
+        }
+        let position = u16::try_from(position)?.next_power_of_two();
+        Ok(Self(position))
+    }
+
+    fn from_wire(position: u16) -> Result<Self> {
+        if position == 0 || position > MAX_SCHEDULING_QUEUE_POSITION || !position.is_power_of_two()
+        {
+            bail!(
+                "coarse queue position must be a power of two between 1 and {MAX_SCHEDULING_QUEUE_POSITION}"
+            );
+        }
+        Ok(Self(position))
+    }
+
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CoarseQueuePosition {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::from_wire(u16::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingOn {
+    Local,
+    Peer,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingAuthority {
+    pub id: SchedulingId,
+    pub connector_generation: u64,
+    pub responder_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyIssue {
+    pub id: SchedulingId,
+    pub network_order: NetworkOrder,
+    pub nonce: SchedulingNonce,
+    pub connector_generation: u64,
+    pub responder_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyAck {
+    pub id: SchedulingId,
+    pub network_order: NetworkOrder,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncQueued {
+    pub waiting_on: WaitingOn,
+    pub position: CoarseQueuePosition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairCheckpoint {
+    pub id: SchedulingId,
+    pub network_order: NetworkOrder,
+    pub nonce: SchedulingNonce,
+    pub predecessor: PredecessorFingerprint,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reservation {
+    pub id: SchedulingId,
+    pub network_order: NetworkOrder,
+    pub nonce: SchedulingNonce,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncStart {
+    pub id: SchedulingId,
+    pub network_order: NetworkOrder,
+    pub nonce: SchedulingNonce,
+    pub connector_generation: u64,
+    pub responder_generation: u64,
+}
+
+impl SyncStart {
+    pub fn reservation(&self) -> Reservation {
+        Reservation {
+            id: self.id.clone(),
+            network_order: self.network_order,
+            nonce: self.nonce.clone(),
+        }
+    }
+}
+
+pub fn peer_order(local: &PeerId, remote: &PeerId) -> Result<Ordering> {
+    for peer in [local, remote] {
+        if peer.0.is_empty()
+            || peer.0.len() > MAX_PEER_ID_BYTES
+            || !peer
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("peer ID must be 1-{MAX_PEER_ID_BYTES} canonical ASCII characters");
+        }
+    }
+    match local.0.as_bytes().cmp(remote.0.as_bytes()) {
+        Ordering::Equal => bail!("local and remote peer IDs must be distinct"),
+        ordering => Ok(ordering),
+    }
+}
+
+pub fn reservation_lease() -> Duration {
+    Duration::from_secs(5)
 }
 
 #[derive(Debug)]
@@ -167,8 +451,8 @@ impl ShareRoot {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum V1Message {
     Register {
         protocol: u32,
@@ -180,12 +464,26 @@ pub enum V1Message {
         protocol: u32,
         share: ShareId,
         peer: PeerId,
+        relationship: RelationshipId,
         dry_run: bool,
     },
     Accepted {
         protocol: u32,
         peer: PeerId,
     },
+    PendingAuthority(PendingAuthority),
+    ProxyIssue(ProxyIssue),
+    ProxyAck(ProxyAck),
+    SyncQueued(SyncQueued),
+    PairPrepare(PairCheckpoint),
+    PairPrepareAck(PairCheckpoint),
+    PairReset(PairCheckpoint),
+    PairResetAck(PairCheckpoint),
+    PairCommit(PairCheckpoint),
+    PairCommitAck(PairCheckpoint),
+    SyncReserved(Reservation),
+    SyncStart(SyncStart),
+    SyncAccepted(Reservation),
     SnapshotChunk {
         records: Vec<Record>,
     },
@@ -235,12 +533,14 @@ pub enum InitialMessage {
         protocol: u32,
         share: ShareId,
         peer: PeerId,
+        relationship: RelationshipId,
         dry_run: bool,
     },
     WatchOpen {
         protocol: u32,
         share: ShareId,
         peer: PeerId,
+        relationship: RelationshipId,
     },
 }
 
@@ -445,11 +745,19 @@ pub enum V2SessionFrame {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum V2RoundFrame {
-    SyncStart {
-        connector_generation: u64,
-        responder_generation: u64,
-    },
-    SyncAccepted,
+    PendingAuthority(PendingAuthority),
+    ProxyIssue(ProxyIssue),
+    ProxyAck(ProxyAck),
+    SyncQueued(SyncQueued),
+    PairPrepare(PairCheckpoint),
+    PairPrepareAck(PairCheckpoint),
+    PairReset(PairCheckpoint),
+    PairResetAck(PairCheckpoint),
+    PairCommit(PairCheckpoint),
+    PairCommitAck(PairCheckpoint),
+    SyncReserved(Reservation),
+    SyncStart(SyncStart),
+    SyncAccepted(Reservation),
     SnapshotChunk {
         records: Vec<Record>,
     },
@@ -692,6 +1000,18 @@ pub fn write_v1_message(writer: &mut impl Write, message: &V1Message) -> Result<
 
 pub fn read_v1_message(reader: &mut impl Read) -> Result<V1Message> {
     read_frame(reader)
+}
+
+pub fn write_v1_message_until(
+    writer: &impl AsFd,
+    message: &V1Message,
+    deadline: Instant,
+) -> Result<()> {
+    write_frame_until(writer, message, deadline)
+}
+
+pub fn read_v1_message_until(reader: &impl AsFd, deadline: Instant) -> Result<V1Message> {
+    read_frame_until(reader, deadline)
 }
 
 pub fn write_initial_message(writer: &mut impl Write, message: &InitialMessage) -> Result<()> {
@@ -1055,13 +1375,145 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
 
 pub fn apply_complete_plan(state: &mut State, share: &ShareId, plan: &Plan) -> Result<()> {
     let root = ShareRoot::open(state, share)?;
-    apply_complete_plan_with_root_skipping(
+    apply_complete_plan_with_root_skipping_inner(
         state,
         share,
         &root,
         plan,
         &std::collections::HashSet::new(),
-    )
+        None,
+    )?;
+    Ok(())
+}
+
+pub fn apply_complete_plan_and_enable_managed(
+    state: &mut State,
+    share: &ShareId,
+    plan: &Plan,
+    expected_generation: i64,
+) -> Result<QueueRequest> {
+    let root = ShareRoot::open(state, share)?;
+    apply_complete_plan_with_root_skipping_inner(
+        state,
+        share,
+        &root,
+        plan,
+        &std::collections::HashSet::new(),
+        Some(expected_generation),
+    )?
+    .context("managed initial apply did not publish its queue request")
+}
+
+pub fn recover_installs_locked(state: &mut State) -> Result<()> {
+    loop {
+        let pending = state.unclassified_install_intents()?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for recovery in pending {
+            let result = (|| {
+                state.validate_root_identity(&recovery.share)?;
+                let _lock = state.lock_share(&recovery.share).map_err(|error| {
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                    }) {
+                        anyhow::Error::new(QueueRejoin)
+                    } else {
+                        error
+                    }
+                })?;
+                recover_install_plan(state, &recovery.share, &recovery.intent)
+            })();
+            if let Err(error) = result {
+                if error.downcast_ref::<QueueRejoin>().is_some() {
+                    return Err(error);
+                }
+                if let Some(current) = state.install_recovery_intent(&recovery.share)? {
+                    state.classify_install_intent_failure(
+                        &recovery.share,
+                        &current.fingerprint,
+                        &format!("{error:#}"),
+                    )?;
+                }
+            }
+        }
+    }
+}
+
+fn recover_install_plan(state: &mut State, share: &ShareId, intent: &InstallIntent) -> Result<()> {
+    #[cfg(feature = "e2e-test-hooks")]
+    e2e_delay_install_recovery(state)?;
+    let plan = Plan {
+        records: intent.records.clone(),
+        conflicts: intent.conflicts.clone(),
+        merges: Vec::new(),
+    };
+    let managed_generation = match intent.managed_generation {
+        Some(generation)
+            if !state.initial_complete(share)?
+                && state.watch_intent_generation(share)? == generation
+                && state.removing_relationship(share)?.is_none() =>
+        {
+            Some(generation)
+        }
+        _ => None,
+    };
+    let root = ShareRoot::open(state, share)?;
+    match apply_complete_plan_with_root_skipping_inner(
+        state,
+        share,
+        &root,
+        &plan,
+        &std::collections::HashSet::new(),
+        managed_generation,
+    ) {
+        Ok(Some(request)) => {
+            request.release_for_reclaim();
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) if error.downcast_ref::<ApplyInvalidated>().is_some() => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("recovering interrupted install for {}", share.0))
+        }
+    }
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_delay_install_recovery(state: &State) -> Result<()> {
+    let Some(claimed) = e2e_claim_install_recovery_delay(state)? else {
+        return Ok(());
+    };
+    std::thread::sleep(Duration::from_secs(35));
+    std::fs::remove_file(claimed).context("consuming E2E install recovery delay marker")
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+pub fn e2e_claim_install_recovery_delay(state: &State) -> Result<Option<std::path::PathBuf>> {
+    let marker = state.dir.join(".e2e-delay-install-recovery");
+    let claimed = state.dir.join(".e2e-delay-install-recovery-claimed");
+    match std::fs::rename(&marker, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&claimed) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error).context("claiming E2E install recovery delay marker"),
+    }
+    let metadata = std::fs::symlink_metadata(&claimed)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("E2E install recovery delay marker is not a regular file");
+    }
+    anyhow::ensure!(
+        metadata.len() == 0,
+        "E2E install recovery delay marker is not empty"
+    );
+    Ok(Some(claimed))
 }
 
 pub fn apply_plan_with_root(
@@ -1106,6 +1558,18 @@ pub fn apply_complete_plan_with_root_skipping(
     plan: &Plan,
     retained_paths: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<()> {
+    apply_complete_plan_with_root_skipping_inner(state, share, root, plan, retained_paths, None)?;
+    Ok(())
+}
+
+fn apply_complete_plan_with_root_skipping_inner(
+    state: &mut State,
+    share: &ShareId,
+    root: &ShareRoot,
+    plan: &Plan,
+    retained_paths: &std::collections::HashSet<Vec<u8>>,
+    managed_generation: Option<i64>,
+) -> Result<Option<QueueRequest>> {
     let records = &plan.records;
     validate_unique_paths(records)?;
     validate_declared_sizes(records)?;
@@ -1127,7 +1591,12 @@ pub fn apply_complete_plan_with_root_skipping(
             }
         }
     }
-    let (intent, _) = state.set_plan_install_intent(share, records, &plan.conflicts)?;
+    let (intent, _) = match managed_generation {
+        Some(generation) => {
+            state.set_managed_plan_install_intent(share, records, &plan.conflicts, generation)?
+        }
+        None => state.set_plan_install_intent(share, records, &plan.conflicts)?,
+    };
     #[cfg(feature = "e2e-test-hooks")]
     e2e_stop_before_apply(state)?;
     let install_temps: std::collections::HashMap<&[u8], _> = intent
@@ -1274,8 +1743,15 @@ pub fn apply_complete_plan_with_root_skipping(
         completed.push(record.clone());
     }
     root.validate(state, share)?;
-    state.finish_install(share, &intent, &accepted)?;
-    Ok(())
+    match managed_generation {
+        Some(generation) => state
+            .finish_install_and_enable_managed(share, &intent, &accepted, generation)
+            .map(Some),
+        None => {
+            state.finish_install(share, &intent, &accepted)?;
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(feature = "e2e-test-hooks")]
@@ -2465,6 +2941,259 @@ mod tests {
     use crate::model::{PeerId, RelativePath, Version};
     use std::fs;
     use tempfile::tempdir;
+
+    fn scheduling_id() -> SchedulingId {
+        SchedulingId::parse(encode_scheduling_bytes([7; SCHEDULING_ID_BYTES])).unwrap()
+    }
+
+    fn scheduling_nonce() -> SchedulingNonce {
+        SchedulingNonce::parse(encode_scheduling_bytes([11; SCHEDULING_NONCE_BYTES])).unwrap()
+    }
+
+    fn predecessor_fingerprint() -> PredecessorFingerprint {
+        PredecessorFingerprint::from_blake3(blake3::hash(b"predecessors"))
+    }
+
+    fn network_order() -> NetworkOrder {
+        NetworkOrder::new(17).unwrap()
+    }
+
+    fn pending_authority() -> PendingAuthority {
+        PendingAuthority {
+            id: scheduling_id(),
+            connector_generation: 3,
+            responder_generation: 5,
+        }
+    }
+
+    fn proxy_issue() -> ProxyIssue {
+        ProxyIssue {
+            id: scheduling_id(),
+            network_order: network_order(),
+            nonce: scheduling_nonce(),
+            connector_generation: 3,
+            responder_generation: 5,
+        }
+    }
+
+    fn proxy_ack() -> ProxyAck {
+        ProxyAck {
+            id: scheduling_id(),
+            network_order: network_order(),
+        }
+    }
+
+    fn sync_queued() -> SyncQueued {
+        SyncQueued {
+            waiting_on: WaitingOn::Peer,
+            position: CoarseQueuePosition::from_exact(6).unwrap(),
+        }
+    }
+
+    fn pair_checkpoint() -> PairCheckpoint {
+        PairCheckpoint {
+            id: scheduling_id(),
+            network_order: network_order(),
+            nonce: scheduling_nonce(),
+            predecessor: predecessor_fingerprint(),
+        }
+    }
+
+    fn reservation() -> Reservation {
+        Reservation {
+            id: scheduling_id(),
+            network_order: network_order(),
+            nonce: scheduling_nonce(),
+        }
+    }
+
+    fn sync_start() -> SyncStart {
+        SyncStart {
+            id: scheduling_id(),
+            network_order: network_order(),
+            nonce: scheduling_nonce(),
+            connector_generation: 3,
+            responder_generation: 5,
+        }
+    }
+
+    #[test]
+    fn scheduling_protocol_versions_are_incremented() {
+        assert_eq!(SYNC_PROTOCOL_VERSION, 5);
+        assert_eq!(WATCH_PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn scheduling_tokens_and_orders_are_canonical_and_bounded() -> Result<()> {
+        let id = SchedulingId::generate();
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(id.as_str())?
+                .len(),
+            SCHEDULING_ID_BYTES
+        );
+        assert_eq!(SchedulingId::parse(id.as_str().to_owned())?, id);
+        assert!(SchedulingId::parse(String::new()).is_err());
+        assert!(
+            SchedulingId::parse(encode_scheduling_bytes([0; SCHEDULING_ID_BYTES - 1])).is_err()
+        );
+        assert!(SchedulingId::parse(format!("{}=", id.as_str())).is_err());
+
+        let nonce = SchedulingNonce::generate();
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(nonce.as_str())?
+                .len(),
+            SCHEDULING_NONCE_BYTES
+        );
+        assert_eq!(SchedulingNonce::parse(nonce.as_str().to_owned())?, nonce);
+        assert!(
+            SchedulingNonce::parse(encode_scheduling_bytes([0; SCHEDULING_NONCE_BYTES - 1]))
+                .is_err()
+        );
+
+        let predecessor = predecessor_fingerprint();
+        assert_eq!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(predecessor.as_str())?
+                .len(),
+            PREDECESSOR_FINGERPRINT_BYTES
+        );
+        assert_eq!(
+            PredecessorFingerprint::parse(predecessor.as_str().to_owned())?,
+            predecessor
+        );
+        assert!(
+            PredecessorFingerprint::parse(encode_scheduling_bytes(
+                [0; PREDECESSOR_FINGERPRINT_BYTES - 1]
+            ))
+            .is_err()
+        );
+
+        assert_eq!(NetworkOrder::new(1)?.get(), 1);
+        assert_eq!(NetworkOrder::new(i64::MAX as u64)?.get(), i64::MAX as u64);
+        assert!(NetworkOrder::new(0).is_err());
+        assert!(NetworkOrder::new(i64::MAX as u64 + 1).is_err());
+        assert!(serde_json::from_str::<NetworkOrder>("0").is_err());
+        assert!(serde_json::from_str::<NetworkOrder>("9223372036854775808").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn queue_positions_are_coarse_and_bounded() -> Result<()> {
+        for (exact, coarse) in [(1, 1), (2, 2), (3, 4), (6, 8), (9, 16), (1024, 1024)] {
+            assert_eq!(CoarseQueuePosition::from_exact(exact)?.get(), coarse);
+        }
+        assert!(CoarseQueuePosition::from_exact(0).is_err());
+        assert!(CoarseQueuePosition::from_exact(1025).is_err());
+        assert_eq!(serde_json::from_str::<CoarseQueuePosition>("8")?.get(), 8);
+        assert!(serde_json::from_str::<CoarseQueuePosition>("3").is_err());
+        assert!(serde_json::from_str::<CoarseQueuePosition>("2048").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_scheduling_frames_round_trip_and_deny_unknown_fields() -> Result<()> {
+        let messages = vec![
+            V1Message::PendingAuthority(pending_authority()),
+            V1Message::ProxyIssue(proxy_issue()),
+            V1Message::ProxyAck(proxy_ack()),
+            V1Message::SyncQueued(sync_queued()),
+            V1Message::PairPrepare(pair_checkpoint()),
+            V1Message::PairPrepareAck(pair_checkpoint()),
+            V1Message::PairCommit(pair_checkpoint()),
+            V1Message::PairCommitAck(pair_checkpoint()),
+            V1Message::SyncReserved(reservation()),
+            V1Message::SyncStart(sync_start()),
+            V1Message::SyncAccepted(reservation()),
+        ];
+        for message in messages {
+            let encoded = serde_json::to_vec(&message)?;
+            assert_eq!(serde_json::from_slice::<V1Message>(&encoded)?, message);
+        }
+
+        let queued = serde_json::to_value(V1Message::SyncQueued(sync_queued()))?;
+        assert_eq!(
+            queued,
+            serde_json::json!({
+                "type": "sync_queued",
+                "waiting_on": "peer",
+                "position": 8
+            })
+        );
+        let object = queued.as_object().unwrap();
+        for forbidden in [
+            "share",
+            "relationship",
+            "path",
+            "active_share",
+            "active_root",
+        ] {
+            assert!(!object.contains_key(forbidden));
+        }
+
+        let mut unknown = queued;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("active_share".into(), serde_json::json!("share-secret"));
+        assert!(serde_json::from_value::<V1Message>(unknown).is_err());
+        assert!(
+            serde_json::from_value::<V1Message>(serde_json::json!({
+                "type": "sync_queued",
+                "waiting_on": "peer",
+                "position": 3
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_scheduling_frames_round_trip_and_deny_unknown_fields() -> Result<()> {
+        let frames = vec![
+            V2RoundFrame::PendingAuthority(pending_authority()),
+            V2RoundFrame::ProxyIssue(proxy_issue()),
+            V2RoundFrame::ProxyAck(proxy_ack()),
+            V2RoundFrame::SyncQueued(sync_queued()),
+            V2RoundFrame::PairPrepare(pair_checkpoint()),
+            V2RoundFrame::PairPrepareAck(pair_checkpoint()),
+            V2RoundFrame::PairCommit(pair_checkpoint()),
+            V2RoundFrame::PairCommitAck(pair_checkpoint()),
+            V2RoundFrame::SyncReserved(reservation()),
+            V2RoundFrame::SyncStart(sync_start()),
+            V2RoundFrame::SyncAccepted(reservation()),
+        ];
+        for frame in frames {
+            let envelope = V2Envelope::Round { round: 23, frame };
+            let encoded = serde_json::to_vec(&envelope)?;
+            assert_eq!(serde_json::from_slice::<V2Envelope>(&encoded)?, envelope);
+        }
+
+        assert!(
+            serde_json::from_value::<V2RoundFrame>(serde_json::json!({
+                "type": "pair_commit",
+                "id": scheduling_id().as_str(),
+                "network_order": network_order().get(),
+                "nonce": scheduling_nonce().as_str(),
+                "predecessor": predecessor_fingerprint().as_str(),
+                "unexpected": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<V2RoundFrame>(serde_json::json!({
+                "type": "pair_commit",
+                "id": "not-a-fixed-size-id",
+                "network_order": network_order().get(),
+                "nonce": scheduling_nonce().as_str(),
+                "predecessor": predecessor_fingerprint().as_str()
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
 
     fn merge_record(
         peer: &str,

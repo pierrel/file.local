@@ -3,12 +3,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
+use base64::Engine as _;
 
-use super::docker::{RunContext, SHARE, image_tag, unique_token};
+use super::docker::{RunContext, SECOND_SHARE, SHARE, image_tag, unique_token};
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(30);
 const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
+const SETUP_COMMAND_DEADLINE: &str = "30s";
+const START_COMMAND_DEADLINE: &str = "5s";
+const TARGET_COMMAND_KILL_AFTER: &str = "1s";
 /// Where a started watcher records its pid inside the container. One watch
 /// per scenario container, so a fixed path suffices — and keeps the start
 /// command a constant string with nothing interpolated into it.
@@ -16,6 +20,11 @@ const WATCH_PIDFILE: &str = "/tmp/flocal-watch.pid";
 const WATCH_LOG: &str = "/home/peer/.flocal-watch.log";
 const APPLY_STOP_MARKER: &str = "/home/peer/.local/state/file.local/.e2e-stop-before-apply";
 const APPLY_STOP_PIDFILE: &str = "/home/peer/.local/state/file.local/.e2e-apply-stop.pid";
+const RESERVATION_STOP_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-stop-before-reservation";
+const RESERVATION_STOP_PIDFILE: &str =
+    "/home/peer/.local/state/file.local/.e2e-reservation-stop.pid";
+const INSTALLATION_HOLD_PIDFILE: &str = "/tmp/flocal-e2e-installation-hold.pid";
 const RECOVERY_DELAY_MARKER: &str =
     "/home/peer/.local/state/file.local/.e2e-delay-install-recovery";
 const RECOVERY_DELAY_CLAIMED: &str =
@@ -27,10 +36,16 @@ const RECOVERY_CONFLICT_LIMIT_MARKER: &str =
     "/home/peer/.local/state/file.local/.e2e-recovery-conflict-limit";
 const RECOVERY_METADATA_LIMIT_MARKER: &str =
     "/home/peer/.local/state/file.local/.e2e-recovery-metadata-limit";
+const SCHEDULING_WAIT_MARKER: &str =
+    "/home/peer/.local/state/file.local/.e2e-observe-global-contention";
+const SCHEDULING_WAIT_OBSERVED: &str =
+    "/home/peer/.local/state/file.local/.e2e-global-contention-observed";
 const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
-/// The product's status JSON schema this harness is written against. Schema 5
-/// adds the durable relationship lifecycle to schema 4's recovery usage.
-const STATUS_SCHEMA: u64 = 5;
+/// The product's status JSON schema this harness is written against. Schema 6
+/// adds installation scheduling to schema 5's durable relationship lifecycle.
+const STATUS_SCHEMA: u64 = 6;
+/// The product's sync-list JSON schema this harness is written against.
+const SYNC_LIST_SCHEMA: u64 = 3;
 /// Recovery records use the versioned three-way merge shape.
 const CONFLICTS_SCHEMA: u64 = 2;
 
@@ -106,6 +121,7 @@ impl std::ops::Deref for Connector {
 #[derive(Debug, serde::Deserialize)]
 pub struct Status {
     pub schema: u64,
+    pub share: String,
     pub bound_peer: Option<String>,
     pub relationship_state: String,
     pub removal_pending: bool,
@@ -116,6 +132,61 @@ pub struct Status {
     #[serde(default)]
     pub tombstones: Option<u64>,
     pub recovery: RecoveryStatus,
+    pub scheduling: SchedulingStatus,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SchedulingStatus {
+    pub state: String,
+    pub waiting_on: Option<String>,
+    pub waiting_root: Option<DaemonPath>,
+    pub operation: Option<String>,
+    pub queue_position: Option<usize>,
+    pub active_share: Option<String>,
+    pub active_root: Option<DaemonPath>,
+    pub active_operation: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct DaemonPath {
+    encoding: String,
+    data: String,
+}
+
+impl DaemonPath {
+    fn decode(&self) -> Result<Vec<u8>> {
+        anyhow::ensure!(self.encoding == "base64", "unexpected path encoding");
+        Ok(base64::engine::general_purpose::STANDARD.decode(&self.data)?)
+    }
+}
+
+impl SchedulingStatus {
+    fn validate_queued(&self) -> Result<()> {
+        anyhow::ensure!(self.state == "queued");
+        anyhow::ensure!(self.operation.is_some());
+        anyhow::ensure!(self.queue_position.is_some());
+        match self.waiting_on.as_deref() {
+            Some("local") => {
+                if let Some(root) = &self.waiting_root {
+                    root.decode()?;
+                }
+            }
+            Some("peer") => anyhow::ensure!(self.waiting_root.is_none()),
+            blocker => anyhow::bail!("queued synchronization has invalid blocker {blocker:?}"),
+        }
+        match (
+            &self.active_share,
+            &self.active_root,
+            &self.active_operation,
+        ) {
+            (Some(_), Some(root), Some(_)) => {
+                root.decode()?;
+            }
+            (None, None, None) => {}
+            active => anyhow::bail!("partial active synchronization identity: {active:#?}"),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -124,10 +195,20 @@ struct SyncListing {
     syncs: Vec<SyncEntry>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 struct SyncEntry {
+    share: String,
     enabled: bool,
     state: String,
+    connection_state: String,
+    scheduling: String,
+    waiting_on: Option<String>,
+    operation: Option<String>,
+    queue_position: Option<usize>,
+    waiting_root: Option<DaemonPath>,
+    active_share: Option<String>,
+    active_root: Option<DaemonPath>,
+    active_operation: Option<String>,
     role: String,
     registration_pending: bool,
     removal_pending: bool,
@@ -289,10 +370,7 @@ pub fn known_failure(body: impl FnOnce() -> Result<()>) -> Result<()> {
     }
     super::docker::set_suppress_dumps(true);
     let _guard = Unsuppress;
-    let outcome = body();
-    match outcome {
-        // A harness-infrastructure failure is not the expected scenario
-        // failure; re-raise it so it cannot masquerade as a satisfied pin.
+    match body() {
         Err(error) if error.is::<super::docker::InfraError>() => Err(error),
         Err(error) => {
             eprintln!("known failure (expected): {error:#}");
@@ -403,12 +481,20 @@ impl Connector {
         self.flocal_ok(&["sync", "start", SHARE]).map(|_| ())
     }
 
+    pub fn sync_start_observed(&self) -> Result<String> {
+        self.peer.sync_start_observed_at(SHARE)
+    }
+
     pub fn sync_stop(&self) -> Result<()> {
         self.flocal_ok(&["sync", "stop", SHARE]).map(|_| ())
     }
 
     pub fn restart_daemon(&self) -> Result<()> {
         self.peer.restart_daemon()
+    }
+
+    pub fn crash_and_restart_daemon(&self) -> Result<()> {
+        self.peer.crash_and_restart_daemon()
     }
 
     pub fn wait_for_sync_diagnostic(&self, needle: &str) -> Result<()> {
@@ -566,6 +652,60 @@ pub struct Watch<'a> {
     stopped: bool,
 }
 
+pub struct StoppedApply<'a> {
+    peer: &'a Peer,
+    pid: u32,
+    resumed: bool,
+}
+
+pub struct StoppedInstallation<'a> {
+    peer: &'a Peer,
+    pid: u32,
+    resumed: bool,
+}
+
+impl StoppedInstallation<'_> {
+    pub fn resume(mut self) -> Result<()> {
+        let output = self.peer.signal("CONT", self.pid)?;
+        if !output.status.success() {
+            return Err(self.peer.fail(format!(
+                "resuming installation holder (pid {}) failed: {}",
+                self.pid,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        self.resumed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StoppedInstallation<'_> {
+    fn drop(&mut self) {
+        if self.resumed || !matches!(self.peer.is_stopped_flocal(self.pid), Ok(true)) {
+            return;
+        }
+        let _ = self.peer.signal("CONT", self.pid);
+    }
+}
+
+impl StoppedApply<'_> {
+    pub fn resume(mut self) -> Result<()> {
+        self.peer.resume_stopped_apply_process(self.pid)?;
+        self.resumed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StoppedApply<'_> {
+    fn drop(&mut self) {
+        if self.resumed || !matches!(self.peer.is_stopped_flocal(self.pid), Ok(true)) {
+            return;
+        }
+        let _ = self.peer.remove_apply_stop_pidfile();
+        let _ = self.peer.signal("CONT", self.pid);
+    }
+}
+
 impl Watch<'_> {
     pub fn wait_stopped(&self) -> Result<()> {
         let pid = self.pid;
@@ -637,6 +777,11 @@ impl Watch<'_> {
         self.wait_stopped()
     }
 
+    pub fn resume_for_next_apply_stop(&self) -> Result<()> {
+        self.peer.remove_apply_stop_pidfile()?;
+        self.resume()
+    }
+
     pub fn wait_for_error(&self, needle: &str) -> Result<()> {
         self.peer
             .wait_for_text("/home/peer/.flocal-stderr.log", needle)
@@ -669,7 +814,8 @@ impl Watch<'_> {
 
     /// Terminates the watcher inside the container — killing the `docker
     /// exec` client would not, and a surviving watcher would keep holding
-    /// the share and global locks — and waits for it to exit. Fails, with
+    /// its share-session lock and any active round permit — and waits for it
+    /// to exit. Fails, with
     /// the dump, if the watcher had already died: an unnoticed mid-scenario
     /// watcher death would silence everything the scenario claims to test.
     pub fn stop(mut self) -> Result<()> {
@@ -721,6 +867,326 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn init_second_share(&self) -> Result<()> {
+        self.exec_ok(&["mkdir", "-p", "--", SECOND_SHARE])?;
+        self.flocal_ok(&["init", SECOND_SHARE]).map(|_| ())
+    }
+
+    pub fn sync_add_second_to(&self, other: &Peer) -> Result<()> {
+        self.flocal_ok(&[
+            "sync",
+            "add",
+            SECOND_SHARE,
+            "--host",
+            &other.alias,
+            "--remote-path",
+            SECOND_SHARE,
+            "--yes",
+        ])?;
+        Ok(())
+    }
+
+    pub fn sync_add_second_observed(&self, other: &Peer) -> Result<String> {
+        let arguments = [
+            "sync",
+            "add",
+            SECOND_SHARE,
+            "--host",
+            &other.alias,
+            "--remote-path",
+            SECOND_SHARE,
+            "--yes",
+        ];
+        let output = self.bounded_flocal_raw(&arguments, SETUP_COMMAND_DEADLINE)?;
+        reject_target_timeout(&output, &arguments, SETUP_COMMAND_DEADLINE)?;
+        if !output.status.success() {
+            bail!(
+                "{}: flocal {} failed: {}",
+                self.alias,
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    pub fn sync_start_second_observed(&self) -> Result<String> {
+        self.sync_start_observed_at(SECOND_SHARE)
+    }
+
+    pub fn sync_stop_second(&self) -> Result<()> {
+        self.flocal_ok(&["sync", "stop", SECOND_SHARE])?;
+        Ok(())
+    }
+
+    pub fn write_second(&self, path: &str, content: &str) -> Result<()> {
+        let full = self.share_path_at(SECOND_SHARE, path)?;
+        if let Some((parent, _)) = full.rsplit_once('/') {
+            self.exec_ok(&["mkdir", "-p", "--", parent])?;
+        }
+        self.exec_with_stdin_ok(&["tee", "--", &full], content.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn assert_second_absent(&self, path: &str) -> Result<()> {
+        self.check(
+            self.absent_condition_at(SECOND_SHARE, path)?,
+            Duration::ZERO,
+        )
+    }
+
+    pub fn wait_for_second_file(&self, path: &str, content: &str) -> Result<()> {
+        self.check(
+            self.file_condition_at(SECOND_SHARE, path, content)?,
+            DEADLINE,
+        )
+    }
+
+    pub fn assert_second_sync_enabled(&self) -> Result<()> {
+        self.assert_second_sync(true, None)
+    }
+
+    pub fn assert_second_sync_not_enabled(&self) -> Result<()> {
+        let share = self.second_status()?.share;
+        let listing = self.sync_list()?;
+        match listing.syncs.iter().find(|sync| sync.share == share) {
+            None => Ok(()),
+            Some(sync) if !sync.enabled => Ok(()),
+            Some(sync) => Err(self.fail(format!(
+                "expected second share not to be enabled, got {sync:#?}"
+            ))),
+        }
+    }
+
+    pub fn assert_second_sync_queued(&self) -> Result<()> {
+        self.assert_second_sync(true, Some("queued"))
+    }
+
+    pub fn assert_second_sync_durably_queued(&self) -> Result<()> {
+        self.second_status()?.scheduling.validate_queued()
+    }
+
+    pub fn wait_for_second_sync_queued_behind(&self, root: &str) -> Result<()> {
+        let share = self.second_status()?.share;
+        let root = root.as_bytes().to_vec();
+        self.poll_until(
+            "second share did not report its local scheduling wait",
+            DEADLINE,
+            move |peer| {
+                let listing = peer.sync_list()?;
+                let Some(sync) = listing.syncs.iter().find(|sync| sync.share == share) else {
+                    return Ok(None);
+                };
+                if sync.scheduling != "queued"
+                    || sync.waiting_on.as_deref() != Some("local")
+                    || sync.queue_position.is_none()
+                    || sync
+                        .waiting_root
+                        .as_ref()
+                        .map(DaemonPath::decode)
+                        .transpose()?
+                        .as_deref()
+                        != Some(root.as_slice())
+                {
+                    return Ok(None);
+                }
+                Ok(Some(()))
+            },
+        )
+    }
+
+    pub fn wait_for_second_sync_idle(&self) -> Result<()> {
+        let share = self.second_status()?.share;
+        self.poll_until(
+            "second share did not release its synchronization slot",
+            DEADLINE,
+            move |peer| {
+                let output = peer.flocal_raw(&["sync", "list", "--json"])?;
+                if !output.status.success() {
+                    return Ok(None);
+                }
+                let Ok(listing) = serde_json::from_slice::<SyncListing>(&output.stdout) else {
+                    return Ok(None);
+                };
+                Ok(listing
+                    .syncs
+                    .iter()
+                    .find(|sync| sync.share == share)
+                    .is_some_and(|sync| sync.scheduling == "idle")
+                    .then_some(()))
+            },
+        )
+    }
+
+    pub fn assert_second_sync_stopped(&self) -> Result<()> {
+        let share = self.second_status()?.share;
+        let listing = self.sync_list()?;
+        let Some(sync) = listing.syncs.iter().find(|sync| sync.share == share) else {
+            return Err(self.fail("second share is absent from sync list".into()));
+        };
+        if sync.enabled || sync.scheduling != "idle" {
+            return Err(self.fail(format!(
+                "expected second share disabled and idle, got {sync:#?}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn assert_second_sync_start_queue_feedback(&self, output: &str) -> Result<()> {
+        let share = self.second_status()?.share;
+        let listing = self.sync_list()?;
+        let Some(sync) = listing.syncs.iter().find(|sync| sync.share == share) else {
+            return Err(self.fail("second share is absent from sync list".into()));
+        };
+        let Some(active_share) = sync.active_share.as_deref() else {
+            return Err(self.fail(format!(
+                "queued second share omitted its active share: {sync:#?}"
+            )));
+        };
+        if sync.scheduling != "queued"
+            || sync.waiting_on.as_deref() != Some("local")
+            || sync.operation.is_none()
+            || sync.queue_position.is_none()
+            || sync
+                .waiting_root
+                .as_ref()
+                .map(DaemonPath::decode)
+                .transpose()?
+                .as_deref()
+                != Some(SHARE.as_bytes())
+        {
+            return Err(self.fail(format!(
+                "expected second share to report local queue contention, got {sync:#?}"
+            )));
+        }
+        anyhow::ensure!(sync.connection_state != "queued");
+        anyhow::ensure!(sync.active_operation.is_some());
+        anyhow::ensure!(
+            sync.active_root
+                .as_ref()
+                .map(DaemonPath::decode)
+                .transpose()?
+                .as_deref()
+                == Some(SHARE.as_bytes())
+        );
+        if !output.contains(&format!("{SHARE} sync")) {
+            return Err(self.fail(format!(
+                "queued sync start did not name the active root {SHARE:?}: {output}"
+            )));
+        }
+        if output.contains(active_share) {
+            return Err(self.fail(format!(
+                "queued sync start exposed internal share ID {active_share:?}: {output}"
+            )));
+        }
+        if output.contains("request-") {
+            return Err(self.fail(format!(
+                "queued sync start exposed an internal request ID: {output}"
+            )));
+        }
+        if !output.contains("queue position") {
+            return Err(self.fail(format!(
+                "queued sync start omitted its queue position: {output}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn assert_sync_add_queue_feedback(&self, output: &str) -> Result<()> {
+        let wait = output
+            .lines()
+            .find(|line| line.contains(&format!("{SHARE} sync")));
+        let Some(wait) = wait else {
+            return Err(self.fail(format!(
+                "queued sync add did not name the active root {SHARE:?}: {output}"
+            )));
+        };
+        if wait.contains("share-") || wait.contains("request-") {
+            return Err(self.fail(format!(
+                "queued sync add exposed an internal scheduler ID: {wait}"
+            )));
+        }
+        if !wait.contains("queue position") {
+            return Err(self.fail(format!(
+                "queued sync add omitted its queue position: {output}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn wait_for_opposite_scheduling_contention(&self, other: &Peer) -> Result<()> {
+        self.poll_until(
+            "opposite-direction starts never exposed a scheduling wait",
+            DEADLINE,
+            |_| {
+                let local = self.status()?;
+                let remote = other.second_status()?;
+                let queued = [&local.scheduling, &remote.scheduling]
+                    .into_iter()
+                    .find(|scheduling| scheduling.state == "queued");
+                let Some(queued) = queued else {
+                    return Ok(None);
+                };
+                queued.validate_queued()?;
+                Ok(Some(()))
+            },
+        )
+    }
+
+    pub fn wait_for_sync_queued_behind(&self, root: &str) -> Result<()> {
+        let root = root.as_bytes().to_vec();
+        self.poll_until(
+            "persistent watch did not report its local scheduling wait",
+            DEADLINE,
+            move |peer| {
+                let scheduling = peer.status()?.scheduling;
+                if scheduling.state != "queued" {
+                    return Ok(None);
+                }
+                scheduling.validate_queued()?;
+                if scheduling.waiting_on.as_deref() != Some("local")
+                    || scheduling
+                        .waiting_root
+                        .as_ref()
+                        .map(DaemonPath::decode)
+                        .transpose()?
+                        .as_deref()
+                        != Some(root.as_slice())
+                {
+                    return Ok(None);
+                }
+                Ok(Some(()))
+            },
+        )
+    }
+
+    pub fn assert_sync_durably_queued(&self) -> Result<()> {
+        self.status()?.scheduling.validate_queued()
+    }
+
+    pub fn arm_scheduling_wait_observation(&self) -> Result<()> {
+        self.exec_ok(&[
+            "rm",
+            "-f",
+            "--",
+            SCHEDULING_WAIT_MARKER,
+            SCHEDULING_WAIT_OBSERVED,
+        ])?;
+        self.exec_ok(&["touch", "--", SCHEDULING_WAIT_MARKER])?;
+        Ok(())
+    }
+
+    pub fn wait_for_scheduling_wait(&self) -> Result<()> {
+        self.poll_until(
+            "no synchronization command joined the installation queue",
+            DEADLINE,
+            |peer| {
+                let output = peer.exec_raw(&["test", "-f", SCHEDULING_WAIT_OBSERVED])?;
+                Ok(output.status.success().then_some(()))
+            },
+        )
+    }
+
     pub fn sync_remove(&self) -> Result<()> {
         self.flocal_ok(&["sync", "remove", SHARE, "--yes"])
             .map(|_| ())
@@ -810,13 +1276,27 @@ impl Peer {
         let output = self.flocal_ok(&["sync", "list", "--json"])?;
         let listing: SyncListing =
             serde_json::from_slice(&output.stdout).context("parsing sync list --json")?;
-        if listing.schema != 2 {
+        if listing.schema != SYNC_LIST_SCHEMA {
             return Err(self.fail(format!(
-                "sync list schema {} does not match the pinned 2",
-                listing.schema
+                "sync list schema {} does not match the pinned {SYNC_LIST_SCHEMA}",
+                listing.schema,
             )));
         }
         Ok(listing)
+    }
+
+    fn assert_second_sync(&self, enabled: bool, state: Option<&str>) -> Result<()> {
+        let share = self.second_status()?.share;
+        let listing = self.sync_list()?;
+        let Some(sync) = listing.syncs.iter().find(|sync| sync.share == share) else {
+            return Err(self.fail("second share is absent from sync list".into()));
+        };
+        if sync.enabled != enabled || state.is_some_and(|expected| sync.state != expected) {
+            return Err(self.fail(format!(
+                "expected second share enabled={enabled} state={state:?}, got {sync:#?}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn arm_apply_stops(&self, count: u8) -> Result<()> {
@@ -834,6 +1314,87 @@ impl Peer {
             &count,
             APPLY_STOP_MARKER,
         ])?;
+        Ok(())
+    }
+
+    pub fn arm_reservation_stop(&self) -> Result<()> {
+        self.exec_ok(&["rm", "-f", "--", RESERVATION_STOP_PIDFILE])?;
+        self.exec_ok(&["touch", "--", RESERVATION_STOP_MARKER])?;
+        Ok(())
+    }
+
+    pub fn hold_installation(&self) -> Result<StoppedInstallation<'_>> {
+        self.exec_ok(&["rm", "-f", "--", INSTALLATION_HOLD_PIDFILE])?;
+        let start = format!(
+            "echo \"$$\" >{INSTALLATION_HOLD_PIDFILE} && exec flocal protocol e2e-hold-installation {SHARE}"
+        );
+        self.context.docker_ok(&[
+            "exec",
+            "-d",
+            "-u",
+            "peer",
+            &self.container.name,
+            "sh",
+            "-c",
+            &start,
+        ])?;
+        let pid = self.poll_until("installation holder never started", DEADLINE, |peer| {
+            let output = peer.exec_raw(&["cat", "--", INSTALLATION_HOLD_PIDFILE])?;
+            if !output.status.success() {
+                return Ok(None);
+            }
+            let Some(pid) = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+            else {
+                return Ok(None);
+            };
+            Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
+        })?;
+        Ok(StoppedInstallation {
+            peer: self,
+            pid,
+            resumed: false,
+        })
+    }
+
+    pub fn wait_for_stopped_reservation_worker(&self) -> Result<u32> {
+        self.poll_until(
+            "managed worker did not stop after its durable enqueue",
+            DEADLINE,
+            |peer| {
+                let output = peer.exec_raw(&["cat", "--", RESERVATION_STOP_PIDFILE])?;
+                if !output.status.success() {
+                    return Ok(None);
+                }
+                let Some(pid) = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                else {
+                    return Ok(None);
+                };
+                Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
+            },
+        )
+    }
+
+    pub fn resume_reservation_worker(&self, pid: u32) -> Result<()> {
+        anyhow::ensure!(
+            self.is_stopped_flocal(pid)?,
+            "{}: pid {pid} is not a stopped flocal worker",
+            self.alias
+        );
+        self.exec_ok(&["rm", "-f", "--", RESERVATION_STOP_PIDFILE])?;
+        let output = self.signal("CONT", pid)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: resuming reservation worker (pid {pid}) failed: {}",
+                self.alias,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
         Ok(())
     }
 
@@ -868,6 +1429,55 @@ impl Peer {
                 Ok(peer.is_stopped_protocol_server(pid)?.then_some(pid))
             },
         )
+    }
+
+    pub fn wait_for_stopped_apply_process(&self) -> Result<StoppedApply<'_>> {
+        let pid = self.poll_until(
+            "flocal process did not stop at the apply boundary",
+            DEADLINE,
+            |peer| {
+                let output = peer.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
+                if !output.status.success() {
+                    return Ok(None);
+                }
+                let Some(pid) = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                else {
+                    return Ok(None);
+                };
+                Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
+            },
+        )?;
+        Ok(StoppedApply {
+            peer: self,
+            pid,
+            resumed: false,
+        })
+    }
+
+    fn resume_stopped_apply_process(&self, pid: u32) -> Result<()> {
+        anyhow::ensure!(
+            self.is_stopped_flocal(pid)?,
+            "{}: pid {pid} is not a stopped flocal process",
+            self.alias
+        );
+        self.remove_apply_stop_pidfile()?;
+        anyhow::ensure!(
+            self.is_stopped_flocal(pid)?,
+            "{}: stopped flocal process changed before resume",
+            self.alias
+        );
+        let output = self.signal("CONT", pid)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: resuming stopped flocal process (pid {pid}) failed: {}",
+                self.alias,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
     }
 
     pub fn resume_protocol_to_next_apply_stop(&self, pid: u32) -> Result<u32> {
@@ -918,18 +1528,10 @@ impl Peer {
             "-c",
             "echo \"$$\" >/home/peer/.flocal-daemon.pid && exec flocal daemon run >/home/peer/.flocal-daemon.log 2>&1",
         ])?;
-        self.poll_until(
-            "daemon did not create its control socket",
-            DEADLINE,
-            |peer| {
-                let output = peer.exec_raw(&[
-                    "test",
-                    "-S",
-                    "/home/peer/.local/state/file.local/run/daemon.sock",
-                ])?;
-                Ok(output.status.success().then_some(()))
-            },
-        )
+        self.poll_until("daemon did not become responsive", DEADLINE, |peer| {
+            let output = peer.flocal_raw(&["sync", "list", "--json"])?;
+            Ok(output.status.success().then_some(()))
+        })
     }
 
     pub fn conflicts(&self) -> Result<Conflicts> {
@@ -1192,9 +1794,20 @@ impl Peer {
     }
 
     pub fn status(&self) -> Result<Status> {
-        let output = self.flocal_ok(&["status", SHARE, "--json"])?;
-        let status: Status =
-            serde_json::from_slice(&output.stdout).context("parsing status --json")?;
+        self.status_at(SHARE)
+    }
+
+    pub fn second_status(&self) -> Result<Status> {
+        self.status_at(SECOND_SHARE)
+    }
+
+    fn status_at(&self, root: &str) -> Result<Status> {
+        let output = self.flocal_ok(&["status", root, "--json"])?;
+        self.parse_status(&output.stdout)
+    }
+
+    fn parse_status(&self, output: &[u8]) -> Result<Status> {
+        let status: Status = serde_json::from_slice(output).context("parsing status --json")?;
         if status.schema != STATUS_SCHEMA {
             return Err(self.fail(format!(
                 "status schema {} does not match the pinned {STATUS_SCHEMA}",
@@ -1328,7 +1941,11 @@ impl Peer {
     }
 
     fn file_condition(&self, path: &str, content: &str) -> Result<Condition> {
-        let full = self.share_path(path)?;
+        self.file_condition_at(SHARE, path, content)
+    }
+
+    fn file_condition_at(&self, root: &str, path: &str, content: &str) -> Result<Condition> {
+        let full = self.share_path_at(root, path)?;
         let expected = content.to_owned();
         Ok(Condition {
             describe: format!("{path} contains {content:?}"),
@@ -1368,8 +1985,33 @@ impl Peer {
         self.start_daemon()
     }
 
+    fn crash_and_restart_daemon(&self) -> Result<()> {
+        let output = self.exec_ok(&["cat", "--", DAEMON_PIDFILE])?;
+        let pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .context("parsing daemon pid")?;
+        let killed = self.signal("KILL", pid)?;
+        if !killed.status.success() {
+            return Err(self.fail(format!(
+                "{}: crashing daemon (pid {pid}) failed: {}",
+                self.alias,
+                String::from_utf8_lossy(&killed.stderr).trim()
+            )));
+        }
+        self.poll_until("crashed daemon did not exit", DEADLINE, move |peer| {
+            let output = peer.exec_raw(&["kill", "-0", &pid.to_string()])?;
+            Ok((!output.status.success()).then_some(()))
+        })?;
+        self.start_daemon()
+    }
+
     fn absent_condition(&self, path: &str) -> Result<Condition> {
-        let full = self.share_path(path)?;
+        self.absent_condition_at(SHARE, path)
+    }
+
+    fn absent_condition_at(&self, root: &str, path: &str) -> Result<Condition> {
+        let full = self.share_path_at(root, path)?;
         Ok(Condition {
             describe: format!("{path} is absent"),
             probe: Box::new(move |peer| {
@@ -1585,6 +2227,24 @@ impl Peer {
             .any(|line| line.starts_with("State:\tT")))
     }
 
+    fn is_stopped_flocal(&self, pid: u32) -> Result<bool> {
+        let command = self.exec_raw(&["cat", "--", &format!("/proc/{pid}/cmdline")])?;
+        if !command.status.success()
+            || !command
+                .stdout
+                .split(|byte| *byte == 0)
+                .next()
+                .is_some_and(|executable| executable.ends_with(b"/flocal-real"))
+        {
+            return Ok(false);
+        }
+        let status = self.exec_raw(&["cat", "--", &format!("/proc/{pid}/status")])?;
+        Ok(status.status.success()
+            && String::from_utf8_lossy(&status.stdout)
+                .lines()
+                .any(|line| line.starts_with("State:\tT")))
+    }
+
     fn require_stopped_protocol_server(&self, pid: u32) -> Result<()> {
         anyhow::ensure!(
             self.is_stopped_protocol_server(pid)?,
@@ -1634,6 +2294,36 @@ impl Peer {
         let mut full = vec!["flocal"];
         full.extend_from_slice(args);
         self.exec_raw(&full)
+    }
+
+    /// Runs a target command behind the container's hard deadline. This is
+    /// used by scheduling bug pins where blocking instead of queueing is
+    /// itself a failure and must not wedge the harness.
+    fn bounded_flocal_raw(&self, args: &[&str], deadline: &str) -> Result<std::process::Output> {
+        let mut full = vec![
+            "/usr/bin/timeout",
+            "--kill-after",
+            TARGET_COMMAND_KILL_AFTER,
+            deadline,
+            "flocal",
+        ];
+        full.extend_from_slice(args);
+        self.exec_raw(&full)
+    }
+
+    fn sync_start_observed_at(&self, root: &str) -> Result<String> {
+        let arguments = ["sync", "start", root];
+        let output = self.bounded_flocal_raw(&arguments, START_COMMAND_DEADLINE)?;
+        reject_target_timeout(&output, &arguments, START_COMMAND_DEADLINE)?;
+        if !output.status.success() {
+            bail!(
+                "{}: flocal {} failed: {}",
+                self.alias,
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn exec_ok(&self, command: &[&str]) -> Result<std::process::Output> {
@@ -1730,6 +2420,13 @@ impl Peer {
     /// Validates a scenario-supplied share-relative path and returns its
     /// absolute form inside the container.
     fn share_path(&self, path: &str) -> Result<String> {
+        self.share_path_at(SHARE, path)
+    }
+
+    fn share_path_at(&self, root: &str, path: &str) -> Result<String> {
+        if root != SHARE && root != SECOND_SHARE {
+            bail!("invalid scenario root: {root:?}");
+        }
         if path.is_empty()
             || path.starts_with('/')
             || path.starts_with('-')
@@ -1740,7 +2437,7 @@ impl Peer {
         {
             bail!("invalid scenario path: {path:?}");
         }
-        Ok(format!("{SHARE}/{path}"))
+        Ok(format!("{root}/{path}"))
     }
 }
 
@@ -1753,4 +2450,39 @@ fn validate_component(value: &str) -> Result<()> {
         bail!("invalid identifier: {value:?}");
     }
     Ok(())
+}
+
+fn reject_target_timeout(
+    output: &std::process::Output,
+    arguments: &[&str],
+    deadline: &str,
+) -> Result<()> {
+    if matches!(output.status.code(), Some(124 | 137)) {
+        bail!(
+            "flocal {} exceeded the E2E target-command deadline of {deadline}",
+            arguments.join(" ")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use super::*;
+
+    #[test]
+    fn target_timeout_cannot_be_pinned_by_its_stderr() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(124 << 8),
+            stdout: Vec::new(),
+            stderr: b"another synchronization operation already owns this installation".to_vec(),
+        };
+        let error = reject_target_timeout(&output, &["sync", "start"], "5s")
+            .expect_err("timeout must be rejected before stderr classification");
+        let error = format!("{error:#}");
+        assert!(error.contains("exceeded the E2E target-command deadline"));
+        assert!(!error.contains("another synchronization operation"));
+    }
 }

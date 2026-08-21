@@ -32,28 +32,30 @@ fn record(path: &[u8], entry: Entry) -> Result<Record> {
 }
 
 #[test]
-fn explicit_v3_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
+fn explicit_v5_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
     let message = Message::Sync {
         protocol: sync::SYNC_PROTOCOL_VERSION,
         share: flocal::model::ShareId("share".into()),
         peer: PeerId("peer".into()),
+        relationship: flocal::model::RelationshipId::parse("relationship".into())?,
         dry_run: false,
     };
     let mut wire = Vec::new();
     sync::write_message(&mut wire, &message)?;
     assert_eq!(
         &wire[4..],
-        br#"{"type":"sync","protocol":3,"share":"share","peer":"peer","dry_run":false}"#
+        br#"{"type":"sync","protocol":5,"share":"share","peer":"peer","relationship":"relationship","dry_run":false}"#
     );
     assert!(matches!(
         sync::read_message(&mut wire.as_slice())?,
-        Message::Sync { protocol: 3, .. }
+        Message::Sync { protocol: 5, .. }
     ));
 
     let initial = InitialMessage::Sync {
         protocol: sync::SYNC_PROTOCOL_VERSION,
         share: flocal::model::ShareId("share".into()),
         peer: PeerId("peer".into()),
+        relationship: flocal::model::RelationshipId::parse("relationship".into())?,
         dry_run: false,
     };
     let mut initial_wire = Vec::new();
@@ -530,12 +532,20 @@ fn v2_session_and_round_frames_are_closed_and_round_tagged() -> Result<()> {
         assert!(sync::read_message(&mut wire.as_slice()).is_err());
     }
 
+    let reservation = sync::Reservation {
+        id: sync::SchedulingId::generate(),
+        network_order: sync::NetworkOrder::new(1)?,
+        nonce: sync::SchedulingNonce::generate(),
+    };
     let round_frames = vec![
-        V2RoundFrame::SyncStart {
+        V2RoundFrame::SyncStart(sync::SyncStart {
+            id: reservation.id.clone(),
+            network_order: reservation.network_order,
+            nonce: reservation.nonce.clone(),
             connector_generation: 7,
             responder_generation: 8,
-        },
-        V2RoundFrame::SyncAccepted,
+        }),
+        V2RoundFrame::SyncAccepted(reservation),
         V2RoundFrame::SnapshotChunk {
             records: vec![sample.clone()],
         },
@@ -582,6 +592,7 @@ fn versioned_decoders_reject_cross_version_untagged_unknown_and_oversized_frames
         protocol: sync::WATCH_PROTOCOL_VERSION,
         share: flocal::model::ShareId("share".into()),
         peer: PeerId("peer".into()),
+        relationship: flocal::model::RelationshipId::parse("relationship".into())?,
     };
     let mut wire = Vec::new();
     sync::write_initial_message(&mut wire, &initial)?;

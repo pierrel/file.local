@@ -362,7 +362,8 @@ conflicts remain restorable after the remap and after the new initial sync.
 
 * 7. Observable states
 
-=sync list= JSON becomes schema 2.  Each listed relationship adds =role=
+In this relationship-removal change, =sync list= JSON became schema 2.  Each
+listed relationship added =role=
 (=connector= or =responder=), =registration_pending=, and
 =removal_pending=.  A prepared connector is =disabled  registering= with
 “rerun `flocal sync add` or abandon with `sync remove --local-only`.”  JSON uses =enabled: false=;
@@ -371,7 +372,7 @@ human output uses the established =disabled  removing= wording, the bounded last
 relationships and disappear from =sync list=; a local-only remote endpoint
 continues to appear as a responder until removed there.
 
-=status --json= becomes schema 5 and adds =bound_peer=,
+=status --json= became schema 5 and added =bound_peer=,
 =relationship_state= (=registering=, =connector=, =responder=, =removing=, or =unpaired=),
 =removal_pending=, and =removal_error=.  Human status prints the same state and
 retry guidance.  In every state it continues to show pending install and

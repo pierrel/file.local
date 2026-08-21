@@ -119,14 +119,18 @@ fn object_provenance_is_share_scoped_and_round_cleanup_is_serialized() -> Result
     sink.write_chunk(b"orphan")?;
     sink.finish()?;
     drop(state);
-    let state = State::open(&state_path)?;
+    let mut state = State::open(&state_path)?;
     assert!(
         state.object_path(&orphan).exists(),
         "opening state must not erase another process's live transfer root"
     );
-    let _global = state.lock_global_sync()?;
+    let mut request = state.enqueue_sync(None, flocal::state::SyncOperation::Maintenance, None)?;
+    let permit = request
+        .try_activate()?
+        .context("maintenance request did not activate")?;
     state.clear_pending_objects(&second_share)?;
     state.prune_unreferenced_objects()?;
+    permit.finish()?;
     assert!(!state.object_path(&orphan).exists());
     Ok(())
 }
@@ -146,7 +150,11 @@ fn state_metadata_and_install_intent_lifecycle() -> Result<()> {
     assert_eq!(state.find_share(&deeper)?.0, share);
     assert_eq!(state.root_for(&share)?, root.canonicalize()?);
     assert!(state.lock_share(&share).is_ok());
-    assert!(state.lock_global_sync().is_ok());
+    let mut request = state.enqueue_sync(None, flocal::state::SyncOperation::Maintenance, None)?;
+    request
+        .try_activate()?
+        .context("maintenance request did not activate")?
+        .finish()?;
     assert_eq!(state.next_sequence(&share)?, 1);
     assert_eq!(state.next_sequence(&share)?, 2);
 
@@ -382,7 +390,7 @@ fn recovery_reclaimability_respects_every_durable_object_root() -> Result<()> {
     );
     state.add_conflicts(&first_share, std::slice::from_ref(&conflict))?;
     let id = flocal::reconcile::conflict_id(&conflict);
-    let reclaimable = |state: &State| -> Result<(u64, u64)> {
+    let reclaimable = |state: &mut State| -> Result<(u64, u64)> {
         Ok((
             state.recovery_usage(&first_share)?.reclaimable_bytes,
             state
@@ -393,17 +401,17 @@ fn recovery_reclaimability_respects_every_durable_object_root() -> Result<()> {
 
     let current = file(b"current", "current", 3)?;
     state.replace_records(&second_share, std::slice::from_ref(&current))?;
-    assert_eq!(reclaimable(&state)?, (0, 0));
+    assert_eq!(reclaimable(&mut state)?, (0, 0));
 
     let mut with_base = record(b"with-base", "current", 4, Entry::Tombstone)?;
     with_base.version.merge_base = current.version.as_base();
     state.replace_records(&second_share, std::slice::from_ref(&with_base))?;
-    assert_eq!(reclaimable(&state)?, (0, 0));
+    assert_eq!(reclaimable(&mut state)?, (0, 0));
 
     state.replace_records(&second_share, std::slice::from_ref(&current))?;
     state.acknowledge_shared_heads(&second_share, std::slice::from_ref(&current))?;
     state.replace_records(&second_share, &[])?;
-    assert_eq!(reclaimable(&state)?, (0, 0));
+    assert_eq!(reclaimable(&mut state)?, (0, 0));
     state.acknowledge_shared_heads(&second_share, &[])?;
 
     state.set_plan_install_intent(
@@ -411,14 +419,14 @@ fn recovery_reclaimability_respects_every_durable_object_root() -> Result<()> {
         std::slice::from_ref(&current),
         std::slice::from_ref(&conflict),
     )?;
-    assert_eq!(reclaimable(&state)?, (0, 0));
+    assert_eq!(reclaimable(&mut state)?, (0, 0));
     state.clear_install_intent(&second_share)?;
 
     state.mark_object_receiving(&second_share, &hash)?;
-    assert_eq!(reclaimable(&state)?, (0, 0));
+    assert_eq!(reclaimable(&mut state)?, (0, 0));
     state.clear_pending_objects(&second_share)?;
     assert_eq!(
-        reclaimable(&state)?,
+        reclaimable(&mut state)?,
         (bytes.len() as u64, bytes.len() as u64)
     );
     Ok(())

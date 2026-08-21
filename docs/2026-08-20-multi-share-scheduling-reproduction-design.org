@@ -1,0 +1,78 @@
+#+title: Multi-share scheduling bug reproduction design
+
+* User-visible failure
+
+One installation can own more than one synchronization relationship, but an
+active round for one share made setup or startup for another share
+fail with =another synchronization operation already owns this installation=.
+The global owner is intentional: mutation rounds share one database, recovery
+journals, and object store and must remain serialized.  Requiring the user to
+repeat =sync add=, =sync start=, or =watch= until a timing window opens is the
+bug pinned here.
+
+This reproduction covers installation-lock contention.  It does not claim to
+reproduce the earlier =Broken pipe=, changing-path, or laptop reconnect
+failures that first exposed it.
+
+* Plan
+
+1. Extend the two-container E2E harness with a fixed sibling share root.  Keep
+   paths as direct argv and add only the second-root verbs used by these
+   scenarios.
+2. Add a one-shot observation hook at the real global-lock contention point.
+   The E2E-only build atomically renames an armed empty marker when
+   =try_lock_exclusive= returns =WouldBlock=.  The default production build
+   contains none of this hook.
+3. Add a strict known-failure wrapper that accepts only the observed
+   installation-owner diagnostic.  Infrastructure errors and unrelated
+   product, assertion, timeout, or cleanup failures remain real test failures.
+4. In the first scenario, stop the managed worker for share A and hold a
+   foreground A round at the existing pre-apply test stop while it owns the
+   global lock.  Run exactly one =sync add --yes= for share B.  A scoped
+   observer waits until that command has actually contended, requires B's
+   seeded payload to remain absent remotely and B not to be enabled, then
+   resumes A.  Once fixed, require that same add command to finish successfully
+   and report its initial plan, then prove A and B both converge without
+   retrying setup.
+5. In the second scenario, configure and confirm both relationships while no
+   round is held, then stop B.  Hold A at the same real apply boundary and run
+   exactly one =sync start= for B.  Require bounded success plus B's durable
+   =enabled= intent and derived =queued= state from =sync list= while A still
+   owns the installation.  B's seeded payload must remain absent until A
+   resumes; both shares must converge afterward without another start.
+6. Keep the two scenarios independent and wrap each in the exact-diagnostic
+   known-failure helper.  A combined scenario would let the setup failure mask
+   the startup failure.  The scheduling fix promotes each test unchanged by
+   deleting its wrapper.
+
+* Safety and cleanup
+
+The tests never weaken or bypass the global lock.  Holding A stopped inside a
+real apply and observing no B payload before release proves serialization is
+preserved.  The contention marker is accepted only as an empty regular file,
+is consumed by atomic rename, and exists only under =e2e-test-hooks=.  The
+target command stays synchronous but runs behind the container's deadline with
+a one-second forced-kill backstop: five seconds for the prompt managed start,
+and the harness's normal thirty seconds for setup and its initial SSH round.
+Blocking instead of queueing therefore fails the scenario without wedging its
+cleanup, while setup retains its normal slow-host budget.  Timeout exit codes
+are rejected before stderr is considered, so a command that prints the pinned
+diagnostic and then hangs cannot false-pass.  A scoped observer thread always
+attempts to resume the stopped watcher, and each scenario explicitly stops it
+before classifying an expected command failure.  The watch guard remains a
+never-panicking force-kill backstop.  Successful paths resume A before waiting
+for convergence and explicitly stop both foreground and managed
+synchronization.
+
+* Historical acceptance before the scheduler implementation
+
+On the implementation under test when this reproduction was written, each
+scenario passed only because its target
+command returns the exact installation-owner error as a typed expected
+failure.  Each scenario is also run alone to prove its intended boundary,
+followed by the complete E2E suite to prove cleanup and isolation.  Formatting,
+linting, unit tests for the one-shot hook and typed matcher, and repository
+coverage gates remain required.  No production synchronization behavior
+changed as part of this reproduction.  The subsequent scheduler implementation
+removed the known-failure wrappers and all six multi-share scenarios now pass
+as ordinary acceptance tests.

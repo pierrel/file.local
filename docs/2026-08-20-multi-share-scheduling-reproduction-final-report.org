@@ -1,0 +1,209 @@
+#+title: Multi-share scheduling reproduction final report
+
+* Outcome
+
+The reported behavior is reproduced as two separate end-to-end scenarios:
+
+1. While share A owns the installation, one =flocal sync add --yes= for a new
+   share B fails with =another synchronization operation already owns this
+   installation= and leaves B unconfigured.
+2. After B has already been configured and stopped, one =flocal sync start B=
+   during the same contention fails with that diagnostic, leaves B disabled,
+   and requires a manual retry.
+
+These were two user-visible failures at the same boundary.  The implementation
+has a deliberate installation-wide mutation lock.  Both commands use its
+nonblocking acquisition and currently turn =WouldBlock= into a terminal CLI
+error.  The lock is not itself the bug.  It protects shared state from two
+simultaneous mutation rounds.  The missing piece is scheduling healthy work
+behind the current owner.
+
+This reproduction pinned the defect before changing that behavior.  The later
+multi-share scheduler change promoted both scenarios to ordinary passing E2Es.
+
+* Intended experience pinned by the tests
+
+The eventual fix must keep one mutation owner while removing manual retries.
+For a previously confirmed B, =sync start B= should durably enable and queue B,
+return success promptly, and let the daemon run B after A releases the
+installation.  For a new B, setup may wait for ownership because the user must
+still see and confirm the initial plan, but the one setup command must continue
+without being repeated.
+
+The tests also preserve the important negative guarantee: B's file must not
+appear on its peer while A still owns the installation.  A fix that permits two
+applies at once is not acceptable.
+
+The broader acceptance criteria are recorded in =ROADMAP.org=: foreground
+commands need a visible cancellable wait, managed starts need durable intent,
+=sync stop= must cancel queued work, active shares need fairness, and status and
+watch output must distinguish queueing from connection or recovery failure.
+
+* How the reproduction works
+
+Each scenario creates two Docker peers and two independent roots on the
+connector.  Share A is paired normally.  A foreground watch is then stopped at
+the existing pre-apply E2E boundary.  At that point it holds the real global
+lock, not a mock lock.
+
+The test arms a one-shot marker.  The E2E build publishes that marker only when
+another real lock attempt receives =WouldBlock=:
+
+#+begin_src rust
+match file.try_lock_exclusive() {
+    Ok(()) => Ok(file),
+    Err(error) => {
+        #[cfg(feature = "e2e-test-hooks")]
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            self.observe_e2e_global_contention()?;
+        }
+        Err(error).context(
+            "another synchronization operation already owns this installation",
+        )
+    }
+}
+#+end_src
+
+The marker is an empty regular file in the owner-private state directory.  It
+is consumed by atomic rename to an observed name.  The hook rejects symlinks,
+non-files, and nonempty files.  It cannot weaken or release the lock, and
+=#[cfg(feature = "e2e-test-hooks")]= removes the entire hook from ordinary
+builds.
+
+Once the harness sees the observed marker, it checks that B has not applied and
+is not enabled, then resumes A.  The setup scenario needs a scoped observer
+thread because =sync add= may eventually wait for A and continue.  Rust's
+=std::thread::scope= lets that thread safely borrow the peer and watch handles;
+the compiler guarantees the thread is joined before those borrowed values can
+go away.
+
+Both target commands run synchronously through the container's bounded
+wrapper:
+
+#+begin_src rust
+let mut full = vec![
+    "/usr/bin/timeout",
+    "--kill-after",
+    "1s",
+    deadline, // 30s for setup, 5s for managed start
+    "flocal",
+];
+full.extend_from_slice(args);
+self.exec_raw(&full)
+#+end_src
+
+This matters for a partial fix.  If =sync start= merely blocks until A finishes
+instead of durably queueing and returning, the test fails within six seconds
+rather than hanging.  Setup retains the harness's normal thirty-second budget
+because it also performs registration, SSH setup, and the initial round.
+Arguments remain direct process argv; no scenario value is interpolated into a
+shell command.  The harness rejects GNU =timeout='s 124 and 137 exit statuses
+before it examines stderr.  A process cannot print the expected lock error,
+hang, get killed, and accidentally satisfy the known-failure pin.
+
+* Exact known failures
+
+An ordinary known-failure wrapper accepts any scenario error, which is too
+broad here.  A timeout, dead container, failed cleanup, or assertion could
+otherwise make a broken test look green.  These scenarios convert only the
+target command's exact diagnostic into a private Rust error type:
+
+#+begin_src rust
+#[derive(Debug)]
+struct PinnedFailure {
+    diagnostic: String,
+    observed: String,
+}
+
+if observed.contains(diagnostic) {
+    anyhow::Error::new(PinnedFailure { diagnostic, observed })
+} else {
+    error
+}
+#+end_src
+
+=known_failure_matching= uses =downcast_ref= to accept only that concrete type
+with the requested diagnostic.  Text from an assertion that happens to quote
+the same words remains an unrelated failure.  This is a Rust-specific benefit
+of errors being values with runtime types rather than only formatted strings.
+
+The subsequent scheduling implementation made each scenario reach all of its
+success assertions and deleted the known-failure wrapper.  This section
+describes the acceptance rule used by that earlier reproduction change.
+
+* Harness and documentation changes
+
+The harness gained a fixed second root and only the operations needed to set it
+up, seed it, inspect its managed state, and wait for its files.  Status parsing
+now retains the share ID so the second root can be matched to the correct
+=sync list --json= row.  Shared path and condition helpers still enforce the
+same root and component validation as the original share.
+
+The E2E harness design records the new contention observation and exact-failure
+contract.  The roadmap now treats multi-share scheduling as an alpha-exit
+prerequisite and states the full user-visible acceptance criteria.  The
+separate reproduction design explains why setup and confirmed start are
+independent tests: if they were combined, setup's current failure would prevent
+the start behavior from ever being exercised.
+
+* Rust details
+
+- =Result<T>= carries either a value or an error.  The =?= operator returns an
+  error immediately while preserving its context.  Cleanup calls are collected
+  before applying =?= where release must still be attempted.
+- The =File= returned by =lock_global_sync= owns the operating-system lock.
+  Rust's RAII model releases it when the =File= is dropped, including on error.
+- =#[cfg(feature = "e2e-test-hooks")]= is compile-time selection.  The Docker
+  E2E binary includes the marker hook; normal release builds do not contain the
+  branch or marker names.
+- =std::thread::scope= permits borrowed references in a thread without
+  ='static= ownership because the scope joins every thread before returning.
+- =PinnedFailure= implements =Display= and =Error=.  =anyhow::Error= preserves
+  that underlying type, allowing =downcast_ref= to distinguish it from an
+  unrelated error with identical text.
+- =fs::rename= publishes the observation atomically.  Pollers see either the
+  armed name or the observed name, never a partly written signal.
+
+* What was hard
+
+The first version was timing-dependent: it launched a second command and hoped
+the first watcher still owned the lock.  That could pass or fail for the wrong
+reason.  Moving observation to the actual =WouldBlock= branch made the boundary
+deterministic.
+
+Command lifetime was the other difficult part.  Killing a host =docker exec=
+client does not guarantee its in-container child is gone.  A large PID-tracking
+guard was considered and removed.  Keeping the command synchronous and using
+the container's existing GNU =timeout= gives an exit status, a hard product
+deadline, and forced child cleanup with much less code.
+
+The expected-failure boundary also needed care.  Setup, assertions, release,
+and watcher shutdown must not be mistaken for the pinned product defect.  The
+private typed sentinel narrows acceptance to the two target CLI calls, and both
+scenarios explicitly resume and stop A before returning the expected error.
+
+* Review and verification
+
+The local review ran in three rounds across correctness and concurrency, error
+handling and adversarial security, simplicity and duplication, design
+adherence, and comment/document alignment.  The first round found that a
+blocking partial implementation could wedge the tests, the confirmed-start
+failure did not explicitly prove B remained disabled, an earlier background
+process guard was too large, and two documents had drifted.  The tests now use
+per-command hard deadlines, classify timeout before stderr, assert B is not
+enabled, use the smaller synchronous design, and align the documents.  The E2E
+marker's path, file type, one-shot behavior, and production exclusion were
+reviewed as the added attack surface.
+
+Verification includes the contention-hook unit test, the typed-matcher unit
+test, both focused Docker scenarios, all Rust unit and integration tests,
+formatting, Clippy with warnings denied, repository and changed-line coverage,
+and the complete serial Docker E2E catalog.
+
+* Subsequent completion
+
+This report covered only the bug-first reproduction.  The subsequent
+installation-wide scheduler promoted both known failures to ordinary passing
+scenarios and added foreground wait feedback, cancellation, repeated
+contention, fairness, visibility, crash recovery, and opposite-direction peer
+reservation coverage.

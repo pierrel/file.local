@@ -18,9 +18,12 @@ fn offline_deletion_propagates_and_nothing_resurrects() -> Result<()> {
     b.offline()?;
     a.remove_dir_all("dir")?;
     for _ in 0..3 {
-        a.sync_expect_offline()?; // a watch cycle: refresh, then fail to reach b
+        a.sync_expect_offline()?;
     }
-    a.assert_status(|s| s.tombstones == Some(2))?; // exactly dir and dir/child
+    // A paired round cannot take the installation permit while its peer is
+    // absent, so status remains the last completed scan until reconnection.
+    a.assert_status(|s| s.entries == 2 && s.tombstones == Some(0))?;
+    a.assert_absent("dir")?;
 
     b.online()?;
     a.sync()?;
