@@ -1437,7 +1437,7 @@ fn quiesce_for_upgrade_until(
                 if reported.as_ref() != Some(&path) {
                     println!(
                         "Waiting for synchronization of {} to finish before upgrade",
-                        path.display()
+                        escaped(&path.to_string_lossy())
                     );
                     reported = Some(path);
                 }
@@ -1447,7 +1447,7 @@ fn quiesce_for_upgrade_until(
             let path = reported.unwrap_or_else(|| state_dir.to_path_buf());
             bail!(
                 "could not safely stop synchronization of {} before upgrade; stop any foreground `flocal watch` or `flocal sync` using that path, upgrade the connector first, and retry `make install`",
-                path.display()
+                escaped(&path.to_string_lossy())
             )
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -11411,6 +11411,10 @@ mod tests {
         let state_dir = temp.path().join("state");
         State::create_upgrade_pending(&state_dir)?;
 
+        complete_upgrade_marker(&state_dir, false, false)?;
+        assert!(!State::upgrade_pending_at(&state_dir)?);
+
+        State::create_upgrade_pending(&state_dir)?;
         complete_upgrade_marker(&state_dir, false, true)?;
         assert!(State::upgrade_pending_at(&state_dir)?);
 
@@ -11433,6 +11437,27 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains(&root.display().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_wait_escapes_control_bytes_in_a_busy_root() -> Result<()> {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("state");
+        let root = temp.path().join("root\n\u{1b}[31m");
+        std::fs::create_dir(&root)?;
+        let state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let _session = state.lock_share_session(&share)?;
+        let error = match quiesce_for_upgrade_until(&state_dir, std::time::Instant::now()) {
+            Ok(_) => bail!("active foreground session did not block upgrade"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("\\n"));
+        assert!(message.contains("\\u{1b}"));
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
         Ok(())
     }
 
