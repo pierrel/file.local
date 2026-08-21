@@ -25,13 +25,19 @@ add a network updater, release server, package manager, downgrade support, or a
 second installed binary.
 
 A foreground =flocal watch PATH= or one-shot =flocal sync PATH= is not owned by
-the managed service. The documented procedure tells the user to end foreground
-commands first. If the user forgets, the installer observes the held share
-session after stopping its daemon, refuses before executable replacement or
-migration, restarts the old service, names the affected root, and gives exact
-retry guidance. Normal daemon-managed =flocal sync start PATH= sessions, both
-idle and in a synchronization round, require no manual stop when this endpoint
-is their connector.
+the managed service. The first transition from the previous alpha requires the
+user to end every foreground command. Active sessions remain observable through
+their legacy locks, so the installer refuses before executable replacement or
+migration, restores only a service that was running, names the affected root,
+and gives exact retry guidance. A previous-alpha initial sync waiting at its
+confirmation prompt has already released those locks and is not observable by
+the candidate, which is why the first-transition prerequisite is stronger than
+the later steady-state behavior. Once this version is installed, foreground
+watches retain the shared installation barrier and their session lock while an
+upgrade is pending, so a forgotten watch is refused rather than terminated.
+Normal daemon-managed =flocal sync start PATH= sessions, both idle and in a
+synchronization round, require no manual stop when this endpoint is their
+connector.
 
 An inbound responder is likewise owned by the peer's connector rather than the
 local daemon. Connector-first installation closes that session. If a responder
@@ -203,7 +209,7 @@ failure does not leave a partial schema change.
 On Linux, an absent unit is a successful stop no-op. On macOS, the operation
 distinguishes an unavailable =gui/UID= domain from an available domain with an
 absent label. It uses =bootout= and observes completion for a loaded label,
-then later =bootstrap= and =kickstart=. In a headless session it retains the
+then later =bootstrap=. In a headless session it retains the
 existing binary-only behavior only after it has created the pending marker and
 acquired daemon plus legacy mutation locks. If it cannot quiesce old work, it
 removes the marker and refuses publication with the exact graphical-session
@@ -290,9 +296,9 @@ synchronized wall-clock timing or an operator restart.
      protocol and equal binary path without relying on a retry gap.
 
    - *In-progress upgrade.* Create another real base pair, start a managed
-     round, and use the existing one-shot E2E apply boundary on the responder.
-     Install the candidate on the connector while that old round is live,
-     resume the stopped responder and prove the severed base process exits,
+     round, and use the existing one-shot E2E apply boundary in the connector.
+     Assert its durable install intent, have service shutdown kill that stopped
+     old daemon before it can apply, install the candidate on the connector,
      then install the responder.
      Require automatic install recovery, exact tree convergence, no unsettled
      paths, no unexplained recovery conflict, no pending install, and an

@@ -43,6 +43,7 @@ const SCHEDULING_WAIT_MARKER: &str =
 const SCHEDULING_WAIT_OBSERVED: &str =
     "/home/peer/.local/state/file.local/.e2e-global-contention-observed";
 const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
+const KILL_DAEMON_ON_STOP_MARKER: &str = "/home/peer/.flocal-kill-daemon-on-stop";
 const MIGRATION_FAILURE_MARKER: &str =
     "/home/peer/.local/state/file.local/.e2e-fail-state-migration";
 
@@ -1056,6 +1057,11 @@ impl Peer {
                 "candidate install error did not contain {needle:?}: {message}"
             )));
         }
+        Ok(())
+    }
+
+    pub fn kill_daemon_on_service_stop(&self) -> Result<()> {
+        self.exec_ok(&["touch", "--", KILL_DAEMON_ON_STOP_MARKER])?;
         Ok(())
     }
 

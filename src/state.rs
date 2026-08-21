@@ -1096,18 +1096,12 @@ fn paired_predecessor_fingerprint(
 }
 
 const INSTALLATION_BARRIER_FILE: &str = "installation.barrier";
+const INSTALLER_LOCK_FILE: &str = "installer.lock";
 const UPGRADE_PENDING_FILE: &str = "upgrade.pending";
 
 fn open_installation_barrier(dir: &Path) -> Result<File> {
     let path = dir.join(INSTALLATION_BARRIER_FILE);
-    if let Ok(metadata) = fs::symlink_metadata(&path)
-        && (!metadata.is_file() || metadata.file_type().is_symlink())
-    {
-        bail!("installation barrier is not a regular file");
-    }
-    let file = OpenOptions::new().create(true).append(true).open(&path)?;
-    set_private_file(&path)?;
-    Ok(file)
+    open_private_regular_file(&path, false).context("opening the private installation barrier")
 }
 
 fn ensure_upgrade_not_pending(dir: &Path) -> Result<()> {
@@ -1206,13 +1200,8 @@ fn legacy_upgrade_inventory(dir: &Path) -> Result<LegacyUpgradeInventory> {
 }
 
 fn try_upgrade_lock(path: &Path, locks: &mut Vec<File>) -> Result<bool> {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && (!metadata.is_file() || metadata.file_type().is_symlink())
-    {
-        bail!("upgrade lock is not a regular file: {}", path.display());
-    }
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    set_private_file(path)?;
+    let file = open_private_regular_file(path, false)
+        .with_context(|| format!("opening private upgrade lock {}", path.display()))?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {
             locks.push(file);
@@ -1688,19 +1677,31 @@ impl State {
         upgrade_pending(&self.dir)
     }
 
+    pub fn acquire_installer_lock(dir: impl AsRef<Path>) -> Result<File> {
+        let path = dir.as_ref().join(INSTALLER_LOCK_FILE);
+        let file = open_private_regular_file(&path, false)
+            .context("opening the private installer lock")?;
+        file.try_lock_exclusive()
+            .context("another flocal installation is already in progress")?;
+        Ok(file)
+    }
+
     pub fn create_upgrade_pending(dir: impl AsRef<Path>) -> Result<()> {
         let dir = dir.as_ref();
         ensure_private_directory(dir)?;
         let path = dir.join(UPGRADE_PENDING_FILE);
-        let file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+        let file = match open_private_regular_file(&path, true) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
                 upgrade_pending(dir)?;
                 return Ok(());
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
-        set_private_file(&path)?;
         file.sync_all()?;
         sync_dir(dir)
     }
@@ -6581,6 +6582,42 @@ fn set_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn open_private_regular_file(path: &Path, create_new: bool) -> Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let mut flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    if create_new {
+        flags |= OFlags::CREATE | OFlags::EXCL;
+    } else {
+        flags |= OFlags::CREATE;
+    }
+    let descriptor = rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!("{} is not an owned private regular file", path.display());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_regular_file(path: &Path, create_new: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true);
+    }
+    Ok(options.open(path)?)
+}
+
 fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
@@ -9280,6 +9317,15 @@ mod tests {
                 ] {
                     ensure_private_directory(&directory)?;
                     assert_eq!(fs::metadata(directory)?.permissions().mode() & 0o077, 0);
+                }
+                let opened = State::open(&state)?;
+                drop(opened);
+                State::create_upgrade_pending(&state)?;
+                for file in [
+                    state.join(INSTALLATION_BARRIER_FILE),
+                    state.join(UPGRADE_PENDING_FILE),
+                ] {
+                    assert_eq!(fs::metadata(file)?.permissions().mode() & 0o077, 0);
                 }
                 Ok(())
             })();

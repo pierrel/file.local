@@ -31,9 +31,12 @@ responder notices the marker and closes its own session.
 
 A foreground =flocal watch PATH= or =flocal sync PATH= is deliberately not
 killed by an installer. It is the user's terminal process, not a managed daemon
-worker. The installer names its root while waiting and eventually refuses
-safely with exact stop-and-retry guidance. No executable or schema has changed
-at that point, and the old managed service is restarted.
+worker. An active session keeps its root lock while the installer waits and
+eventually refuses safely with exact stop-and-retry guidance. No executable or
+schema has changed at that point, and only a managed service that was running
+is restored. The first transition still requires ending every foreground
+command: the previous alpha releases its lock while an initial plan waits for
+confirmation, and a candidate cannot safely observe that idle old process.
 
 If power loss or another post-publication failure interrupts an upgrade, normal
 commands report:
@@ -51,9 +54,9 @@ The operation has a deliberately asymmetric boundary.
 
 Before executable replacement, failure is reversible. The old executable and
 schema remain authoritative. The candidate removes its pending marker, syncs
-that removal, restarts the old service, and returns the original error. If
-cleanup or restart also fails, the message includes both failures instead of
-pretending recovery succeeded.
+that removal, restores the old service when it was previously running, and
+returns the original error. If cleanup or restoration also fails, the message
+includes both failures instead of pretending recovery succeeded.
 
 After executable replacement, failure is resumable but not reversible. The
 candidate never starts whatever now happens to be at the old path as though it
@@ -253,9 +256,10 @@ column nor a newly created table remains afterward.
 ** Platform service handling
 
 Linux preparation asks the systemd user manager for its own environment and
-uses that environment's config directory. It separately checks whether the
-unit is loaded, stops only an existing unit, writes the durable unit and marker,
-runs =daemon-reload=, and finally performs =enable --now=.
+uses that environment's config directory. It records whether the unit is
+active, stops only an active unit, writes the durable unit and marker, runs
+=daemon-reload=, and finally performs =enable --now=. A reversible failure
+starts the old unit only when it was active before installation.
 
 macOS preparation distinguishes the graphical domain from an already loaded
 job. A loaded job is booted out before migration and bootstrapped only after
@@ -265,10 +269,11 @@ path; service paths are validated and encoded for systemd or XML before use.
 
 The Docker image supplies a small fake =systemctl=. It is not a mock of
 synchronization or state. It owns only the missing container service-manager
-boundary: stop sends TERM and CONT like systemd does for a stopped process,
-waits for live non-zombie exit, and =enable --now= launches the installed
-daemon. The paired directories, SSH sessions, old daemon, new daemon, SQLite
-state, locks, journals, and files are real.
+boundary: normal stop sends TERM and CONT, the interrupted-apply scenario kills
+the deliberately stopped old daemon before it can resume, every stop waits for
+live non-zombie exit, and =enable --now= launches the installed daemon. The
+paired directories, SSH sessions, old daemon, new daemon, SQLite state, locks,
+journals, and files are real.
 
 * The base-to-candidate E2E path
 
@@ -288,10 +293,11 @@ Six ordinary E2E scenarios now cover:
 
 1. An idle base pair, connector-first installation, bidirectional candidate
    convergence, then a compatible responder-first reinstall.
-2. A base daemon stopped at the exact pre-apply boundary, service shutdown,
-   candidate installation, install-intent recovery, and convergence.
-3. A foreground base watch causing a bounded, root-naming refusal; after the
-   watch ends, retry succeeds without state repair.
+2. A base daemon stopped at the exact pre-apply boundary with a proven durable
+   intent, killed by service shutdown before apply, followed by candidate
+   recovery and convergence.
+3. A foreground base watch and a later candidate watch each causing a bounded,
+   root-naming refusal; after each watch ends, retry succeeds without repair.
 4. An injected failure inside the candidate migration transaction, followed by
    a successful rerun with the same paired state and files.
 5. A responder-first legacy attempt refusing safely, followed by the documented

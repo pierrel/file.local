@@ -47,11 +47,16 @@ directories are retained. Later compatible upgrades can also ask an inbound
 responder session to drain itself, so endpoint order is no longer significant.
 
 Foreground =flocal watch PATH= and one-shot =flocal sync PATH= are not owned by
-the managed daemon. End them before upgrading. If one is still active, the
-installer reports the affected human-readable root while it waits, then leaves
-the old executable and state unchanged, restarts the old service, and tells you
-what to stop before retrying. A responder-first immediate upgrade can receive
-the same safe refusal while an old inbound session is active.
+the managed daemon. End all of them before the first upgrade from the previous
+alpha. The previous binary releases its session lock while an initial plan is
+waiting for confirmation, so that particular idle prompt cannot be detected by
+the candidate. Active sessions are detected: the installer reports the
+affected human-readable root while it waits, then leaves the old executable and
+state unchanged, restores only a service that was running, and tells you what
+to stop before retrying. Once this version is installed, a foreground watch
+keeps its lifetime lock during later upgrades and receives the same safe
+refusal. A responder-first immediate upgrade can also refuse while an old
+inbound session is active.
 
 An interrupted upgrade leaves an owner-only =upgrade.pending= marker that
 blocks ordinary commands from opening or migrating state. Rerun =make install=

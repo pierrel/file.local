@@ -31,12 +31,21 @@ fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
     a.arm_apply_stops(1)?;
     b.write("during-upgrade.txt", "interrupted base apply")?;
     let stopped = a.wait_for_stopped_apply_process()?;
+    anyhow::ensure!(
+        a.status()?.pending_install,
+        "base daemon stopped before apply without recording install intent"
+    );
+    a.kill_daemon_on_service_stop()?;
 
     a.install_candidate()?;
     drop(stopped);
     b.install_candidate()?;
 
     a.wait_for_file("during-upgrade.txt", "interrupted base apply")?;
+    anyhow::ensure!(
+        !a.status()?.pending_install,
+        "candidate did not clear the interrupted install intent"
+    );
     a.write("after-upgrade.txt", "candidate session resumed")?;
     b.wait_for_file("after-upgrade.txt", "candidate session resumed")?;
     e2e::assert_trees_equal(&a, &b)
@@ -55,6 +64,13 @@ fn foreground_watch_causes_a_safe_upgrade_refusal() -> Result<()> {
 
     a.install_candidate()?;
     b.install_candidate()?;
+    a.sync_start()?;
+    a.sync_stop()?;
+    let candidate_watch = a.watch_start()?;
+    candidate_watch.wait_for_log("Peer connected")?;
+    a.install_candidate_expect_err("stop any foreground `flocal watch`")?;
+    candidate_watch.stop()?;
+    a.install_candidate()?;
     a.sync_start()?;
     a.write(
         "after-refusal.txt",

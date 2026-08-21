@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 #[cfg(unix)]
@@ -24,7 +24,6 @@ use flocal::sync::{
     self, InitialMessage, Message, RegisterRelationshipResponse, RelationshipRequest,
     RemoveRelationshipResponse, V2Envelope, V2RoundFrame, V2SessionFrame,
 };
-use fs2::FileExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Debug)]
@@ -1283,16 +1282,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
         bail!("daemon state path must be absolute")
     }
     flocal::state::ensure_private_directory(&state_dir)?;
-    let installer_path = state_dir.join("installer.lock");
-    validate_private_file(&installer_path)?;
-    let installer = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&installer_path)?;
-    set_owner_only_file(&installer_path)?;
-    installer
-        .try_lock_exclusive()
-        .context("another flocal installation is already in progress")?;
+    let _installer = State::acquire_installer_lock(&state_dir)?;
 
     let candidate = std::env::current_exe()?;
     let mut staged = StagedExecutable::prepare(&candidate, destination)?;
@@ -1300,16 +1290,15 @@ fn install_daemon(destination: &Path) -> Result<()> {
     if service_managed(&service) {
         preflight_managed_state_marker()?;
     }
-    stop_daemon_service(&service).context("stopping the managed daemon for upgrade")?;
+    if let Err(error) =
+        stop_daemon_service(&service).context("stopping the managed daemon for upgrade")
+    {
+        return restore_before_upgrade(&service, &state_dir, error);
+    }
     if let Err(error) =
         State::create_upgrade_pending(&state_dir).context("creating the upgrade marker")
     {
-        if let Err(restoration) = start_daemon_service(&service) {
-            bail!(
-                "upgrade failed before executable replacement: {error:#}; the old service could not be restarted: {restoration:#}"
-            )
-        }
-        return Err(error);
+        return restore_before_upgrade(&service, &state_dir, error);
     }
 
     let quiesced = quiesce_for_upgrade(&state_dir);
@@ -1322,6 +1311,8 @@ fn install_daemon(destination: &Path) -> Result<()> {
 
     if let Err(error) = staged.publish() {
         if !staged.published {
+            drop(barrier);
+            drop(legacy_locks);
             return restore_before_upgrade(&service, &state_dir, error);
         }
         return Err(error.context(
@@ -1370,7 +1361,7 @@ fn restore_before_upgrade(
             "upgrade failed before executable replacement: {error:#}; the upgrade marker could not be cleared, so the old service was not restarted: {cleanup:#}"
         )
     }
-    if let Err(restoration) = start_daemon_service(service) {
+    if let Err(restoration) = restore_daemon_service(service) {
         bail!(
             "upgrade failed before executable replacement: {error:#}; the old service could not be restarted: {restoration:#}"
         )
@@ -1437,7 +1428,7 @@ fn quiesce_for_upgrade_until(
 struct DaemonService {
     unit: PathBuf,
     content: String,
-    loaded: bool,
+    running: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1469,28 +1460,33 @@ fn prepare_daemon_service(state_dir: &Path, executable: &Path) -> Result<DaemonS
     let unit = config.join("systemd/user/flocal-daemon.service");
     preflight_text_file(&unit)?;
     let content = systemd_unit_content(executable, state_dir)?;
-    let load_state = Command::new("systemctl")
+    let active_state = Command::new("systemctl")
         .args([
             "--user",
             "show",
-            "--property=LoadState",
+            "--property=ActiveState",
             "--value",
             "flocal-daemon.service",
         ])
         .output()?;
-    if !load_state.status.success() {
-        bail!("cannot query the existing flocal-daemon.service")
+    if !active_state.status.success() {
+        bail!("cannot query whether flocal-daemon.service is active")
     }
+    let running = match String::from_utf8(active_state.stdout)?.trim() {
+        "active" | "activating" | "reloading" | "deactivating" => true,
+        "inactive" | "failed" => false,
+        state => bail!("systemd returned an unknown active state: {state}"),
+    };
     Ok(DaemonService {
         unit,
         content,
-        loaded: String::from_utf8(load_state.stdout)?.trim() != "not-found",
+        running,
     })
 }
 
 #[cfg(target_os = "linux")]
 fn stop_daemon_service(service: &DaemonService) -> Result<()> {
-    if service.loaded {
+    if service.running {
         run_manager("systemctl", &["--user", "stop", "flocal-daemon.service"])?;
     }
     Ok(())
@@ -1510,6 +1506,14 @@ fn start_daemon_service(_: &DaemonService) -> Result<()> {
         "systemctl",
         &["--user", "enable", "--now", "flocal-daemon.service"],
     )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn restore_daemon_service(service: &DaemonService) -> Result<()> {
+    if service.running {
+        run_manager("systemctl", &["--user", "start", "flocal-daemon.service"])?;
+    }
     Ok(())
 }
 
@@ -1621,6 +1625,14 @@ fn start_daemon_service(service: &DaemonService) -> Result<()> {
             .to_str()
             .context("launchd service path must be valid UTF-8")?;
         run_manager("launchctl", &["bootstrap", &service.domain, plist])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn restore_daemon_service(service: &DaemonService) -> Result<()> {
+    if service.loaded {
+        start_daemon_service(service)?;
     }
     Ok(())
 }
@@ -6279,7 +6291,7 @@ fn persistent_watch_loop_control(
     let mut connected = false;
     let mut connecting_logged = false;
     loop {
-        if state.upgrade_pending()? {
+        if stop.is_some() && state.upgrade_pending()? {
             return Ok(());
         }
         if let Some(worker_state) = worker_state {
@@ -6338,7 +6350,7 @@ fn persistent_watch_loop_control(
             Ok(()) if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) => return Ok(()),
             Ok(()) => bail!("persistent watch session ended unexpectedly"),
             Err(error)
-                if error.downcast_ref::<UpgradePending>().is_some()
+                if (stop.is_some() && error.downcast_ref::<UpgradePending>().is_some())
                     || (stop.is_some()
                         && error.chain().any(|cause| {
                             cause
@@ -6613,7 +6625,7 @@ fn persistent_watch_session_io(
     let mut scheduled_local_generation = completed_local;
     let mut scheduled_remote_generation = remote_generation;
     loop {
-        if state.upgrade_pending()? {
+        if stop.is_some() && state.upgrade_pending()? {
             return Err(UpgradePending.into());
         }
         if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
@@ -11211,7 +11223,7 @@ mod tests {
         let systemctl = bin.join("systemctl");
         std::fs::write(
             &systemctl,
-            "#!/bin/sh\nif [ \"$2\" = show-environment ]; then printf 'HOME=%s\\n' \"$FLOCAL_TEST_MANAGER_HOME\"; elif [ \"$2\" = show ]; then if [ -e \"$FLOCAL_TEST_MANAGER_HOME/show-fail\" ]; then exit 1; elif [ -e \"$FLOCAL_TEST_MANAGER_HOME/load-state\" ]; then cat \"$FLOCAL_TEST_MANAGER_HOME/load-state\"; else printf 'not-found\\n'; fi; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$2\" = show-environment ]; then printf 'HOME=%s\\n' \"$FLOCAL_TEST_MANAGER_HOME\"; elif [ \"$2\" = show ]; then if [ -e \"$FLOCAL_TEST_MANAGER_HOME/show-fail\" ]; then exit 1; elif [ -e \"$FLOCAL_TEST_MANAGER_HOME/active-state\" ]; then cat \"$FLOCAL_TEST_MANAGER_HOME/active-state\"; else printf 'inactive\\n'; fi; fi\nexit 0\n",
         )?;
         #[cfg(unix)]
         {
@@ -11265,8 +11277,19 @@ mod tests {
         assert!(ensure_daemon(&state).is_err());
         drop(state);
         let destination = client_home.join(".local/bin/flocal");
-        install_daemon(&destination)?;
+        let old_umask = rustix::process::umask(rustix::fs::Mode::empty());
+        let installed = install_daemon(&destination);
+        rustix::process::umask(old_umask);
+        installed?;
         assert_eq!(std::fs::read(&destination)?, std::fs::read(&executable)?);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(state_dir.join("installer.lock"))?
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
         assert!(
             manager_home
                 .join(".config/systemd/user/flocal-daemon.service")
@@ -11277,10 +11300,10 @@ mod tests {
             format!("{}\n", state_dir.display())
         );
 
-        let installer = OpenOptions::new()
+        let installer = std::fs::OpenOptions::new()
             .append(true)
             .open(state_dir.join("installer.lock"))?;
-        installer.try_lock_exclusive()?;
+        fs2::FileExt::try_lock_exclusive(&installer)?;
         assert!(install_daemon(&client_home.join(".local/bin/other")).is_err());
         drop(installer);
 
@@ -11294,10 +11317,10 @@ mod tests {
         .expect_err("restoration returns the original refusal");
         assert!(refused.to_string().contains("synthetic safe refusal"));
 
-        std::fs::write(manager_home.join("load-state"), "loaded\n")?;
-        let loaded = prepare_daemon_service(&state_dir, &destination)?;
-        assert!(loaded.loaded);
-        stop_daemon_service(&loaded)?;
+        std::fs::write(manager_home.join("active-state"), "active\n")?;
+        let running = prepare_daemon_service(&state_dir, &destination)?;
+        assert!(running.running);
+        stop_daemon_service(&running)?;
         std::fs::write(manager_home.join("show-fail"), "")?;
         assert!(prepare_daemon_service(&state_dir, &destination).is_err());
         Ok(())
