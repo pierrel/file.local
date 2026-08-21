@@ -1336,7 +1336,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
             )?;
         drop(state);
     }
-    State::remove_upgrade_pending(&state_dir).context(
+    complete_upgrade_marker(&state_dir, service_managed(&service), preserve_pending).context(
         "the candidate executable was published; rerun `make install` to finish the upgrade",
     )?;
     drop(barrier);
@@ -1386,6 +1386,17 @@ fn fail_before_publication(
         ));
     }
     restore_before_upgrade(service, state_dir, error)
+}
+
+fn complete_upgrade_marker(
+    state_dir: &Path,
+    managed_install_complete: bool,
+    preserve_pending: bool,
+) -> Result<()> {
+    if managed_install_complete || !preserve_pending {
+        State::remove_upgrade_pending(state_dir)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -11391,6 +11402,20 @@ mod tests {
         std::fs::write(&untrusted, "not executable")?;
         let untrusted = File::open(untrusted)?;
         assert!(validate_trusted_executable_file(&untrusted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn binary_only_retry_preserves_an_inherited_upgrade_marker() -> Result<()> {
+        let temp = tempdir()?;
+        let state_dir = temp.path().join("state");
+        State::create_upgrade_pending(&state_dir)?;
+
+        complete_upgrade_marker(&state_dir, false, true)?;
+        assert!(State::upgrade_pending_at(&state_dir)?);
+
+        complete_upgrade_marker(&state_dir, true, true)?;
+        assert!(!State::upgrade_pending_at(&state_dir)?);
         Ok(())
     }
 

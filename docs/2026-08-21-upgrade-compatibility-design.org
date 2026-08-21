@@ -153,10 +153,12 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
    additive and accepts the immediate predecessor's writes.
 
    While waiting, print =Waiting for synchronization of PATH to finish before
-   upgrade=. After a bounded deadline, release locks already acquired, remove
-   and sync the pending marker, restart the unchanged old service, and fail
+   upgrade=. After a bounded deadline, release locks already acquired and fail
    with the affected root plus connector-first/foreground-stop instructions.
-   No executable, schema, managed marker, or service asset has changed.
+   On a first attempt, remove and sync its marker and restore the unchanged old
+   service if it was running. On a retry with an inherited marker, preserve the
+   marker and stopped service. No executable, schema, managed marker, or service
+   asset changes during this invocation.
 
    New-version =State= instances also hold a shared installation barrier for
    their lifetime. The installer acquires its exclusive side after the old
@@ -172,10 +174,12 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
 6. Revalidate the destination relative to the held directory, then atomically
    rename the fully staged candidate over it and sync the parent directory on
    Linux and macOS. The helper rejects a symlink, non-regular, foreign-owned,
-   or group/other-writable existing destination. A failure before rename leaves
-   the old executable and state intact, so the installer attempts to restart
-   the old service and reports both failures if restoration also fails. A
-   successful rename is the irreversible boundary. A later executable,
+   or group/other-writable existing destination. On a first attempt, a failure
+   before rename leaves the old executable and state intact, so the installer
+   attempts to restore a previously running old service and reports both
+   failures if restoration also fails. An inherited-marker retry remains on
+   its earlier candidate-recovery side of the boundary. A successful rename is
+   the irreversible boundary. A later executable,
    migration, or asset-publication failure leaves the service stopped, keeps
    the pending marker, and gives candidate-retry guidance; it never attempts to
    start the old service through a path that may now name the candidate.
@@ -202,10 +206,11 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
    that reconnecting and local-only edits are expected meanwhile when protocol
    versions differ, and says that no re-pair or state reset is needed.
 
-Failure recovery follows the irreversible boundary. Before candidate
-publication, the old executable and schema remain intact and the installer
-attempts to restore the old service. After publication, it never starts the
-old executable. A migration, service-asset, or start failure leaves the
+Failure recovery follows the earliest irreversible boundary. Before any
+candidate publication, the old executable and schema remain intact and the
+installer attempts to restore a previously running old service. Once a marker
+is inherited or publication succeeds, it never starts an executable as though
+it were the old version. A migration, service-asset, or start failure leaves the
 candidate installed, reports the exact phase, and tells the user to correct it
 and rerun =make install=. Migrations are one transaction, so a migration
 failure does not leave a partial schema change.
@@ -213,14 +218,16 @@ failure does not leave a partial schema change.
 On Linux, an absent unit is a successful stop no-op. On macOS, the operation
 distinguishes an unavailable =gui/UID= domain from an available domain with an
 absent label. It uses =bootout= and observes completion for a loaded label,
-then later =bootstrap=. In a headless session it retains the
-existing binary-only behavior only after it has created the pending marker and
-acquired daemon plus legacy mutation locks. If it cannot quiesce old work, it
-removes the marker and refuses publication with the exact graphical-session
-command. Otherwise it publishes the candidate, removes the pending marker,
-does not open or migrate state, does not change a plist or managed-state marker,
-and prints the graphical completion command. A later graphical invocation
-completes the normal sequence.
+then later =bootstrap=. In a headless session it retains the existing
+binary-only behavior only after it has created or retained the pending marker
+and acquired daemon plus legacy mutation locks. If it cannot quiesce old work,
+it rolls back only a marker created by that invocation and refuses publication
+with the exact graphical-session command. Otherwise it publishes the
+   candidate. It removes a marker created by that binary-only invocation, but
+   retains an inherited marker because a previous invocation may still require
+   migration. It does not open or migrate state or change a plist or
+   managed-state marker, and prints the graphical completion command. A later
+   graphical invocation completes the normal sequence.
 
 * 4. Managed-round shutdown and recovery
 
@@ -403,10 +410,11 @@ CI ref selection, fake-manager limits, and the upgrade scenarios.
 2. One Rust operation owns preflight, stop, executable replacement, migration,
    service replacement, and start; =make install= contains no duplicate
    platform lifecycle.
-3. Preflight failure leaves the old daemon and executable running. Stop,
-   session-quiescence, or pre-rename publication failure leaves the old
-   executable and schema untouched and attempts to restore the old service.
-   Every post-rename failure stays on the candidate-retry path.
+3. Preflight failure leaves the old daemon and executable running. On a first
+   attempt, stop, session-quiescence, or pre-rename publication failure leaves
+   the old executable and schema untouched and attempts to restore a service
+   that was running. Every post-rename failure and every retry carrying its
+   inherited marker stays on the candidate-retry path.
 4. Executable replacement is atomic and rejects unsafe paths.
 5. An idle base managed sync survives rolling installation on both endpoints
    and resumes without a control command.
