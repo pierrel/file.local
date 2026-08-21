@@ -462,7 +462,7 @@ Completed locally before the independent review pass:
 - All 235 non-Docker unit and integration tests: pass.
 - Whole-project executable-line coverage: 19,062/20,775, 91.75%.
 - Changed executable-line coverage: 897/974, 92.09%.
-- The uncontended Docker run passed 51 of 52 scenarios in 410.41 seconds. A
+- The full Docker run passed 51 of 52 scenarios in 410.41 seconds. A
   competing harness cleanup removed both containers from the remaining
   network-recovery scenario; its immediate isolated rerun passed in 43.69
   seconds. All seven base-to-candidate installer scenarios passed in the full
