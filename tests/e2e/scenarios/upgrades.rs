@@ -76,7 +76,10 @@ fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Resul
     let (a, b) = e2e::upgrade_managed_pair()?;
     a.sync_stop()?;
     let watch = a.watch_start_with_apply_stop()?;
-    b.write("interrupted-watch.txt", "written while the old watch is stopped")?;
+    b.write(
+        "interrupted-watch.txt",
+        "written while the old watch is stopped",
+    )?;
     watch.wait_stopped()?;
     anyhow::ensure!(
         a.status()?.pending_install,
@@ -90,7 +93,10 @@ fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Resul
     let recovered_watch = a.watch_start()?;
     recovered_watch.wait_for_log("Peer connected")?;
     a.wait_for_recovered_install()?;
-    b.wait_for_file("interrupted-watch.txt", "written while the old watch is stopped")?;
+    b.wait_for_file(
+        "interrupted-watch.txt",
+        "written while the old watch is stopped",
+    )?;
     anyhow::ensure!(
         !a.status()?.pending_install && a.status()?.unsettled.is_empty(),
         "foreground recovery left pending or unsettled state"
