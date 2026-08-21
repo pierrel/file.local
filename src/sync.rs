@@ -24,6 +24,7 @@ pub const RELATIONSHIP_REMOVAL_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_RELATIONSHIP_ID_BYTES: usize = 128;
 pub const MAX_RELATIONSHIP_ROOT_BYTES: usize = 16 * 1024;
 pub const MAX_RELATIONSHIP_ERROR_BYTES: usize = 4096;
+pub const LEGACY_RELATIONSHIP_PREFIX: &str = "legacy-";
 pub const SCHEDULING_ID_BYTES: usize = 16;
 pub const SCHEDULING_NONCE_BYTES: usize = 16;
 pub const PREDECESSOR_FINGERPRINT_BYTES: usize = 32;
@@ -605,6 +606,9 @@ pub fn validate_relationship_request(request: &RelationshipRequest) -> Result<()
             validate_relationship_wire_id("share", &share.0)?;
             validate_relationship_wire_id("peer", &peer.0)?;
             validate_relationship_wire_id("relationship", &relationship.0)?;
+            if relationship.0.starts_with(LEGACY_RELATIONSHIP_PREFIX) {
+                bail!("relationship ID uses the reserved legacy namespace");
+            }
             validate_relationship_root(root)
         }
         RelationshipRequest::RemoveRelationship {
@@ -3407,6 +3411,36 @@ mod tests {
 
         let ordinary = map_precondition(anyhow::anyhow!("ordinary failure"), &path);
         assert_eq!(ordinary.to_string(), "ordinary failure");
+        Ok(())
+    }
+
+    #[test]
+    fn registration_reserves_legacy_relationship_ids_but_sync_frames_accept_them() -> Result<()> {
+        let relationship = RelationshipId::parse("legacy-derived".into())?;
+        let registration = RelationshipRequest::RegisterRelationship {
+            registration_protocol: RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION,
+            share: ShareId("share".into()),
+            peer: PeerId("peer".into()),
+            root: b"/remote".to_vec(),
+            relationship: relationship.clone(),
+        };
+        assert!(validate_relationship_request(&registration).is_err());
+
+        let one_shot = InitialMessage::Sync {
+            protocol: PROTOCOL_VERSION,
+            share: ShareId("share".into()),
+            peer: PeerId("peer".into()),
+            relationship: relationship.clone(),
+            dry_run: false,
+        };
+        let watch = InitialMessage::WatchOpen {
+            protocol: WATCH_PROTOCOL_VERSION,
+            share: ShareId("share".into()),
+            peer: PeerId("peer".into()),
+            relationship,
+        };
+        serde_json::from_slice::<InitialMessage>(&serde_json::to_vec(&one_shot)?)?;
+        serde_json::from_slice::<InitialMessage>(&serde_json::to_vec(&watch)?)?;
         Ok(())
     }
 

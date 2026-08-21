@@ -1,8 +1,60 @@
-//! Clean relationship-removal boundaries over real SSH and daemon control.
+//! Relationship compatibility and lifecycle boundaries over real SSH and daemon control.
 
 use anyhow::Result;
 
 use crate::harness as e2e;
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn upgraded_legacy_relationship_continues_without_repair() -> Result<()> {
+    const REGRESSION: &str = "connector relationship registration is incomplete";
+    let (a, b) = e2e::managed_pair()?;
+    a.sync_stop()?;
+    a.make_relationship_legacy()?;
+    b.make_relationship_legacy()?;
+
+    let watch = a.watch_start()?;
+    watch.wait_for_log_or_error("Peer connected", REGRESSION)?;
+    a.write(
+        "from-connector.txt",
+        "legacy relationship still synchronizes",
+    )?;
+    b.write(
+        "from-responder.txt",
+        "legacy relationship synchronizes back",
+    )?;
+    b.wait_for_file(
+        "from-connector.txt",
+        "legacy relationship still synchronizes",
+    )?;
+    a.wait_for_file(
+        "from-responder.txt",
+        "legacy relationship synchronizes back",
+    )?;
+    e2e::assert_trees_equal(&a, &b)?;
+    watch.stop()?;
+
+    a.write("from-one-shot.txt", "legacy one-shot sync")?;
+    a.sync()?;
+    b.wait_for_file("from-one-shot.txt", "legacy one-shot sync")?;
+
+    a.sync_start()?;
+    b.offline()?;
+    a.restart_daemon()?;
+    a.write(
+        "after-daemon-restart.txt",
+        "managed legacy watch retried while offline",
+    )?;
+    a.wait_for_managed_watch_error("synchronization failed; retrying in background")?;
+    b.online()?;
+    b.wait_for_file(
+        "after-daemon-restart.txt",
+        "managed legacy watch retried while offline",
+    )?;
+    a.assert_relationship_legacy()?;
+    b.assert_relationship_legacy()?;
+    a.sync_stop()
+}
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
