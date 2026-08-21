@@ -534,11 +534,11 @@ One image serves both peers, built by a multi-stage Dockerfile at
   BuildKit as a host prerequisite.
 - *Runtime stage:* =debian:bookworm-slim= (likewise digest-pinned in the
   Dockerfile) plus =openssh-server=, =openssh-client=, and =bash=; copies
-the binary in, creates the =peer= user, generates host keys, and installs
-the =flocal= entry point as the thin stderr-teeing wrapper described in
-section 8, with the lifetime-bounded =entrypoint.sh= as PID 1. The runtime also
-contains =tests/e2e/systemctl=, a narrow user-service boundary used only by the
-installer scenarios.
+  the binary in, creates the =peer= user, generates host keys, and installs
+  the =flocal= entry point as the thin stderr-teeing wrapper described in
+  section 8, with the lifetime-bounded =entrypoint.sh= as PID 1. The runtime
+  also contains =tests/e2e/systemctl=, a narrow user-service boundary used only
+  by the installer scenarios.
 
 The build context is minimal and explicit: the Dockerfile =COPY=s
 =Cargo.toml=, =Cargo.lock=, =src/=, and the three runtime scripts
@@ -554,14 +554,14 @@ makes it an acceptance criterion.
 
 *** 3.2.1 Base-to-candidate upgrade transitions (2026-08-21)
 
-Every upgrade scenario builds a second image from an exact ancestor commit and
-extracts that base executable into fresh candidate-image containers. CI passes
-the pull request's exact base SHA through =FLOCAL_E2E_UPGRADE_FROM=. A local run
-uses the merge base of =HEAD= and =COVERAGE_BASE= (default =github/main=), so an
-advanced base ref does not invalidate an existing feature branch. The harness
-records both commit IDs and both executable SHA-256 hashes in its transcript;
-every successful install also verifies that the installed path hashes to the
-candidate.
+Every base-to-candidate upgrade scenario builds a second image from an exact
+ancestor commit and extracts that base executable into fresh candidate-image
+containers. CI passes the pull request's exact base SHA through
+=FLOCAL_E2E_UPGRADE_FROM=. A local run uses the merge base of =HEAD= and
+=COVERAGE_BASE= (default =github/main=), so an advanced base ref does not
+invalidate an existing feature branch. The harness records both commit IDs and
+both executable SHA-256 hashes in its transcript; every successful install also
+verifies that the installed path hashes to the candidate.
 
 The fake =systemctl= owns only the service-manager boundary absent inside a
 container. The installed base/candidate binaries, paired roots, SQLite state,

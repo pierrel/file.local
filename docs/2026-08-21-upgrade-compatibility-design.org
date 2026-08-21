@@ -240,14 +240,15 @@ written a durable install intent. Shutdown is allowed to interrupt the network
 session, but not to erase durable intent or claim that a partial action
 committed. On startup the daemon enqueues global recovery before it
 reconstructs enabled watch requests, so scheduler ordering prevents those
-watches from mutating until recovery is ready. The acceptance test stops a
-real old protocol process immediately before apply, installs its connector,
-explicitly resumes the test's SIGSTOPped responder so it can observe the
-severed SSH session and exit, and then installs the responder. The candidate
-pair must finish recovery and converge without a manual synchronization
-command. This tests the valuable interruption boundary without pretending a
-SIGSTOPped process can exit. Existing install-transition tests continue to
-cover the finer local journal states.
+watches from mutating until recovery is ready. The managed-sync acceptance
+test stops the old connector daemon immediately before apply and makes service
+shutdown kill that deliberately stopped process. The candidate installer then
+recovers its durable install intent after both endpoints are upgraded. A
+separate foreground-watch scenario kills an old watch stopped at the same
+boundary, installs both endpoints, and starts a candidate watch to recover the
+intent. Both pairs must finish recovery and converge without a manual one-shot
+synchronization command. Existing install-transition tests continue to cover
+the finer local journal states.
 
 Only one endpoint is replaced at a time. If wire versions differ, neither
 binary invents a compatibility fallback. The new connector reports the
@@ -330,11 +331,12 @@ synchronized wall-clock timing or an operator restart.
    enabled pair. The responder-first refusal already covers the reversible
    post-stop, pre-publication failure boundary with a real pair.
 
-   All scenarios record both executable hashes and the two resolved commit IDs
-   in a failure dump. Equal executable hashes are valid for a documentation or
-   test-only change; the exact source transition and real lifecycle still run.
-   They use real SQLite state, object files, SSH, processes, notifications, and
-   paired directories. No database row is fabricated.
+   All base-to-candidate scenarios record both executable hashes and the two
+   resolved commit IDs in a failure dump. Equal executable hashes are valid for
+   a documentation or test-only change; the exact source transition and real
+   lifecycle still run. They use real SQLite state, object files, SSH,
+   processes, notifications, and paired directories. No database row is
+   fabricated.
 
 * 6. Per-change compatibility rule
 
