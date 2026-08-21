@@ -285,11 +285,11 @@ acceptance is not treated as readiness: the installer waits for the daemon's
 private socket, and stops a candidate that fails to initialize before returning
 log-and-retry guidance.
 
-Before selecting the home-based global lock and marker namespace, Linux
-requires process =HOME= to equal the systemd manager's reported home. macOS
-requires it to equal the account home returned by directory services. Two
-differently overridden homes therefore cannot race the same per-user systemd
-unit or fixed per-UID LaunchAgent label.
+Linux requires process =HOME= to equal the systemd manager's reported home
+before any service mutation. macOS validates it against the account home
+returned by directory services before selecting home-based state, marker, and
+lock paths. Two differently overridden homes therefore cannot race the same
+per-user systemd unit or fixed per-UID LaunchAgent label.
 
 macOS preparation distinguishes the graphical domain from an already loaded
 job. A loaded job is booted out before migration and bootstrapped only after

@@ -103,7 +103,7 @@ unit tests also cannot prove that an interrupted real two-peer round resumes.
    retain a descriptor for the validated destination directory; resolve and
    query the correct Linux user manager or macOS GUI domain; require process
    =HOME= to match the systemd manager home on Linux or the directory-service
-   account home on macOS before selecting the global lock and marker namespace;
+   account home on macOS before any service mutation;
    validate all service paths; and prepare the service definition in memory. Capture the
    held candidate descriptor's length, copy exactly that many bytes into a
    private temporary in the held destination directory, and reject an early
