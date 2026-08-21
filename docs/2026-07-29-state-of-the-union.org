@@ -190,7 +190,8 @@ main command families are:
 - =sync add/list/start/stop= manages durable daemon-owned watches.
 - =status=, =conflicts=, and =restore= expose state and recovery.
 - =watch PATH= runs a foreground persistent watcher, useful for diagnostics.
-- =daemon run/install-service= is the service-manager-facing daemon interface.
+- =daemon run= is the service-manager entry point; the hidden =daemon install=
+  command owns first installation and upgrades for =make install=.
 
 The =SyncArgs= shape supports the original one-shot form and the managed
 subcommands.  The code deliberately validates ambiguous mixtures before it
@@ -209,20 +210,24 @@ reject invalid user input before it can produce a side effect.
 ** Installation and process ownership
 
 [[file:Makefile][Makefile]] is intentionally thin.  =make install= builds the
-release binary, stops a prior per-user service if one exists, installs the
-binary, and invokes =flocal daemon install-service=.  The Rust code generates
-the system-specific service definition.
+release binary and invokes one =flocal daemon install DESTINATION= operation.
+That Rust operation stages and validates the complete candidate, stops a
+running per-user service, quiesces old state users, atomically publishes the
+binary, migrates state, replaces the service assets, starts the daemon, and
+waits for its control socket.
 
 On Linux, [[file:src/main.rs][src/main.rs]] writes a per-user systemd unit,
 reloads the user manager, and enables/starts it:
 
 #+begin_src rust
-let unit = config.join("systemd/user/flocal-daemon.service");
-let content = systemd_unit_content(executable, &state.dir)?;
-install_managed_state_marker(state)?;
-install_text_file(&unit, &content)?;
-run_manager("systemctl", &["--user", "daemon-reload"])?;
-run_manager("systemctl", &["--user", "enable", "--now", "flocal-daemon.service"])?;
+let mut staged = StagedExecutable::prepare(&candidate, destination)?;
+let service = prepare_daemon_service(&state_dir, destination)?;
+stop_daemon_service(&service)?;
+State::create_upgrade_pending(&state_dir)?;
+let (legacy_locks, barrier) = quiesce_for_upgrade(&state_dir)?;
+staged.publish()?;
+let state = State::open_for_upgrade(&state_dir, &barrier)?;
+publish_daemon_service(&service, &state.dir)?;
 #+end_src
 
 The generated service executes =flocal daemon run= with an explicit state
@@ -583,8 +588,8 @@ with =make e2e=.  GitHub CI runs Linux, macOS, changed-line coverage, and E2E.
 
 - This is alpha software, not a substitute for backups.
 - It is two peers per share, with SSH as the initial transport.
-- Persistent managed watch now requires protocol version 6 on both peers, while
-  explicit one-shot synchronization uses protocol version 5. During a
+- Persistent managed watch now requires protocol version 7 on both peers, while
+  explicit one-shot synchronization uses protocol version 6. During a
   rolling upgrade the enabled watch remains reconnecting with bounded upgrade
   diagnostics until both peers are upgraded; no manual restart is required.
 - A scan/install race is recovered automatically in-session. Repeatedly changing

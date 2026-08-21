@@ -214,20 +214,30 @@ fn prepare() -> Result<()> {
     build_image()
 }
 
-pub fn prepare_upgrade_base() -> Result<String> {
-    static BASE: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+#[derive(Clone)]
+pub struct UpgradeTransition {
+    pub base: String,
+    pub candidate: String,
+}
+
+pub fn prepare_upgrade_base() -> Result<UpgradeTransition> {
+    static BASE: OnceLock<std::result::Result<UpgradeTransition, String>> = OnceLock::new();
     BASE.get_or_init(|| prepare_upgrade_base_inner().map_err(|error| format!("{error:#}")))
         .clone()
         .map_err(|message| anyhow::Error::new(InfraError(message)))
 }
 
-fn prepare_upgrade_base_inner() -> Result<String> {
-    let raw = std::env::var("FLOCAL_E2E_UPGRADE_FROM")
-        .or_else(|_| std::env::var("COVERAGE_BASE"))
-        .unwrap_or_else(|_| "github/main".into());
-    let mut base = canonical_commit(&raw)?;
+fn prepare_upgrade_base_inner() -> Result<UpgradeTransition> {
     let candidate = canonical_commit("HEAD")?;
-    if base == candidate {
+    let exact = std::env::var("FLOCAL_E2E_UPGRADE_FROM").ok();
+    let exact_selected = exact.is_some();
+    let mut base = if let Some(raw) = exact.as_deref() {
+        canonical_commit(raw)?
+    } else {
+        let raw = std::env::var("COVERAGE_BASE").unwrap_or_else(|_| "github/main".into());
+        merge_base(&candidate, &canonical_commit(&raw)?)?
+    };
+    if base == candidate && !exact_selected {
         base = canonical_commit("HEAD^1")?;
     }
     anyhow::ensure!(
@@ -273,7 +283,21 @@ fn prepare_upgrade_base_inner() -> Result<String> {
         "upgrade E2E base image build failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(base)
+    Ok(UpgradeTransition { base, candidate })
+}
+
+fn merge_base(left: &str, right: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["merge-base", left, right])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .context("resolving the upgrade E2E merge base")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git merge-base failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    canonical_commit(String::from_utf8(output.stdout)?.trim())
 }
 
 fn canonical_commit(input: &str) -> Result<String> {

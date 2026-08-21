@@ -1341,6 +1341,8 @@ impl State {
         set_private_file(&database)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        #[cfg(target_os = "macos")]
+        conn.pragma_update(None, "fullfsync", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let transaction = conn.transaction()?;
         transaction.execute_batch(
@@ -1706,7 +1708,7 @@ impl State {
             }
             Err(error) => return Err(error),
         };
-        file.sync_all()?;
+        crate::durability::sync_file(&file)?;
         sync_dir(dir)?;
         Ok(true)
     }
@@ -7098,6 +7100,18 @@ mod tests {
         fs::remove_file(state_dir.join(INSTALLATION_BARRIER_FILE))?;
         fs::create_dir(state_dir.join(INSTALLATION_BARRIER_FILE))?;
         assert!(State::open(&state_dir).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_state_enables_full_filesystem_sync() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let enabled: i64 = state
+            .conn
+            .pragma_query_value(None, "fullfsync", |row| row.get(0))?;
+        assert_eq!(enabled, 1);
         Ok(())
     }
 

@@ -2141,11 +2141,7 @@ fn sync_regular_file(directory: impl AsFd, path: &Path) -> Result<()> {
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )?;
-    #[cfg(target_os = "macos")]
-    rustix::fs::fcntl_fullfsync(&fd)?;
-    #[cfg(not(target_os = "macos"))]
-    rustix::fs::fsync(&fd)?;
-    Ok(())
+    crate::durability::sync_file(&fd)
 }
 
 fn sync_directory_chain(root: &cap_std::fs::Dir, relative: &Path) -> Result<()> {

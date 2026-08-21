@@ -97,11 +97,14 @@ upgrade.
 The E2E suite builds the pull request's exact base revision separately from the
 candidate, creates a real paired installation with the base binaries, and
 carries its working trees and state through the candidate. Ordinary scenarios
-cover idle restart, an apply interrupted at the service stop, compatible
-responder-first reinstall, foreground refusal and retry, and migration failure
-and retry. CI checks out full history and pins that transition to the exact
-pull-request base SHA. Downgrade and network-distributed updating remain out of
-scope.
+cover an incompatible mixed-version reconnect, idle restart, an apply killed at
+the service stop, compatible endpoint reinstalls, foreground refusal and retry,
+and migration failure and retry. They record both commit IDs and executable
+hashes and require preserved relationship identity, empty unsettled/conflict
+state, candidate binary publication, and resumed watching. CI checks out full
+history and pins that transition to the exact pull-request base SHA. The native
+macOS graphical-manager upgrade remains part of the pre-=v0.0.1= platform gate.
+Downgrade and network-distributed updating remain out of scope.
 
 ** TODO Schedule multiple shares without manual retries
 

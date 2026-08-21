@@ -309,9 +309,13 @@ fn setup_containers() -> Result<(PeerBox, PeerBox)> {
 }
 
 fn setup_upgrade_containers() -> Result<(PeerBox, PeerBox)> {
-    let base = prepare_upgrade_base()?;
+    let transition = prepare_upgrade_base()?;
     let context = RunContext::new()?;
-    context.record(format!("upgrade base commit: {base}"));
+    context.record(format!("upgrade base commit: {}", transition.base));
+    context.record(format!(
+        "upgrade candidate commit: {}",
+        transition.candidate
+    ));
     let base_binary = context.temp.path().join("flocal-upgrade-base");
     let exporter = format!("flocal-e2e-{}-base-export", context.run_id);
     context.docker_ok(&[
@@ -338,6 +342,14 @@ fn setup_upgrade_containers() -> Result<(PeerBox, PeerBox)> {
         peer.install_ssh_material()?;
         peer.exec_ok(&["mkdir", "-p", SHARE])?;
     }
+    context.record(format!(
+        "upgrade base executable sha256: {}",
+        a.executable_hash("/home/peer/.local/bin/flocal")?
+    ));
+    context.record(format!(
+        "upgrade candidate executable sha256: {}",
+        a.executable_hash("/usr/local/libexec/flocal-real")?
+    ));
     Ok((PeerBox { peer: a }, PeerBox { peer: b }))
 }
 
@@ -970,6 +982,33 @@ impl Watch<'_> {
         self.peer.wait_for_text_within(WATCH_LOG, needle, deadline)
     }
 
+    /// Abruptly stops a watcher only after proving that this guard still owns
+    /// the stopped `flocal watch` process. This models a killed old binary at
+    /// the durable install boundary without ever signaling a recycled PID.
+    pub fn kill(mut self) -> Result<()> {
+        let pid = self.pid;
+        anyhow::ensure!(
+            self.peer.is_watcher(pid)? && self.peer.is_stopped_flocal(pid)?,
+            "{}: flocal watch (pid {pid}) changed before killed interruption",
+            self.peer.alias
+        );
+        let killed = self.peer.signal("KILL", pid)?;
+        if !killed.status.success() && self.peer.is_watcher(pid)? {
+            return Err(self.peer.fail(format!(
+                "{}: killing stopped flocal watch (pid {pid}) failed: {}",
+                self.peer.alias,
+                String::from_utf8_lossy(&killed.stderr).trim()
+            )));
+        }
+        self.peer.poll_until(
+            &format!("flocal watch (pid {pid}) did not exit after SIGKILL"),
+            DEADLINE,
+            move |peer| Ok((!peer.is_watcher(pid)?).then_some(())),
+        )?;
+        self.stopped = true;
+        Ok(())
+    }
+
     /// Terminates the watcher inside the container — killing the `docker
     /// exec` client would not, and a surviving watcher would keep holding
     /// its share-session lock and any active round permit — and waits for it
@@ -1026,12 +1065,39 @@ impl Drop for Watch<'_> {
 
 impl Peer {
     pub fn install_candidate(&self) -> Result<()> {
-        self.exec_ok(&[
+        let output = self.exec_ok(&[
             "/usr/local/libexec/flocal-real",
             "daemon",
             "install",
             "/home/peer/.local/bin/flocal",
         ])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "Preflight complete; stopping managed synchronization",
+            "Candidate executable installed",
+            "State migration and managed service update complete",
+            "Starting enabled managed synchronization",
+            "enabled syncs are restarting automatically",
+            "Upgrade the other endpoint next",
+            "no re-pair or state reset is needed",
+        ] {
+            anyhow::ensure!(
+                stdout.contains(expected),
+                "{}: candidate install omitted {expected:?}: {stdout}",
+                self.alias
+            );
+        }
+        let installed = self.executable_hash("/home/peer/.local/bin/flocal")?;
+        let candidate = self.executable_hash("/usr/local/libexec/flocal-real")?;
+        anyhow::ensure!(
+            installed == candidate,
+            "{}: installed executable hash {installed} differs from candidate {candidate}",
+            self.alias
+        );
+        self.context.record(format!(
+            "{} installed candidate executable sha256: {installed}",
+            self.alias
+        ));
         Ok(())
     }
 
@@ -1063,6 +1129,21 @@ impl Peer {
     pub fn kill_daemon_on_service_stop(&self) -> Result<()> {
         self.exec_ok(&["touch", "--", KILL_DAEMON_ON_STOP_MARKER])?;
         Ok(())
+    }
+
+    fn executable_hash(&self, path: &str) -> Result<String> {
+        let output = self.exec_ok(&["sha256sum", "--", path])?;
+        let hash = String::from_utf8(output.stdout)?
+            .split_whitespace()
+            .next()
+            .context("sha256sum omitted the executable hash")?
+            .to_owned();
+        anyhow::ensure!(
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{}: invalid executable sha256 {hash:?}",
+            self.alias
+        );
+        Ok(hash)
     }
 
     pub fn arm_migration_failure(&self) -> Result<()> {
@@ -2012,6 +2093,51 @@ impl Peer {
 
     pub fn status(&self) -> Result<Status> {
         self.status_at(SHARE)
+    }
+
+    pub fn assert_clean_upgrade_status(&self, before: &Status) -> Result<()> {
+        let after = self.status()?;
+        if after.share != before.share
+            || after.bound_peer != before.bound_peer
+            || after.relationship_state != before.relationship_state
+            || after.pending_install
+            || !after.unsettled.is_empty()
+            || after.recovery.conflicts != 0
+        {
+            return Err(self.fail(format!(
+                "upgrade did not preserve a clean relationship state:\nbefore={before:#?}\nafter={after:#?}"
+            )));
+        }
+        self.conflicts()?.expect_none()
+    }
+
+    pub fn wait_for_recovered_install(&self) -> Result<()> {
+        self.poll_until(
+            "interrupted install did not recover to a settled state",
+            DEADLINE,
+            |peer| {
+                let status = peer.status()?;
+                Ok((!status.pending_install && status.unsettled.is_empty()).then_some(()))
+            },
+        )
+    }
+
+    pub fn wait_for_managed_connection(&self, expected: &'static str) -> Result<()> {
+        self.poll_until(
+            &format!("managed sync did not reach {expected}"),
+            DEADLINE,
+            move |peer| {
+                let listing = peer.sync_list()?;
+                Ok(matches!(
+                    listing.syncs.as_slice(),
+                    [sync]
+                        if sync.enabled
+                            && sync.role == "connector"
+                            && sync.connection_state == expected
+                )
+                .then_some(()))
+            },
+        )
     }
 
     pub fn second_status(&self) -> Result<Status> {

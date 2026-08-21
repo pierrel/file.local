@@ -1219,8 +1219,7 @@ impl StagedExecutable {
         let mut output = directory.open_with(&temporary, &options)?;
         io::copy(&mut source, &mut output).context("staging the candidate executable")?;
         directory.set_permissions(&temporary, Permissions::from_mode(0o755))?;
-        output
-            .sync_all()
+        flocal::durability::sync_file(&output)
             .context("syncing the staged candidate executable")?;
         Ok(Self {
             directory,
@@ -1283,6 +1282,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
     }
     flocal::state::ensure_private_directory(&state_dir)?;
     let _installer = State::acquire_installer_lock(&state_dir)?;
+    validate_managed_state_selection(&state_dir, State::managed_state_dir()?)?;
     let inherited_pending = State::upgrade_pending_at(&state_dir)?;
 
     let candidate = std::env::current_exe()?;
@@ -1290,6 +1290,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
     let service = prepare_daemon_service(&state_dir, destination)?;
     if service_managed(&service) {
         preflight_managed_state_marker()?;
+        println!("Preflight complete; stopping managed synchronization");
     }
     if let Err(error) =
         stop_daemon_service(&service).context("stopping the managed daemon for upgrade")
@@ -1323,6 +1324,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
             "the candidate executable was published; rerun `make install` to finish the upgrade",
         ));
     }
+    println!("Candidate executable installed");
     if service_managed(&service) {
         let state = State::open_for_upgrade(&state_dir, &barrier)
             .context("migrating local state with the candidate")
@@ -1335,6 +1337,7 @@ fn install_daemon(destination: &Path) -> Result<()> {
                 "the candidate executable was published; rerun `make install` to finish the upgrade",
             )?;
         drop(state);
+        println!("State migration and managed service update complete");
     }
     complete_upgrade_marker(&state_dir, service_managed(&service), preserve_pending).context(
         "the candidate executable was published; rerun `make install` to finish the upgrade",
@@ -1342,14 +1345,76 @@ fn install_daemon(destination: &Path) -> Result<()> {
     drop(barrier);
     drop(legacy_locks);
     if service_managed(&service) {
-        start_daemon_service(&service).context(
-            "the upgrade is durable but the managed daemon did not start; rerun `make install`",
+        println!("Starting enabled managed synchronization");
+        start_and_verify_daemon(
+            &service,
+            &state_dir,
+            std::time::Instant::now() + Duration::from_secs(5),
         )?;
-        println!("Upgrade complete; managed synchronization resumed");
+        println!(
+            "Installation complete; enabled syncs are restarting automatically. Upgrade the other endpoint next. Reconnecting and local-only edits are expected until then; no re-pair or state reset is needed."
+        );
     } else {
         println!(
             "Installed binary only. In a macOS graphical session, run `make install` again to migrate state and resume managed synchronization."
         );
+    }
+    Ok(())
+}
+
+fn validate_managed_state_selection(selected: &Path, managed: Option<PathBuf>) -> Result<()> {
+    if managed
+        .as_deref()
+        .is_some_and(|managed| managed != selected)
+    {
+        bail!(
+            "FLOCAL_STATE_DIR does not match the existing managed installation; unset it or use the managed state path before upgrading"
+        )
+    }
+    Ok(())
+}
+
+fn wait_for_daemon_ready(state_dir: &Path, deadline: std::time::Instant) -> Result<()> {
+    let socket = state_dir.join("run/daemon.sock");
+    loop {
+        if matches!(
+            daemon_request_inner(&socket, &DaemonRequest::List { cursor: None }),
+            Ok(DaemonResponse::List { .. })
+        ) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("daemon control socket did not answer a list request")
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn start_and_verify_daemon(
+    service: &DaemonService,
+    state_dir: &Path,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    if let Err(error) = start_daemon_service(service) {
+        if let Err(stop) = stop_started_daemon_service(service) {
+            bail!(
+                "the managed daemon start failed: {error:#}; stopping the partially started service also failed: {stop:#}; inspect the user-service logs and rerun `make install`"
+            )
+        }
+        bail!(
+            "the managed daemon start failed: {error:#}; the service was stopped; inspect the user-service logs and rerun `make install`"
+        )
+    }
+    if let Err(error) = wait_for_daemon_ready(state_dir, deadline) {
+        if let Err(stop) = stop_started_daemon_service(service) {
+            bail!(
+                "the service manager accepted the candidate but its daemon did not become ready: {error:#}; stopping the failed service also failed: {stop:#}; inspect the user-service logs and rerun `make install`"
+            )
+        }
+        bail!(
+            "the service manager accepted the candidate but its daemon did not become ready: {error:#}; the service was stopped; inspect the user-service logs and rerun `make install`"
+        )
     }
     Ok(())
 }
@@ -1540,6 +1605,11 @@ fn start_daemon_service(_: &DaemonService) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn stop_started_daemon_service(_: &DaemonService) -> Result<()> {
+    run_manager("systemctl", &["--user", "stop", "flocal-daemon.service"])
+}
+
+#[cfg(target_os = "linux")]
 fn restore_daemon_service(service: &DaemonService) -> Result<()> {
     if service.running {
         run_manager("systemctl", &["--user", "start", "flocal-daemon.service"])?;
@@ -1660,6 +1730,15 @@ fn start_daemon_service(service: &DaemonService) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn stop_started_daemon_service(service: &DaemonService) -> Result<()> {
+    let plist = service
+        .plist
+        .to_str()
+        .context("launchd service path must be valid UTF-8")?;
+    run_manager("launchctl", &["bootout", &service.domain, plist])
+}
+
+#[cfg(target_os = "macos")]
 fn restore_daemon_service(service: &DaemonService) -> Result<()> {
     if service.loaded {
         start_daemon_service(service)?;
@@ -1728,7 +1807,7 @@ fn install_text_file(path: &Path, content: &str) -> Result<()> {
         let mut file = directory.open_with(&temporary, &options)?;
         directory.set_permissions(&temporary, Permissions::from_mode(0o600))?;
         file.write_all(content.as_bytes())?;
-        file.sync_all()?;
+        flocal::durability::sync_file(&file)?;
         directory.rename(&temporary, &directory, destination)?;
         sync_directory.sync_all()?;
         Ok(())
@@ -11307,10 +11386,14 @@ mod tests {
         assert!(ensure_daemon(&state).is_err());
         drop(state);
         let destination = client_home.join(".local/bin/flocal");
+        let ready = serve_one_daemon_list(&state_dir)?;
         let old_umask = rustix::process::umask(rustix::fs::Mode::empty());
         let installed = install_daemon(&destination);
         rustix::process::umask(old_umask);
         installed?;
+        ready
+            .join()
+            .map_err(|_| anyhow::anyhow!("test daemon socket panicked"))??;
         assert_eq!(std::fs::read(&destination)?, std::fs::read(&executable)?);
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
@@ -11364,9 +11447,32 @@ mod tests {
         let running = prepare_daemon_service(&state_dir, &destination)?;
         assert!(running.running);
         stop_daemon_service(&running)?;
+        let readiness = start_and_verify_daemon(&running, &state_dir, std::time::Instant::now())
+            .expect_err("manager acceptance without a daemon socket must fail");
+        assert!(readiness.to_string().contains("did not become ready"));
         std::fs::write(manager_home.join("show-fail"), "")?;
         assert!(prepare_daemon_service(&state_dir, &destination).is_err());
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn serve_one_daemon_list(state_dir: &Path) -> Result<std::thread::JoinHandle<Result<()>>> {
+        let run = state_dir.join("run");
+        flocal::state::ensure_private_directory(&run)?;
+        let listener = UnixListener::bind(run.join("daemon.sock"))?;
+        Ok(std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept()?;
+            let _ = read_daemon_message(&mut stream)?;
+            serde_json::to_writer(
+                &mut stream,
+                &DaemonResponse::List {
+                    syncs: Vec::new(),
+                    next: None,
+                },
+            )?;
+            stream.write_all(b"\n")?;
+            Ok(())
+        }))
     }
 
     #[test]
@@ -11420,6 +11526,19 @@ mod tests {
 
         complete_upgrade_marker(&state_dir, true, true)?;
         assert!(!State::upgrade_pending_at(&state_dir)?);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_install_refuses_a_different_selected_state_directory() -> Result<()> {
+        let temp = tempdir()?;
+        let selected = temp.path().join("selected");
+        let managed = temp.path().join("managed");
+        validate_managed_state_selection(&selected, Some(selected.clone()))?;
+        validate_managed_state_selection(&selected, None)?;
+        let error = validate_managed_state_selection(&selected, Some(managed))
+            .expect_err("a managed installation cannot be silently relocated");
+        assert!(error.to_string().contains("does not match"));
         Ok(())
     }
 

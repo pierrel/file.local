@@ -361,12 +361,12 @@ all historical snapshots is outside this slice.
 - Linux E2E proves the product lifecycle with real signals and a narrow fake
   manager. Linux unit tests prove generated systemd paths and calls. Native
   Linux release evidence proves actual user-systemd behavior.
-- macOS CI unit tests prove missing-domain binary-only behavior, absent-label
-  behavior, bootout failure, generated plist, bootstrap failure, and kickstart
-  failure with a fake =launchctl=. They also hold a legacy session during a
-  headless upgrade and prove publication is refused before releasing it. The
-  existing graphical-login native gate must
-  perform idle and in-progress upgrades against Linux before =v0.0.1=.
+- Native macOS CI compiles the launchd/headless paths and proves the platform's
+  SQLite =fullfsync= setting; platform-neutral tests pin marker provenance,
+  binary-only retry behavior, filesystem publication, and migration rollback.
+  The existing graphical-login native gate must perform idle and in-progress
+  upgrades against Linux before =v0.0.1=. Fake-launchctl lifecycle coverage is
+  not claimed by this slice.
 - The installer never accepts a remote host, synchronized path, secret, or
   service arguments from peer input. Its only path argument is the local
   destination supplied by the build/install process.
@@ -426,8 +426,10 @@ CI ref selection, fake-manager limits, and the upgrade scenarios.
    signals are used by the E2E scenarios.
 9. Pull-request and main CI select and report an exact base commit and both
    binary hashes, including valid equal-binary transitions.
-10. Linux and macOS deterministic tests pin lifecycle ordering and failure
-    phases; the roadmap retains native manager and macOS-to-Linux gates.
+10. Linux deterministic tests pin lifecycle ordering, readiness, and failure
+    phases. Platform-neutral tests pin headless marker behavior; native macOS
+    CI pins full-fsync configuration and the roadmap retains the graphical
+    manager and macOS-to-Linux gates.
 11. README, CLI help, E2E design, roadmap, and every touched comment agree that
     connector-first managed syncs resume automatically while foreground
     commands and the opposite-direction fallback are explicit.

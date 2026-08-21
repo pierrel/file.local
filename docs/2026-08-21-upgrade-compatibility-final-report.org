@@ -76,6 +76,8 @@ The successful sequence is:
 2. Take the installation-operation lock so two installs cannot overlap.
 3. Validate the candidate, destination, state path, service manager, managed
    marker, and service-definition path while the old service is still live.
+   Refuse an explicit state path that differs from an existing managed
+   installation instead of silently redirecting the global service.
 4. Copy the candidate through held file and directory descriptors into an
    owner-controlled temporary, set its final mode, and fully sync it.
 5. Stop the managed daemon and durably create =upgrade.pending=.
@@ -92,7 +94,9 @@ The successful sequence is:
    entire schema in one SQLite transaction.
 10. Replace and sync the managed-state marker and systemd unit or LaunchAgent.
 11. Remove and sync =upgrade.pending=, release the barriers, then start the
-    service. Every enabled managed sync is reconstructed from durable intent.
+    service. Wait for its private control socket to answer a real list request
+    before reporting success. Every enabled managed sync is reconstructed from
+    durable intent.
 
 On headless macOS there is no graphical LaunchAgent domain to stop or start.
 The installer still quiesces local work and safely publishes the binary, but it
@@ -148,7 +152,7 @@ let mut output = directory.open_with(&temporary, &options)?;
 io::copy(&mut source, &mut output)
     .context("staging the candidate executable")?;
 directory.set_permissions(&temporary, Permissions::from_mode(0o755))?;
-output.sync_all()?;
+flocal::durability::sync_file(&output)?;
 #+end_src
 
 Publication is relative to that retained directory capability:
@@ -166,7 +170,9 @@ after directory sync. If directory sync fails, the executable may already have
 changed, so recovery must use the post-publication rule and must not restart the
 old service.
 
-Service files and the managed-state marker use the same held-directory shape:
+On macOS, =sync_file= uses =F_FULLFSYNC= rather than ordinary =fsync=; SQLite
+also enables its =fullfsync= pragma before migration. Linux uses ordinary
+=fsync=. Service files and the managed-state marker use the same held-directory shape:
 create a private temporary, write and sync it, rename it relative to the open
 directory, and sync the directory. A failed pre-rename write removes its owned
 temporary.
@@ -265,7 +271,10 @@ Linux preparation asks the systemd user manager for its own environment and
 uses that environment's config directory. It records whether the unit is
 active, stops only an active unit, writes the durable unit and marker, runs
 =daemon-reload=, and finally performs =enable --now=. A reversible failure
-starts the old unit only when it was active before installation.
+starts the old unit only when it was active before installation. Manager
+acceptance is not treated as readiness: the installer waits for the daemon's
+private socket, and stops a candidate that fails to initialize before returning
+log-and-retry guidance.
 
 macOS preparation distinguishes the graphical domain from an already loaded
 job. A loaded job is booted out before migration and bootstrapped only after
@@ -311,9 +320,12 @@ Six ordinary E2E scenarios now cover:
 6. A fresh two-peer installation through exactly the same owned installer.
 
 CI checks out full history and passes the pull request's exact base SHA as
-=FLOCAL_E2E_UPGRADE_FROM=. Equal source hashes are allowed, but equal base and
-candidate commits are rejected. This makes every pull request carry a real
-transition from the version it proposes to replace.
+=FLOCAL_E2E_UPGRADE_FROM=. Local runs use the merge base with =COVERAGE_BASE=.
+Equal executable hashes are allowed for documentation-only transitions, but
+equal base and candidate commits are rejected. Both commit IDs and executable
+hashes are recorded, and every successful install verifies the destination is
+the candidate. This makes every pull request carry a real transition from the
+version it proposes to replace.
 
 * Rust features used here
 
@@ -402,6 +414,14 @@ Linux always has a user-manager decision at install time; macOS may run from a
 headless SSH session with no graphical domain. Keeping that as a platform plan
 inside one shared installer avoids a second upgrade implementation while
 preserving the safe binary-only result.
+
+The local review found several boundaries that were easy to state too broadly:
+marker creation had to be private in the creating syscall; a retry must not
+erase an inherited post-publication marker; headless macOS must retain that
+marker until graphical migration; and service-manager acceptance is not daemon
+readiness. It also found that peer-controlled roots reached upgrade guidance.
+Those paths now use the same bounded control-byte escaping as other untrusted
+diagnostics.
 
 * Validation and review status
 

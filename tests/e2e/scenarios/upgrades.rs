@@ -8,19 +8,31 @@ use crate::harness as e2e;
 #[ignore = "requires docker; run via `make e2e`"]
 fn idle_managed_pair_survives_a_real_candidate_install() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
+    let before_a = a.status()?;
+    let before_b = b.status()?;
     a.write("before-upgrade.txt", "created by the base connector")?;
     b.wait_for_file("before-upgrade.txt", "created by the base connector")?;
 
     a.install_candidate()?;
+    a.wait_for_managed_connection("reconnecting")?;
+    a.write("mixed-version.txt", "held until the responder upgrade")?;
+    b.assert_absent("mixed-version.txt")?;
     b.install_candidate()?;
 
+    b.wait_for_file("mixed-version.txt", "held until the responder upgrade")?;
     a.write("after-upgrade-a.txt", "candidate connector resumed")?;
     b.write("after-upgrade-b.txt", "candidate responder resumed")?;
     b.wait_for_file("after-upgrade-a.txt", "candidate connector resumed")?;
     a.wait_for_file("after-upgrade-b.txt", "candidate responder resumed")?;
     b.install_candidate()?;
+    a.install_candidate()?;
     a.write("after-compatible-reinstall.txt", "responder drained itself")?;
     b.wait_for_file("after-compatible-reinstall.txt", "responder drained itself")?;
+    a.wait_for_managed_connection("watching")?;
+    a.assert_clean_upgrade_status(&before_a)?;
+    b.assert_clean_upgrade_status(&before_b)?;
+    a.assert_sync_role("connector")?;
+    b.assert_sync_role("responder")?;
     e2e::assert_trees_equal(&a, &b)
 }
 
@@ -28,6 +40,8 @@ fn idle_managed_pair_survives_a_real_candidate_install() -> Result<()> {
 #[ignore = "requires docker; run via `make e2e`"]
 fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
+    let before_a = a.status()?;
+    let before_b = b.status()?;
     a.arm_apply_stops(1)?;
     b.write("during-upgrade.txt", "interrupted base apply")?;
     let stopped = a.wait_for_stopped_apply_process()?;
@@ -48,6 +62,39 @@ fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
     );
     a.write("after-upgrade.txt", "candidate session resumed")?;
     b.wait_for_file("after-upgrade.txt", "candidate session resumed")?;
+    a.wait_for_managed_connection("watching")?;
+    a.assert_clean_upgrade_status(&before_a)?;
+    b.assert_clean_upgrade_status(&before_b)?;
+    a.assert_sync_role("connector")?;
+    b.assert_sync_role("responder")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Result<()> {
+    let (a, b) = e2e::upgrade_managed_pair()?;
+    a.sync_stop()?;
+    let watch = a.watch_start_with_apply_stop()?;
+    b.write("interrupted-watch.txt", "written while the old watch is stopped")?;
+    watch.wait_stopped()?;
+    anyhow::ensure!(
+        a.status()?.pending_install,
+        "old foreground watch stopped before apply without recording install intent"
+    );
+    watch.kill()?;
+
+    a.install_candidate()?;
+    b.install_candidate()?;
+
+    let recovered_watch = a.watch_start()?;
+    recovered_watch.wait_for_log("Peer connected")?;
+    a.wait_for_recovered_install()?;
+    b.wait_for_file("interrupted-watch.txt", "written while the old watch is stopped")?;
+    anyhow::ensure!(
+        !a.status()?.pending_install && a.status()?.unsettled.is_empty(),
+        "foreground recovery left pending or unsettled state"
+    );
     e2e::assert_trees_equal(&a, &b)
 }
 
