@@ -568,15 +568,22 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
     let declined_remote = temporary.path().join("declined-remote");
     std::fs::create_dir(&declined_root)?;
     std::fs::create_dir(&declined_remote)?;
-    let declined = invoke(&[
-        "sync",
-        "add",
-        declined_root.to_str().context("test root is utf-8")?,
-        "--host",
-        "test-peer",
-        "--remote-path",
-        declined_remote.to_str().context("test root is utf-8")?,
-    ])?;
+    let declined = Command::new(binary)
+        .args([
+            "sync",
+            "add",
+            declined_root.to_str().context("test root is utf-8")?,
+            "--host",
+            "test-peer",
+            "--remote-path",
+            declined_remote.to_str().context("test root is utf-8")?,
+        ])
+        .env("FLOCAL_STATE_DIR", &local_state)
+        .env("FAKE_REMOTE_STATE", &remote_state)
+        .env("FLOCAL_BIN", binary)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .output()?;
     assert!(declined.status.success(), "{:?}", declined);
     assert!(
         !String::from_utf8_lossy(&declined.stdout).contains("Connected "),

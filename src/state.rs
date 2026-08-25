@@ -5784,7 +5784,6 @@ impl State {
             fs::remove_file(&final_path)?;
             sync_dir(final_path.parent().expect("object parent"))?;
         }
-        *remaining = available - expected_size;
         let temp_path = self
             .dir
             .join("objects")
@@ -5793,7 +5792,13 @@ impl State {
             .create_new(true)
             .write(true)
             .open(&temp_path)?;
-        set_private_file(&temp_path)?;
+        if let Err(error) = set_private_file(&temp_path) {
+            drop(file);
+            fs::remove_file(&temp_path).context("removing unsealed object temporary")?;
+            *remaining = available;
+            return Err(error);
+        }
+        *remaining = available - expected_size;
         Ok(ObjectSink {
             _budget_lock: None,
             file: Some(file),

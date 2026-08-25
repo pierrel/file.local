@@ -105,12 +105,10 @@ already-existing lock.
 
 Add a private state-layer scan-capture scope, named for example
 =ObjectStoreBudget=, created by =State::object_store_budget()=. It owns
-the exclusive =objects.lock= file handle and these initial values:
-
-- the parsed current cap (the existing malformed-value fallback remains
-  unchanged); and
-- the exact used byte total from one =objects/= directory walk using the
-  current regular-file/non-symlink rule.
+the exclusive =objects.lock= file handle and the remaining capacity derived
+from one =objects/= directory walk using the current regular-file/non-symlink
+rule. The existing parsed-cap and malformed-value fallback behavior remains
+unchanged.
 
 The scope exposes the narrow operation needed by =scan.rs=:
 
@@ -151,13 +149,14 @@ For each new requested object while its scope is live:
    size is no greater than the current remaining bytes.  It follows the
    current publication rule for any non-regular final path and creates the
    private temporary only after successful admission.
-4. Account for the temporary as soon as it is created.  Replacing a malformed
-   regular file first credits its removed length, then debits the requested
-   size; an ordinary new object only debits its requested size.  On successful
-   =sync_all=, verified hash, and rename, that resulting total becomes the
-   next object's view.  A capture error exits the scan and drops the whole
-   scope, so no later capture can observe its in-memory debit; the normal sink
-   cleanup removes its temporary and the next scan starts with a fresh census.
+4. Create and seal the private temporary before reserving capacity. Replacing
+   a malformed regular file first credits its removed length, then debits the
+   requested size; an ordinary new object only debits its requested size.  On
+   successful =sync_all=, verified hash, and rename, that resulting total
+   becomes the next object's view. A capture error exits the scan and drops
+   the whole scope, so no later capture can observe its in-memory debit; the
+   normal sink cleanup removes its temporary and the next scan starts with a
+   fresh census.
 
 The implementation may retain the current =ObjectSink= for ordinary writers
 and introduce a private budgeted sink/helper for the scoped path.  It must not
