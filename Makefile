@@ -1,4 +1,4 @@
-.PHONY: build install check test test-make-prefix test-make-prefix-value coverage coverage-tools e2e
+.PHONY: build install check test elisp-test test-make-prefix test-make-prefix-value coverage coverage-tools e2e
 
 PREFIX ?=
 override PREFIX := $(value PREFIX)
@@ -14,6 +14,9 @@ install: build
 
 test:
 	cargo test --all-targets -- --test-threads=1
+
+elisp-test:
+	cd emacs && eldev test
 
 test-make-prefix:
 	sh tests/make_prefix.sh
@@ -31,6 +34,6 @@ coverage: coverage-tools
 e2e:
 	cargo test --test e2e -- --ignored --test-threads=1 --skip scenarios::upgrades::legacy_
 
-check: coverage test-make-prefix
+check: coverage test-make-prefix elisp-test
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings

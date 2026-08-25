@@ -131,6 +131,139 @@ fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
 }
 
 #[test]
+fn status_list_reads_stored_shares_without_starting_a_daemon() -> Result<()> {
+    let temporary = tempdir()?;
+    let state_dir = temporary.path().join("state");
+    let root = temporary.path().join("root");
+    std::fs::create_dir(&root)?;
+    let mut state = State::open(&state_dir)?;
+    let share = state.init_share(&root)?;
+    state.set_peer(
+        &share,
+        &flocal::model::PeerConfig {
+            peer_id: Some(flocal::model::PeerId("peer-stored-status".into())),
+            relationship: None,
+            host: "127.0.0.1".into(),
+            remote_path: b"/remote".to_vec(),
+            executable: "/bin/false".into(),
+        },
+    )?;
+    state.set_watch_enabled(&share, true)?;
+    drop(state);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flocal"))
+        .args(["status", "--list", "--json"])
+        .env("FLOCAL_STATE_DIR", &state_dir)
+        .output()?;
+    assert!(output.status.success(), "{:?}", output);
+    assert!(!state_dir.join("run/daemon.sock").exists());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["schema"], 1);
+    assert_eq!(report["source"], "stored");
+    assert_eq!(report["daemon"]["state"], "unavailable");
+    assert_eq!(report["shares"].as_array().map(Vec::len), Some(1));
+    assert_eq!(report["shares"][0]["share"], share.0);
+    assert_eq!(report["shares"][0]["enabled"], true);
+    assert_eq!(report["shares"][0]["connection_state"], "unknown");
+    Ok(())
+}
+
+#[test]
+fn status_list_reports_no_shares_without_creating_missing_state() -> Result<()> {
+    let temporary = tempdir()?;
+    let state_dir = temporary.path().join("missing-state");
+    let output = Command::new(env!("CARGO_BIN_EXE_flocal"))
+        .args(["status", "--list", "--json"])
+        .env("FLOCAL_STATE_DIR", &state_dir)
+        .output()?;
+    assert!(output.status.success(), "{:?}", output);
+    assert!(!state_dir.exists());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["source"], "stored");
+    assert_eq!(report["shares"], serde_json::json!([]));
+    Ok(())
+}
+
+#[test]
+fn status_list_rejects_a_relative_state_directory() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_flocal"))
+        .args(["status", "--list", "--json"])
+        .env("FLOCAL_STATE_DIR", "relative-state")
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn status_list_refuses_a_symlinked_daemon_run_directory() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempdir()?;
+    let state_dir = temporary.path().join("state");
+    State::open(&state_dir)?;
+    let target = temporary.path().join("attacker-run");
+    std::fs::create_dir(&target)?;
+    symlink(&target, state_dir.join("run"))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flocal"))
+        .args(["status", "--list", "--json"])
+        .env("FLOCAL_STATE_DIR", &state_dir)
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    Ok(())
+}
+
+#[test]
+fn status_list_reads_live_daemon_state() -> Result<()> {
+    let temporary = tempdir()?;
+    let state_dir = temporary.path().join("state");
+    let root = temporary.path().join("root");
+    std::fs::create_dir(&root)?;
+    let mut state = State::open(&state_dir)?;
+    let share = state.init_share(&root)?;
+    state.set_peer(
+        &share,
+        &flocal::model::PeerConfig {
+            peer_id: Some(flocal::model::PeerId("peer-status-list".into())),
+            relationship: None,
+            host: "127.0.0.1".into(),
+            remote_path: b"/remote".to_vec(),
+            executable: "/bin/false".into(),
+        },
+    )?;
+    state.set_initial_complete(&share)?;
+    state.set_watch_enabled(&share, true)?;
+    drop(state);
+
+    let binary = env!("CARGO_BIN_EXE_flocal");
+    let daemon = spawn_daemon(
+        Command::new(binary)
+            .args(["daemon", "run"])
+            .env("FLOCAL_STATE_DIR", &state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
+    wait_until(
+        || Ok(state_dir.join("run/daemon.sock").exists()),
+        "daemon control socket",
+    )?;
+    let output = Command::new(binary)
+        .args(["status", "--list", "--json"])
+        .env("FLOCAL_STATE_DIR", &state_dir)
+        .output()?;
+    daemon.stop()?;
+    assert!(output.status.success(), "{:?}", output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["source"], "live");
+    assert_eq!(report["daemon"]["state"], "live");
+    assert_eq!(report["shares"][0]["share"], share.0);
+    assert_eq!(report["shares"][0]["enabled"], true);
+    Ok(())
+}
+
+#[test]
 fn running_daemon_recovers_a_managed_install_created_after_startup() -> Result<()> {
     let temporary = tempdir()?;
     let state_dir = temporary.path().join("state");

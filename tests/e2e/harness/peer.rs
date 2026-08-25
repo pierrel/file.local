@@ -1077,6 +1077,47 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn emacs_ok(&self, form: &str) -> Result<std::process::Output> {
+        self.exec_ok(&[
+            "emacs",
+            "-Q",
+            "--batch",
+            "-L",
+            "/usr/local/share/flocal/emacs",
+            "--eval",
+            form,
+        ])
+    }
+
+    /// Starts a detached batch Emacs client.  Scenarios coordinate it through
+    /// ignored files below its share, so they still exercise a real container
+    /// and never rely on host-side Emacs state.
+    pub fn emacs_start(&self, form: &str) -> Result<()> {
+        let arguments = [
+            "exec",
+            "-d",
+            "-u",
+            "peer",
+            &self.container.name,
+            "emacs",
+            "-Q",
+            "--batch",
+            "-L",
+            "/usr/local/share/flocal/emacs",
+            "--eval",
+            form,
+        ];
+        let output = self.context.docker_raw(&arguments)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: starting detached Emacs failed: {}",
+                self.alias,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    }
+
     pub fn install_candidate(&self) -> Result<()> {
         let output = self.exec_ok(&[
             "/usr/local/libexec/flocal-real",

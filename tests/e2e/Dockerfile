@@ -20,7 +20,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked --features e2
 # debian:bookworm-slim
 FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-server openssh-client bash \
+    && apt-get install -y --no-install-recommends openssh-server openssh-client bash emacs-nox \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd \
     && ssh-keygen -A \
@@ -29,5 +29,6 @@ COPY --from=builder /build/target/release/flocal /usr/local/libexec/flocal-real
 COPY tests/e2e/flocal-wrapper.sh /usr/local/bin/flocal
 COPY tests/e2e/systemctl /usr/local/bin/systemctl
 COPY tests/e2e/entrypoint.sh /usr/local/bin/e2e-entrypoint
+COPY emacs /usr/local/share/flocal/emacs
 RUN chmod 755 /usr/local/bin/flocal /usr/local/bin/systemctl /usr/local/bin/e2e-entrypoint /usr/local/libexec/flocal-real
 ENTRYPOINT ["/usr/local/bin/e2e-entrypoint"]

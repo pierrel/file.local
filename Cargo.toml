@@ -20,7 +20,7 @@ ignore = "0.4"
 notify = "8.2"
 rand = "0.9"
 rusqlite = { version = "0.38", features = ["bundled"] }
-rustix = { version = "1.1", features = ["event", "fs"] }
+rustix = { version = "1.1", features = ["event", "fs", "net"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.3"

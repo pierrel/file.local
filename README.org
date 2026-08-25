@@ -184,6 +184,35 @@ removal error. Human status reports =registering=, =connector=, =responder=,
 current queue state. Unlike list, =status PATH= shows a retained unpaired root
 as not configured.
 
+** Read-only client status
+
+=flocal status --list --json= is the versioned, read-only status interface for
+editor integrations and future clients. It never starts a daemon. When the
+daemon is reachable it reports =source: live=; otherwise it reads only durable
+state and reports enabled shares as =unknown=. Roots remain base64-encoded
+native path bytes. The initial schema is 1 and deliberately contains only the
+share identity/root, enabled state, connection and scheduling state, role,
+initial-completion state, bounded diagnostic, and unsettled count.
+
+** Emacs guard
+
+[[file:emacs/README.org][flocal-guard]] is an optional Emacs 28+ companion,
+tested with Eldev. Enable its global mode after installing =flocal=:
+
+#+begin_src emacs-lisp
+(require 'flocal-guard)
+(flocal-guard-mode 1)
+#+end_src
+
+It discovers enabled shares that are not stopped through the read-only status
+interface. Its modeline and =M-x flocal-guard-status= distinguish live from
+stored status. A modified guarded buffer never saves on a cold or expired
+status cache. When disk bytes differ from the visiting buffer's recorded
+serialized-content baseline, it opens Ediff with the user buffer first and a read-only =DISK:=
+snapshot second. Ediff's write-A saves the resolved user buffer only if disk
+has not changed again; abort leaves both versions intact. This is accidental
+clobber protection, not a filesystem compare-and-swap guarantee.
+
 ** Troubleshooting a managed watch
 
 Start with =flocal sync list=. A healthy connector is =watching=;

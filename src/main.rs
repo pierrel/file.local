@@ -9,11 +9,11 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use flocal::model::{Entry, PeerConfig, PeerId, RelationshipId, ShareId};
 use flocal::state::{
     EndpointBinding, IncomingRemoval, InstallationPermit, PairedQueueState, PreparedRemoval,
@@ -86,8 +86,15 @@ enum Commands {
         command: PeerCommand,
     },
     Sync(SyncArgs),
+    #[command(group(
+        ArgGroup::new("status_target")
+            .required(true)
+            .args(["path", "list"])
+    ))]
     Status {
-        path: PathBuf,
+        path: Option<PathBuf>,
+        #[arg(long, requires = "json", conflicts_with = "path")]
+        list: bool,
         #[arg(long)]
         json: bool,
     },
@@ -294,6 +301,16 @@ fn run() -> Result<()> {
     {
         return install_daemon(executable);
     }
+    if matches!(
+        &cli.command,
+        Commands::Status {
+            path: None,
+            list: true,
+            json: true,
+        }
+    ) {
+        return status_list();
+    }
     let mut state = State::open_default()?;
     match cli.command {
         Commands::Init { path } => {
@@ -341,7 +358,14 @@ fn run() -> Result<()> {
                 }
             }
         },
-        Commands::Status { path, json } => status(&mut state, &path, json)?,
+        Commands::Status {
+            path: Some(path),
+            list: false,
+            json,
+        } => status(&mut state, &path, json)?,
+        Commands::Status { .. } => {
+            bail!("status requires PATH, or use `flocal status --list --json`")
+        }
         Commands::Conflicts { command } => conflicts(&mut state, command)?,
         Commands::Restore {
             path,
@@ -462,6 +486,22 @@ struct DaemonSync {
     role: String,
     registration_pending: bool,
     removal_pending: bool,
+}
+
+/// Versioned, editor-neutral projection of synchronization state.  Keep this
+/// separate from `DaemonSync`: daemon control data grows for operations while
+/// this is a stable, read-only client contract.
+#[derive(serde::Serialize)]
+struct StatusListShare {
+    share: String,
+    root: DaemonPath,
+    enabled: bool,
+    connection_state: String,
+    scheduling: String,
+    role: String,
+    initial_complete: bool,
+    diagnostic: Option<String>,
+    unsettled: usize,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1187,6 +1227,222 @@ fn daemon_request_inner(socket: &Path, request: &DaemonRequest) -> Result<Daemon
     stream.flush()?;
     serde_json::from_slice(&read_daemon_message(&mut stream)?)
         .context("daemon sent an invalid response")
+}
+
+fn status_list() -> Result<()> {
+    let state_dir = State::default_dir()?;
+    if !state_dir.is_absolute() {
+        bail!("FLOCAL_STATE_DIR must be an absolute path for read-only status");
+    }
+    if !state_dir.exists() {
+        return status_list_stored(&state_dir);
+    }
+    let Some(socket) = State::status_daemon_socket_read_only(&state_dir)? else {
+        return status_list_stored(&state_dir);
+    };
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut cursor = None;
+    let mut syncs = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            bail!("flocal daemon did not answer status within 250ms");
+        }
+        let response = match daemon_request_with_timeout(
+            &socket,
+            &DaemonRequest::List {
+                cursor: cursor.clone(),
+            },
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return status_list_stored(&state_dir),
+        };
+        let DaemonResponse::List { syncs: page, next } = response else {
+            bail!("daemon returned an invalid response to status list")
+        };
+        syncs.extend(page);
+        match next {
+            Some(next) if cursor.as_deref() != Some(&next) => cursor = Some(next),
+            Some(_) => bail!("daemon returned an invalid status list continuation"),
+            None => break,
+        }
+    }
+    print_status_list(
+        "live",
+        "live",
+        syncs.into_iter().map(status_share_live).collect(),
+    )?;
+    Ok(())
+}
+
+fn status_list_stored(state_dir: &Path) -> Result<()> {
+    let shares = if state_dir.exists() {
+        State::status_snapshot_read_only(state_dir)?
+            .into_iter()
+            .filter_map(status_share_stored)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    print_status_list("stored", "unavailable", shares)?;
+    Ok(())
+}
+
+fn status_share_live(sync: DaemonSync) -> StatusListShare {
+    StatusListShare {
+        share: sync.share,
+        root: sync.root,
+        enabled: sync.enabled,
+        connection_state: sync.connection_state,
+        scheduling: sync.scheduling,
+        role: if sync.removal_pending {
+            "removing".into()
+        } else if sync.registration_pending {
+            "registering".into()
+        } else {
+            sync.role
+        },
+        initial_complete: sync.initial_complete,
+        diagnostic: sync.diagnostic,
+        unsettled: sync.unsettled,
+    }
+}
+
+fn status_share_stored(snapshot: flocal::state::ReadOnlyStatusShare) -> Option<StatusListShare> {
+    let managed = snapshot.managed;
+    let role = match managed.binding {
+        EndpointBinding::Connector(peer) if peer.peer_id.is_none() => "registering",
+        EndpointBinding::Connector(_) => "connector",
+        EndpointBinding::Responder { .. } => "responder",
+        EndpointBinding::Unpaired => return None,
+    };
+    Some(StatusListShare {
+        share: managed.id.0,
+        root: daemon_path(&path_bytes(&managed.root)),
+        enabled: managed.watch_enabled,
+        connection_state: if managed.watch_enabled {
+            "unknown"
+        } else {
+            "stopped"
+        }
+        .into(),
+        scheduling: "unknown".into(),
+        role: if managed.removing_relationship.is_some() {
+            "removing".into()
+        } else {
+            role.into()
+        },
+        initial_complete: managed.initial_complete,
+        diagnostic: managed.blocked_diagnostic,
+        unsettled: snapshot.unsettled,
+    })
+}
+
+fn print_status_list(source: &str, daemon_state: &str, shares: Vec<StatusListShare>) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": 1,
+            "source": source,
+            "observed_at": utc_timestamp(),
+            "daemon": {"state": daemon_state, "diagnostic": serde_json::Value::Null},
+            "shares": shares,
+        }))?
+    );
+    Ok(())
+}
+
+fn daemon_request_with_timeout(
+    socket: &Path,
+    request: &DaemonRequest,
+    deadline: Instant,
+) -> Result<DaemonResponse> {
+    let timeout = deadline
+        .checked_duration_since(Instant::now())
+        .context("flocal daemon did not answer status within 250ms")?;
+    let stream = connect_daemon_with_timeout(socket, timeout)?;
+    let mut stream = StatusDeadlineStream { stream, deadline };
+    serde_json::to_writer(&mut stream, request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    serde_json::from_slice(&read_daemon_message(&mut stream)?)
+        .context("daemon sent an invalid response")
+}
+
+/// A daemon reply may arrive in several reads.  Resetting a socket timeout for
+/// each one would allow a peer to keep a status request alive indefinitely, so
+/// every operation receives only the remainder of one absolute deadline.
+struct StatusDeadlineStream {
+    stream: UnixStream,
+    deadline: Instant,
+}
+
+impl StatusDeadlineStream {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "flocal daemon did not answer status within 250ms",
+                )
+            })
+    }
+}
+
+impl Read for StatusDeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for StatusDeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn connect_daemon_with_timeout(socket: &Path, timeout: Duration) -> Result<UnixStream> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::io::Errno;
+    use rustix::net::sockopt::socket_error;
+    use rustix::net::{
+        AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with,
+    };
+
+    let descriptor = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .with_context(|| format!("creating a daemon socket for {}", socket.display()))?;
+    let address = SocketAddrUnix::new(socket)
+        .with_context(|| format!("reading daemon socket path {}", socket.display()))?;
+    match connect(&descriptor, &address) {
+        Ok(()) => {}
+        Err(Errno::INPROGRESS) | Err(Errno::WOULDBLOCK) => {
+            let mut descriptors = [PollFd::new(&descriptor, PollFlags::OUT)];
+            let wait = Timespec {
+                tv_sec: timeout.as_secs().try_into().expect("duration fits i64"),
+                tv_nsec: timeout.subsec_nanos().into(),
+            };
+            if poll(&mut descriptors, Some(&wait))? == 0 {
+                bail!("flocal daemon did not accept status within the deadline");
+            }
+            socket_error(&descriptor)??;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let stream = UnixStream::from(descriptor);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
 }
 
 fn read_daemon_message(stream: &mut impl Read) -> Result<Vec<u8>> {
@@ -8233,6 +8489,81 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn status_list_projection_distinguishes_live_and_stored_roles() {
+        let live = |registration_pending, removal_pending| DaemonSync {
+            share: "live-share".into(),
+            root: DaemonPath {
+                encoding: "base64".into(),
+                data: "L3RtcA==".into(),
+            },
+            host: None,
+            remote_path: None,
+            enabled: true,
+            initial_complete: true,
+            state: "watching".into(),
+            connection_state: "watching".into(),
+            scheduling: "idle".into(),
+            waiting_on: None,
+            operation: None,
+            queue_position: None,
+            waiting_root: None,
+            active_share: None,
+            active_root: None,
+            active_operation: None,
+            diagnostic: Some("diagnostic".into()),
+            unsettled: 3,
+            role: "connector".into(),
+            registration_pending,
+            removal_pending,
+        };
+        assert_eq!(status_share_live(live(false, false)).role, "connector");
+        assert_eq!(status_share_live(live(true, false)).role, "registering");
+        assert_eq!(status_share_live(live(true, true)).role, "removing");
+
+        let stored = |binding, enabled, removing_relationship| {
+            status_share_stored(flocal::state::ReadOnlyStatusShare {
+                managed: flocal::state::ManagedShare {
+                    id: ShareId("stored-share".into()),
+                    root: PathBuf::from("/tmp"),
+                    binding,
+                    initial_complete: false,
+                    watch_enabled: enabled,
+                    blocked_diagnostic: None,
+                    removing_relationship,
+                },
+                unsettled: 2,
+            })
+        };
+        assert!(stored(EndpointBinding::Unpaired, false, None).is_none());
+        let registering = stored(
+            EndpointBinding::Connector(PeerConfig {
+                peer_id: None,
+                relationship: None,
+                host: "peer".into(),
+                remote_path: b"/remote".to_vec(),
+                executable: "/bin/flocal".into(),
+            }),
+            true,
+            None,
+        );
+        let registering = registering.expect("registered shares are visible");
+        assert_eq!(registering.role, "registering");
+        assert_eq!(registering.connection_state, "unknown");
+        let removing = stored(
+            EndpointBinding::Responder {
+                peer: PeerId("peer".into()),
+                relationship: None,
+            },
+            true,
+            Some(RelationshipId::generate()),
+        );
+        assert_eq!(
+            removing.expect("removing shares are visible").role,
+            "removing"
+        );
+    }
+
     #[cfg(feature = "e2e-test-hooks")]
     #[test]
     fn e2e_recovery_delay_claim_survives_a_killed_process() -> Result<()> {
@@ -9479,6 +9810,40 @@ mod tests {
             unreachable!()
         };
         assert!(validate_sync_arguments(&arguments).is_err());
+    }
+
+    #[test]
+    fn status_command_grammar_keeps_the_read_only_form_unambiguous() {
+        assert!(Cli::try_parse_from(["flocal", "status", "/tmp/root"]).is_ok());
+        assert!(Cli::try_parse_from(["flocal", "status", "/tmp/root", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["flocal", "status", "--list", "--json"]).is_ok());
+        for arguments in [
+            vec!["flocal", "status"],
+            vec!["flocal", "status", "--json"],
+            vec!["flocal", "status", "--list"],
+            vec!["flocal", "status", "--list", "--json", "/tmp/root"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_deadline_is_not_renewed_by_an_earlier_read() -> Result<()> {
+        let (mut writer, stream) = UnixStream::pair()?;
+        writer.write_all(b"x")?;
+        let mut stream = StatusDeadlineStream {
+            stream,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte)?, 1);
+        std::thread::sleep(Duration::from_millis(20));
+        let error = stream
+            .read(&mut byte)
+            .expect_err("expired deadline must fail");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Ok(())
     }
 
     #[test]
