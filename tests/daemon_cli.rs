@@ -542,6 +542,60 @@ exec env LLVM_PROFILE_FILE=/dev/null FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" "$FLO
     if !add.status.success() {
         anyhow::bail!("sync add failed: {}", String::from_utf8_lossy(&add.stderr));
     }
+    let add_stdout = String::from_utf8_lossy(&add.stdout);
+    assert!(add_stdout.contains("Connected "));
+    assert!(!add_stdout.contains("flocal: scanning local files"));
+    let phases = String::from_utf8_lossy(&add.stderr);
+    assert!(phases.contains("flocal: scanning local files"), "{phases}");
+    assert!(
+        phases.contains("flocal: waiting for the remote file scan"),
+        "{phases}"
+    );
+    assert!(phases.contains("flocal: comparing file lists"), "{phases}");
+
+    let stop_before_decline = invoke(&[
+        "sync",
+        "stop",
+        local_root.to_str().context("test root is utf-8")?,
+    ])?;
+    assert!(
+        stop_before_decline.status.success(),
+        "{:?}",
+        stop_before_decline
+    );
+
+    let declined_root = temporary.path().join("declined-local");
+    let declined_remote = temporary.path().join("declined-remote");
+    std::fs::create_dir(&declined_root)?;
+    std::fs::create_dir(&declined_remote)?;
+    let declined = invoke(&[
+        "sync",
+        "add",
+        declined_root.to_str().context("test root is utf-8")?,
+        "--host",
+        "test-peer",
+        "--remote-path",
+        declined_remote.to_str().context("test root is utf-8")?,
+    ])?;
+    assert!(declined.status.success(), "{:?}", declined);
+    assert!(
+        !String::from_utf8_lossy(&declined.stdout).contains("Connected "),
+        "{:?}",
+        declined
+    );
+    assert!(
+        !String::from_utf8_lossy(&declined.stdout).contains("flocal: scanning local files"),
+        "{:?}",
+        declined
+    );
+    let remove_declined = invoke(&[
+        "sync",
+        "remove",
+        declined_root.to_str().context("test root is utf-8")?,
+        "--local-only",
+        "--yes",
+    ])?;
+    assert!(remove_declined.status.success(), "{:?}", remove_declined);
     let repeat = invoke(&[
         "sync",
         "add",

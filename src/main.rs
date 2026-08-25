@@ -310,7 +310,10 @@ fn run() -> Result<()> {
                 path,
                 host,
                 remote_path,
-            } => add_peer(&mut state, &path, &host, &remote_path)?,
+            } => {
+                add_peer(&mut state, &path, &host, &remote_path)?;
+                connected_line(&state, &state.find_share(&path)?.0)?;
+            }
             PeerCommand::List { path, json } => list_peer(&state, &path, json)?,
         },
         Commands::Sync(SyncArgs {
@@ -629,6 +632,7 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                     },
                 )?;
             }
+            connected_line(state, &share)?;
             report_managed_queue(state, &share)?;
         }
         SyncCommand::List { json } => {
@@ -768,6 +772,20 @@ fn validate_sync_add_path(path: &Path) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("sync root must be an existing directory, not a symbolic link");
     }
+    Ok(())
+}
+
+fn connected_line(state: &State, share: &ShareId) -> Result<()> {
+    let peer = state
+        .peer(share)?
+        .context("managed connector is missing its peer")?;
+    peer.completed_peer_id()?;
+    println!(
+        "Connected {} to {}:{}",
+        escaped(&share.0),
+        escaped(&peer.host),
+        escaped(&bytes_path(&peer.remote_path).to_string_lossy())
+    );
     Ok(())
 }
 
@@ -2920,12 +2938,6 @@ fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> R
     state.complete_connector_registration_locked(&share, &prepared, &peer_id)?;
     registration.finish()?;
     state.clear_blocked(&share)?;
-    println!(
-        "Connected {} to {}:{}",
-        escaped(&share.0),
-        escaped(&prepared.host),
-        escaped(&bytes_path(&prepared.remote_path).to_string_lossy())
-    );
     if let Some(prior_share) = prior_share {
         println!(
             "Responder remapped retained root from {} to {}.",
@@ -3991,6 +4003,12 @@ fn run_sync(
     }
 }
 
+fn sync_phase(report: PlanReport, message: &str) {
+    if report == PlanReport::Full {
+        eprintln!("flocal: {message}");
+    }
+}
+
 fn run_sync_attempt(
     state: &mut State,
     path: &Path,
@@ -4061,12 +4079,15 @@ fn run_sync_attempt(
     validate_final_sync_binding(state, &share, &binding, None)?;
     state.clear_pending_objects(&share)?;
     state.prune_unreferenced_objects()?;
+    sync_phase(report, "scanning local files");
     let local = if dry_run {
         sync::preview_refresh(state, &share)?
     } else {
         sync::refresh(state, &share)?
     };
+    sync_phase(report, "waiting for the remote file scan");
     let remote_records = sync::read_snapshot(&mut remote.output)?;
+    sync_phase(report, "comparing file lists");
     state.validate_remote_records(&share, &local, &remote_records)?;
     let mut plan = sync::plan(&local, &remote_records);
     let fingerprint = sync_plan_fingerprint(&local, &remote_records, &plan)?;

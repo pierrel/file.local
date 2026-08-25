@@ -498,7 +498,7 @@ pub enum InstallTempPhase {
 }
 
 pub struct ObjectSink {
-    _budget_lock: File,
+    _budget_lock: Option<File>,
     file: Option<File>,
     temp_path: Option<PathBuf>,
     final_path: PathBuf,
@@ -506,6 +506,11 @@ pub struct ObjectSink {
     expected_size: u64,
     written: u64,
     hasher: blake3::Hasher,
+}
+
+pub(crate) struct ObjectStoreBudget {
+    _lock: File,
+    remaining: u64,
 }
 
 impl ObjectSink {
@@ -568,6 +573,35 @@ impl ObjectSink {
             Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+}
+
+impl ObjectStoreBudget {
+    pub(crate) fn store_object(
+        &mut self,
+        state: &State,
+        mut input: File,
+    ) -> Result<(ObjectHash, u64)> {
+        let metadata_before = input.metadata()?;
+        let (hash, size) = state.hash_object(input.try_clone()?)?;
+        input.rewind()?;
+        let mut sink = state.begin_object_with_budget(hash.clone(), size, &mut self.remaining)?;
+        if sink.already_present() {
+            return Ok((hash, size));
+        }
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            sink.write_chunk(&buffer[..read])?;
+        }
+        if !same_file_snapshot(&metadata_before, &input.metadata()?)? {
+            bail!("file changed while it was being captured");
+        }
+        sink.finish()?;
+        Ok((hash, size))
     }
 }
 
@@ -5644,28 +5678,8 @@ impl State {
         Ok(())
     }
 
-    pub fn store_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {
-        let metadata_before = input.metadata()?;
-        let (probe_hash, probe_size) = self.hash_object(input.try_clone()?)?;
-        input.rewind()?;
-        let mut sink = self.begin_object(probe_hash.clone(), probe_size)?;
-        if sink.already_present() {
-            return Ok((probe_hash, probe_size));
-        }
-        let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
-            let read = input.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            sink.write_chunk(&buffer[..read])?;
-        }
-        let metadata_after = input.metadata()?;
-        if !same_file_snapshot(&metadata_before, &metadata_after)? {
-            bail!("file changed while it was being captured");
-        }
-        sink.finish()?;
-        Ok((probe_hash, probe_size))
+    pub fn store_object(&self, input: File) -> Result<(ObjectHash, u64)> {
+        self.object_store_budget()?.store_object(self, input)
     }
 
     pub fn hash_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {
@@ -5706,6 +5720,14 @@ impl State {
         Ok(budget.saturating_sub(used))
     }
 
+    pub(crate) fn object_store_budget(&self) -> Result<ObjectStoreBudget> {
+        let lock = self.lock_objects()?;
+        Ok(ObjectStoreBudget {
+            _lock: lock,
+            remaining: self.available_object_bytes()?,
+        })
+    }
+
     pub fn object_path(&self, hash: &ObjectHash) -> PathBuf {
         self.dir.join("objects").join(hash.as_str())
     }
@@ -5722,12 +5744,25 @@ impl State {
         expected_size: u64,
     ) -> Result<ObjectSink> {
         let budget_lock = self.lock_objects()?;
+        let mut remaining = self.available_object_bytes()?;
+        let mut sink =
+            self.begin_object_with_budget(expected_hash, expected_size, &mut remaining)?;
+        sink._budget_lock = Some(budget_lock);
+        Ok(sink)
+    }
+
+    fn begin_object_with_budget(
+        &self,
+        expected_hash: ObjectHash,
+        expected_size: u64,
+        remaining: &mut u64,
+    ) -> Result<ObjectSink> {
         let final_path = self.object_path(&expected_hash);
         let reclaimable = match fs::symlink_metadata(&final_path) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                 if object_path_matches(&final_path, &expected_hash)? {
                     return Ok(ObjectSink {
-                        _budget_lock: budget_lock,
+                        _budget_lock: None,
                         file: None,
                         temp_path: None,
                         final_path,
@@ -5741,13 +5776,15 @@ impl State {
             }
             Ok(_) | Err(_) => 0,
         };
-        if expected_size > self.available_object_bytes()?.saturating_add(reclaimable) {
+        let available = remaining.saturating_add(reclaimable);
+        if expected_size > available {
             bail!("object exceeds remaining state storage budget");
         }
         if reclaimable > 0 {
             fs::remove_file(&final_path)?;
             sync_dir(final_path.parent().expect("object parent"))?;
         }
+        *remaining = available - expected_size;
         let temp_path = self
             .dir
             .join("objects")
@@ -5758,7 +5795,7 @@ impl State {
             .open(&temp_path)?;
         set_private_file(&temp_path)?;
         Ok(ObjectSink {
-            _budget_lock: budget_lock,
+            _budget_lock: None,
             file: Some(file),
             temp_path: Some(temp_path),
             final_path,
@@ -9519,6 +9556,26 @@ mod tests {
             .env(PERMISSIVE_UMASK_STATE_DIR, temporary.path().join("state"))
             .output()?;
         assert!(output.status.success(), "{:?}", output);
+        Ok(())
+    }
+
+    #[test]
+    fn object_store_budget_enforces_the_cumulative_limit() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let state = State::open(temporary.path().join("state"))?;
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        let third = temporary.path().join("third");
+        fs::write(&first, b"a")?;
+        fs::write(&second, b"bc")?;
+        fs::write(&third, b"d")?;
+
+        let mut budget = state.object_store_budget()?;
+        budget.remaining = 3;
+        budget.store_object(&state, File::open(first)?)?;
+        budget.store_object(&state, File::open(second)?)?;
+        assert_eq!(budget.remaining, 0);
+        assert!(budget.store_object(&state, File::open(third)?).is_err());
         Ok(())
     }
 }

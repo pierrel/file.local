@@ -1,0 +1,106 @@
+#+title: Initial scan completion and object-budget report
+#+date: 2026-08-24
+#+status: implemented and validated
+
+* What shipped
+
+=flocal sync add= no longer says =Connected= immediately after relationship
+registration. It now reports three visible planning phases on stderr, presents
+the existing initial plan and confirmation on stdout, and prints =Connected=
+only after the initial synchronization has applied and the managed connector
+start request succeeds.
+
+The initial scan now takes one exact census of the local object store and holds
+the existing object-store lock while it captures the whole tree. It updates a
+scan-local remaining-byte allowance for each new object rather than rereading
+the growing =objects/= directory for every file.
+
+This came from an observed large working tree: an ignored =.worktrees/=
+directory accounted for most of its disk use, while the eligible tree still
+contained roughly eighteen thousand files and several hundred MiB. The old
+code had already written more than a thousand objects after more than a minute
+and then slowed as each new object caused another full object-directory walk.
+
+* User experience
+
+An initial add now reads like this while it works:
+
+#+begin_example
+flocal: scanning local files
+flocal: waiting for the remote file scan
+flocal: comparing file lists
+... initial plan ...
+Apply this initial plan? [y/N]
+Connected share-... to host:/absolute/root
+#+end_example
+
+The phase lines are fixed local text, intentionally without filenames, remote
+text, or estimates. A declined or interrupted plan leaves the durable
+relationship available for =flocal sync start PATH= but does not claim it is
+connected. A successful managed start may still be queued behind another share;
+the existing queue message follows the completed connection message.
+
+* Implementation
+
+** Scan-scoped object admission
+
+=ObjectStoreBudget= owns =objects.lock= and one current-capacity census.
+=scan_mode= creates one scope before directory traversal and gives only its
+regular-file branch access to it:
+
+#+begin_src rust
+let mut objects = state.object_store_budget()?;
+...
+let (hash, size) = objects.store_object(state, input)?;
+#+end_src
+
+The Rust mutable borrow of =objects= makes every new capture update the same
+remaining-byte value. The OS file lock keeps another process from changing the
+directory between the census and those updates. The existing =ObjectSink=
+still checks hashes, writes a private temporary, syncs the file, atomically
+publishes it, and removes the temporary on failure.
+
+Ordinary callers retain =State::store_object= and =State::begin_object=.
+The former creates a one-object budget scope; the latter keeps its streaming
+sink and lock semantics. This confines the optimization to capture admission
+instead of changing the protocol or persistent state schema.
+
+** Truthful completion and status
+
+=add_peer= now only records the successful relationship. =connected_line=
+reads the completed stored peer configuration and formats the final message,
+so the reported host/path is durable state rather than a stale CLI value.
+
+=run_sync_attempt= emits a phase immediately before local refresh, before
+reading the remote snapshot, and before validation/planning. It is limited to
+=PlanReport::Full=, so managed watch logs and protocol output do not gain
+foreground status lines. Because the lines use stderr, legacy JSON plans on
+stdout remain parseable.
+
+* Validation and review
+
+- =make check= passed: 99 library tests, 70 main tests, 21 core tests, 7
+  managed-CLI tests, the SSH process-boundary test, formatting, and Clippy.
+- Changed executable-line coverage was 88/89 (98.88%), above the required
+  90% threshold.
+- The new state test proves three bytes of scan-scoped admission accept a
+  one-byte and a two-byte object, then reject another byte.
+- The managed CLI test proves phase text is stderr-only, a successful add emits
+  =Connected=, and a declined initial plan emits no =Connected= line.
+- Design review corrected JSON-test scope, final connection data ownership,
+  and phase placement. Filesystem and adversarial-security review found the
+  held lock and existing no-follow/hash/publication rules appropriate.
+
+* Limits and operation
+
+The scan still hashes and stores every eligible file once. That is required for
+content-addressed synchronization, but it is linear in file count and content
+instead of quadratic in object-directory entries. The peer protocol retains
+its existing bounded no-frame read and one-hour session limits; this change
+does not add peer-controlled progress frames.
+
+Deploy this branch with =make install= on both endpoints, then retry the
+initiating peer's =flocal sync add= command. If the earlier incomplete legacy
+relationship rejects the retry after both upgrades, run =flocal sync remove
+PATH --local-only --yes= on the initiating peer and add the same relationship
+again. That removal preserves both directories' files.
