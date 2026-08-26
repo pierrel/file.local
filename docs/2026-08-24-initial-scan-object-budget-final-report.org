@@ -81,7 +81,7 @@ stdout remain parseable.
 
 - =make check= passed: 99 library tests, 70 main tests, 21 core tests, 7
   managed-CLI tests, the SSH process-boundary test, formatting, and Clippy.
-- Changed executable-line coverage was 90/95 (94.74%), above the required
+- Changed executable-line coverage was 90/96 (93.75%), above the required
   90% threshold.
 - The new state test proves three bytes of scan-scoped admission accept a
   one-byte and a two-byte object, then reject another byte.
