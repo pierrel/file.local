@@ -1,4 +1,5 @@
 #+title: CI upgrade E2E selection repair
+#+date: 2026-08-25
 
 * 1. User outcome
 
@@ -50,8 +51,8 @@ ordinary =make e2e= suite and is a release blocker if it recurs.
 and records both revisions and hashes.  =Makefile= runs all general ignored E2E
 tests with that base.  CI supplies the pull request base SHA for that run.  The
 workflow then reads the immutable deployed-alpha anchor from
-=docs/deployed-alpha.org= and runs =scenarios::upgrades::= again with that
-older revision.
+=docs/deployed-alpha.org= and runs only =scenarios::upgrades::legacy_= with
+that older revision.
 
 The second run is the appropriate place for assertions about a legacy
 predecessor.  It is currently unreachable whenever the first run executes
