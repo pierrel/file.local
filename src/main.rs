@@ -5806,12 +5806,13 @@ fn serve_v2_round(
     sync::verify_materialized_plan(state, &plan, &expected)
         .map_err(|error| watch_protocol_error(format!("{error:#}")))?;
     budget.check()?;
-    if let Err(error) = sync::apply_complete_plan_with_root_skipping(
+    if let Err(error) = sync::apply_complete_plan_with_root_skipping_guarding_snapshot(
         state,
         share,
         root,
         &applied_plan.plan,
         &applied_plan.retained_paths,
+        &advertised,
     ) {
         if let Some(invalidated) = error.downcast_ref::<sync::ApplyInvalidated>() {
             write_v2_round(
@@ -7671,12 +7672,13 @@ fn connector_v2_round(
         }
     }
     budget.check()?;
-    if let Err(error) = sync::apply_complete_plan_with_root_skipping(
+    if let Err(error) = sync::apply_complete_plan_with_root_skipping_guarding_snapshot(
         state,
         share,
         root,
         &applied_plan.plan,
         &applied_plan.retained_paths,
+        &local,
     ) {
         if let Some(invalidated) = error.downcast_ref::<sync::ApplyInvalidated>() {
             write_v2_round(

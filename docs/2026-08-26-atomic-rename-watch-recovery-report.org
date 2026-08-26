@@ -1,0 +1,93 @@
+#+title: Atomic rename watch recovery
+
+* What users get
+
+An editor safe-save while =flocal watch= is starting can no longer make the
+watcher abandon its persistent connection after it has reported success. If
+the verifier sees an editor replacement after the watcher snapshot, that round
+records the changed path as =UNSETTLED= and recalculates in the same SSH
+session. An edit arriving just after an exact-record no-op is discovered by the
+following scan. In both cases the edited file is never echoed back over the
+editor's replacement.
+
+* The race and final design
+
+An atomic save commonly writes =.notes.txt.tmp=, then renames it over
+=notes.txt=. A persistent round can snapshot the temporary plus the old
+=notes.txt= just before that rename. Its plan includes those same local
+records, so applying them back to the local peer is unnecessary. Previously
+the apply path still attempted that work; a vanished temporary could surface
+as an ordinary =ENOENT=, stop the session, and leave the other peer stale.
+
+The persistent connector and responder now pass their own snapshot to the
+apply boundary. The boundary only treats a record as local when its complete
+version exactly equals an entry in that snapshot. It safely verifies the live
+entry, then skips that record instead of applying or durability-syncing it.
+When verification differs, it returns the existing =ApplyInvalidated= type.
+The existing transaction retires the install intent, rescans, marks the path
+=UNSETTLED=, and sends the existing =RoundInvalidated= frame. No protocol or
+CLI schema changed.
+
+#+begin_src rust
+if guard_local_snapshot && local_snapshot_matches(root_dir, record)? {
+    // This exact record already exists locally. Do not echo it through apply.
+    continue;
+}
+let result = if guard_local_snapshot {
+    Err(ApplyInvalidated { path: record.path.clone() }.into())
+} else {
+    apply_record(state, share, root_dir, record, expected, &token, phase)
+};
+#+end_src
+
+=&&= short-circuits: Rust evaluates the expensive verifier only for records
+that exactly match the snapshot. =?= propagates an operational error to the
+caller. =continue= moves directly to the next plan record, making the no-write
+property structural rather than a best-effort check. The explicit =Result=
+error reuses Rust's typed error downcast path for the existing invalidation
+transaction.
+
+* Filesystem boundary
+
+Verification is descriptor-relative. Each parent is opened with
+=DIRECTORY|NOFOLLOW=, and a regular final entry is opened with =NOFOLLOW= and
+=NONBLOCK= before metadata and BLAKE3 content verification.
+
+#+begin_src rust
+let fd = rustix::fs::openat(
+    parent.as_fd(), name,
+    rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::NONBLOCK
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC,
+    rustix::fs::Mode::empty(),
+)?;
+let mut file = std::fs::File::from(fd);
+if !file.metadata()?.is_file() {
+    return Ok(false);
+}
+#+end_src
+
+=openat= resolves =name= relative to the already-open parent descriptor,
+rather than reparsing an attacker-changeable absolute path. =NOFOLLOW=
+rejects a final symlink; =DIRECTORY|NOFOLLOW= does the same for each parent.
+=NONBLOCK= matters for a local FIFO: opening a FIFO for reading normally waits
+for a writer, while this verification instead opens without waiting and rejects
+its non-regular metadata. Rust ownership converts Rustix's owned descriptor
+into =std::fs::File=, so it closes automatically at scope exit.
+
+* Tests and operational check
+
+The Docker scenario now stops a watcher after its snapshot and before apply,
+performs the rename, resumes it, and asserts the typed recalculation log,
+=v2= on B, no temporary file on either peer, and clean pending/unsettled
+status. Docker-free core tests cover changed content, a vanished file, a FIFO,
+a Unix socket, and a parent replaced by a symlink; the last test also proves no
+write escapes the share.
+
+After deployment, upgrade both endpoints normally and run =flocal watch PATH=
+on the connector. A =UNSETTLED … recalculating now= line for a save race seen
+by the verifier is an expected recovery transition, followed by =SETTLED=.
+An edit that follows an exact-record no-op is picked up by the following scan.
+A generic ="apply stopped; state was recovered from disk"= line is not the
+expected path for this case.

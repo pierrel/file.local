@@ -1,0 +1,70 @@
+#+title: Atomic-rename watch recovery design
+
+* Failure
+
+CI run 32971558983 failed the Docker scenario =watch_notices_an_atomic_rename_save=.
+After A created =.notes.txt.tmp= and renamed it over =notes.txt=, A held
+=notes.txt=v2= while B retained =notes.txt=v1= and received the temporary file.
+A reported =apply stopped; state was recovered from disk: No such file or directory=.
+The focused scenario passes locally, so the failure is a timing boundary rather
+than a deterministic environment failure.
+
+The foreground watch begins a full startup round before it has completed a
+round with its peer. The editor can rename its temporary after that round has
+snapshotted =(.notes.txt.tmp=v2, notes.txt=v1)= but before local apply. Applying
+the old snapshot back to A then encounters a disappeared or changed path. That
+ordinary filesystem error ends the persistent session instead of sending the
+existing typed =RoundInvalidated= frame. B may already have applied the old
+snapshot, leaving it stale.
+
+* Plan
+
+1. Retain the exact local snapshot at each persistent-watch apply boundary:
+   the connector's =local= records and the responder's =advertised= records.
+   Add an apply variant used only by the package's persistent-watch binary;
+   Rust's library/binary crate boundary makes that function public to the
+   binary, but it is not a CLI or protocol contract. Direct and one-shot
+   callers keep the existing unguarded API.
+2. Before an apply record that exactly equals a local snapshot record can
+   create a parent or staging file, compare its descriptor-relative current
+   entry with the snapshotted entry. Traverse every parent with =openat= and
+   =DIRECTORY|NOFOLLOW=, then open a regular final entry with =NOFOLLOW= and
+   compare that descriptor. If it matches, skip the apply entirely: echoing an
+   exact local record has no useful filesystem work. A missing path, changed
+   content/mode/type, or =ENOENT=, =ENOTDIR=, or =ELOOP= during this traversal
+   returns =ApplyInvalidated= for that path. It does not use a peer ID
+   heuristic: exact record versions decide whether the record is locally
+   snapshotted.
+3. Preserve every other error. Object-store failure, unsafe entry, permission
+   failure, unexpected I/O, failed durability step, and records that came from
+   the peer still use the present apply path. This prevents a local-race
+   recovery rule from hiding corruption or a security failure.
+4. Let the existing invalidation transaction recover durable state and the
+   =RoundInvalidated= protocol run. Its first invalidation immediately
+   recalculates; the next round sees =notes.txt=v2= and the temporary tombstone,
+   so both peers converge without a new session or a stale install intent.
+5. Make the Docker scenario deterministic with the existing Linux-only E2E
+   pre-apply stop hook: establish the watch, arm the stop, create the editor
+   temporary, wait until the resulting round has stopped after its snapshot but
+   before apply, rename the temporary over =notes.txt=, then resume. It must assert
+   =notes.txt=v2= on B, no temporary artifact on either peer, no pending install
+   or unsettled state, and the typed recalculation transition rather than the
+   generic recovered-apply diagnostic. Add Docker-free Linux and macOS
+   regressions for a vanished final file, FIFO or socket replacement, and a
+   parent replaced by a symlink or non-directory; they must invalidate without
+   an escaped write or blocking.
+
+* Boundaries and acceptance
+
+The check remains descriptor-relative and no-follow. It runs before any
+filesystem creation, so a vanished user path cannot be recreated by echo apply.
+It does not change ignore handling, reconciliation, protocol schema, temporary
+name policy, or normal one-shot sync behavior. Regular-file verification uses
+=O_NONBLOCK= before checking the opened descriptor's type, so a local FIFO
+cannot hold the persistent watcher; a socket open error is likewise a changed
+entry type.
+
+The change is complete when the forced atomic-rename race recalculates and
+converges, the focused Docker scenario is repeatable, the full Docker suite and
+=make check= pass, and the persistent-watch/recovery report documents this
+specific local-snapshot invalidation boundary.
