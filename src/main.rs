@@ -1225,8 +1225,8 @@ fn daemon_request_inner(socket: &Path, request: &DaemonRequest) -> Result<Daemon
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    serde_json::from_slice(&read_daemon_message(&mut stream)?)
-        .context("daemon sent an invalid response")
+    let message = read_daemon_message(&mut stream)?;
+    serde_json::from_slice(&message).context("daemon sent an invalid response")
 }
 
 fn status_list() -> Result<()> {
@@ -1255,7 +1255,8 @@ fn status_list() -> Result<()> {
             deadline,
         ) {
             Ok(response) => response,
-            Err(_) => return status_list_stored(&state_dir),
+            Err(StatusDaemonRequestError::Unavailable) => return status_list_stored(&state_dir),
+            Err(StatusDaemonRequestError::Protocol(error)) => return Err(error),
         };
         let DaemonResponse::List { syncs: page, next } = response else {
             bail!("daemon returned an invalid response to status list")
@@ -1352,21 +1353,37 @@ fn print_status_list(source: &str, daemon_state: &str, shares: Vec<StatusListSha
     Ok(())
 }
 
+enum StatusDaemonRequestError {
+    Unavailable,
+    Protocol(anyhow::Error),
+}
+
 fn daemon_request_with_timeout(
     socket: &Path,
     request: &DaemonRequest,
     deadline: Instant,
-) -> Result<DaemonResponse> {
+) -> std::result::Result<DaemonResponse, StatusDaemonRequestError> {
     let timeout = deadline
         .checked_duration_since(Instant::now())
-        .context("flocal daemon did not answer status within 250ms")?;
-    let stream = connect_daemon_with_timeout(socket, timeout)?;
+        .ok_or(StatusDaemonRequestError::Unavailable)?;
+    let stream = connect_daemon_with_timeout(socket, timeout)
+        .map_err(|_| StatusDaemonRequestError::Unavailable)?;
     let mut stream = StatusDeadlineStream { stream, deadline };
-    serde_json::to_writer(&mut stream, request)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    serde_json::from_slice(&read_daemon_message(&mut stream)?)
+    serde_json::to_writer(&mut stream, request)
+        .map_err(|_| StatusDaemonRequestError::Unavailable)?;
+    stream
+        .write_all(b"\n")
+        .map_err(|_| StatusDaemonRequestError::Unavailable)?;
+    stream
+        .flush()
+        .map_err(|_| StatusDaemonRequestError::Unavailable)?;
+    let message = read_daemon_message(&mut stream).map_err(|error| match error {
+        DaemonMessageError::Transport(_) => StatusDaemonRequestError::Unavailable,
+        protocol => StatusDaemonRequestError::Protocol(protocol.into()),
+    })?;
+    serde_json::from_slice(&message)
         .context("daemon sent an invalid response")
+        .map_err(StatusDaemonRequestError::Protocol)
 }
 
 /// A daemon reply may arrive in several reads.  Resetting a socket timeout for
@@ -1450,13 +1467,47 @@ fn connect_daemon_with_timeout(socket: &Path, timeout: Duration) -> Result<UnixS
     Ok(stream)
 }
 
-fn read_daemon_message(stream: &mut impl Read) -> Result<Vec<u8>> {
+#[derive(Debug)]
+enum DaemonMessageError {
+    Transport(io::Error),
+    Protocol(String),
+}
+
+impl std::fmt::Display for DaemonMessageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => error.fmt(formatter),
+            Self::Protocol(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for DaemonMessageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Protocol(_) => None,
+        }
+    }
+}
+
+fn read_daemon_message(stream: &mut impl Read) -> std::result::Result<Vec<u8>, DaemonMessageError> {
     let mut message = Vec::new();
     let mut buffer = [0u8; 4096];
     loop {
-        let count = stream.read(&mut buffer)?;
+        let count = stream
+            .read(&mut buffer)
+            .map_err(DaemonMessageError::Transport)?;
         if count == 0 {
-            bail!("daemon control connection closed before a complete message")
+            if message.is_empty() {
+                return Err(DaemonMessageError::Transport(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "daemon control connection closed before a response",
+                )));
+            }
+            return Err(DaemonMessageError::Protocol(
+                "daemon control connection closed before a complete message".into(),
+            ));
         }
         let end = buffer[..count]
             .iter()
@@ -1464,10 +1515,10 @@ fn read_daemon_message(stream: &mut impl Read) -> Result<Vec<u8>> {
             .map(|index| index + 1)
             .unwrap_or(count);
         if message.len().saturating_add(end) > MAX_DAEMON_MESSAGE_BYTES {
-            bail!(
+            return Err(DaemonMessageError::Protocol(format!(
                 "daemon control message exceeds {} bytes",
                 MAX_DAEMON_MESSAGE_BYTES
-            )
+            )));
         }
         message.extend_from_slice(&buffer[..end]);
         if end < count || message.last() == Some(&b'\n') {
@@ -2596,6 +2647,7 @@ fn handle_daemon_request(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let response = match read_daemon_message(&mut stream)
+        .map_err(anyhow::Error::from)
         .and_then(|message| serde_json::from_slice::<DaemonRequest>(&message).map_err(Into::into))
     {
         Ok(DaemonRequest::List { cursor }) => match daemon_sync_page(state, workers, cursor) {

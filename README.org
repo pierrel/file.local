@@ -187,11 +187,13 @@ as not configured.
 ** Read-only client status
 
 =flocal status --list --json= is the versioned, read-only status interface for
-editor integrations and future clients. It never starts a daemon. When the
-daemon is reachable it reports =source: live=; otherwise it reads only durable
-state and reports enabled shares as =unknown=. Roots remain base64-encoded
-native path bytes. The initial schema is 1 and deliberately contains only the
-share identity/root, enabled state, connection and scheduling state, role,
+editor integrations and future clients. It never starts a daemon. When its
+private daemon transport is usable it reports =source: live=; a connection,
+write, read, or deadline transport failure instead reads only durable state and
+reports enabled shares as =unknown=. A malformed, truncated, or oversized reply
+is an error, not a stored fallback. Roots remain base64-encoded native path
+bytes. The initial schema is 1 and deliberately contains only the share
+identity/root, enabled state, connection and scheduling state, role,
 initial-completion state, bounded diagnostic, and unsettled count.
 
 ** Emacs guard

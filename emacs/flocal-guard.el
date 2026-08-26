@@ -66,16 +66,18 @@
 (defvar-local flocal-guard--private-disk-buffer nil)
 
 (defun flocal-guard--mode-line ()
-  (let ((share (cdr flocal-guard--share)))
-    (pcase flocal-guard--state
-      ((or 'guarded 'stored)
-       (format " FLOCAL:%s/%s/%s" flocal-guard--state
-               (or (alist-get 'connection_state share) "unknown")
-               (or (alist-get 'scheduling share) "unknown")))
-      ('conflict " FLOCAL:conflict")
-      ('checking " FLOCAL:checking")
-      ('cannot-verify " FLOCAL:cannot-verify")
-      (_ ""))))
+  (if buffer-file-name
+      (let ((share (cdr flocal-guard--share)))
+        (pcase flocal-guard--state
+          ((or 'guarded 'stored)
+           (format " FLOCAL:%s/%s/%s" flocal-guard--state
+                   (or (alist-get 'connection_state share) "unknown")
+                   (or (alist-get 'scheduling share) "unknown")))
+          ('conflict " FLOCAL:conflict")
+          ('checking " FLOCAL:checking")
+          ('cannot-verify " FLOCAL:cannot-verify")
+          (_ "")))
+    ""))
 
 (add-to-list 'minor-mode-alist
              '(flocal-guard-mode (:eval (flocal-guard--mode-line))))

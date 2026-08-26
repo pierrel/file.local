@@ -16,6 +16,7 @@ test:
 	cargo test --all-targets -- --test-threads=1
 
 elisp-test:
+	@command -v eldev >/dev/null 2>&1 || { echo "install Eldev 1.11.2 first; see emacs/README.org" >&2; exit 1; }
 	cd emacs && eldev test
 
 test-make-prefix:

@@ -14,7 +14,7 @@
 {"schema":1,"source":"live|stored","observed_at":"RFC3339 UTC","daemon":{"state":"live|unavailable","diagnostic":null},"shares":[{"share":"opaque-id","root":{"encoding":"base64","data":"..."},"enabled":true,"connection_state":"starting|watching|reconnecting|stopping|blocked|stopped|unknown|registering|removing","scheduling":"idle|queued|active|unknown","role":"connector|responder|registering|removing","initial_complete":true,"diagnostic":null,"unsettled":0}]}
 #+end_src
 
-Roots are base64 native path bytes. An unpaired durable root is absent because it has no flocal relationship to protect. The command first uses the private daemon socket, with directory/socket ownership, mode, and symlink checks and one 250ms nonblocking-connect/read/write deadline. A missing daemon falls back to a SQLite immutable read-only durable snapshot, creating no state directory, locks, migration, or WAL sidecars. Missing state means empty stored status; unsafe, busy, or malformed state is an error rather than an empty answer.
+Roots are base64 native path bytes. An unpaired durable root is absent because it has no flocal relationship to protect. The command first uses the private daemon socket, with directory/socket ownership, mode, and symlink checks and one 250ms nonblocking-connect/read/write deadline. A connection, write, read, or deadline transport failure falls back to a SQLite immutable read-only durable snapshot, creating no state directory, locks, migration, or WAL sidecars. A malformed, truncated, or oversized reply after connection is an error, not a fallback. Missing state means empty stored status; unsafe, busy, or malformed state is an error rather than an empty answer.
 
 * Emacs discovery and presentation
 

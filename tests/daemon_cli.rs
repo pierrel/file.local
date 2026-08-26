@@ -214,6 +214,97 @@ fn status_list_refuses_a_symlinked_daemon_run_directory() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn run_status_list_with_fake_daemon(
+    handler: impl FnOnce(std::os::unix::net::UnixStream) -> Result<()> + Send + 'static,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let temporary = tempdir()?;
+    let state_dir = temporary.path().join("state");
+    drop(State::open(&state_dir)?);
+    let run = state_dir.join("run");
+    std::fs::create_dir(&run)?;
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
+    let socket = run.join("daemon.sock");
+    let listener = UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let server = thread::spawn(move || -> Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer)?;
+            anyhow::ensure!(count > 0, "status client closed before its request");
+            request.extend_from_slice(&buffer[..count]);
+            if request.contains(&b'\n') {
+                break;
+            }
+        }
+        handler(stream)
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flocal"))
+        .args(["status", "--list", "--json"])
+        .env("FLOCAL_STATE_DIR", &state_dir)
+        .output()?;
+    server.join().expect("fake daemon server panicked")?;
+    Ok(output)
+}
+
+#[cfg(unix)]
+#[test]
+fn status_list_rejects_a_malformed_live_daemon_reply() -> Result<()> {
+    use std::io::Write;
+
+    let output = run_status_list_with_fake_daemon(|mut stream| {
+        stream.write_all(b"{not-json}\n")?;
+        Ok(())
+    })?;
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("daemon sent an invalid response"),
+        "{output:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn status_list_rejects_truncated_and_oversized_live_daemon_replies() -> Result<()> {
+    use std::io::Write;
+
+    for reply in [b"{\"partial\"".to_vec(), vec![b'x'; 64 * 1024 + 1]] {
+        let output = run_status_list_with_fake_daemon(move |mut stream| {
+            stream.write_all(&reply)?;
+            Ok(())
+        })?;
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn status_list_falls_back_when_the_live_daemon_disconnects_or_times_out() -> Result<()> {
+    for delay in [Duration::ZERO, Duration::from_millis(300)] {
+        let output = run_status_list_with_fake_daemon(move |_stream| {
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            Ok(())
+        })?;
+        assert!(output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["source"], "stored");
+        assert_eq!(report["daemon"]["state"], "unavailable");
+    }
+    Ok(())
+}
+
 #[test]
 fn status_list_reads_live_daemon_state() -> Result<()> {
     let temporary = tempdir()?;

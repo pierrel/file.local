@@ -44,7 +44,10 @@ can still win a race after the final inspection and before the write.
 
 * Development
 
-Run the ERT suite with:
+The full =make check= gate runs the ERT suite. Install Eldev 1.11.2 through
+your usual package manager or from [[https://github.com/doublep/eldev][Eldev's
+release instructions]], put it on =PATH=, and confirm =eldev --version= reports
+that version. Then run:
 
 #+begin_src sh
 cd emacs && eldev test

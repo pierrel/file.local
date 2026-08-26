@@ -23,6 +23,11 @@
                   '((encoding . "base64") (data . "L3RtcA==")))
                  "/tmp")))
 
+(ert-deftest flocal-guard-hides-the-modeline-marker-in-non-file-buffers ()
+  (with-temp-buffer
+    (setq-local flocal-guard--state 'checking)
+    (should (equal (flocal-guard--mode-line) ""))))
+
 (ert-deftest flocal-guard-status-validation-keeps-active-non-stopped-shares ()
   (let ((shares (flocal-guard--validate-report
                  '((schema . 1) (source . "live")
