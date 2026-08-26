@@ -40,6 +40,7 @@ fn emacs_snapshots_a_real_remote_change_before_saving() -> Result<()> {
     a.write("emacs-conflict.txt", "base\n")?;
     b.wait_for_file("emacs-conflict.txt", "base\n")?;
     let form = r#"(progn
+      (require 'cl-lib)
       (require 'flocal-guard)
       (setq flocal-guard-executable "/usr/local/bin/flocal")
       (flocal-guard-mode 1)

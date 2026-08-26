@@ -63,6 +63,7 @@
 (defvar-local flocal-guard--base-hash nil)
 (defvar-local flocal-guard--pending-disk-hash nil)
 (defvar-local flocal-guard--saving nil)
+(defvar-local flocal-guard--private-disk-buffer nil)
 
 (defun flocal-guard--mode-line ()
   (let ((share (cdr flocal-guard--share)))

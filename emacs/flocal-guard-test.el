@@ -1,6 +1,7 @@
 ;;; flocal-guard-test.el --- Tests for flocal-guard -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'cl-lib)
 (require 'flocal-guard)
 
 (ert-deftest flocal-guard-most-specific-share-wins ()

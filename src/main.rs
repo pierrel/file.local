@@ -1410,7 +1410,8 @@ impl Write for StatusDeadlineStream {
 
 fn connect_daemon_with_timeout(socket: &Path, timeout: Duration) -> Result<UnixStream> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    use rustix::io::Errno;
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd};
     use rustix::net::sockopt::socket_error;
     use rustix::net::{
         AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with,
@@ -1419,10 +1420,14 @@ fn connect_daemon_with_timeout(socket: &Path, timeout: Duration) -> Result<UnixS
     let descriptor = socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,
-        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        SocketFlags::empty(),
         None,
     )
     .with_context(|| format!("creating a daemon socket for {}", socket.display()))?;
+    fcntl_setfd(&descriptor, fcntl_getfd(&descriptor)? | FdFlags::CLOEXEC)
+        .context("setting the daemon socket close-on-exec")?;
+    fcntl_setfl(&descriptor, fcntl_getfl(&descriptor)? | OFlags::NONBLOCK)
+        .context("setting the daemon socket nonblocking")?;
     let address = SocketAddrUnix::new(socket)
         .with_context(|| format!("reading daemon socket path {}", socket.display()))?;
     match connect(&descriptor, &address) {
