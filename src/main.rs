@@ -800,11 +800,10 @@ fn registered_message(state: &State, share: &ShareId) -> Result<String> {
         .context("registered connector is missing its peer")?;
     peer.completed_peer_id()?;
     Ok(format!(
-        "Registered {} with {}:{}; run `flocal sync {}` to synchronize.",
+        "Registered {} with {}:{}; run `flocal sync PATH` to synchronize.",
         escaped(&share.0),
         escaped(&peer.host),
         escaped(&bytes_path(&peer.remote_path).to_string_lossy()),
-        escaped(&state.root_for(share)?.to_string_lossy()),
     ))
 }
 
@@ -8319,7 +8318,7 @@ mod tests {
     #[test]
     fn registration_message_does_not_claim_the_initial_sync_completed() -> Result<()> {
         let temporary = tempdir()?;
-        let root = temporary.path().join("root");
+        let root = temporary.path().join("root; not-a-command");
         std::fs::create_dir(&root)?;
         let mut state = State::open(temporary.path().join("state"))?;
         let share = state.init_share(&root)?;
@@ -8328,7 +8327,11 @@ mod tests {
         let message = registered_message(&state, &share)?;
         assert!(message.starts_with("Registered "), "{message}");
         assert!(!message.contains("Connected "), "{message}");
-        assert!(message.contains("flocal sync"), "{message}");
+        assert!(message.contains("flocal sync PATH"), "{message}");
+        assert!(
+            !message.contains(&root.to_string_lossy().to_string()),
+            "{message}"
+        );
         Ok(())
     }
 

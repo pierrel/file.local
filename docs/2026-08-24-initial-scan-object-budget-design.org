@@ -39,7 +39,9 @@ deployment mechanism changes here.
 * 2. Completion message and visible phases
 
 =add_peer= records and verifies the relationship but does not print
-=Connected=.  A shared =connected_line(state, share)= helper reads the
+=Connected=. Its registration message directs the user to =flocal sync PATH=
+with a literal placeholder, so an arbitrary local path never appears as
+shell-ready text. A shared =connected_line(state, share)= helper reads the
 completed configured peer from durable state and formats the existing success
 line.  The =sync add= command calls that helper only
 after all of these steps succeed: the initial plan is confirmed and applied,
