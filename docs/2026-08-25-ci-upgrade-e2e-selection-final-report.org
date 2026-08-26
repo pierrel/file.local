@@ -33,6 +33,9 @@ describe the same split.
 - The deployed-alpha filter lists and passes exactly the two legacy scenarios.
 - The migration-retry upgrade scenario passes when run from the pull request
   base to this candidate.
+- The macOS gate also exposed a valid third cancellation-race outcome where
+  activation observes that it is no longer eligible before taking the permit.
+  Its assertion now verifies the resulting inactive scheduler state.
 - A complete local ordinary Docker run reached 49 passing scenarios but had two
   unrelated harness failures: one container exited during setup and one test
   queried a deliberately locked database.  Re-running the affected product

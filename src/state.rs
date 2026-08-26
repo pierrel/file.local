@@ -8904,7 +8904,9 @@ mod tests {
             Err(error) if error.downcast_ref::<QueueCancelled>().is_some() => {
                 assert!(state.scheduling_snapshot()?.active.is_none());
             }
-            Ok(None) => bail!("activation race ended without activation or cancellation"),
+            Ok(None) => {
+                assert!(state.scheduling_snapshot()?.active.is_none());
+            }
             Err(error) => return Err(error),
         }
         assert!(!state.managed_share(&share)?.watch_enabled);
