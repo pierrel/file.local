@@ -585,6 +585,17 @@ impl ObjectStoreBudget {
         let metadata_before = input.metadata()?;
         let (hash, size) = state.hash_object(input.try_clone()?)?;
         input.rewind()?;
+        self.store_hashed_object(state, input, metadata_before, hash, size)
+    }
+
+    fn store_hashed_object(
+        &mut self,
+        state: &State,
+        mut input: File,
+        metadata_before: fs::Metadata,
+        hash: ObjectHash,
+        size: u64,
+    ) -> Result<(ObjectHash, u64)> {
         let mut sink = state.begin_object_with_budget(hash.clone(), size, &mut self.remaining)?;
         if sink.already_present() {
             return Ok((hash, size));
@@ -5678,8 +5689,12 @@ impl State {
         Ok(())
     }
 
-    pub fn store_object(&self, input: File) -> Result<(ObjectHash, u64)> {
-        self.object_store_budget()?.store_object(self, input)
+    pub fn store_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {
+        let metadata_before = input.metadata()?;
+        let (hash, size) = self.hash_object(input.try_clone()?)?;
+        input.rewind()?;
+        self.object_store_budget()?
+            .store_hashed_object(self, input, metadata_before, hash, size)
     }
 
     pub fn hash_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {

@@ -61,7 +61,8 @@ still checks hashes, writes a private temporary, syncs the file, atomically
 publishes it, and removes the temporary on failure.
 
 Ordinary callers retain =State::store_object= and =State::begin_object=.
-The former creates a one-object budget scope; the latter keeps its streaming
+The former hashes before creating a one-object budget scope, so a large input
+does not occupy =objects.lock= while it is hashed; the latter keeps its streaming
 sink and lock semantics. This confines the optimization to capture admission
 instead of changing the protocol or persistent state schema.
 
@@ -81,7 +82,7 @@ stdout remain parseable.
 
 - =make check= passed: 99 library tests, 70 main tests, 21 core tests, 7
   managed-CLI tests, the SSH process-boundary test, formatting, and Clippy.
-- Changed executable-line coverage was 90/96 (93.75%), above the required
+- Changed executable-line coverage was 106/106 (100.00%), above the required
   90% threshold.
 - The new state test proves three bytes of scan-scoped admission accept a
   one-byte and a two-byte object, then reject another byte.

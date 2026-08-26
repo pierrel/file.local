@@ -122,8 +122,8 @@ write.  The scope is the sole owner of its mutable remaining-byte accounting;
 =scan.rs= cannot provide an arbitrary charge or mutate the counter.
 
 =State::store_object= remains the simple public, one-object convenience path
-for non-scan callers.  It creates the same admission scope for that one
-capture and delegates.  =State::begin_object= remains the public streaming
+for non-scan callers.  It hashes before creating the one-object admission
+scope, then delegates the reservation and capture.  =State::begin_object= remains the public streaming
 sink path for received/imported/generated objects and keeps its current lock
 and single-operation census behavior.  This avoids widening protocol and
 merge interfaces to solve a local scanner cost.

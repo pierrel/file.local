@@ -86,7 +86,7 @@ flocal sync add ~/src/example --host buildbox --remote-path /srv/work/example
 
 The =--host= value can be a hostname, address, or =~/.ssh/config= alias.
 =sync add= reports when it is scanning local files, waiting for the remote
-scan, and comparing the two file lists while it builds the first plan. It then
+file scan, and comparing the two file lists while it builds the first plan. It then
 asks before changing file content in either directory. Pairing may create the
 missing remote root directory first. After that confirmed initial
 synchronization succeeds, it reports the connection and starts the initiating
