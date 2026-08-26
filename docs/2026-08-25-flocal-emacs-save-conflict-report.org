@@ -46,11 +46,11 @@ Two originally discussed sync-tree hygiene changes are intentionally deferred: s
 
 * Validation and review
 
-The final local gate ran =make check=: Rust tests, 91.33% changed-line coverage (390/427, above the 90% requirement), Eldev ERT, formatting, and clippy all passed. ERT has 17 tests covering stale cache blocking, JSON false/null decoding, root selection, byte-identical replacement, external edits, the visit race, refresh without rebaselining unsaved edits, custom writers, first save, Ediff abort/write-A, and supersession handling.
+The final local gate ran =make check=: Rust tests, 91.20% changed-line coverage (394/432, above the 90% requirement), Eldev ERT, formatting, and clippy all passed. ERT has 17 tests covering stale cache blocking, JSON false/null decoding, root selection, byte-identical replacement, external edits, the visit race, refresh without rebaselining unsaved edits, custom writers, first save, Ediff abort/write-A, and supersession handling.
 
-The real Docker E2E uses paired flocal peers and =emacs -Q --batch=. It passed both the live guarded modeline/status scenario and the remote synchronized change scenario, which verifies B is the remote disk version and that A does not overwrite it. CI now installs Emacs and runs Eldev on Linux and macOS; its Eldev bootstrap is pinned to an immutable upstream commit.
+The real Docker E2E uses paired flocal peers and =emacs -Q --batch=. It passed both the live guarded modeline/status scenario and the remote synchronized change scenario, which verifies B is the remote disk version and that A does not overwrite it. CI installed Emacs and ran Eldev on Linux and macOS; its test and coverage jobs passed. Its full E2E job failed in two upgrade scenarios before its upgrade-anchor phase.
 
-Review converged through simplicity/shared-logic, interfaces/readability/existing patterns, filesystem/security, correctness/error handling, and documentation/design lenses. Findings fixed included user-known baselines, bounded disk reads, private socket validation, one absolute status deadline, strict status grammar/schema validation, JSON false/null handling, and reclassification baseline preservation.
+Review converged through simplicity/shared-logic, interfaces/readability/existing patterns, filesystem/security, correctness/error handling, and documentation/design lenses. Copilot's first review found three real Emacs byte-compilation issues: two missing =cl-lib= imports and one undeclared buffer-local marker. They were fixed, replied to, and resolved; its second review raised no new threads. Findings fixed in local and Copilot review included user-known baselines, bounded disk reads, private socket validation, one absolute status deadline, strict status grammar/schema validation, JSON false/null handling, and reclassification baseline preservation.
 
 * Limits and operational note
 
