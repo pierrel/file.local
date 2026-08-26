@@ -15,6 +15,10 @@ the existing object-store lock while it captures the whole tree. It updates a
 scan-local remaining-byte allowance for each new object rather than rereading
 the growing =objects/= directory for every file.
 
+The lower-level =peer add= registration command now reports registration and
+the required next =sync= step, rather than claiming that synchronization is
+already connected.
+
 This came from an observed large working tree: an ignored =.worktrees/=
 directory accounted for most of its disk use, while the eligible tree still
 contained roughly eighteen thousand files and several hundred MiB. The old
@@ -82,7 +86,7 @@ stdout remain parseable.
 
 - =make check= passed: 99 library tests, 70 main tests, 21 core tests, 7
   managed-CLI tests, the SSH process-boundary test, formatting, and Clippy.
-- Changed executable-line coverage was 121/125 (96.80%), above the required
+- Changed executable-line coverage was 142/152 (93.42%), above the required
   90% threshold.
 - The new state test proves three bytes of scan-scoped admission accept a
   one-byte and a two-byte object, then reject another byte.

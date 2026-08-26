@@ -312,7 +312,7 @@ fn run() -> Result<()> {
                 remote_path,
             } => {
                 add_peer(&mut state, &path, &host, &remote_path)?;
-                connected_line(&state, &state.find_share(&path)?.0)?;
+                registered_line(&state, &state.find_share(&path)?.0)?;
             }
             PeerCommand::List { path, json } => list_peer(&state, &path, json)?,
         },
@@ -787,6 +787,25 @@ fn connected_line(state: &State, share: &ShareId) -> Result<()> {
         escaped(&bytes_path(&peer.remote_path).to_string_lossy())
     );
     Ok(())
+}
+
+fn registered_line(state: &State, share: &ShareId) -> Result<()> {
+    println!("{}", registered_message(state, share)?);
+    Ok(())
+}
+
+fn registered_message(state: &State, share: &ShareId) -> Result<String> {
+    let peer = state
+        .peer(share)?
+        .context("registered connector is missing its peer")?;
+    peer.completed_peer_id()?;
+    Ok(format!(
+        "Registered {} with {}:{}; run `flocal sync {}` to synchronize.",
+        escaped(&share.0),
+        escaped(&peer.host),
+        escaped(&bytes_path(&peer.remote_path).to_string_lossy()),
+        escaped(&state.root_for(share)?.to_string_lossy()),
+    ))
 }
 
 fn complete_initial_and_enable(state: &mut State, share: &ShareId, yes: bool) -> Result<bool> {
@@ -8295,6 +8314,22 @@ mod tests {
             remote_path: b"/remote".to_vec(),
             executable: "/bin/false".into(),
         }
+    }
+
+    #[test]
+    fn registration_message_does_not_claim_the_initial_sync_completed() -> Result<()> {
+        let temporary = tempdir()?;
+        let root = temporary.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temporary.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_peer(&share, &test_connector("remote"))?;
+
+        let message = registered_message(&state, &share)?;
+        assert!(message.starts_with("Registered "), "{message}");
+        assert!(!message.contains("Connected "), "{message}");
+        assert!(message.contains("flocal sync"), "{message}");
+        Ok(())
     }
 
     fn test_state_with_peer_id(path: &Path, peer: &str) -> Result<State> {
