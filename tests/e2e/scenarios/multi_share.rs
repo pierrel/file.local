@@ -125,6 +125,7 @@ fn persistent_watch_requeues_behind_an_older_managed_start() -> Result<()> {
     a.sync_add_second_to(&b)?;
     a.sync_stop_second()?;
     a.write_second("fairness.txt", "older queued share runs first")?;
+    let second_share = a.second_status()?.share;
 
     let watch = a.watch_start_with_apply_stops(2)?;
     a.write("round-one.txt", "first watch round")?;
@@ -134,11 +135,12 @@ fn persistent_watch_requeues_behind_an_older_managed_start() -> Result<()> {
 
     // Round two becomes pending while round one still owns the installation.
     // The persistent watch must rejoin behind the already-queued second share.
+    a.arm_scheduling_wait_observation()?;
     a.write("round-two.txt", "second watch round")?;
 
     watch.resume_for_next_apply_stop()?;
-    let older = a.wait_for_stopped_apply_process()?;
-    a.wait_for_sync_queued_behind("/home/peer/second-share")?;
+    a.wait_for_scheduling_wait()?;
+    let older = a.wait_for_stopped_apply_process_for(&second_share)?;
     b.assert_absent("round-two.txt")?;
 
     older.resume()?;

@@ -1640,7 +1640,7 @@ fn apply_complete_plan_with_root_skipping_inner(
         None => state.set_plan_install_intent(share, records, &plan.conflicts)?,
     };
     #[cfg(feature = "e2e-test-hooks")]
-    e2e_stop_before_apply(state)?;
+    e2e_stop_before_apply(state, share)?;
     let install_temps: std::collections::HashMap<&[u8], _> = intent
         .temps
         .iter()
@@ -1817,16 +1817,16 @@ fn apply_complete_plan_with_root_skipping_inner(
 }
 
 #[cfg(feature = "e2e-test-hooks")]
-fn e2e_stop_before_apply(state: &State) -> Result<()> {
+fn e2e_stop_before_apply(state: &State, share: &ShareId) -> Result<()> {
     if e2e_claim_apply_stop(state)? {
-        e2e_publish_apply_stop_pid(state)?;
+        e2e_publish_apply_stop_pid(state, share)?;
         signal_hook::low_level::raise(signal_hook::consts::SIGSTOP)?;
     }
     Ok(())
 }
 
 #[cfg(feature = "e2e-test-hooks")]
-fn e2e_publish_apply_stop_pid(state: &State) -> Result<()> {
+fn e2e_publish_apply_stop_pid(state: &State, share: &ShareId) -> Result<()> {
     use std::io::Write as _;
 
     let path = state.dir.join(".e2e-apply-stop.pid");
@@ -1835,7 +1835,7 @@ fn e2e_publish_apply_stop_pid(state: &State) -> Result<()> {
         .create_new(true)
         .open(&path)
         .context("publishing E2E stopped apply pid")?;
-    write!(file, "{}", std::process::id())?;
+    write!(file, "{} {}", std::process::id(), share.0)?;
     file.sync_all()?;
     Ok(())
 }
@@ -3643,15 +3643,16 @@ mod tests {
         let temp = tempdir()?;
         let state = State::open(temp.path().join("state"))?;
         let pidfile = state.dir.join(".e2e-apply-stop.pid");
-        e2e_publish_apply_stop_pid(&state)?;
+        let share = ShareId("share".into());
+        e2e_publish_apply_stop_pid(&state, &share)?;
         assert_eq!(
             fs::read_to_string(&pidfile)?,
-            std::process::id().to_string()
+            format!("{} {}", std::process::id(), share.0)
         );
-        assert!(e2e_publish_apply_stop_pid(&state).is_err());
+        assert!(e2e_publish_apply_stop_pid(&state, &share).is_err());
         fs::remove_file(&pidfile)?;
         std::os::unix::fs::symlink(temp.path().join("target"), &pidfile)?;
-        assert!(e2e_publish_apply_stop_pid(&state).is_err());
+        assert!(e2e_publish_apply_stop_pid(&state, &share).is_err());
         Ok(())
     }
 

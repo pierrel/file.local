@@ -3053,6 +3053,10 @@ impl State {
             ],
         )?;
         transaction.commit()?;
+        #[cfg(feature = "e2e-test-hooks")]
+        if changed != 0 {
+            self.observe_e2e_global_contention()?;
+        }
         Ok((changed != 0).then_some(network_order))
     }
 
@@ -9340,6 +9344,8 @@ mod tests {
         let original_token = original.token().to_owned();
         let relationship = RelationshipId::generate();
         let authority = state.peer_id()?;
+        #[cfg(feature = "e2e-test-hooks")]
+        fs::write(state_dir.join(".e2e-observe-global-contention"), [])?;
         assert!(
             state
                 .convert_managed_to_authoritative_parked(
@@ -9354,6 +9360,8 @@ mod tests {
                 )?
                 .is_some()
         );
+        #[cfg(feature = "e2e-test-hooks")]
+        assert!(state_dir.join(".e2e-global-contention-observed").is_file());
         drop(original.owner.take());
         drop(original);
 

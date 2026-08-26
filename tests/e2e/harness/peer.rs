@@ -1485,34 +1485,6 @@ impl Peer {
         )
     }
 
-    pub fn wait_for_sync_queued_behind(&self, root: &str) -> Result<()> {
-        let root = root.as_bytes().to_vec();
-        self.poll_until(
-            "persistent watch did not report its local scheduling wait",
-            DEADLINE,
-            move |peer| {
-                let status = peer.status()?;
-                let scheduling = status.scheduling().clone();
-                if scheduling.state != "queued" {
-                    return Ok(None);
-                }
-                scheduling.validate_queued()?;
-                if scheduling.waiting_on.as_deref() != Some("local")
-                    || scheduling
-                        .waiting_root
-                        .as_ref()
-                        .map(DaemonPath::decode)
-                        .transpose()?
-                        .as_deref()
-                        != Some(root.as_slice())
-                {
-                    return Ok(None);
-                }
-                Ok(Some(()))
-            },
-        )
-    }
-
     pub fn assert_sync_durably_queued(&self) -> Result<()> {
         self.status()?.scheduling().validate_queued()
     }
@@ -1768,15 +1740,7 @@ impl Peer {
             "flocal protocol serve did not stop at the apply boundary",
             DEADLINE,
             |peer| {
-                let output = peer.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
-                if !output.status.success() {
-                    return Ok(None);
-                }
-                let Some(pid) = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                else {
+                let Some(pid) = peer.stopped_apply_pid(None)? else {
                     return Ok(None);
                 };
                 Ok(peer.is_stopped_protocol_server(pid)?.then_some(pid))
@@ -1789,15 +1753,26 @@ impl Peer {
             "flocal process did not stop at the apply boundary",
             DEADLINE,
             |peer| {
-                let output = peer.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
-                if !output.status.success() {
+                let Some(pid) = peer.stopped_apply_pid(None)? else {
                     return Ok(None);
-                }
-                let Some(pid) = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                else {
+                };
+                Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
+            },
+        )?;
+        Ok(StoppedApply {
+            peer: self,
+            pid,
+            resumed: false,
+        })
+    }
+
+    pub fn wait_for_stopped_apply_process_for(&self, share: &str) -> Result<StoppedApply<'_>> {
+        let share = share.to_owned();
+        let pid = self.poll_until(
+            "expected share did not stop at the apply boundary",
+            DEADLINE,
+            |peer| {
+                let Some(pid) = peer.stopped_apply_pid(Some(&share))? else {
                     return Ok(None);
                 };
                 Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
@@ -2630,6 +2605,25 @@ impl Peer {
     fn remove_apply_stop_pidfile(&self) -> Result<()> {
         self.exec_ok(&["rm", "-f", "--", APPLY_STOP_PIDFILE])?;
         Ok(())
+    }
+
+    fn stopped_apply_pid(&self, expected_share: Option<&str>) -> Result<Option<u32>> {
+        let output = self.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let contents = String::from_utf8_lossy(&output.stdout);
+        let mut fields = contents.split_whitespace();
+        let Some(pid) = fields.next().and_then(|pid| pid.parse::<u32>().ok()) else {
+            return Ok(None);
+        };
+        let Some(share) = fields.next() else {
+            return Ok(None);
+        };
+        if fields.next().is_some() || expected_share.is_some_and(|expected| expected != share) {
+            return Ok(None);
+        }
+        Ok(Some(pid))
     }
 
     fn is_protocol_server(&self, pid: u32) -> Result<bool> {
