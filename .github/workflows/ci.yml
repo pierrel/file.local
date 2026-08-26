@@ -64,4 +64,4 @@ jobs:
           done < <(git log --full-history --format=%H -- docs/deployed-alpha.org)
           test "$commit" != "$(git rev-parse HEAD)"
           FLOCAL_E2E_UPGRADE_FROM="$commit" \
-            cargo test --test e2e scenarios::upgrades:: -- --ignored --test-threads=1
+            cargo test --test e2e scenarios::upgrades::legacy_ -- --ignored --test-threads=1

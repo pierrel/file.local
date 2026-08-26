@@ -14,6 +14,39 @@ fn idle_managed_pair_survives_a_real_candidate_install() -> Result<()> {
     b.wait_for_file("before-upgrade.txt", "created by the base connector")?;
 
     a.install_candidate()?;
+    a.wait_for_managed_connection("watching")?;
+    a.write("mixed-version.txt", "compatible base receives the edit")?;
+    b.wait_for_file("mixed-version.txt", "compatible base receives the edit")?;
+    b.install_candidate()?;
+
+    a.write("after-upgrade-a.txt", "candidate connector resumed")?;
+    b.write("after-upgrade-b.txt", "candidate responder resumed")?;
+    b.wait_for_file("after-upgrade-a.txt", "candidate connector resumed")?;
+    a.wait_for_file("after-upgrade-b.txt", "candidate responder resumed")?;
+    b.install_candidate()?;
+    a.install_candidate()?;
+    a.write("after-compatible-reinstall.txt", "responder drained itself")?;
+    b.wait_for_file("after-compatible-reinstall.txt", "responder drained itself")?;
+    a.wait_for_managed_connection("watching")?;
+    a.wait_for_recovered_install()?;
+    b.wait_for_recovered_install()?;
+    a.assert_clean_upgrade_status(&before_a)?;
+    b.assert_clean_upgrade_status(&before_b)?;
+    a.assert_sync_role("connector")?;
+    b.assert_sync_role("responder")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn legacy_idle_managed_pair_reconnects_before_responder_upgrade() -> Result<()> {
+    let (a, b) = e2e::upgrade_managed_pair()?;
+    let before_a = a.predecessor_status()?;
+    let before_b = b.predecessor_status()?;
+    a.write("before-upgrade.txt", "created by the base connector")?;
+    b.wait_for_file("before-upgrade.txt", "created by the base connector")?;
+
+    a.install_candidate()?;
     a.wait_for_managed_connection("reconnecting")?;
     a.write("mixed-version.txt", "held until the responder upgrade")?;
     b.assert_absent("mixed-version.txt")?;
@@ -174,7 +207,7 @@ fn failed_candidate_migration_is_retryable_without_state_repair() -> Result<()> 
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
-fn responder_first_legacy_upgrade_refuses_then_connector_first_succeeds() -> Result<()> {
+fn legacy_responder_first_upgrade_refuses_until_connector_is_upgraded() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
     a.write("before-responder-first.txt", "base session is established")?;
     b.wait_for_file("before-responder-first.txt", "base session is established")?;

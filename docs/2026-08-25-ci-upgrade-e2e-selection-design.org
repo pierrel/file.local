@@ -1,0 +1,160 @@
+#+title: CI upgrade E2E selection repair
+
+* 1. User outcome
+
+Every pull request should have a meaningful Docker E2E result.  An ordinary
+base-to-candidate upgrade must prove that the candidate can replace the
+current base without losing a managed relationship.  The one-time transition
+from the deployed legacy alpha must additionally prove the special safety
+rules that only apply while the base does not understand the installer:
+connector-first ordering and a persistent-watch protocol mismatch.
+
+Those two kinds of evidence must not be confused.  A source-only candidate
+whose base already contains the compatible installer must not fail CI merely
+because it did not recreate the legacy protocol boundary.
+
+* 2. Failing evidence and cause
+
+The CI run for the initial-scan candidate used base
+=6f0daf757a2da4e66bf64b69438a287f33671d00= and candidate merge commit
+=1f3b8048f03919413181a9b7c1f8d4c897edaf87=.  Its permanent diagnostics
+showed distinct executable hashes, so it exercised a real replacement.
+Nevertheless, two tests failed:
+
+1. =idle_managed_pair_survives_a_real_candidate_install= waited for
+   =reconnecting= after installing the candidate on the connector.
+2. =responder_first_legacy_upgrade_refuses_then_connector_first_succeeds=
+   required the responder candidate install to fail with =upgrade the
+   connector first=.
+
+Both requirements describe the first upgrade from an unaware predecessor.
+The current base is already the merge of the compatibility-installer work and
+defines persistent-watch protocol 7; the candidate defines the same protocol.
+Thus the connector legitimately stays watching, and responder-first is
+legitimately supported.  The failures are stale test preconditions, not a
+failure to install the candidate.
+
+The same CI run passed the other upgrade scenarios, including interrupted
+install recovery, foreground-watch refusal, migration retry, and a fresh
+candidate installation.  The earlier post-merge main run did fail
+=offline_removal_stays_pending_until_the_user_retries=, but the current
+initial-scan CI run passed that scenario.  Its earlier failure left the
+responder's active watch holding the scheduler while a retry was processed,
+then the relationship RPC was killed at its deadline.  This plan does not
+change removal code or hide that failure: the scenario remains in the
+ordinary =make e2e= suite and is a release blocker if it recurs.
+
+* 3. Existing test boundary
+
+=tests/e2e/harness/docker.rs= deliberately builds an exact ancestor executable
+and records both revisions and hashes.  =Makefile= runs all ignored E2E tests
+with that base.  CI supplies the pull request base SHA for that run.  The
+workflow then reads the immutable deployed-alpha anchor from
+=docs/deployed-alpha.org= and runs =scenarios::upgrades::= again with that
+older revision.
+
+The second run is the appropriate place for assertions about a legacy
+predecessor.  It is currently unreachable whenever the first run executes
+those two legacy-only tests against a compatible base and fails first.
+
+* 4. Design
+
+1. Split the existing idle scenario in =tests/e2e/scenarios/upgrades.rs= into
+   a compatible-base idle upgrade scenario and a clearly named
+   =legacy_= scenario. The compatible scenario remains in ordinary E2E and
+   proves a normal idle replacement, mixed-version edit propagation, and
+   convergence. The legacy scenario retains the incompatible reconnect and
+   withheld mixed-version assertions. Rename the responder-first refusal with
+   the same =legacy_= prefix. Do not weaken either legacy assertion to accept
+   both old and new behavior; each is an exact claim about the deployed alpha
+   transition.
+
+2. Define the ordinary E2E target to run the ignored suite serially with one
+   literal libtest =--skip scenarios::upgrades::legacy_= filter. It must still
+   run the compatible idle scenario, every other general upgrade scenario
+   against the pull request base, and non-upgrade scenarios such as offline
+   removal. The target retains =--test-threads=1=. The filter is passed
+   directly to libtest, so there is no environment-controlled
+   pass-without-running branch in test bodies.
+
+3. Make the CI job invoke that ordinary target with the pull request base SHA.
+   Keep the existing deployed-alpha provenance validation, then run the
+   =scenarios::upgrades::legacy_= filter with the deployed alpha revision.
+   That second command includes both legacy-only tests and preserves their
+   assertions against the only base for which their preconditions hold.
+
+4. Amend every affected statement in the E2E harness design document,
+   including its base-to-candidate contract, =make e2e= example, and
+   acceptance criteria that currently say ordinary E2E runs every scenario.
+   State the split precisely: ordinary E2E validates the current-base upgrade
+   contract; the anchored alpha run validates the one-time legacy compatibility
+   contract. No README change is needed because user installation behavior and
+   compatibility guarantees do not change.
+5. Write a dated reader-first final implementation report with the actual
+   ordinary and anchored E2E results, the reason the legacy selection is
+   anchored, and any remaining E2E failure. Do not send it externally unless
+   it contains an important finding.
+
+* 5. Interfaces and data flow
+
+#+begin_example
+pull request base ── ordinary make e2e ──> all general E2E
+                                        └─> compatible idle and general upgrades
+
+deployed alpha anchor ── legacy upgrade E2E ──> legacy reconnect and
+                                                 responder-first refusal
+#+end_example
+
+The interface is the existing test filter after =cargo test --test e2e --
+--ignored=.  The filter names are source-controlled test paths, not peer input
+or externally supplied shell data.  =FLOCAL_E2E_UPGRADE_FROM= continues to be
+an exact revision selected by CI and validated as an ancestor by the harness.
+
+* 6. Failure and security boundaries
+
+- A general upgrade regression still fails the ordinary run: only the two
+  assertions whose necessary legacy precondition is absent are skipped there.
+- A regression in connector-first legacy protection still fails the anchored
+  alpha run.  The workflow validates every historical alpha tag and commit
+  before it uses the current anchor, preventing an edited document from
+  silently selecting an arbitrary base.
+- Test filters must be literal argv elements in Make or CI, never assembled
+  from branch names, revision strings, peer output, or filesystem paths.  This
+  preserves the harness's no-shell-interpolation boundary for untrusted data.
+- The older offline-removal timeout is not classified as fixed by changing
+  selection.  It remains executed in ordinary E2E; a repeat requires a
+  separate failing-scenario design and a production fix.
+
+* 7. Acceptance tests
+
+1. Run the ordinary E2E target with =FLOCAL_E2E_UPGRADE_FROM= set to the
+   current base. Confirm the =legacy_= tests are not run, the compatible idle
+   upgrade scenario and every other ordinary scenario are run, and the
+   offline-removal scenario runs and passes.
+2. Run the anchored legacy-upgrade command with the deployed-alpha commit.
+   Confirm both legacy-only tests run, the connector reaches =reconnecting=
+   before the responder upgrade, and responder-first emits the connector-first
+   refusal.
+3. Run =make check=, including changed-line and whole-project coverage.  The
+   selection code is Make/workflow/test-source only, so add a focused
+   non-Docker assertion only if a small parsing helper is introduced; do not
+   add a fake replacement for the real Docker coverage.
+4. Run the full CI workflow on the feature branch.  The E2E job must reach its
+   anchored-alpha step, rather than stopping after ordinary E2E.
+5. Reconcile the final implementation report with the reviewed head and CI
+   results before the local review closes.
+
+* 8. Alternatives rejected
+
+- Relax the legacy assertions to accept either =watching= or =reconnecting=,
+  and either success or refusal.  That would turn two safety guarantees into
+  non-assertions and would not document which base makes each behavior valid.
+- Run all upgrade tests only from the deployed alpha.  That would miss
+  migrations and compatibility changes affecting the actual pull-request
+  base.
+- Add a product feature flag or synthetic protocol mismatch solely for tests.
+  It would add a new production interface and a less-real transition when the
+  existing immutable alpha provides the required predecessor.
+- Treat the earlier offline-removal timeout as fixed because it did not recur.
+  The scenario stays active; absence of a current failure is not evidence of a
+  removal-protocol repair.
