@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::harness as e2e;
 
 macro_rules! finish_idle_upgrade {
-    ($a:expr, $b:expr, $before_a:expr, $before_b:expr) => {{
+    ($a:ident, $b:ident, $before_a:ident, $before_b:ident) => {{
         $a.write("after-upgrade-a.txt", "candidate connector resumed")?;
         $b.write("after-upgrade-b.txt", "candidate responder resumed")?;
         $b.wait_for_file("after-upgrade-a.txt", "candidate connector resumed")?;
