@@ -2329,6 +2329,18 @@ fn local_snapshot_matches(root: &cap_std::fs::Dir, record: &Record) -> Result<bo
         Entry::File {
             hash, executable, ..
         } => {
+            let metadata = match rustix::fs::statat(
+                parent.as_fd(),
+                name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(metadata) => metadata,
+                Err(error) if snapshot_path_changed_errno(error) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            if !rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_file() {
+                return Ok(false);
+            }
             let fd = match rustix::fs::openat(
                 parent.as_fd(),
                 name,
