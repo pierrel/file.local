@@ -598,6 +598,9 @@ impl ObjectStoreBudget {
     ) -> Result<(ObjectHash, u64)> {
         let mut sink = state.begin_object_with_budget(hash.clone(), size, &mut self.remaining)?;
         if sink.already_present() {
+            if !same_file_snapshot(&metadata_before, &input.metadata()?)? {
+                bail!("file changed while it was being captured");
+            }
             return Ok((hash, size));
         }
         let mut buffer = vec![0u8; 1024 * 1024];
@@ -9598,6 +9601,27 @@ mod tests {
         budget.store_object(&state, File::open(second)?)?;
         assert_eq!(budget.remaining, 0);
         assert!(budget.store_object(&state, File::open(third)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn deduplicated_object_capture_rechecks_the_source_snapshot() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let state = State::open(temporary.path().join("state"))?;
+        let source = temporary.path().join("source");
+        fs::write(&source, b"before")?;
+        let (hash, size) = state.store_object(File::open(&source)?)?;
+
+        let input = File::open(&source)?;
+        let metadata_before = input.metadata()?;
+        fs::write(&source, b"after mutation")?;
+
+        let mut budget = state.object_store_budget()?;
+        assert!(
+            budget
+                .store_hashed_object(&state, input, metadata_before, hash, size)
+                .is_err()
+        );
         Ok(())
     }
 }
