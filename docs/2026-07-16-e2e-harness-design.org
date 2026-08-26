@@ -704,12 +704,14 @@ the harness re-supplies the reattaching peer's own alias on reconnect.
 
 ** 5.1 Invocation
 
-Scenarios are ordinary integration tests under =tests/e2e/= marked
-=#[ignore = "requires docker; run via `make e2e`"]=. New Makefile target:
+Scenarios are ordinary integration tests under =tests/e2e/= marked =#[ignore]=.
+=make e2e= runs every general scenario and skips the
+=scenarios::upgrades::legacy_= prefix; CI separately runs that prefix against
+the immutable deployed alpha.
 
 #+begin_example
 e2e:
-	cargo test --test e2e -- --ignored --test-threads=1
+	cargo test --test e2e -- --ignored --test-threads=1 --skip scenarios::upgrades::legacy_
 #+end_example
 
 Host prerequisites, each failing with a one-line diagnosis: a reachable

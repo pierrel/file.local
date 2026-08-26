@@ -97,11 +97,12 @@ upgrade.
 The E2E suite builds both the pull request's exact base revision and the
 recorded deployed-alpha revision separately from the candidate, creates a real
 paired installation with each predecessor, and carries its working trees and
-state through the candidate. Ordinary scenarios cover an incompatible
-mixed-version reconnect, idle restart, an apply killed at the service stop,
-compatible endpoint reinstalls, foreground refusal and retry, and migration
-failure and retry. The foreground interruption case kills the old watch after
-it durably writes its intent, then proves the candidate recovers without state
+state through the candidate. Ordinary scenarios cover compatible idle restart,
+an apply killed at the service stop, compatible endpoint reinstalls, foreground
+refusal and retry, and migration failure and retry. The deployed-alpha run
+additionally proves incompatible mixed-version reconnect and responder-first
+legacy refusal. The foreground interruption case kills the old watch after it
+durably writes its intent, then proves the candidate recovers without state
 deletion or re-pairing. They record predecessor and candidate commit IDs and
 executable hashes and require preserved relationship identity, empty
 unsettled/conflict state, candidate binary publication, and resumed watching.

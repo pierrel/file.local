@@ -47,8 +47,8 @@ ordinary =make e2e= suite and is a release blocker if it recurs.
 * 3. Existing test boundary
 
 =tests/e2e/harness/docker.rs= deliberately builds an exact ancestor executable
-and records both revisions and hashes.  =Makefile= runs all ignored E2E tests
-with that base.  CI supplies the pull request base SHA for that run.  The
+and records both revisions and hashes.  =Makefile= runs all general ignored E2E
+tests with that base.  CI supplies the pull request base SHA for that run.  The
 workflow then reads the immutable deployed-alpha anchor from
 =docs/deployed-alpha.org= and runs =scenarios::upgrades::= again with that
 older revision.
