@@ -1,0 +1,244 @@
+#+title: Initial scan object-store budget design
+#+date: 2026-08-24
+#+status: implemented and validated
+
+* 1. Outcome and confirmed failing scenario
+
+Running the public setup command against a large new tree must reach its
+initial-plan prompt in time proportional to the tree and bytes it actually
+captures, not quadratically in the number of distinct objects already captured
+during that scan.  It must also describe its current phase while it works and
+must not claim a completed connection before initial synchronization completes.
+
+The confirmed scenario is:
+
+#+begin_example
+cd ~/project
+flocal sync add --host buildbox --remote-path /srv/project ./project
+#+end_example
+
+The command successfully reports =Connected share-example to
+buildbox:/srv/project=, then appears to hang before it prints the
+initial plan or its confirmation prompt.  That message is emitted after
+relationship registration and before initial synchronization, so it is both
+misleading and too early: pairing is not the stuck operation, and the promised
+connection is not yet usable.
+
+The direct cause is local capture in =src/scan.rs=.  Each regular file calls
+=State::store_object=.  =store_object= calls =State::begin_object=, which
+acquires =objects.lock= and calls =available_object_bytes=.  The latter reads,
+stats, and totals the complete =objects/= directory.  A scan with N distinct
+objects therefore repeats an increasingly large directory walk N times: O(N²)
+metadata work.  A source tree with many small distinct files looks stalled
+after the connection succeeds even though it is making slow local progress.
+
+This change only repairs local object-store admission during scanning. No
+application SSH endpoint, relationship registration rule, protocol version, or
+deployment mechanism changes here.
+
+* 2. Completion message and visible phases
+
+=add_peer= records and verifies the relationship but does not print
+=Connected=. Its registration message directs the user to =flocal sync PATH=
+with a literal placeholder, so an arbitrary local path never appears as
+shell-ready text. A shared =connected_line(state, share)= helper reads the
+completed configured peer from durable state and formats the existing success
+line.  The =sync add= command calls that helper only
+after all of these steps succeed: the initial plan is confirmed and applied,
+the initial synchronization is marked complete, and the daemon accepts the
+connector start request.  Queue feedback may follow because an accepted start
+can wait for another share; it does not invalidate a completed initial sync.
+
+If the user declines the initial plan, or any later phase fails or is
+interrupted, =Connected= is not printed.  The registered but incomplete
+relationship remains recoverable through =flocal sync start PATH=, exactly as
+the existing durable state model intends.
+
+Only =PlanReport::Full= foreground attempts write these fixed, locally
+generated lines to stderr, before their corresponding potentially long steps:
+
+- =flocal: scanning local files=
+- =flocal: waiting for the remote file scan=
+- =flocal: comparing file lists=
+
+The local line precedes =sync::refresh= or =preview_refresh=; the remote line
+precedes =sync::read_snapshot=; and the comparison line precedes both
+=state.validate_remote_records= and =sync::plan=.  They deliberately contain no paths, filenames, peer-supplied text, counters,
+or progress estimates.  stdout retains plans, prompts, JSON, queue feedback,
+and the final =Connected= line, so JSON consumers remain valid.  A confirmation
+can cause the existing two-attempt initial-plan flow to repeat the phase lines;
+each line describes a real new scan or comparison.
+
+The protocol retains its bounded 30-second no-frame read behavior and
+one-hour session bound.  This change does not add unauthenticated progress
+frames merely to mask a slow or stalled peer.  The local phase line makes a
+remote-scan wait visible; a bounded no-frame failure remains an actionable
+error rather than an unbounded apparent hang.
+
+* 3. Invariants and non-goals
+
+1. =FLOCAL_MAX_STATE_BYTES= retains its current meaning: an installation-wide
+   hard cap, defaulting to 10 GiB, over regular non-symlink files in =objects/=.
+   A capture that would exceed it fails with the existing remaining-storage
+   diagnostic before creating its temporary file.
+2. Object deduplication remains exact.  A valid object already at its hash
+   path succeeds without consuming capacity; a regular but hash-invalid object
+   is reclaimable exactly as today and its prior length is credited only for
+   replacing that path.
+3. All writers in separate processes remain serialized by =objects.lock=.
+   The census and every reservation in one scan occur under one exclusive
+   lock, so another process cannot add an object between the census and a
+   reservation.  The lock's lifetime also continues through each temporary
+   file's durable rename or cleanup.
+4. A failed hash, size, write, sync, rename, or capture-snapshot check leaves
+   no capacity reservation behind and leaves the normal temporary-file cleanup
+   behavior intact.  Existing valid objects are never deleted.
+5. Receiving protocol objects, merge materialization, direct imports,
+   collection, and recovery behavior retain their current admission semantics.
+   They may use the ordinary one-object admission path; this is deliberately
+   not a broad object-store redesign.
+
+There is no per-file progress UI, cap change, background scan, parallel
+capture, protocol change, or new persistent state.  The desired small
+representation is a scan-local remaining-byte counter protected by the
+already-existing lock.
+
+* 4. Scan-scoped admission interface
+
+Add a private state-layer scan-capture scope, named for example
+=ObjectStoreBudget=, created by =State::object_store_budget()=. It owns
+the exclusive =objects.lock= file handle and the remaining capacity derived
+from one =objects/= directory walk using the current regular-file/non-symlink
+rule. The existing parsed-cap and malformed-value fallback behavior remains
+unchanged.
+
+The scope exposes the narrow operation needed by =scan.rs=:
+
+#+begin_src rust
+fn store_object(&mut self, state: &State, input: File) -> Result<(ObjectHash, u64)>;
+#+end_src
+
+It hashes and rechecks the source snapshot exactly as =State::store_object=
+does today, then performs the existing expected-hash and expected-size object
+write.  The scope is the sole owner of its mutable remaining-byte accounting;
+=scan.rs= cannot provide an arbitrary charge or mutate the counter.
+
+=State::store_object= remains the simple public, one-object convenience path
+for non-scan callers.  It hashes before creating the one-object admission
+scope, then delegates the reservation and capture.  =State::begin_object= remains the public streaming
+sink path for received/imported/generated objects and keeps its current lock
+and single-operation census behavior.  This avoids widening protocol and
+merge interfaces to solve a local scanner cost.
+
+Refactor =scan_mode= to construct one mutable scope before walking entries and
+pass it only to the regular-file branch.  Replace that branch's
+=state.store_object(input)= with =budget.store_object(state, input)=.  Both
+=scan= and =preview= flow through =scan_mode= and currently capture objects,
+so both receive the same one-census rule.  No caller-visible scan signature
+changes and no lock escapes =src/state.rs=.
+
+* 5. Reservation and failure behavior
+
+For each new requested object while its scope is live:
+
+1. Look up its final hash path under the held lock.  A valid regular object
+   returns already-present and changes neither used nor remaining bytes.
+2. For a malformed regular existing object, record its length as reclaimable.
+   The requested size is admitted only when it is no greater than current
+   remaining bytes plus that exact reclaimable length.  Remove that bad path
+   only after admission, as the current implementation does.
+3. For a missing or non-regular destination, admit only when the requested
+   size is no greater than the current remaining bytes.  It follows the
+   current publication rule for any non-regular final path and creates the
+   private temporary only after successful admission.
+4. Create and seal the private temporary before reserving capacity. Replacing
+   a malformed regular file first credits its removed length, then debits the
+   requested size; an ordinary new object only debits its requested size.  On
+   successful =sync_all=, verified hash, and rename, that resulting total
+   becomes the next object's view. A capture error exits the scan and drops
+   the whole scope, so no later capture can observe its in-memory debit; the
+   normal sink cleanup removes its temporary and the next scan starts with a
+   fresh census.
+
+The implementation may retain the current =ObjectSink= for ordinary writers
+and introduce a private budgeted sink/helper for the scoped path.  It must not
+make a sink outlive a mutable budget scope or drop the lock before its temp is
+removed or published.  A duplicate created by another writer cannot arise in
+the scope because the lock excludes it; duplicate handling at final rename
+still retains its current defensive correctness.
+
+The scan lock intentionally covers the complete scan, including directory
+walk and source capture.  This is the smallest way to make one initial census
+exact across processes; releasing it between files would reintroduce an
+unaccounted writer race.  Other transfers wait at =objects.lock= rather than
+overcommitting the cap.  This is bounded by the scan's normal lifecycle and
+the existing error/cleanup paths always release the OS lock when the scope is
+dropped.
+
+* 6. Filesystem and security boundaries
+
+The implementation keeps all existing hostile-filesystem rules: source files
+are opened no-follow through the capability directory; source metadata is
+checked before and after hashing/capture; destination objects are inspected
+with =symlink_metadata=; symlinks do not count toward the cap and are never
+accepted as valid objects.  Temporary files stay private and use create-new
+names; publication still verifies the BLAKE3 address and syncs the containing
+directory.
+
+The object directory is local but must still be treated as adversarial or
+corrupt state.  The single census must use exactly the existing regular-file
+filter, propagate read/stat errors rather than silently undercounting, and use
+saturating subtraction only for an already-over-cap store.  It must not trust
+the requested size until normal stream/hash checks complete.  The held
+cross-process advisory lock is the authority that makes the census and the
+reservation serializable; no in-memory counter is shared across processes.
+
+A crash leaves either a private =.tmp-= file or a fully renamed object, as
+today.  A later state open/collector retains its established treatment of
+temporaries, and a later scan's one census includes any regular temporary just
+as the current admission check does.  No database transaction, protocol frame,
+or remote state is committed by this change.
+
+* 7. Test and acceptance plan
+
+1. Add a focused state test for a scope containing several new distinct
+   objects. It gives the scope a three-byte allowance, captures one- and
+   two-byte files, then rejects one additional byte. This pins cumulative
+   accounting without a timing threshold.
+2. Extend the managed =sync add= CLI integration test to assert the phase
+   lines are on stderr, =Connected= is on stdout only after a successful
+   =--yes= initial synchronization, and a declined plan emits no =Connected=
+   line.  Separately run legacy =flocal sync PATH --json= to prove the stderr
+   phases leave JSON stdout valid; managed =sync add= intentionally has no
+   =--json= syntax.
+3. Run =make check=. Its coverage gate executes the foreground SSH process
+   boundary suite, the managed CLI test, all unit tests, formatting, and
+   Clippy. Docker E2E remains unchanged because this fix changes only local
+   capture admission, already exercised through the real fake-SSH boundary.
+
+Run =make check= with its whole-project and changed-line coverage gates, the
+focused state and managed CLI tests on Linux and macOS CI, then the required
+review lenses. The final implementation report must record test results.
+README.org must describe the delayed completion message and phase diagnostics.
+
+* 8. Implementation sequence and acceptance criteria
+
+1. Add the private state budget scope and make the current one-object
+   =store_object= delegate to it without changing its public result or error
+   behavior.
+2. Route the regular-file branch of =src/scan.rs= through one scope per scan.
+3. Route full foreground sync attempts through the fixed stderr phase helper,
+   and move the =Connected= print from relationship registration to final
+   =sync add= success.
+4. Implement the focused state and managed CLI regressions above.
+5. Update README.org to say that =sync add= reports =Connected= after the
+   confirmed initial synchronization and show the phase diagnostics as
+   progress, then reconcile the document and README.org with the actual implementation;
+   write the required final report; run the full local review loop, including
+   filesystem, adversarial-security, and documentation-alignment passes.
+
+The change is accepted when the original setup reaches its normal initial-plan
+confirmation instead of spending one full object-directory walk per captured
+file; a scan performs one initial usage census; sequential captures cannot
+exceed the exact configured cap; and another process cannot invalidate the
+census before the scan releases its lock.

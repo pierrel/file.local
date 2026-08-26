@@ -29,7 +29,7 @@ coverage: coverage-tools
 	python3 tools/check_changed_coverage.py target/coverage.xml $(COVERAGE_BASE) 90
 
 e2e:
-	cargo test --test e2e -- --ignored --test-threads=1
+	cargo test --test e2e -- --ignored --test-threads=1 --skip scenarios::upgrades::legacy_
 
 check: coverage test-make-prefix
 	cargo fmt --all -- --check

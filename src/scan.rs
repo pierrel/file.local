@@ -90,6 +90,7 @@ fn scan_mode(
     let mut records = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut loaded_scopes = BTreeMap::new();
+    let mut objects = state.object_store_budget()?;
     let mut directories = vec![(PathBuf::new(), None::<Arc<IgnoreScope>>)];
     while let Some((directory_path, parent_scope)) = directories.pop() {
         let scope = load_ignore_scope(
@@ -135,7 +136,7 @@ fn scan_mode(
                 Entry::Directory
             } else if metadata.is_file() {
                 let input = open_regular_nofollow(root_dir, &relative)?;
-                let (hash, size) = state.store_object(input).with_context(|| {
+                let (hash, size) = objects.store_object(state, input).with_context(|| {
                     format!("capturing {}", display_root.join(&relative).display())
                 })?;
                 Entry::File {

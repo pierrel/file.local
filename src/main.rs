@@ -310,7 +310,10 @@ fn run() -> Result<()> {
                 path,
                 host,
                 remote_path,
-            } => add_peer(&mut state, &path, &host, &remote_path)?,
+            } => {
+                add_peer(&mut state, &path, &host, &remote_path)?;
+                registered_line(&state, &state.find_share(&path)?.0)?;
+            }
             PeerCommand::List { path, json } => list_peer(&state, &path, json)?,
         },
         Commands::Sync(SyncArgs {
@@ -629,6 +632,7 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                     },
                 )?;
             }
+            connected_line(state, &share)?;
             report_managed_queue(state, &share)?;
         }
         SyncCommand::List { json } => {
@@ -769,6 +773,38 @@ fn validate_sync_add_path(path: &Path) -> Result<()> {
         bail!("sync root must be an existing directory, not a symbolic link");
     }
     Ok(())
+}
+
+fn connected_line(state: &State, share: &ShareId) -> Result<()> {
+    let peer = state
+        .peer(share)?
+        .context("managed connector is missing its peer")?;
+    peer.completed_peer_id()?;
+    println!(
+        "Connected {} to {}:{}",
+        escaped(&share.0),
+        escaped(&peer.host),
+        escaped(&bytes_path(&peer.remote_path).to_string_lossy())
+    );
+    Ok(())
+}
+
+fn registered_line(state: &State, share: &ShareId) -> Result<()> {
+    println!("{}", registered_message(state, share)?);
+    Ok(())
+}
+
+fn registered_message(state: &State, share: &ShareId) -> Result<String> {
+    let peer = state
+        .peer(share)?
+        .context("registered connector is missing its peer")?;
+    peer.completed_peer_id()?;
+    Ok(format!(
+        "Registered {} with {}:{}; run `flocal sync PATH` to synchronize.",
+        escaped(&share.0),
+        escaped(&peer.host),
+        escaped(&bytes_path(&peer.remote_path).to_string_lossy()),
+    ))
 }
 
 fn complete_initial_and_enable(state: &mut State, share: &ShareId, yes: bool) -> Result<bool> {
@@ -2920,12 +2956,6 @@ fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> R
     state.complete_connector_registration_locked(&share, &prepared, &peer_id)?;
     registration.finish()?;
     state.clear_blocked(&share)?;
-    println!(
-        "Connected {} to {}:{}",
-        escaped(&share.0),
-        escaped(&prepared.host),
-        escaped(&bytes_path(&prepared.remote_path).to_string_lossy())
-    );
     if let Some(prior_share) = prior_share {
         println!(
             "Responder remapped retained root from {} to {}.",
@@ -3991,6 +4021,12 @@ fn run_sync(
     }
 }
 
+fn sync_phase(report: PlanReport, message: &str) {
+    if report == PlanReport::Full {
+        eprintln!("flocal: {message}");
+    }
+}
+
 fn run_sync_attempt(
     state: &mut State,
     path: &Path,
@@ -4061,12 +4097,15 @@ fn run_sync_attempt(
     validate_final_sync_binding(state, &share, &binding, None)?;
     state.clear_pending_objects(&share)?;
     state.prune_unreferenced_objects()?;
+    sync_phase(report, "scanning local files");
     let local = if dry_run {
         sync::preview_refresh(state, &share)?
     } else {
         sync::refresh(state, &share)?
     };
+    sync_phase(report, "waiting for the remote file scan");
     let remote_records = sync::read_snapshot(&mut remote.output)?;
+    sync_phase(report, "comparing file lists");
     state.validate_remote_records(&share, &local, &remote_records)?;
     let mut plan = sync::plan(&local, &remote_records);
     let fingerprint = sync_plan_fingerprint(&local, &remote_records, &plan)?;
@@ -8274,6 +8313,26 @@ mod tests {
             remote_path: b"/remote".to_vec(),
             executable: "/bin/false".into(),
         }
+    }
+
+    #[test]
+    fn registration_message_does_not_claim_the_initial_sync_completed() -> Result<()> {
+        let temporary = tempdir()?;
+        let root = temporary.path().join("root; not-a-command");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temporary.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_peer(&share, &test_connector("remote"))?;
+
+        let message = registered_message(&state, &share)?;
+        assert!(message.starts_with("Registered "), "{message}");
+        assert!(!message.contains("Connected "), "{message}");
+        assert!(message.contains("flocal sync PATH"), "{message}");
+        assert!(
+            !message.contains(&root.to_string_lossy().to_string()),
+            "{message}"
+        );
+        Ok(())
     }
 
     fn test_state_with_peer_id(path: &Path, peer: &str) -> Result<State> {

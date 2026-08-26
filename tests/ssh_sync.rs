@@ -193,7 +193,18 @@ exec env FLOCAL_STATE_DIR="$FAKE_REMOTE_STATE" FLOCAL_MAX_SESSION_BYTES="$FAKE_R
 
     fs::write(local_root.join("from-local.txt"), "local edit")?;
     fs::write(remote_root.join("from-local.txt"), "remote edit")?;
-    run(&["sync", local_root.to_str().unwrap(), "--yes", "--json"])?;
+    let json = Command::new(binary)
+        .args(["sync", local_root.to_str().unwrap(), "--yes", "--json"])
+        .env("FLOCAL_STATE_DIR", &local_state)
+        .env("FAKE_REMOTE_STATE", &remote_state)
+        .env("FLOCAL_BIN", binary)
+        .env("FAKE_REMOTE_MAX_SESSION_BYTES", "10737418240")
+        .env("PATH", &path)
+        .output()?;
+    assert!(json.status.success(), "{:?}", json);
+    serde_json::from_slice::<serde_json::Value>(&json.stdout)?;
+    assert!(!String::from_utf8_lossy(&json.stdout).contains("flocal: scanning local files"));
+    assert!(String::from_utf8_lossy(&json.stderr).contains("flocal: scanning local files"));
     let local_database = State::open(&local_state)?;
     let conflicts = local_database.conflicts(&share)?;
     let conflict = conflicts.first().context("expected a conflict")?;

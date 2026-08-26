@@ -1,0 +1,49 @@
+#+title: CI upgrade E2E selection final report
+#+date: 2026-08-25
+
+* What shipped
+
+The Docker E2E job now distinguishes a pull request's compatible base from the
+immutable deployed alpha.  General E2E coverage still runs against the pull
+request base.  The two scenarios that require the older deployed protocol run
+only in the deployed-alpha step.
+
+* User-visible result
+
+Contributors can run =make e2e= for the normal suite.  It includes the
+compatible idle upgrade scenario and skips only tests whose names begin
+=scenarios::upgrades::legacy_=.  CI then runs that prefix with the commit named
+by =docs/deployed-alpha.org=.
+
+* Implementation
+
+=tests/e2e/scenarios/upgrades.rs= keeps the compatible idle transition as the
+ordinary scenario: after upgrading the connector, the compatible base remains
+in =watching= and receives an edit.  The previous incompatible transition is a
+separate =legacy_= scenario, as is responder-first refusal.  Both use the same
+post-upgrade assertions so their common recovery contract cannot drift.
+
+The Makefile skips that literal prefix and the workflow supplies the deployed
+commit only to the matching filtered command.  The E2E design and roadmap now
+describe the same split.
+
+* Validation and review
+
+- The ordinary filter lists 51 scenarios and excludes both legacy scenarios.
+- The deployed-alpha filter lists and passes exactly the two legacy scenarios.
+- The migration-retry upgrade scenario passes when run from the pull request
+  base to this candidate.
+- The macOS gate also exposed a valid third cancellation-race outcome where
+  activation observes that it is no longer eligible before taking the permit.
+  Its assertion now verifies the resulting inactive scheduler state.
+- A complete local ordinary Docker run reached 49 passing scenarios but had two
+  unrelated harness failures: one container exited during setup and one test
+  queried a deliberately locked database.  Re-running the affected product
+  transition in isolation passes.  The target CI failures are covered by the
+  passing focused commands above.
+
+* Operational note
+
+This changes only tests, CI selection, and documentation.  It does not change
+the installed daemon, so no deployment is required.  The CI job is the
+authoritative full-run confirmation on a clean hosted runner.

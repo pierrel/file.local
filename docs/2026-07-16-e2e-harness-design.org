@@ -572,14 +572,16 @@ to the installed executable, then either performs a bounded TERM drain or kills
 a process held at the pre-apply hook. Its start path launches that executable,
 so the installer must observe a real control socket.
 
-The ordinary upgrade scenarios cover an idle pair across an incompatible
-mixed-version reconnect, a killed pre-apply daemon with durable install-intent
-recovery, a killed pre-apply foreground watch recovered by a candidate watch,
-base and candidate foreground-watch refusals, transactional migration failure
-and retry, responder-first legacy refusal followed by connector-first success,
-and fresh installation through the same installer. They assert tree
-convergence, preserved share/peer relationship, empty unsettled and conflict
-state, enabled watching ownership, and candidate executable identity.
+The ordinary upgrade scenarios cover an idle compatible base-to-candidate
+replacement, a killed pre-apply daemon with durable install-intent recovery, a
+killed pre-apply foreground watch recovered by a candidate watch, base and
+candidate foreground-watch refusals, transactional migration failure and retry,
+and fresh installation through the same installer. The immutable deployed-alpha
+upgrade run additionally covers the one-time incompatible mixed-version
+reconnect and responder-first legacy refusal followed by connector-first
+success. They assert tree convergence, preserved share/peer relationship, empty
+unsettled and conflict state, enabled watching ownership, and candidate
+executable identity.
 
 Building on the host and copying the binary in was rejected: the developer
 host and CI runner link against a newer glibc than a stable slim base, so a
@@ -702,12 +704,14 @@ the harness re-supplies the reattaching peer's own alias on reconnect.
 
 ** 5.1 Invocation
 
-Scenarios are ordinary integration tests under =tests/e2e/= marked
-=#[ignore = "requires docker; run via `make e2e`"]=. New Makefile target:
+Scenarios are ordinary integration tests under =tests/e2e/= marked =#[ignore]=.
+=make e2e= runs every general scenario and skips the
+=scenarios::upgrades::legacy_= prefix; CI separately runs that prefix against
+the immutable deployed alpha.
 
 #+begin_example
 e2e:
-	cargo test --test e2e -- --ignored --test-threads=1
+	cargo test --test e2e -- --ignored --test-threads=1 --skip scenarios::upgrades::legacy_
 #+end_example
 
 Host prerequisites, each failing with a one-line diagnosis: a reachable
@@ -1012,10 +1016,13 @@ responder-side failure — must be diagnosable from its CI log alone.
 * 11. Platform and CI
 
 A new =e2e= job in CI runs =make e2e= on =ubuntu-latest=, where Docker is
-preinstalled. The job is Linux-only: GitHub's macOS runners provide no
-Docker daemon, and macOS cannot be containerized regardless. (A developer on
-a macOS machine with Docker Desktop can still run =make e2e= locally —
-Linux containers — per section 3.2.)
+preinstalled, then runs the =legacy_= upgrade scenarios against the immutable
+deployed alpha. =make e2e= exercises every general scenario, including the
+compatible current-base upgrade path; only the predecessor-only scenarios are
+selected by the anchored run. The job is Linux-only: GitHub's macOS runners
+provide no Docker daemon, and macOS cannot be containerized regardless. (A
+developer on a macOS machine with Docker Desktop can still run =make e2e=
+locally — Linux containers — per section 3.2.)
 
 Consequence for the acceptance gap, stated plainly: this harness closes the
 "real cross-machine SSH" gap for Linux–Linux only. The macOS side of
@@ -1039,7 +1046,7 @@ runners are exactly where the cached dependency layer delivers warm builds.
 The harness's first implementation is acceptable when:
 
 1. =make e2e= on a Linux machine with Docker, running against =main=, builds
-   the image and runs all sixteen S1 scenarios (catalog #1–#12 and #17–#20)
+   the image and runs all general S1 scenarios (catalog #1–#12 and #17–#20)
    over real SSH between two containers, with every scenario matching its
    declared expectation: nine pass, and seven (#5, #6, #7, #8, #10, #11,
    #18)
@@ -1067,8 +1074,9 @@ The harness's first implementation is acceptable when:
    developer machine or persistent runner; a cold CI run, including the
    image build, completes in under twenty-five minutes on a standard
    GitHub-hosted runner.
-8. The CI =e2e= job runs =make e2e= on the Linux runner and fails the build
-   on any scenario failure.
+8. The CI =e2e= job runs =make e2e= on the Linux runner, then runs the
+   =legacy_= upgrade scenarios from the immutable deployed alpha, and fails
+   the build on any scenario failure.
 9. The image build context contains only =Cargo.toml=, =Cargo.lock=,
    =src/=, and the two runtime scripts =tests/e2e/entrypoint.sh= and
    =tests/e2e/flocal-wrapper.sh= (readmitted by =.dockerignore=
