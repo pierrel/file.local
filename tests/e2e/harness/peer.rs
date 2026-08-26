@@ -1490,26 +1490,40 @@ impl Peer {
     }
 
     pub fn arm_scheduling_wait_observation(&self) -> Result<()> {
-        self.exec_ok(&[
-            "rm",
-            "-f",
-            "--",
-            SCHEDULING_WAIT_MARKER,
-            SCHEDULING_WAIT_OBSERVED,
-        ])?;
-        self.exec_ok(&["touch", "--", SCHEDULING_WAIT_MARKER])?;
-        Ok(())
+        self.arm_observation(SCHEDULING_WAIT_MARKER, SCHEDULING_WAIT_OBSERVED)
     }
 
     pub fn wait_for_scheduling_wait(&self) -> Result<()> {
-        self.poll_until(
+        self.wait_for_observation(
+            SCHEDULING_WAIT_OBSERVED,
             "no synchronization command joined the installation queue",
-            DEADLINE,
-            |peer| {
-                let output = peer.exec_raw(&["test", "-f", SCHEDULING_WAIT_OBSERVED])?;
-                Ok(output.status.success().then_some(()))
-            },
         )
+    }
+
+    pub fn arm_managed_watch_enqueue_observation(&self, share: &str) -> Result<()> {
+        let (marker, observed) = managed_watch_marker_paths(share)?;
+        self.arm_observation(&marker, &observed)
+    }
+
+    pub fn wait_for_managed_watch_enqueue(&self, share: &str) -> Result<()> {
+        let (_, observed) = managed_watch_marker_paths(share)?;
+        self.wait_for_observation(
+            &observed,
+            "persistent watch did not queue its next synchronization round",
+        )
+    }
+
+    fn arm_observation(&self, marker: &str, observed: &str) -> Result<()> {
+        self.exec_ok(&["rm", "-f", "--", marker, observed])?;
+        self.exec_ok(&["touch", "--", marker])?;
+        Ok(())
+    }
+
+    fn wait_for_observation(&self, observed: &str, timeout_message: &str) -> Result<()> {
+        self.poll_until(timeout_message, DEADLINE, |peer| {
+            let output = peer.exec_raw(&["test", "-f", observed])?;
+            Ok(output.status.success().then_some(()))
+        })
     }
 
     pub fn sync_remove(&self) -> Result<()> {
@@ -2617,10 +2631,9 @@ impl Peer {
         let Some(pid) = fields.next().and_then(|pid| pid.parse::<u32>().ok()) else {
             return Ok(None);
         };
-        let Some(share) = fields.next() else {
-            return Ok(None);
-        };
-        if fields.next().is_some() || expected_share.is_some_and(|expected| expected != share) {
+        let share = fields.next();
+        if fields.next().is_some() || expected_share.is_some_and(|expected| share != Some(expected))
+        {
             return Ok(None);
         }
         Ok(Some(pid))
@@ -2894,6 +2907,22 @@ fn reject_target_timeout(
     Ok(())
 }
 
+fn managed_watch_marker_paths(share: &str) -> Result<(String, String)> {
+    if share.is_empty()
+        || share.len() > 128
+        || !share
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("E2E marker share ID is unsafe");
+    }
+    let state = "/home/peer/.local/state/file.local";
+    Ok((
+        format!("{state}/.e2e-observe-managed-watch-{share}"),
+        format!("{state}/.e2e-managed-watch-{share}-observed"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt as _;
@@ -2912,5 +2941,11 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("exceeded the E2E target-command deadline"));
         assert!(!error.contains("another synchronization operation"));
+    }
+
+    #[test]
+    fn managed_watch_marker_paths_reject_unsafe_share_ids() {
+        assert!(managed_watch_marker_paths("share-safe_1").is_ok());
+        assert!(managed_watch_marker_paths("share/../../outside").is_err());
     }
 }

@@ -1005,6 +1005,20 @@ fn validate_pair_value(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_marker_share_suffix(share: &ShareId) -> Result<&str> {
+    if share.0.is_empty()
+        || share.0.len() > 128
+        || !share
+            .0
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("E2E marker share ID is unsafe");
+    }
+    Ok(&share.0)
+}
+
 fn honor_relationship_yield(
     transaction: &rusqlite::Transaction<'_>,
     relationship: &RelationshipId,
@@ -3053,10 +3067,6 @@ impl State {
             ],
         )?;
         transaction.commit()?;
-        #[cfg(feature = "e2e-test-hooks")]
-        if changed != 0 {
-            self.observe_e2e_global_contention()?;
-        }
         Ok((changed != 0).then_some(network_order))
     }
 
@@ -3152,6 +3162,13 @@ impl State {
         )? != 0
         {
             self.observe_e2e_global_contention()?;
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        if operation == SyncOperation::Watch
+            && let Some(share) = share
+        {
+            self.observe_e2e_managed_watch_enqueue(share)?;
         }
 
         Ok(QueueRequest {
@@ -3978,16 +3995,40 @@ impl State {
 
     #[cfg(feature = "e2e-test-hooks")]
     fn observe_e2e_global_contention(&self) -> Result<()> {
-        let marker = self.dir.join(".e2e-observe-global-contention");
-        let observed = self.dir.join(".e2e-global-contention-observed");
+        self.observe_e2e_marker(
+            ".e2e-observe-global-contention",
+            ".e2e-global-contention-observed",
+            "global contention",
+        )
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    fn observe_e2e_managed_watch_enqueue(&self, share: &ShareId) -> Result<()> {
+        let suffix = e2e_marker_share_suffix(share)?;
+        self.observe_e2e_marker(
+            &format!(".e2e-observe-managed-watch-{suffix}"),
+            &format!(".e2e-managed-watch-{suffix}-observed"),
+            "managed watch enqueue",
+        )
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    fn observe_e2e_marker(
+        &self,
+        marker_name: &str,
+        observed_name: &str,
+        event: &str,
+    ) -> Result<()> {
+        let marker = self.dir.join(marker_name);
+        let observed = self.dir.join(observed_name);
         match fs::rename(&marker, &observed) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error).context("publishing E2E global contention"),
+            Err(error) => return Err(error).with_context(|| format!("publishing E2E {event}")),
         }
         let metadata = fs::symlink_metadata(&observed)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 0 {
-            bail!("E2E global contention marker is not an empty regular file");
+            bail!("E2E {event} marker is not an empty regular file");
         }
         Ok(())
     }
@@ -8667,6 +8708,37 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn managed_watch_enqueue_has_a_share_specific_observation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let state_dir = temp.path().join("state");
+        let root = temp.path().join("root");
+        let mut state = State::open(&state_dir)?;
+        let share = ShareId::generate();
+        state.register_share(&share, &root)?;
+        let mut active = state.enqueue_sync(None, SyncOperation::Maintenance, None)?;
+        let active = active
+            .try_activate()?
+            .context("maintenance request did not activate")?;
+        let marker = state_dir.join(format!(".e2e-observe-managed-watch-{}", share.0));
+        let observed = state_dir.join(format!(".e2e-managed-watch-{}-observed", share.0));
+        let other = ShareId::generate();
+        let other_marker = state_dir.join(format!(".e2e-observe-managed-watch-{}", other.0));
+        let other_observed = state_dir.join(format!(".e2e-managed-watch-{}-observed", other.0));
+        fs::write(&marker, [])?;
+        fs::write(&other_marker, [])?;
+
+        state.enqueue_sync(Some(&share), SyncOperation::Watch, Some(1))?;
+
+        assert!(!marker.exists());
+        assert!(observed.is_file());
+        assert!(other_marker.is_file());
+        assert!(!other_observed.exists());
+        active.finish()?;
+        Ok(())
+    }
+
     #[test]
     fn legacy_registration_only_acknowledges_an_existing_null_incarnation() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -9344,8 +9416,6 @@ mod tests {
         let original_token = original.token().to_owned();
         let relationship = RelationshipId::generate();
         let authority = state.peer_id()?;
-        #[cfg(feature = "e2e-test-hooks")]
-        fs::write(state_dir.join(".e2e-observe-global-contention"), [])?;
         assert!(
             state
                 .convert_managed_to_authoritative_parked(
@@ -9360,8 +9430,6 @@ mod tests {
                 )?
                 .is_some()
         );
-        #[cfg(feature = "e2e-test-hooks")]
-        assert!(state_dir.join(".e2e-global-contention-observed").is_file());
         drop(original.owner.take());
         drop(original);
 

@@ -46,8 +46,9 @@ connector.  Share A is paired normally.  A foreground watch is then stopped at
 the existing pre-apply E2E boundary.  At that point it holds the real global
 lock, not a mock lock.
 
-The test arms a one-shot marker.  The E2E build publishes that marker only when
-another real lock attempt receives =WouldBlock=:
+The setup test arms a one-shot contention marker.  The E2E build publishes it
+when an enqueue commits behind a live active row or another real lock attempt
+receives =WouldBlock=:
 
 #+begin_src rust
 match file.try_lock_exclusive() {
@@ -69,6 +70,24 @@ is consumed by atomic rename to an observed name.  The hook rejects symlinks,
 non-files, and nonempty files.  It cannot weaken or release the lock, and
 =#[cfg(feature = "e2e-test-hooks")]= removes the entire hook from ordinary
 builds.
+
+The later persistent-watch fairness test uses a separate marker namespaced by
+the primary share.  It is published only after that share has durably queued
+its managed watch request for round two:
+
+#+begin_src rust
+transaction.commit()?;
+#[cfg(feature = "e2e-test-hooks")]
+if operation == SyncOperation::Watch {
+    self.observe_e2e_managed_watch_enqueue(share)?;
+}
+Ok(QueueRequest { /* committed request */ })
+#+end_src
+
+That distinct marker cannot be consumed by the older share's enqueue or by a
+worker retrying the global lock.  The harness then waits for an apply-stop
+record tagged with the older second share, proving that the older request
+reached apply before the newly queued watch round.
 
 Once the harness sees the observed marker, it checks that B has not applied and
 is not enabled, then resumes A.  The setup scenario needs a scoped observer

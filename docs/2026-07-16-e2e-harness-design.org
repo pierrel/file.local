@@ -1357,7 +1357,7 @@ Four focused scenarios extend that boundary:
 1. =sync stop= removes a queued managed start before the active owner releases,
    and a later completed permit proves the canceled payload cannot run.
 2. A second watch event becomes pending while round one still owns the
-   installation.  Its queued request is converted for round two, then the
+   installation.  It queues a new managed request for round two, then the
    older sibling reaches a real apply stop; only then does the watch complete
    round two.
 3. SIGKILL of the daemon discards request liveness but preserves enabled intent;
@@ -1376,11 +1376,11 @@ row or final OS-lock acquisition reports =WouldBlock=, because the relationship
 is not yet configured and therefore cannot appear in =sync list=.  After
 release it also asserts the command's captured human path and queue position.
 Configured-share scenarios assert scheduling through list/status instead.  The
-fairness scenario above uses a one-shot observation when the older managed
-request converts, then accepts only an apply-stop record tagged with that
-second share.  This proves the older sibling reaches apply first without
-reading SQLite while its deliberate stop holds the database.  Default
-production builds contain no marker behavior.
+fairness scenario above uses a one-shot observation for the primary share when
+it queues the second watch round, then accepts only an
+apply-stop record tagged with the older second share.  This proves the older
+sibling reaches apply first without reading SQLite while its deliberate stop
+holds the database.  Default production builds contain no marker behavior.
 
 The opposite-direction scenario uses a hidden, E2E-only protocol command to
 hold an unrelated real maintenance permit.  Its RAII guard resumes the stopped
