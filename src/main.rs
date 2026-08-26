@@ -1495,9 +1495,20 @@ fn read_daemon_message(stream: &mut impl Read) -> std::result::Result<Vec<u8>, D
     let mut message = Vec::new();
     let mut buffer = [0u8; 4096];
     loop {
-        let count = stream
-            .read(&mut buffer)
-            .map_err(DaemonMessageError::Transport)?;
+        let count = loop {
+            match stream.read(&mut buffer) {
+                Ok(count) => break count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if message.is_empty() => {
+                    return Err(DaemonMessageError::Transport(error));
+                }
+                Err(error) => {
+                    return Err(DaemonMessageError::Protocol(format!(
+                        "daemon control connection failed before a complete message: {error}"
+                    )));
+                }
+            }
+        };
         if count == 0 {
             if message.is_empty() {
                 return Err(DaemonMessageError::Transport(io::Error::new(
@@ -12358,6 +12369,59 @@ esac
         let error = read_daemon_message(&mut input.as_slice())
             .expect_err("control framing must bound allocation");
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn daemon_control_rejects_a_read_failure_after_a_partial_message() {
+        struct PartialMessage {
+            sent_prefix: bool,
+        }
+
+        impl Read for PartialMessage {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.sent_prefix {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "reply stalled"));
+                }
+                self.sent_prefix = true;
+                buffer[..7].copy_from_slice(b"partial");
+                Ok(7)
+            }
+        }
+
+        let error = read_daemon_message(&mut PartialMessage { sent_prefix: false })
+            .expect_err("a partial daemon reply must not become a stored fallback");
+        assert!(matches!(error, DaemonMessageError::Protocol(_)));
+    }
+
+    #[test]
+    fn daemon_control_retries_an_interrupted_read() -> Result<()> {
+        struct InterruptedMessage {
+            step: u8,
+        }
+
+        impl Read for InterruptedMessage {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.step += 1;
+                match self.step {
+                    1 => {
+                        buffer[..4].copy_from_slice(b"part");
+                        Ok(4)
+                    }
+                    2 => Err(io::Error::new(io::ErrorKind::Interrupted, "signal")),
+                    3 => {
+                        buffer[..4].copy_from_slice(b"ial\n");
+                        Ok(4)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+
+        assert_eq!(
+            read_daemon_message(&mut InterruptedMessage { step: 0 })?,
+            b"partial\n"
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

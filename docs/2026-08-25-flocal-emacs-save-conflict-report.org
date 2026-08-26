@@ -19,7 +19,7 @@ The CLI has a new deliberately narrow grammar. The Clap argument group prevents 
 Status { path: Option<PathBuf>, #[arg(long, requires = "json", conflicts_with = "path")] list: bool, #[arg(long)] json: bool }
 #+end_src
 
-The list implementation validates the private state/run/socket path before live connection. Its =StatusDeadlineStream= recomputes time remaining from one =Instant= before every read and write. Rust's =Read= and =Write= traits let serde use that deadline-aware stream without a separate JSON framing implementation. A connection, write, read, or deadline transport failure uses stored status; a malformed, truncated, or oversized reply after connection is a hard error. If no safe daemon socket exists, the state layer opens SQLite through an immutable read-only URI. It neither creates a state directory nor allows a WAL/SHM sidecar to make a supposedly read-only query unsafe.
+The list implementation validates the private state/run/socket path before live connection. Its =StatusDeadlineStream= recomputes time remaining from one =Instant= before every read and write. Rust's =Read= and =Write= traits let serde use that deadline-aware stream without a separate JSON framing implementation. A connection, write, deadline, or read failure before the first reply byte uses stored status; a malformed, truncated, oversized, or stalled partial reply is a hard error. If no safe daemon socket exists, the state layer opens SQLite through an immutable read-only URI. It neither creates a state directory nor allows a WAL/SHM sidecar to make a supposedly read-only query unsafe.
 
 ** Save guard
 
@@ -40,7 +40,7 @@ The asynchronous status process takes argv rather than a shell, requires a canon
 
 The two subtle races were the visit hook and Ediff snapshot. A disk-path baseline looks natural but is unsafe: the file can be replaced after Emacs read it and before the hook. Using serialized buffer bytes makes that bad state unrepresentable. Separately, hashing disk and then reading B can otherwise compare different versions; the second B digest makes that path fail closed.
 
-The status client also needs to be genuinely read-only. SQLite read-only mode can still create WAL sidecars, so the durable fallback uses an immutable URI and rejects existing WAL/SHM files. Its Unix socket connection is nonblocking and polled, while the same absolute deadline applies through pagination and trickle reads. A connection, write, read, or deadline transport failure falls back to durable state; a completed malformed, truncated, or oversized reply remains a hard error.
+The status client also needs to be genuinely read-only. SQLite read-only mode can still create WAL sidecars, so the durable fallback uses an immutable URI and rejects existing WAL/SHM files. Its Unix socket connection is nonblocking and polled, while the same absolute deadline applies through pagination and trickle reads. A connection, write, deadline, or read failure before the first reply byte falls back to durable state; a malformed, truncated, oversized, or stalled partial reply remains a hard error.
 
 Two originally discussed sync-tree hygiene changes are intentionally deferred: setting =create-lockfiles= globally and redirecting all Emacs auto-saves would affect unrelated buffers and are not required for the save-safety invariant. They should be designed as a separately scoped Emacs workflow feature, rather than silently changing global editor behavior.
 
