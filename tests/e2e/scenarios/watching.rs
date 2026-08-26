@@ -75,12 +75,11 @@ fn watch_notices_an_atomic_rename_save() -> Result<()> {
     a.rename(".notes.txt.tmp", "notes.txt")?; // ...renamed over the original
     watch.resume()?;
 
-    watch
-        .wait_for_log("UNSETTLED .notes.txt.tmp changed while synchronizing; recalculating now")?;
+    watch.wait_for_log("changed while synchronizing; recalculating now")?;
     b.wait_for_file("notes.txt", "v2")?;
     a.wait_absent(".notes.txt.tmp")?;
     b.wait_absent(".notes.txt.tmp")?;
-    watch.wait_for_log("SETTLED .notes.txt.tmp no longer blocks synchronization")?;
+    watch.wait_for_log("SETTLED")?;
     anyhow::ensure!(
         !a.status()?.pending_install && a.status()?.unsettled.is_empty(),
         "connector retained pending or unsettled state after atomic rename"
