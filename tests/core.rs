@@ -2,10 +2,34 @@ use std::fs;
 
 use anyhow::Result;
 use flocal::model::{Entry, RelativePath};
+use flocal::reconcile::Plan;
 use flocal::scan::scan;
 use flocal::state::State;
-use flocal::sync::{ShareRoot, apply_plan, plan, refresh, refresh_with_root};
+use flocal::sync::{
+    ShareRoot, apply_complete_plan_with_root_skipping_guarding_snapshot, apply_plan, plan, refresh,
+    refresh_with_root,
+};
 use tempfile::tempdir;
+
+fn apply_guarded_snapshot(
+    state: &mut State,
+    share: &flocal::model::ShareId,
+    root: &ShareRoot,
+    snapshot: &[flocal::model::Record],
+) -> Result<()> {
+    apply_complete_plan_with_root_skipping_guarding_snapshot(
+        state,
+        share,
+        root,
+        &Plan {
+            records: snapshot.to_vec(),
+            conflicts: Vec::new(),
+            merges: Vec::new(),
+        },
+        &std::collections::HashSet::new(),
+        snapshot,
+    )
+}
 
 #[test]
 fn acknowledged_file_head_survives_restart_as_the_next_merge_base() -> Result<()> {
@@ -99,6 +123,176 @@ fn held_share_root_rejects_path_replacement_without_tombstones() -> Result<()> {
     );
     assert!(fs::read_dir(&root)?.next().is_none());
     assert_eq!(fs::read_to_string(held_tree.join("kept.txt"))?, "kept");
+    Ok(())
+}
+
+#[test]
+fn persistent_apply_invalidates_a_changed_local_snapshot_before_overwriting_it() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir(&root)?;
+    fs::write(root.join("notes.txt"), "v1")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let snapshot = refresh(&mut state, &share)?;
+    let capability = ShareRoot::open(&state, &share)?;
+
+    fs::write(root.join("notes.txt"), "v2")?;
+    let error = apply_guarded_snapshot(&mut state, &share, &capability, &snapshot)
+        .expect_err("a changed local snapshot must invalidate persistent apply");
+
+    assert!(
+        error
+            .downcast_ref::<flocal::sync::ApplyInvalidated>()
+            .is_some()
+    );
+    assert_eq!(fs::read_to_string(root.join("notes.txt"))?, "v2");
+    assert!(state.install_intent(&share)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn persistent_apply_invalidates_a_vanished_local_snapshot_file() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir(&root)?;
+    fs::write(root.join("notes.txt"), "v1")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let snapshot = refresh(&mut state, &share)?;
+    let capability = ShareRoot::open(&state, &share)?;
+
+    fs::remove_file(root.join("notes.txt"))?;
+    let error = apply_guarded_snapshot(&mut state, &share, &capability, &snapshot)
+        .expect_err("a vanished local snapshot must invalidate persistent apply");
+
+    assert!(
+        error
+            .downcast_ref::<flocal::sync::ApplyInvalidated>()
+            .is_some()
+    );
+    assert!(!root.join("notes.txt").exists());
+    assert!(state.install_intent(&share)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn persistent_apply_invalidates_a_recreated_local_snapshot_tombstone() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir(&root)?;
+    fs::write(root.join("notes.txt"), "v1")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    refresh(&mut state, &share)?;
+    fs::remove_file(root.join("notes.txt"))?;
+    let snapshot = refresh(&mut state, &share)?;
+    assert!(matches!(snapshot[0].version.entry, Entry::Tombstone));
+    let capability = ShareRoot::open(&state, &share)?;
+
+    fs::write(root.join("notes.txt"), "v2")?;
+    let error = apply_guarded_snapshot(&mut state, &share, &capability, &snapshot)
+        .expect_err("a recreated local tombstone must invalidate persistent apply");
+
+    assert!(
+        error
+            .downcast_ref::<flocal::sync::ApplyInvalidated>()
+            .is_some()
+    );
+    assert_eq!(fs::read_to_string(root.join("notes.txt"))?, "v2");
+    assert!(state.install_intent(&share)?.is_none());
+    assert_eq!(
+        state.unsettled_paths(&share)?,
+        vec![RelativePath::from_bytes(b"notes.txt".to_vec())?]
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_apply_rejects_a_fifo_without_blocking() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir(&root)?;
+    fs::write(root.join("notes.txt"), "v1")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let snapshot = refresh(&mut state, &share)?;
+    let capability = ShareRoot::open(&state, &share)?;
+
+    fs::remove_file(root.join("notes.txt"))?;
+    let status = std::process::Command::new("mkfifo")
+        .arg(root.join("notes.txt"))
+        .status()?;
+    anyhow::ensure!(status.success(), "mkfifo failed with {status}");
+    let error = apply_guarded_snapshot(&mut state, &share, &capability, &snapshot)
+        .expect_err("a FIFO must invalidate persistent apply without blocking");
+
+    assert!(
+        error
+            .downcast_ref::<flocal::sync::ApplyInvalidated>()
+            .is_some()
+    );
+    assert!(state.install_intent(&share)?.is_none());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_apply_rejects_a_socket_as_a_changed_file_type() -> Result<()> {
+    use std::os::unix::net::UnixListener;
+
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    fs::create_dir(&root)?;
+    fs::write(root.join("notes.txt"), "v1")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let snapshot = refresh(&mut state, &share)?;
+    let capability = ShareRoot::open(&state, &share)?;
+
+    fs::remove_file(root.join("notes.txt"))?;
+    let _socket = UnixListener::bind(root.join("notes.txt"))?;
+    let error = apply_guarded_snapshot(&mut state, &share, &capability, &snapshot)
+        .expect_err("a socket must invalidate persistent apply as a changed file type");
+
+    assert!(
+        error
+            .downcast_ref::<flocal::sync::ApplyInvalidated>()
+            .is_some()
+    );
+    assert!(state.install_intent(&share)?.is_none());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_apply_rejects_a_snapshot_parent_replaced_by_a_symlink() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir()?;
+    let root = temp.path().join("root");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(root.join("nested"))?;
+    fs::create_dir(&outside)?;
+    fs::write(root.join("nested/notes.txt"), "v1")?;
+    let mut state = State::open(temp.path().join("state"))?;
+    let share = state.init_share(&root)?;
+    let snapshot = refresh(&mut state, &share)?;
+    let capability = ShareRoot::open(&state, &share)?;
+
+    fs::remove_dir_all(root.join("nested"))?;
+    symlink(&outside, root.join("nested"))?;
+    let error = apply_guarded_snapshot(&mut state, &share, &capability, &snapshot)
+        .expect_err("a replaced snapshot parent must invalidate persistent apply");
+
+    assert!(
+        error
+            .downcast_ref::<flocal::sync::ApplyInvalidated>()
+            .is_some()
+    );
+    assert!(fs::read_dir(&outside)?.next().is_none());
+    assert!(state.install_intent(&share)?.is_none());
     Ok(())
 }
 

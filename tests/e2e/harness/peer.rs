@@ -1077,6 +1077,47 @@ impl Drop for Watch<'_> {
 }
 
 impl Peer {
+    pub fn emacs_ok(&self, form: &str) -> Result<std::process::Output> {
+        self.exec_ok(&[
+            "emacs",
+            "-Q",
+            "--batch",
+            "-L",
+            "/usr/local/share/flocal/emacs",
+            "--eval",
+            form,
+        ])
+    }
+
+    /// Starts a detached batch Emacs client.  Scenarios coordinate it through
+    /// ignored files below its share, so they still exercise a real container
+    /// and never rely on host-side Emacs state.
+    pub fn emacs_start(&self, form: &str) -> Result<()> {
+        let arguments = [
+            "exec",
+            "-d",
+            "-u",
+            "peer",
+            &self.container.name,
+            "emacs",
+            "-Q",
+            "--batch",
+            "-L",
+            "/usr/local/share/flocal/emacs",
+            "--eval",
+            form,
+        ];
+        let output = self.context.docker_raw(&arguments)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: starting detached Emacs failed: {}",
+                self.alias,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
+    }
+
     pub fn install_candidate(&self) -> Result<()> {
         let output = self.exec_ok(&[
             "/usr/local/libexec/flocal-real",
@@ -1444,59 +1485,45 @@ impl Peer {
         )
     }
 
-    pub fn wait_for_sync_queued_behind(&self, root: &str) -> Result<()> {
-        let root = root.as_bytes().to_vec();
-        self.poll_until(
-            "persistent watch did not report its local scheduling wait",
-            DEADLINE,
-            move |peer| {
-                let status = peer.status()?;
-                let scheduling = status.scheduling().clone();
-                if scheduling.state != "queued" {
-                    return Ok(None);
-                }
-                scheduling.validate_queued()?;
-                if scheduling.waiting_on.as_deref() != Some("local")
-                    || scheduling
-                        .waiting_root
-                        .as_ref()
-                        .map(DaemonPath::decode)
-                        .transpose()?
-                        .as_deref()
-                        != Some(root.as_slice())
-                {
-                    return Ok(None);
-                }
-                Ok(Some(()))
-            },
-        )
-    }
-
     pub fn assert_sync_durably_queued(&self) -> Result<()> {
         self.status()?.scheduling().validate_queued()
     }
 
     pub fn arm_scheduling_wait_observation(&self) -> Result<()> {
-        self.exec_ok(&[
-            "rm",
-            "-f",
-            "--",
-            SCHEDULING_WAIT_MARKER,
-            SCHEDULING_WAIT_OBSERVED,
-        ])?;
-        self.exec_ok(&["touch", "--", SCHEDULING_WAIT_MARKER])?;
-        Ok(())
+        self.arm_observation(SCHEDULING_WAIT_MARKER, SCHEDULING_WAIT_OBSERVED)
     }
 
     pub fn wait_for_scheduling_wait(&self) -> Result<()> {
-        self.poll_until(
+        self.wait_for_observation(
+            SCHEDULING_WAIT_OBSERVED,
             "no synchronization command joined the installation queue",
-            DEADLINE,
-            |peer| {
-                let output = peer.exec_raw(&["test", "-f", SCHEDULING_WAIT_OBSERVED])?;
-                Ok(output.status.success().then_some(()))
-            },
         )
+    }
+
+    pub fn arm_managed_watch_enqueue_observation(&self, share: &str) -> Result<()> {
+        let (marker, observed) = managed_watch_marker_paths(share)?;
+        self.arm_observation(&marker, &observed)
+    }
+
+    pub fn wait_for_managed_watch_enqueue(&self, share: &str) -> Result<()> {
+        let (_, observed) = managed_watch_marker_paths(share)?;
+        self.wait_for_observation(
+            &observed,
+            "persistent watch did not queue its next synchronization round",
+        )
+    }
+
+    fn arm_observation(&self, marker: &str, observed: &str) -> Result<()> {
+        self.exec_ok(&["rm", "-f", "--", marker, observed])?;
+        self.exec_ok(&["touch", "--", marker])?;
+        Ok(())
+    }
+
+    fn wait_for_observation(&self, observed: &str, timeout_message: &str) -> Result<()> {
+        self.poll_until(timeout_message, DEADLINE, |peer| {
+            let output = peer.exec_raw(&["test", "-f", observed])?;
+            Ok(output.status.success().then_some(()))
+        })
     }
 
     pub fn sync_remove(&self) -> Result<()> {
@@ -1727,15 +1754,7 @@ impl Peer {
             "flocal protocol serve did not stop at the apply boundary",
             DEADLINE,
             |peer| {
-                let output = peer.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
-                if !output.status.success() {
-                    return Ok(None);
-                }
-                let Some(pid) = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                else {
+                let Some(pid) = peer.stopped_apply_pid(None)? else {
                     return Ok(None);
                 };
                 Ok(peer.is_stopped_protocol_server(pid)?.then_some(pid))
@@ -1748,15 +1767,26 @@ impl Peer {
             "flocal process did not stop at the apply boundary",
             DEADLINE,
             |peer| {
-                let output = peer.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
-                if !output.status.success() {
+                let Some(pid) = peer.stopped_apply_pid(None)? else {
                     return Ok(None);
-                }
-                let Some(pid) = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                else {
+                };
+                Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
+            },
+        )?;
+        Ok(StoppedApply {
+            peer: self,
+            pid,
+            resumed: false,
+        })
+    }
+
+    pub fn wait_for_stopped_apply_process_for(&self, share: &str) -> Result<StoppedApply<'_>> {
+        let share = share.to_owned();
+        let pid = self.poll_until(
+            "expected share did not stop at the apply boundary",
+            DEADLINE,
+            |peer| {
+                let Some(pid) = peer.stopped_apply_pid(Some(&share))? else {
                     return Ok(None);
                 };
                 Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
@@ -2591,6 +2621,24 @@ impl Peer {
         Ok(())
     }
 
+    fn stopped_apply_pid(&self, expected_share: Option<&str>) -> Result<Option<u32>> {
+        let output = self.exec_raw(&["cat", "--", APPLY_STOP_PIDFILE])?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let contents = String::from_utf8_lossy(&output.stdout);
+        let mut fields = contents.split_whitespace();
+        let Some(pid) = fields.next().and_then(|pid| pid.parse::<u32>().ok()) else {
+            return Ok(None);
+        };
+        let share = fields.next();
+        if fields.next().is_some() || expected_share.is_some_and(|expected| share != Some(expected))
+        {
+            return Ok(None);
+        }
+        Ok(Some(pid))
+    }
+
     fn is_protocol_server(&self, pid: u32) -> Result<bool> {
         let output = self.exec_raw(&["cat", "--", &format!("/proc/{pid}/cmdline")])?;
         if !output.status.success() {
@@ -2859,6 +2907,22 @@ fn reject_target_timeout(
     Ok(())
 }
 
+fn managed_watch_marker_paths(share: &str) -> Result<(String, String)> {
+    if share.is_empty()
+        || share.len() > 128
+        || !share
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("E2E marker share ID is unsafe");
+    }
+    let state = "/home/peer/.local/state/file.local";
+    Ok((
+        format!("{state}/.e2e-observe-managed-watch-{share}"),
+        format!("{state}/.e2e-managed-watch-{share}-observed"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::ExitStatusExt as _;
@@ -2877,5 +2941,11 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("exceeded the E2E target-command deadline"));
         assert!(!error.contains("another synchronization operation"));
+    }
+
+    #[test]
+    fn managed_watch_marker_paths_reject_unsafe_share_ids() {
+        assert!(managed_watch_marker_paths("share-safe_1").is_ok());
+        assert!(managed_watch_marker_paths("share/../../outside").is_err());
     }
 }

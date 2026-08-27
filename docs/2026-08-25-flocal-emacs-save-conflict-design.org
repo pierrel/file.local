@@ -1,0 +1,37 @@
+#+title: flocal Emacs companion implementation design
+#+date: 2026-08-25
+#+status: implemented
+
+* Purpose
+
+=flocal-guard= is an optional Emacs 28+ affordance for local files under enabled flocal shares. It discovers shares and prevents a modified visiting buffer from silently overwriting a different disk version. It never pairs, starts, stops, or synchronizes a share.
+
+* Shared status contract
+
+=flocal status --list --json= is the editor-neutral, read-only API. Its only list grammar is exactly that command; the existing =status PATH [--json]= interface is unchanged. Schema 1 has an RFC3339 observation time, =source= (=live= or =stored=), daemon availability, and configured shares.
+
+#+begin_src js
+{"schema":1,"source":"live|stored","observed_at":"RFC3339 UTC","daemon":{"state":"live|unavailable","diagnostic":null},"shares":[{"share":"opaque-id","root":{"encoding":"base64","data":"..."},"enabled":true,"connection_state":"starting|watching|reconnecting|stopping|blocked|stopped|unknown|registering|removing","scheduling":"idle|queued|active|unknown","role":"connector|responder|registering|removing","initial_complete":true,"diagnostic":null,"unsettled":0}]}
+#+end_src
+
+Roots are base64 native path bytes. An unpaired durable root is absent because it has no flocal relationship to protect. The command first uses the private daemon socket, with directory/socket ownership, mode, and symlink checks and one 250ms nonblocking-connect/read/write deadline. A connection, write, deadline, or read failure before any reply byte falls back to a SQLite immutable read-only durable snapshot, creating no state directory, locks, migration, or WAL sidecars. A malformed, truncated, oversized, or stalled partial reply is an error, not a fallback. Missing state means empty stored status; unsafe, busy, or malformed state is an error rather than an empty answer.
+
+* Emacs discovery and presentation
+
+The global minor mode starts an asynchronous status query on enable, find-file, and every 15 seconds of idle time. Exactly one query runs at a time; a timer kills it after three seconds and stdout is capped at 64KiB. The executable must resolve to an absolute regular non-symlink executable, arguments are passed directly, and only a fully validated response replaces the cache. An expired cache blocks a modified save and starts a refresh instead of guessing that a file is outside a share.
+
+Roots are decoded as native filename data, canonicalized with =file-truename=, and matched at a directory boundary. The most-specific nested root wins. Enabled shares except positively stopped shares are guarded. The modeline shows =FLOCAL:guarded/<connection>/<scheduling>=, =stored=, =checking=, =conflict=, or =cannot-verify=. =M-x flocal-guard-status= is a read-only cache view.
+
+* Save guard
+
+The baseline is a SHA-256 of bytes serialized from the visiting buffer with its normal file coding system, never a pathname read after the user saw the buffer. An atomic replacement between visit and its hook is therefore visible on the next save. Custom write functions fail closed because their serialized output is not knowable. A new file gets its first ordinary save then a baseline; an existing protected file without a baseline cannot be saved.
+
+A literal disk hash authorizes a modified guarded save only when it equals the baseline. Disk reads are capped at 1MiB by default before and during reading. A differing digest creates a private read-only literal =DISK:= buffer and calls Ediff with the user buffer first. The snapshot is digested again before Ediff starts, so it cannot display one disk version while authorizing another. Binary (NUL-containing), oversized, nonregular, symlinked, missing, or unreadable inputs stop rather than choosing a side.
+
+Ediff write-A is the sole reentrant write: it rehashes the pathname and proceeds only if it remains the displayed B snapshot. Abort retains the pending conflict; a later save opens a fresh comparison. The package leaves Emacs lockfiles, auto-save locations, backups, and behavior outside guarded buffers unchanged. The normal mtime-only supersession question is suppressed only for a fresh classified guarded buffer; all other buffers retain Emacs behavior.
+
+This is accidental-clobber protection, not filesystem compare-and-swap. A writer can still replace the pathname after the final hash and before/during Emacs's write, and Emacs cannot bound a kernel call stuck in a filesystem.
+
+* Validation
+
+ERT covers cache blocking, root specificity, content-neutral replacement, external changes, the visit/replacement race, custom writers, first save, Ediff write-A/abort, and the supersession boundary. Rust tests cover status grammar, live/stored projections, no-state behavior, and unsafe socket refusal. Docker E2E uses real paired flocal peers plus batch Emacs to verify the live modeline/status view and a remote synchronized change that opens Ediff without overwriting disk. CI installs Emacs and an immutable-pinned Eldev launcher on Linux and macOS.

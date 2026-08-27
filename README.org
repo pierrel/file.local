@@ -184,6 +184,42 @@ removal error. Human status reports =registering=, =connector=, =responder=,
 current queue state. Unlike list, =status PATH= shows a retained unpaired root
 as not configured.
 
+** Read-only client status
+
+=flocal status --list --json= is the versioned, read-only status interface for
+editor integrations and future clients. It never starts a daemon. When its
+private daemon transport is usable it reports =source: live=; a connection,
+write, deadline, or read failure before any reply byte instead reads only durable
+state and reports enabled shares as =unknown=. A malformed, truncated, oversized,
+or stalled partial reply is an error, not a stored fallback. Roots remain
+base64-encoded native path bytes and carry the registered filesystem device and
+inode as decimal strings, so clients can reject a path replaced by a different
+directory. The initial schema is 1 and deliberately contains only the share
+identity/root, enabled state, connection and scheduling state, role,
+initial-completion state, bounded diagnostic, and unsettled count.
+
+** Emacs integration
+
+[[file:emacs/README.org][flocal]] is an optional Emacs 28+ companion,
+tested with Eldev. Enable its global mode after installing =flocal=:
+
+#+begin_src emacs-lisp
+(require 'flocal)
+(flocal-mode 1)
+#+end_src
+
+It discovers enabled, non-stopped shares through the read-only status
+interface. Its modeline and =M-x flocal-status= distinguish live from stored
+status; the status buffer shows every configured share and =g= refreshes it
+asynchronously. A root whose registered device/inode no longer matches is
+visible for diagnosis but never guarded. A modified guarded buffer never saves
+on a cold or expired status cache. When disk bytes differ from the visiting
+buffer's recorded serialized-content baseline, it opens Ediff with the user
+buffer first and a read-only =DISK:= snapshot second. Ediff's write-A saves the
+resolved user buffer only if disk has not changed again; abort leaves both
+versions intact. This is accidental clobber protection, not a filesystem
+compare-and-swap guarantee.
+
 ** Troubleshooting a managed watch
 
 Start with =flocal sync list=. A healthy connector is =watching=;
@@ -332,11 +368,14 @@ prefix and payload still have a hard 30-second deadline. This lets an
 interrupted install recover without a reconnect loop while keeping partial
 frames and silent peers bounded.
 
-If a file changes after a round scans it but before installation, watch keeps
-that local change, records the path as =UNSETTLED=, and recalculates immediately
-without reconnecting. A path that changes again is isolated so stable sibling
-paths can finish. A later full round reports =SETTLED=. =flocal status= and
-=sync list= expose durable unsettled state across daemon restarts.
+If a path changes after a round scans it and before its replacement is
+installed, watch keeps that local change, records the path as =UNSETTLED=, and
+recalculates immediately without reconnecting. A record that still exactly
+matches that peer's own snapshot is not installed again; a subsequent local
+edit is discovered by the following scan. A path that changes again is isolated
+so stable sibling paths can finish. A later full round reports =SETTLED=.
+=flocal status= and =sync list= expose durable unsettled state across daemon
+restarts.
 
 Persistent watch uses protocol version 7, so install or upgrade =flocal= on both
 peers before adding a managed sync. Explicit =flocal sync= uses protocol

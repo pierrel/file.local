@@ -16,9 +16,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
+      - name: Install supported Emacs
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install --yes emacs-nox
+          else
+            brew install emacs
+          fi
+      - name: Install Eldev 1.11.2
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl --fail --location --output "$HOME/.local/bin/eldev" \
+            https://raw.githubusercontent.com/doublep/eldev/92a46b48793e561b00189a06014df0d7bbeed3be/bin/eldev
+          chmod +x "$HOME/.local/bin/eldev"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          eldev --version | grep -F 'eldev 1.11.2'
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets -- --test-threads=1
+      - run: make elisp-test
 
   coverage:
     runs-on: ubuntu-latest

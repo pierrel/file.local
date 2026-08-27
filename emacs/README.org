@@ -1,0 +1,63 @@
+#+title: flocal
+
+=flocal= is an Emacs 28+ companion for local files synchronized by
+=flocal=. Its global =flocal-mode= provides read-only share status and
+save-conflict protection. It has no commands to pair, start, stop, or
+synchronize shares.
+
+* Install and enable
+
+Put this directory on =load-path=, then enable the global mode:
+
+#+begin_src emacs-lisp
+(require 'flocal)
+(flocal-mode 1)
+#+end_src
+
+The mode discovers shares with =flocal status --list --json=. Set
+=flocal-executable= to an absolute, regular, executable non-symlink file when
+normal =PATH= discovery does not find it. The command is read-only: it never
+starts a daemon.
+
+* What it does
+
+For an enabled share not known to be stopped, visiting buffers show an
+=FLOCAL:= modeline item. =M-x flocal-status= shows every configured share,
+including disabled and stopped ones, with the observation source, daemon state,
+connection, scheduling, role, completion, diagnostic, and unsettled count.
+Press =g= in that read-only buffer to start a bounded asynchronous refresh. The
+cache expires after 15 seconds; a modified buffer waits for a fresh status
+result instead of guessing that it is outside a share. A stale status view is
+marked as such and retains its last report only for explanation.
+
+Only enabled, non-stopped roots whose registered filesystem device and inode
+still match are guarded. A renamed, replaced, or symlinked root is still shown
+in status but is never treated as the configured share. Status fields are
+escaped before display, so unusual filenames or diagnostics cannot forge rows.
+
+On visit and after each successful save, the guard stores a SHA-256 hash of
+the visiting buffer's normal serialized content. Before a guarded modified
+save, it hashes the current disk file. An atomic replacement with identical
+bytes is harmless and saves normally. A different disk version starts Ediff
+with the user buffer as A and a private, read-only =DISK:= snapshot as B.
+Writing A is allowed only while disk still equals that snapshot. Quitting Ediff
+leaves the conflict pending, so the next save opens it again.
+
+The guard refuses snapshots larger than =flocal-max-conflict-bytes=
+(1 MiB by default), and refuses to save when it cannot verify a regular local
+file. This preserves the buffer and disk rather than silently choosing one.
+
+This is best-effort accidental-clobber protection. Emacs cannot make the final
+pathname write a filesystem compare-and-swap operation, so a concurrent writer
+can still win a race after the final inspection and before the write.
+
+* Development
+
+The full =make check= gate runs the ERT suite. Install Eldev 1.11.2 through
+your usual package manager or from [[https://github.com/doublep/eldev][Eldev's
+release instructions]], put it on =PATH=, and confirm =eldev --version= reports
+that version. Then run:
+
+#+begin_src sh
+cd emacs && eldev test
+#+end_src

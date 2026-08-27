@@ -68,13 +68,28 @@ fn watch_notices_an_atomic_rename_save() -> Result<()> {
     a.sync()?;
 
     let watch = a.watch_start()?;
+    watch.wait_for_log("Peer connected")?;
+    a.arm_apply_stops(1)?;
     a.write(".notes.txt.tmp", "v2")?; // editor safe-save: temp file...
+    watch.wait_stopped()?; // ...snapshot captured, before echo apply
     a.rename(".notes.txt.tmp", "notes.txt")?; // ...renamed over the original
-    // The assertion: this fails with the dump if v2 never arrives by the
-    // deadline, returning early — in which case the watcher is torn down by
-    // `Watch`'s Drop backstop, not the `stop()` below. On success, `stop()`
-    // terminates it and reports any teardown failure.
+    watch.resume()?;
+
+    watch.wait_for_log("changed while synchronizing; recalculating now")?;
     b.wait_for_file("notes.txt", "v2")?;
+    a.wait_absent(".notes.txt.tmp")?;
+    b.wait_absent(".notes.txt.tmp")?;
+    watch.wait_for_log("SETTLED")?;
+    let connector_status = a.status()?;
+    anyhow::ensure!(
+        !connector_status.pending_install && connector_status.unsettled.is_empty(),
+        "connector retained pending or unsettled state after atomic rename"
+    );
+    let responder_status = b.status()?;
+    anyhow::ensure!(
+        !responder_status.pending_install && responder_status.unsettled.is_empty(),
+        "responder retained pending or unsettled state after atomic rename"
+    );
     watch.stop()
 }
 

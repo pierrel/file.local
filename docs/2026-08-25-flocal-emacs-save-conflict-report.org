@@ -1,0 +1,59 @@
+#+title: flocal Emacs guard implementation report
+#+date: 2026-08-25
+#+status: reviewed implementation
+
+* What shipped
+
+This change adds =flocal-guard=, an optional Emacs 28+ global minor mode, plus an editor-neutral =flocal status --list --json= API. A file under an enabled, non-stopped flocal share is visibly marked in Emacs. If the disk becomes different while the user has unsaved edits, saving opens Ediff instead of accepting Emacs's mtime-only overwrite prompt. The user's buffer is A, a private read-only literal disk snapshot is B, and Ediff write-A is allowed only while disk still equals B.
+
+The workflow is intentionally ordinary: install =flocal=, put =emacs/= on =load-path=, require the package, and enable =flocal-guard-mode=. It has no flocal control commands. =M-x flocal-guard-status= explains whether the current cache was live or durable stored state, while the modeline makes guarded, stored, checking, conflict, and cannot-verify states visible at the buffer.
+
+* Components
+
+** Read-only status API
+
+The CLI has a new deliberately narrow grammar. The Clap argument group prevents malformed variants from opening or migrating state before failing, and preserves the existing path-oriented command.
+
+#+begin_src rust
+#[command(group(ArgGroup::new("status_target").required(true).args(["path", "list"])))]
+Status { path: Option<PathBuf>, #[arg(long, requires = "json", conflicts_with = "path")] list: bool, #[arg(long)] json: bool }
+#+end_src
+
+The list implementation validates the private state/run/socket path before live connection. Its =StatusDeadlineStream= recomputes time remaining from one =Instant= before every read and write. Rust's =Read= and =Write= traits let serde use that deadline-aware stream without a separate JSON framing implementation. A connection, write, deadline, or read failure before the first reply byte uses stored status; a malformed, truncated, oversized, or stalled partial reply is a hard error. If no safe daemon socket exists, the state layer opens SQLite through an immutable read-only URI. It neither creates a state directory nor allows a WAL/SHM sidecar to make a supposedly read-only query unsafe.
+
+** Save guard
+
+The important representation is the buffer-derived baseline. It hashes the exact buffer coding output instead of rereading the pathname after =find-file=, which prevents an atomic flocal replacement in the visit-hook window from becoming an unseen "baseline."
+
+#+begin_src emacs-lisp
+(defun flocal-guard--capture-base ()
+  (when (and buffer-file-name (file-regular-p buffer-file-name)
+             (not (file-symlink-p buffer-file-name)))
+    (setq flocal-guard--base-hash (flocal-guard--buffer-hash))))
+#+end_src
+
+=flocal-guard--buffer-hash= serializes with =buffer-file-coding-system= and rejects binary/NUL or over-limit input. The save advice compares that baseline with a literal disk hash. Equal bytes make atomic rename saves harmless. Different bytes create B and call Ediff. B is hashed after it is read, so an observed replacement cannot show the user one version while authorizing another. A pending Ediff conflict remains pending on abort; only the dynamic Ediff write-A path may reenter normal saving, after rehashing disk.
+
+The asynchronous status process takes argv rather than a shell, requires a canonical regular executable, caps output, and is killed by a timer. A stale cache cancels a modified save rather than treating the path as outside flocal. Reclassification never overwrites a baseline for a modified buffer, which avoids false conflicts after idle refresh. The modeline is empty in non-file buffers, so it never claims that scratch or message buffers are guarded.
+
+* Difficult parts and decisions
+
+The two subtle races were the visit hook and Ediff snapshot. A disk-path baseline looks natural but is unsafe: the file can be replaced after Emacs read it and before the hook. Using serialized buffer bytes makes that bad state unrepresentable. Separately, hashing disk and then reading B can otherwise compare different versions; the second B digest makes that path fail closed.
+
+The status client also needs to be genuinely read-only. SQLite read-only mode can still create WAL sidecars, so the durable fallback uses an immutable URI and rejects existing WAL/SHM files. Its Unix socket connection is nonblocking and polled, while the same absolute deadline applies through pagination and trickle reads. A connection, write, deadline, or read failure before the first reply byte falls back to durable state; a malformed, truncated, oversized, or stalled partial reply remains a hard error.
+
+Two originally discussed sync-tree hygiene changes are intentionally deferred: setting =create-lockfiles= globally and redirecting all Emacs auto-saves would affect unrelated buffers and are not required for the save-safety invariant. They should be designed as a separately scoped Emacs workflow feature, rather than silently changing global editor behavior.
+
+* Validation and review
+
+The final local gate ran =make check=: Rust tests, 92.83% changed-line coverage (414/446, above the 90% requirement), Eldev ERT, formatting, and clippy all passed. ERT has 18 tests covering stale cache blocking, JSON false/null decoding, root selection, byte-identical replacement, external edits, the visit race, refresh without rebaselining unsaved edits, custom writers, first save, Ediff abort/write-A, supersession handling, and the absence of a marker in non-file buffers. The daemon CLI regressions distinguish unavailable transport from malformed, truncated, and oversized live replies.
+
+The real Docker E2E uses paired flocal peers and =emacs -Q --batch=. It passed both the live guarded modeline/status scenario and the remote synchronized change scenario, which verifies B is the remote disk version and that A does not overwrite it. CI installed Emacs and ran Eldev on Linux and macOS; all Linux, macOS, coverage, and Docker E2E jobs passed after the branch was rebased onto the corrected upgrade-selection CI.
+
+Review converged through simplicity/shared-logic, interfaces/readability/existing patterns, filesystem/security, correctness/error handling, and documentation/design lenses. Copilot's first review found three real Emacs byte-compilation issues: two missing =cl-lib= imports and one undeclared buffer-local marker. Its rebased-head review found the non-file modeline marker, missing local Eldev guidance, and overly broad live-status fallback. The fixes were a file-buffer guard, an explicit Eldev prerequisite, and a typed transport-versus-protocol split: only transport loss falls back to stored state. Findings fixed in local and Copilot review included user-known baselines, bounded disk reads, private socket validation, one absolute status deadline, strict status grammar/schema validation, JSON false/null handling, and reclassification baseline preservation.
+
+* Limits and operational note
+
+This is best-effort accidental-clobber protection, not a filesystem compare-and-swap transaction. A writer can still replace the pathname after the final comparison and before/during Emacs's actual write. The 1MiB cap bounds bytes read by the guard, but no Emacs Lisp implementation can forcibly interrupt a kernel call already stuck in a local, NFS, or FUSE filesystem; a three-second status-process timeout is real, while disk-I/O liveness is not. Binary files and custom save functions fail closed.
+
+No flocal state migration is needed. Updating the binary and adding =emacs/= to an Emacs load path is sufficient; disabling the minor mode removes its hooks, advice, timers, and status process.

@@ -1386,6 +1386,7 @@ pub fn apply_complete_plan(state: &mut State, share: &ShareId, plan: &Plan) -> R
         plan,
         &std::collections::HashSet::new(),
         None,
+        &[],
     )?;
     Ok(())
 }
@@ -1404,6 +1405,7 @@ pub fn apply_complete_plan_and_enable_managed(
         plan,
         &std::collections::HashSet::new(),
         Some(expected_generation),
+        &[],
     )?
     .context("managed initial apply did not publish its queue request")
 }
@@ -1472,6 +1474,7 @@ fn recover_install_plan(state: &mut State, share: &ShareId, intent: &InstallInte
         &plan,
         &std::collections::HashSet::new(),
         managed_generation,
+        &[],
     ) {
         Ok(Some(request)) => {
             request.release_for_reclaim();
@@ -1562,7 +1565,37 @@ pub fn apply_complete_plan_with_root_skipping(
     plan: &Plan,
     retained_paths: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<()> {
-    apply_complete_plan_with_root_skipping_inner(state, share, root, plan, retained_paths, None)?;
+    apply_complete_plan_with_root_skipping_inner(
+        state,
+        share,
+        root,
+        plan,
+        retained_paths,
+        None,
+        &[],
+    )?;
+    Ok(())
+}
+
+/// Applies a persistent-watch plan while protecting records captured from this
+/// same local root against a later local filesystem change.
+pub fn apply_complete_plan_with_root_skipping_guarding_snapshot(
+    state: &mut State,
+    share: &ShareId,
+    root: &ShareRoot,
+    plan: &Plan,
+    retained_paths: &std::collections::HashSet<Vec<u8>>,
+    local_snapshot: &[Record],
+) -> Result<()> {
+    apply_complete_plan_with_root_skipping_inner(
+        state,
+        share,
+        root,
+        plan,
+        retained_paths,
+        None,
+        local_snapshot,
+    )?;
     Ok(())
 }
 
@@ -1573,6 +1606,7 @@ fn apply_complete_plan_with_root_skipping_inner(
     plan: &Plan,
     retained_paths: &std::collections::HashSet<Vec<u8>>,
     managed_generation: Option<i64>,
+    local_snapshot: &[Record],
 ) -> Result<Option<QueueRequest>> {
     let records = &plan.records;
     validate_unique_paths(records)?;
@@ -1583,6 +1617,10 @@ fn apply_complete_plan_with_root_skipping_inner(
     let prior: std::collections::HashMap<_, _> = prior
         .iter()
         .map(|record| (record.path.as_bytes().to_vec(), record))
+        .collect();
+    let local_snapshot: std::collections::HashMap<_, _> = local_snapshot
+        .iter()
+        .map(|record| (record.path.as_bytes(), record))
         .collect();
     let matcher = IgnoreMatcher::from_cap(&root.path, &root.directory)?;
     let root_dir = &root.directory;
@@ -1602,7 +1640,7 @@ fn apply_complete_plan_with_root_skipping_inner(
         None => state.set_plan_install_intent(share, records, &plan.conflicts)?,
     };
     #[cfg(feature = "e2e-test-hooks")]
-    e2e_stop_before_apply(state)?;
+    e2e_stop_before_apply(state, share)?;
     let install_temps: std::collections::HashMap<&[u8], _> = intent
         .temps
         .iter()
@@ -1658,28 +1696,46 @@ fn apply_complete_plan_with_root_skipping_inner(
         let expected = prior
             .get(record.path.as_bytes())
             .map(|old| &old.version.entry);
+        let guard_local_snapshot = local_snapshot
+            .get(record.path.as_bytes())
+            .is_some_and(|snapshot| snapshot.version == record.version);
+        if guard_local_snapshot && local_snapshot_matches(root_dir, record)? {
+            // This exact record already exists locally. Do not echo it through
+            // apply: a later local rename must be discovered by the next scan,
+            // never overwritten by this round.
+            continue;
+        }
         // A tombstone with nothing recorded to delete must not touch the
         // filesystem: creating its parent directories would resurrect a
         // deleted directory tree on every synchronization.
-        if matches!(record.version.entry, Entry::Tombstone)
+        if !guard_local_snapshot
+            && matches!(record.version.entry, Entry::Tombstone)
             && matches!(expected, None | Some(Entry::Tombstone))
         {
             continue;
         }
-        let install_temp = install_temps
-            .get(record.path.as_bytes())
-            .copied()
-            .context("install intent is missing a temporary token")?;
-        let mut token = install_temp.token.clone();
-        let mut phase = install_temp.phase;
-        if phase == InstallTempPhase::Pending {
-            while install_temp_exists(root_dir, record, &token)? {
-                token = state.rotate_unowned_install_temp(share, &record.path)?;
+        let result = if guard_local_snapshot {
+            Err(ApplyInvalidated {
+                path: record.path.clone(),
             }
-            state.mark_install_temp_creating(share, &record.path)?;
-            phase = InstallTempPhase::Creating;
-        }
-        if let Err(error) = apply_record(state, share, root_dir, record, expected, &token, phase) {
+            .into())
+        } else {
+            let install_temp = install_temps
+                .get(record.path.as_bytes())
+                .copied()
+                .context("install intent is missing a temporary token")?;
+            let mut token = install_temp.token.clone();
+            let mut phase = install_temp.phase;
+            if phase == InstallTempPhase::Pending {
+                while install_temp_exists(root_dir, record, &token)? {
+                    token = state.rotate_unowned_install_temp(share, &record.path)?;
+                }
+                state.mark_install_temp_creating(share, &record.path)?;
+                phase = InstallTempPhase::Creating;
+            }
+            apply_record(state, share, root_dir, record, expected, &token, phase)
+        };
+        if let Err(error) = result {
             if let Some(invalidated) = error.downcast_ref::<ApplyInvalidated>() {
                 let parent = record
                     .path
@@ -1687,7 +1743,9 @@ fn apply_complete_plan_with_root_skipping_inner(
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
                     .to_path_buf();
-                sync_directory_chain(root_dir, &parent)?;
+                if !guard_local_snapshot {
+                    sync_directory_chain(root_dir, &parent)?;
+                }
                 let mut baseline: std::collections::HashMap<_, _> = state
                     .records(share)?
                     .into_iter()
@@ -1759,16 +1817,16 @@ fn apply_complete_plan_with_root_skipping_inner(
 }
 
 #[cfg(feature = "e2e-test-hooks")]
-fn e2e_stop_before_apply(state: &State) -> Result<()> {
+fn e2e_stop_before_apply(state: &State, share: &ShareId) -> Result<()> {
     if e2e_claim_apply_stop(state)? {
-        e2e_publish_apply_stop_pid(state)?;
+        e2e_publish_apply_stop_pid(state, share)?;
         signal_hook::low_level::raise(signal_hook::consts::SIGSTOP)?;
     }
     Ok(())
 }
 
 #[cfg(feature = "e2e-test-hooks")]
-fn e2e_publish_apply_stop_pid(state: &State) -> Result<()> {
+fn e2e_publish_apply_stop_pid(state: &State, share: &ShareId) -> Result<()> {
     use std::io::Write as _;
 
     let path = state.dir.join(".e2e-apply-stop.pid");
@@ -1777,7 +1835,7 @@ fn e2e_publish_apply_stop_pid(state: &State) -> Result<()> {
         .create_new(true)
         .open(&path)
         .context("publishing E2E stopped apply pid")?;
-    write!(file, "{}", std::process::id())?;
+    write!(file, "{} {}", std::process::id(), share.0)?;
     file.sync_all()?;
     Ok(())
 }
@@ -2226,6 +2284,113 @@ fn disk_matches_cap(root: &cap_std::fs::Dir, path: &Path, expected: &Entry) -> R
         }
         _ => false,
     })
+}
+
+fn local_snapshot_matches(root: &cap_std::fs::Dir, record: &Record) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = record.path.to_path_buf();
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let (_, parent) = match open_directory_chain(root, parent) {
+        Ok(directory) => directory,
+        Err(error) if snapshot_path_changed(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let name = Path::new(path.file_name().context("entry has no basename")?);
+    match &record.version.entry {
+        Entry::Tombstone => {
+            match rustix::fs::statat(parent.as_fd(), name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => Ok(false),
+                Err(error) if error == rustix::io::Errno::NOENT => Ok(true),
+                Err(error) if snapshot_path_changed_errno(error) => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Entry::Directory => match rustix::fs::openat(
+            parent.as_fd(),
+            name,
+            directory_open_flags(),
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) if snapshot_path_changed_errno(error) => Ok(false),
+            Err(error) => Err(error.into()),
+        },
+        Entry::Symlink { target } => match rustix::fs::readlinkat(parent.as_fd(), name, Vec::new())
+        {
+            Ok(link) => Ok(link.as_bytes() == target),
+            Err(error)
+                if snapshot_path_changed_errno(error) || error == rustix::io::Errno::INVAL =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        },
+        Entry::File {
+            hash, executable, ..
+        } => {
+            let metadata = match rustix::fs::statat(
+                parent.as_fd(),
+                name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(metadata) => metadata,
+                Err(error) if snapshot_path_changed_errno(error) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            if !rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_file() {
+                return Ok(false);
+            }
+            let fd = match rustix::fs::openat(
+                parent.as_fd(),
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(error)
+                    if snapshot_path_changed_errno(error) || error == rustix::io::Errno::NXIO =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut file = std::fs::File::from(fd);
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Ok(false);
+            }
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = vec![0; CHUNK];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            Ok(hasher.finalize().to_hex().as_str() == hash.as_str()
+                && (metadata.permissions().mode() & 0o111 != 0) == *executable)
+        }
+    }
+}
+
+fn snapshot_path_changed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rustix::io::Errno>()
+            .is_some_and(|error| snapshot_path_changed_errno(*error))
+    })
+}
+
+fn snapshot_path_changed_errno(error: rustix::io::Errno) -> bool {
+    matches!(
+        error,
+        rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP
+    )
 }
 
 fn remove_entry(root: &cap_std::fs::Dir, path: &Path) -> Result<()> {
@@ -3478,15 +3643,16 @@ mod tests {
         let temp = tempdir()?;
         let state = State::open(temp.path().join("state"))?;
         let pidfile = state.dir.join(".e2e-apply-stop.pid");
-        e2e_publish_apply_stop_pid(&state)?;
+        let share = ShareId("share".into());
+        e2e_publish_apply_stop_pid(&state, &share)?;
         assert_eq!(
             fs::read_to_string(&pidfile)?,
-            std::process::id().to_string()
+            format!("{} {}", std::process::id(), share.0)
         );
-        assert!(e2e_publish_apply_stop_pid(&state).is_err());
+        assert!(e2e_publish_apply_stop_pid(&state, &share).is_err());
         fs::remove_file(&pidfile)?;
         std::os::unix::fs::symlink(temp.path().join("target"), &pidfile)?;
-        assert!(e2e_publish_apply_stop_pid(&state).is_err());
+        assert!(e2e_publish_apply_stop_pid(&state, &share).is_err());
         Ok(())
     }
 

@@ -1,0 +1,122 @@
+#+title: flocal-mode implementation report
+#+date: 2026-08-26
+#+status: reviewed implementation
+
+* What shipped
+
+The Emacs companion is now =flocal= and its one global entry point is
+=flocal-mode=.  The previous save guard is still present, but it is now one
+part of a useful read-only integration: =M-x flocal-status= shows every
+configured share and =g= refreshes that view asynchronously.  The normal
+=flocal= CLI remains responsible for lifecycle changes.
+
+This is an intentional pre-release rename.  Current source, examples, E2E
+forms, and user documentation use =flocal=; the dated record of the original
+guard keeps its historical name.
+
+* User experience
+
+After adding =emacs/= to =load-path=, a user runs:
+
+#+begin_src emacs-lisp
+(require 'flocal)
+(flocal-mode 1)
+#+end_src
+
+The mode queries =flocal status --list --json= without starting a daemon.  Its
+modeline marks an eligible visiting file.  The status buffer explains live or
+stored observation, daemon availability, and each configured share, including
+disabled or stopped ones that need attention.  A stale cached report stays
+visible but says it is no longer fresh.  Refreshing never runs more than one
+bounded status process.
+
+An enabled, non-stopped share is eligible only while its configured root still
+has the device/inode identity registered by flocal.  A renamed directory,
+ordinary replacement, or symlink at that path remains visible for diagnosis but
+is not silently treated as the share.  The established Ediff save-conflict flow
+continues to protect eligible modified buffers.
+
+* Components
+
+** Read-only status identity
+
+The status projection now carries a decimal identity alongside its
+byte-preserving root path:
+
+#+begin_src rust
+fn status_list_root(path: DaemonPath, device: String, inode: String) -> StatusListRoot {
+    StatusListRoot { encoding: path.encoding, data: path.data, device, inode }
+}
+#+end_src
+
+Rust strings preserve the full unsigned values in JSON clients that cannot
+represent all 64-bit integers exactly.  Both live daemon and durable stored
+projections use the managed share's already-persisted identity.  CLI tests
+check both paths against the real filesystem metadata.
+
+** Emacs report and guard selection
+
+The Emacs client validates one complete report before deriving guard candidates.
+It keeps report metadata and every share for presentation, then filters only
+current active roots for protection.  This avoids hiding a stopped share while
+also avoiding the unsafe inverse: treating a displayed share as guarded.
+
+#+begin_src emacs-lisp
+(when (and (flocal--root-identity-matches-p raw details)
+           (flocal--root-identity-matches-p canonical details))
+  (setf (flocal--share-canonical-root share) canonical)
+  share)
+#+end_src
+
+The second check catches a pathname changed while Emacs resolves it.  As with
+the existing save guard, Emacs cannot turn later filesystem pathname use into a
+kernel compare-and-swap operation; the implementation fails closed whenever an
+observed identity cannot be verified.
+
+** Status display
+
+=flocal-status-mode= is a small derived special mode.  Its local =g= key calls
+=flocal-refresh=.  Root paths, IDs, and diagnostics are rendered with Lisp
+control/newline escaping, so output from the process cannot forge a report row.
+Diagnostics over 4KiB are rejected before caching, in addition to the 64KiB
+whole-response limit.
+
+* Validation and review
+
+=eldev test= passes 26 ERT tests.  They cover the renamed public library,
+disabled-share presentation, =g= binding, stale and save-conflict behavior,
+native filename bytes, changed ordinary and symlinked roots, executable
+symlink refusal, escaped controls, diagnostic bounds, and ordinary digit-zero
+versus literal-NUL content and roots.  Targeted Rust
+=status_list= integration tests pass for live and stored projections,
+including real device/inode values.
+
+=make check= passes with whole-project coverage above 90% and 91.11% changed
+line coverage (687/754).  It includes Rust tests, ERT, formatting, and clippy.
+The two real Docker Emacs scenarios pass: a guarded live share/status view and
+a remote synchronized change that opens Ediff without overwriting disk.
+
+Local review covered simplicity; interfaces; shared logic; readability;
+existing patterns; design adherence; documentation alignment; cross-platform
+filesystem correctness; and adversarial security.  One review round found an
+open status buffer could retain =Fresh: yes= while a refresh was in flight.
+The refresh now redraws immediately and the ERT suite drives its sentinel to
+prove the final redraw.  The affected review reran clear.  CI then exposed a
+macOS temporary root with ordinary digit =0=; two regexp checks had
+interpreted it as binary.  Both now test literal NUL bytes and ERT pins accepted
+digit-zero text/paths as well as rejected NUL roots/content.  The affected
+platform, security, interface, and documentation reviews reran clear.  A
+comment-alignment pass renamed the library's save-protection-only header.  CI
+and Copilot follow the reviewed push.
+
+* Limits and upgrade note
+
+The companion remains read-only.  It does not pair peers, operate a daemon, or
+duplicate lifecycle confirmations from the CLI.  It has the same explicit
+limits as the save guard: disk I/O cannot be forcibly interrupted once inside a
+kernel call, and a concurrent writer can still race after Emacs's final
+inspection and before its save.
+
+Install the updated binary before enabling the updated package: its status
+report supplies the root identity the mode requires.  No state migration is
+introduced because flocal already persists that identity for managed shares.

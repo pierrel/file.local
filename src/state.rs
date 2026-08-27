@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{ErrorKind, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -365,7 +365,7 @@ pub struct StoredConflict {
     pub created_ns: i64,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct ManagedShare {
     pub id: ShareId,
     pub root: PathBuf,
@@ -374,6 +374,16 @@ pub struct ManagedShare {
     pub watch_enabled: bool,
     pub blocked_diagnostic: Option<String>,
     pub removing_relationship: Option<RelationshipId>,
+}
+
+/// The durable portion of a managed share suitable for a non-mutating client
+/// status view.  It deliberately omits operational state, which only a live
+/// daemon can know.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadOnlyStatusShare {
+    pub managed: ManagedShare,
+    pub root_identity: RootIdentity,
+    pub unsettled: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -996,6 +1006,20 @@ fn validate_pair_value(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "e2e-test-hooks")]
+fn e2e_marker_share_suffix(share: &ShareId) -> Result<&str> {
+    if share.0.is_empty()
+        || share.0.len() > 128
+        || !share
+            .0
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("E2E marker share ID is unsafe");
+    }
+    Ok(&share.0)
+}
+
 fn honor_relationship_yield(
     transaction: &rusqlite::Transaction<'_>,
     relationship: &RelationshipId,
@@ -1151,6 +1175,71 @@ const UPGRADE_PENDING_FILE: &str = "upgrade.pending";
 fn open_installation_barrier(dir: &Path) -> Result<File> {
     let path = dir.join(INSTALLATION_BARRIER_FILE);
     open_private_regular_file(&path, false).context("opening the private installation barrier")
+}
+
+#[cfg(unix)]
+fn open_private_regular_file_read_only(path: &Path) -> Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!("{} is not an owned private regular file", path.display());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_regular_file_read_only(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new().read(true).open(path)?)
+}
+
+fn validate_private_regular_file(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading {description} {}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("{description} is not a regular file");
+    }
+    #[cfg(unix)]
+    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+        bail!("{description} is not private");
+    }
+    Ok(())
+}
+
+/// SQLite's normal read-only WAL open may still create zero-length sidecars.
+/// The status path promises not to mutate state, so use an immutable URI only
+/// after the directory/database ownership checks above have completed.
+#[cfg(unix)]
+fn read_only_database_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded = path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                vec![char::from(*byte).to_string()]
+            }
+            byte => vec![format!("%{byte:02X}")],
+        })
+        .collect::<String>();
+    format!("file:{encoded}?immutable=1")
+}
+
+#[cfg(not(unix))]
+fn read_only_database_uri(path: &Path) -> String {
+    format!("file:{}?immutable=1", path.to_string_lossy())
 }
 
 fn ensure_upgrade_not_pending(dir: &Path) -> Result<()> {
@@ -1322,6 +1411,104 @@ impl State {
             bail!("managed daemon state marker is not an absolute path");
         }
         Ok(Some(path))
+    }
+
+    /// Reads durable managed-share state without creating, locking for write,
+    /// migrating, or repairing any state files.
+    pub fn status_snapshot_read_only(dir: impl AsRef<Path>) -> Result<Vec<ReadOnlyStatusShare>> {
+        let dir = dir.as_ref();
+        ensure_existing_private_directory(dir)?;
+        ensure_upgrade_not_pending(dir)?;
+        let barrier = open_private_regular_file_read_only(&dir.join(INSTALLATION_BARRIER_FILE))
+            .context("opening the private installation barrier")?;
+        FileExt::try_lock_shared(&barrier).context("state is busy with an upgrade")?;
+        if let Err(error) = ensure_upgrade_not_pending(dir) {
+            let _ = FileExt::unlock(&barrier);
+            return Err(error);
+        }
+
+        let database = dir.join("state.sqlite3");
+        validate_private_regular_file(&database, "state database")?;
+        for sidecar in ["state.sqlite3-wal", "state.sqlite3-shm"] {
+            if dir.join(sidecar).exists() {
+                bail!("state has an active SQLite sidecar; read-only status is unavailable");
+            }
+        }
+        let connection = Connection::open_with_flags(
+            read_only_database_uri(&database),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        connection.busy_timeout(Duration::from_millis(250))?;
+        let mut statement = connection.prepare(
+            "SELECT share_id, root, peer_json, initial_complete, watch_enabled,
+                    blocked_diagnostic, bound_peer, bound_relationship,
+                    removing_relationship, root_device, root_inode,
+                    (SELECT COUNT(*) FROM unsettled_paths
+                     WHERE unsettled_paths.share_id=shares.share_id)
+             FROM shares ORDER BY share_id",
+        )?;
+        let shares = statement
+            .query_map([], |row| {
+                let managed = managed_share_from_row(row)?;
+                let unsettled = row.get::<_, i64>(11)?;
+                let root = &managed.root;
+                if !root.is_absolute() || root.as_os_str().is_empty() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let root_identity = RootIdentity {
+                    device: row
+                        .get::<_, String>(9)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    inode: row
+                        .get::<_, String>(10)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                };
+                Ok(ReadOnlyStatusShare {
+                    managed,
+                    root_identity,
+                    unsettled: usize::try_from(unsettled)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(11, unsettled))?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(barrier);
+        Ok(shares)
+    }
+
+    /// Returns the private daemon socket when it can be safely observed
+    /// without creating a run directory or starting a daemon.
+    pub fn status_daemon_socket_read_only(dir: impl AsRef<Path>) -> Result<Option<PathBuf>> {
+        let dir = dir.as_ref();
+        ensure_existing_private_directory(dir)?;
+        let run = dir.join("run");
+        match fs::symlink_metadata(&run) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => ensure_existing_private_directory(&run)?,
+        }
+        let socket = run.join("daemon.sock");
+        let metadata = match fs::symlink_metadata(&socket) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) => metadata,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+            if !metadata.file_type().is_socket()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                bail!("daemon socket is not an owned private socket");
+            }
+        }
+        Ok(Some(socket))
     }
 
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
@@ -2989,6 +3176,13 @@ impl State {
             self.observe_e2e_global_contention()?;
         }
 
+        #[cfg(feature = "e2e-test-hooks")]
+        if operation == SyncOperation::Watch
+            && let Some(share) = share
+        {
+            self.observe_e2e_managed_watch_enqueue(share)?;
+        }
+
         Ok(QueueRequest {
             state_dir: self.dir.clone(),
             ticket,
@@ -3813,16 +4007,40 @@ impl State {
 
     #[cfg(feature = "e2e-test-hooks")]
     fn observe_e2e_global_contention(&self) -> Result<()> {
-        let marker = self.dir.join(".e2e-observe-global-contention");
-        let observed = self.dir.join(".e2e-global-contention-observed");
+        self.observe_e2e_marker(
+            ".e2e-observe-global-contention",
+            ".e2e-global-contention-observed",
+            "global contention",
+        )
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    fn observe_e2e_managed_watch_enqueue(&self, share: &ShareId) -> Result<()> {
+        let suffix = e2e_marker_share_suffix(share)?;
+        self.observe_e2e_marker(
+            &format!(".e2e-observe-managed-watch-{suffix}"),
+            &format!(".e2e-managed-watch-{suffix}-observed"),
+            "managed watch enqueue",
+        )
+    }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    fn observe_e2e_marker(
+        &self,
+        marker_name: &str,
+        observed_name: &str,
+        event: &str,
+    ) -> Result<()> {
+        let marker = self.dir.join(marker_name);
+        let observed = self.dir.join(observed_name);
         match fs::rename(&marker, &observed) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error).context("publishing E2E global contention"),
+            Err(error) => return Err(error).with_context(|| format!("publishing E2E {event}")),
         }
         let metadata = fs::symlink_metadata(&observed)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 0 {
-            bail!("E2E global contention marker is not an empty regular file");
+            bail!("E2E {event} marker is not an empty regular file");
         }
         Ok(())
     }
@@ -6364,9 +6582,54 @@ pub fn ensure_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn ensure_existing_private_directory(path: &Path) -> Result<()> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let path = private_directory_walk_path(path)?;
+    let mut current = if path.is_absolute() {
+        File::open("/")?
+    } else {
+        File::open(".")?
+    };
+    let mut current_path = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    validate_private_directory(&current, &current_path)?;
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::Prefix(_) => unreachable!("Unix paths have no prefix"),
+        };
+        let next_path = current_path.join(name);
+        let next = openat(
+            &current,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        current = File::from(next);
+        validate_private_directory(&current, &next_path)?;
+        current_path = next_path;
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
 pub fn ensure_private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_existing_private_directory(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("state directory does not exist");
+    }
     Ok(())
 }
 
@@ -8457,6 +8720,37 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn managed_watch_enqueue_has_a_share_specific_observation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let state_dir = temp.path().join("state");
+        let root = temp.path().join("root");
+        let mut state = State::open(&state_dir)?;
+        let share = ShareId::generate();
+        state.register_share(&share, &root)?;
+        let mut active = state.enqueue_sync(None, SyncOperation::Maintenance, None)?;
+        let active = active
+            .try_activate()?
+            .context("maintenance request did not activate")?;
+        let marker = state_dir.join(format!(".e2e-observe-managed-watch-{}", share.0));
+        let observed = state_dir.join(format!(".e2e-managed-watch-{}-observed", share.0));
+        let other = ShareId::generate();
+        let other_marker = state_dir.join(format!(".e2e-observe-managed-watch-{}", other.0));
+        let other_observed = state_dir.join(format!(".e2e-managed-watch-{}-observed", other.0));
+        fs::write(&marker, [])?;
+        fs::write(&other_marker, [])?;
+
+        state.enqueue_sync(Some(&share), SyncOperation::Watch, Some(1))?;
+
+        assert!(!marker.exists());
+        assert!(observed.is_file());
+        assert!(other_marker.is_file());
+        assert!(!other_observed.exists());
+        active.finish()?;
+        Ok(())
+    }
+
     #[test]
     fn legacy_registration_only_acknowledges_an_existing_null_incarnation() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -8758,6 +9052,50 @@ mod tests {
                 )
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_status_snapshot_never_changes_state() -> Result<()> {
+        fn tree(path: &Path, root: &Path, entries: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let entry_path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    tree(&entry_path, root, entries)?;
+                } else {
+                    entries.push((
+                        entry_path.strip_prefix(root)?.to_path_buf(),
+                        fs::read(entry_path)?,
+                    ));
+                }
+            }
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(())
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        state.set_watch_enabled(&share, true)?;
+        drop(state);
+        let mut before = Vec::new();
+        tree(&state_dir, &state_dir, &mut before)?;
+
+        let snapshot = State::status_snapshot_read_only(&state_dir)?;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].managed.id, share);
+        assert!(snapshot[0].managed.watch_enabled);
+
+        let mut after = Vec::new();
+        tree(&state_dir, &state_dir, &mut after)?;
+        assert_eq!(before, after);
+
+        fs::write(state_dir.join("state.sqlite3-wal"), [])?;
+        assert!(State::status_snapshot_read_only(&state_dir).is_err());
         Ok(())
     }
 
