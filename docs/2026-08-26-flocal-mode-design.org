@@ -16,12 +16,17 @@ flocal control from Emacs.
 This is a pre-release repository feature: the package has not been released or
 documented as a stable external API.  A complete rename is smaller and clearer
 than retaining =flocal-guard= compatibility aliases, two customize groups, and
-two names for one global toggle.
+two names for one global toggle.  The rename applies to current user-facing
+documentation and active source/test entry points.  Dated implementation
+records retain their historical names and state; this document records when the
+rename superseded them.
 
 * User flow
 
-1. The user puts =emacs/= on =load-path=, then enables the companion with
-   =(require 'flocal)= and =(flocal-mode 1)=.  The mode begins its bounded,
+1. The user installs =flocal= and puts =emacs/= on =load-path=, then enables
+   the companion with =(require 'flocal)= and =(flocal-mode 1)=.  Discovery
+   uses the normal executable on =PATH= or the explicit absolute
+   =flocal-executable= customization.  The mode begins its bounded,
    asynchronous read-only status discovery exactly as the current guard does.
 2. A visiting file under an enabled, non-stopped share shows its flocal state
    in the modeline.  A cold or stale discovery result says =checking= and
@@ -64,9 +69,24 @@ implementation-local variables and functions to the =flocal--= prefix as
 well, including test names and E2E forms.  The modeline marker stays
 =FLOCAL:=; its established state spelling stays unchanged.
 
-Keep two representations after validating the schema-1 response:
+The existing schema-1 root gains only its registered filesystem identity; it
+remains byte-preserving and editor-neutral:
 
-- The complete validated share list is the status presentation cache.
+#+begin_src js
+{"encoding":"base64","data":"...","device":"64768","inode":"10781882"}
+#+end_src
+
+Both integers are decimal strings so every JSON client preserves their full
+unsigned range.  They identify only an already locally readable configured
+directory and do not introduce a control surface.
+
+Keep one validated report cache plus two derived representations after a
+schema-1 response:
+
+- The report cache retains =source=, =observed_at=, daemon state/diagnostic,
+  and the complete validated share list.  The status renderer takes only this
+  cache, never an Emacs refresh timestamp or a partially parsed report.
+- The complete share list is the presentation list.
 - The derived eligible list contains only enabled, non-stopped shares and is
   the input to most-specific-root matching and save protection.
 
@@ -76,30 +96,67 @@ both caches for classification.  The status buffer may retain its last
 successfully rendered information for explanation, but must mark it stale and
 show the error rather than calling it current.
 
+Roots remain native filename bytes.  Decode each base64 root with
+=file-name-coding-system=, preserving raw filename bytes when that system is
+nil, and retain that native representation for root matching.  A presentation
+never emits those bytes raw: roots, share IDs, and diagnostics use a
+deterministic Lisp-escaped display form, so a newline or control byte cannot
+forge a status row.  Reject diagnostic strings above 4KiB before caching them;
+the 64KiB whole-response cap remains a separate bound.  A root remains visible
+in the full status list even if it is unavailable, but is eligible for guard
+classification only if its configured path is an existing, non-symlink
+directory with the registered identity at refresh time.  Extend each schema-1
+root with its registered device and inode as decimal strings, sourced from the
+existing private daemon/state identity on both live and stored projections.
+Cache a canonical directory path only after its Emacs-observed identity matches
+those values, then check the configured path's identity again before every
+classification.  A symlink, replacement by a different ordinary directory, or
+other classification failure makes the buffer =cannot-verify= instead of
+extending protection through a different tree.
+
 * Implementation plan
 
 1. Rename the Emacs library, feature, test library, symbols, customization
    group, documentation examples, E2E batch forms, and README link from
    =flocal-guard= to =flocal=.  Replace the global mode definition with
    =flocal-mode=.  Do not leave aliases or duplicate loadable packages.
-2. Split status validation from guard eligibility.  Validate every schema-1
-   share once, retain its decoded canonical root and report fields for status,
-   then derive a filtered eligible share list for buffer classification.  Keep
-   the current most-specific-root rule.
-3. Turn the current status display into =flocal-status= and define a tiny
+2. Add registered =device= and =inode= decimal strings to each schema-1 root
+   projection, from the same managed-share identity in the live daemon and
+   stored read-only paths.  Validate their range in Emacs and compare them with
+   =file-attribute-device-number= and =file-attribute-inode-number= without
+   following a configured root symlink.
+3. Split status validation from guard eligibility.  Validate every schema-1
+   report once into a metadata-bearing report cache.  Preserve every decoded
+   native root for display, then derive a filtered eligible list only from
+   roots that are existing non-symlink directories with matching registered
+   identities and retain their canonical root for buffer classification.  Check
+   that identity again while classifying a buffer.  Keep the current
+   most-specific-root rule.
+4. Turn the current status display into =flocal-status= and define a tiny
    derived special mode for =*flocal status*=.  Give it a local =g= binding.
    Render a deterministic, readable report from the cached validated data;
    redraw it in the async sentinel if that buffer exists.  Refresh remains
    coalesced: at most one process runs.
-4. Preserve every save-guard hook, advice, baseline rule, byte and timeout
+5. Preserve every save-guard hook, advice, baseline rule, byte and timeout
    limit, Ediff authorization check, and cleanup behavior.  Update their
    names/comments only where the package rename makes the old wording false.
-5. Add ERT coverage for the renamed public load/mode/commands, full-status
+6. Inspect =flocal-executable= itself before resolving it: it must already be
+   absolute, regular, executable, and non-symlink.  Add ERT coverage for a
+   configured symlink rejection; only then canonicalize it to start the
+   direct-argv process.
+7. Add ERT coverage for the renamed public load/mode/commands, full-status
    display of a disabled or stopped share, status refresh/redraw behavior, and
-   the fact that those shares are excluded from guarding.  Rename the existing
+   the fact that those shares are excluded from guarding.  Test a root changed
+   to a symlink or another ordinary directory between refresh and
+   classification, native non-UTF-8 root bytes, and escaped newline/control
+   status fields.  Rename the existing
    save-conflict tests rather than duplicating them.  Update the real Emacs E2E
    to load =flocal=, enable =flocal-mode=, and assert the renamed status path.
-6. Reconcile =emacs/README.org=, the root README, this design, and the final
+8. Extend the existing Rust CLI acceptance tests for live and stored
+   =status --list --json= projections to assert the decimal root device and
+   inode values, so the Emacs identity contract is producer-tested rather than
+   only mocked in ERT.
+9. Reconcile =emacs/README.org=, the root README, this design, and the final
    implementation report with the shipped interface.  Run the full =make
    check= gate and the Docker Emacs scenarios on Linux; CI continues to cover
    Eldev on Linux and macOS.
@@ -107,8 +164,9 @@ show the error rather than calling it current.
 * Failure and security boundaries
 
 The CLI invocation remains =flocal status --list --json= with an absolute,
-regular, non-symlink executable and direct argv.  The one-process, three-second
-timeout and 64KiB output cap remain in force.  Validation remains all-or-
+regular, executable, non-symlink configured path inspected before resolution,
+and direct argv.  The one-process, three-second timeout and 64KiB output cap
+remain in force.  Validation remains all-or-
 nothing: malformed roots, fields, timestamps, or schema never become partial
 status or an unguarded classification.  The status buffer is presentation only
 and contains no action that starts a daemon or mutates flocal state.
@@ -138,14 +196,18 @@ shipping aliases that make the interface ambiguous.
 * Acceptance criteria
 
 - A fresh Emacs 28+ session can load =flocal= and enable =flocal-mode=; no
-  =flocal-guard= filename, feature, public symbol, or documentation example
-  remains.
+  =flocal-guard= filename, feature, public symbol, or current user-facing
+  documentation example remains.  Dated historical records retain their
+  original names.
 - =flocal-status= presents live or stored source, daemon diagnostic, and every
   configured share, including disabled and stopped ones; =g= requests a
   bounded asynchronous redraw.
 - Only enabled, non-stopped shares receive modeline guard state and the
   content-aware save guard.  Nested eligible roots still select the most
-  specific root.
+  specific root.  Native filename bytes match correctly; roots swapped for
+  another directory or a symlink are shown in status but never made eligible.
+- The status buffer escapes control data and rejects an overlong diagnostic;
+  a symlink configured as =flocal-executable= is rejected before execution.
 - Every existing conflict-protection behavior still has passing ERT coverage:
   stale-cache blocking, baseline preservation, identical replacement,
   conflict/Ediff write-A and abort, nonregular and custom writers, and bounded
