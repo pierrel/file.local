@@ -255,7 +255,7 @@
   (let ((bytes (encode-coding-string
                 (buffer-substring-no-properties (point-min) (point-max))
                 buffer-file-coding-system)))
-    (when (string-match-p "\\0" bytes)
+    (when (string-match-p "\0" bytes)
       (user-error "flocal guard cannot merge binary buffer contents"))
     (when (> (string-bytes bytes) flocal-max-conflict-bytes)
       (user-error "flocal guard refuses to protect a buffer larger than %d bytes"
@@ -425,7 +425,7 @@ fail closed instead of presenting one disk version and authorizing another."
     (flocal--identity-number (alist-get 'inode details))
     (unless (and (> (length root) 0)
                  (file-name-absolute-p root)
-                 (not (string-match-p "\\0" root)))
+                 (not (string-match-p "\0" root)))
       (error "flocal returned an invalid share root"))
     (flocal--share-create :root root :details share)))
 

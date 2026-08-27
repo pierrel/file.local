@@ -59,13 +59,21 @@
     (setq-local flocal--state 'checking)
     (should (equal (flocal--mode-line) ""))))
 
+(ert-deftest flocal-buffer-hash-accepts-zero-and-rejects-nul ()
+  (with-temp-buffer
+    (insert "version 0\n")
+    (should (stringp (flocal--buffer-hash)))
+    (erase-buffer)
+    (insert "x\0")
+    (should-error (flocal--buffer-hash) :type 'user-error)))
+
 (ert-deftest flocal-status-validation-keeps-active-non-stopped-shares ()
   (let* ((report (flocal--validate-report
                  '((schema . 1) (source . "live")
                    (observed_at . "2026-08-25T00:00:00Z")
                    (daemon . ((state . "live") (diagnostic . nil)))
                    (shares . (((share . "active")
-                               (root . ((encoding . "base64") (data . "L3RtcA==")
+                               (root . ((encoding . "base64") (data . "L3RtcC8w")
                                         (device . "1") (inode . "2")))
                                (enabled . t) (connection_state . "watching")
                                (scheduling . "idle") (role . "connector")
@@ -84,7 +92,7 @@
                                (initial_complete . :false) (diagnostic . nil) (unsettled . 0)))))))
          (shares (flocal--report-shares report)))
     (should (= (length shares) 3))
-    (should (equal (flocal--share-root (car shares)) "/tmp"))))
+    (should (equal (flocal--share-root (car shares)) "/tmp/0"))))
 
 (ert-deftest flocal-status-validation-accepts-json-null-and-false ()
   (let ((report
@@ -110,6 +118,10 @@
     (setf (alist-get 'data (alist-get 'root (car (alist-get 'shares report))))
           "L3RtcA==")
     (setf (alist-get 'observed_at report) "2026-02-31T99:99:99Z")
+    (should-error (flocal--validate-report report) :type 'error)
+    (setf (alist-get 'observed_at report) "2026-08-25T00:00:00Z"
+          (alist-get 'data (alist-get 'root (car (alist-get 'shares report))))
+          "L3RtcC8AeA==")
     (should-error (flocal--validate-report report) :type 'error)))
 
 (ert-deftest flocal-status-shows-disabled-shares-with-escaped-fields ()

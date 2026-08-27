@@ -83,15 +83,16 @@ whole-response limit.
 
 * Validation and review
 
-=eldev test= passes 25 ERT tests.  They cover the renamed public library,
+=eldev test= passes 26 ERT tests.  They cover the renamed public library,
 disabled-share presentation, =g= binding, stale and save-conflict behavior,
 native filename bytes, changed ordinary and symlinked roots, executable
-symlink refusal, escaped controls, and diagnostic bounds.  Targeted Rust
+symlink refusal, escaped controls, diagnostic bounds, and ordinary digit-zero
+versus literal-NUL content and roots.  Targeted Rust
 =status_list= integration tests pass for live and stored projections,
 including real device/inode values.
 
-=make check= passes with whole-project coverage above 90% and 90.61% changed
-line coverage (666/735).  It includes Rust tests, ERT, formatting, and clippy.
+=make check= passes with whole-project coverage above 90% and 91.11% changed
+line coverage (687/754).  It includes Rust tests, ERT, formatting, and clippy.
 The two real Docker Emacs scenarios pass: a guarded live share/status view and
 a remote synchronized change that opens Ediff without overwriting disk.
 
@@ -100,9 +101,13 @@ existing patterns; design adherence; documentation alignment; cross-platform
 filesystem correctness; and adversarial security.  One review round found an
 open status buffer could retain =Fresh: yes= while a refresh was in flight.
 The refresh now redraws immediately and the ERT suite drives its sentinel to
-prove the final redraw.  The affected review reran clear.  A comment-alignment
-pass renamed the library's save-protection-only header.  CI and Copilot follow
-the reviewed push.
+prove the final redraw.  The affected review reran clear.  CI then exposed a
+macOS temporary root with ordinary digit =0=; two regexp checks had
+interpreted it as binary.  Both now test literal NUL bytes and ERT pins accepted
+digit-zero text/paths as well as rejected NUL roots/content.  The affected
+platform, security, interface, and documentation reviews reran clear.  A
+comment-alignment pass renamed the library's save-protection-only header.  CI
+and Copilot follow the reviewed push.
 
 * Limits and upgrade note
 
