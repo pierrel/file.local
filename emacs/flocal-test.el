@@ -59,6 +59,13 @@
     (setq-local flocal--state 'checking)
     (should (equal (flocal--mode-line) ""))))
 
+(ert-deftest flocal-leaves-remote-buffers-outside ()
+  (with-temp-buffer
+    (setq buffer-file-name "/ssh:test@host:/tmp/note")
+    (flocal--classify-buffer)
+    (should (eq flocal--state 'outside))
+    (should-not flocal--share)))
+
 (ert-deftest flocal-buffer-hash-accepts-zero-and-rejects-nul ()
   (with-temp-buffer
     (insert "version 0\n")

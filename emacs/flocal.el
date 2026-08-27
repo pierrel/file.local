@@ -175,25 +175,28 @@
 
 (defun flocal--classify-buffer ()
   (when buffer-file-name
-    ;; Capture the version Emacs showed at visit (or when the mode is enabled
-    ;; for an already visiting, unmodified buffer).  Reclassification after a
-    ;; status refresh must never turn unsaved edits into a disk baseline.
-    (when (and (not flocal--base-hash) (not (buffer-modified-p)))
-      (condition-case _error
-          (flocal--capture-base)
-        (error (setq flocal--state 'cannot-verify))))
-    (if (not (flocal--cache-fresh-p))
+    (if (file-remote-p buffer-file-name)
         (setq flocal--share nil
-              flocal--state 'checking)
-      (condition-case _error
-          (setq flocal--share (flocal--share-for-file buffer-file-name)
-                flocal--state
-                (cond ((not flocal--share) 'outside)
-                      ((equal (flocal--report-source flocal--report) "stored") 'stored)
-                      (t 'guarded)))
-        (error
-         (setq flocal--share nil
-               flocal--state 'cannot-verify))))))
+              flocal--state 'outside)
+      ;; Capture the version Emacs showed at visit (or when the mode is enabled
+      ;; for an already visiting, unmodified buffer).  Reclassification after a
+      ;; status refresh must never turn unsaved edits into a disk baseline.
+      (when (and (not flocal--base-hash) (not (buffer-modified-p)))
+        (condition-case _error
+            (flocal--capture-base)
+          (error (setq flocal--state 'cannot-verify))))
+      (if (not (flocal--cache-fresh-p))
+          (setq flocal--share nil
+                flocal--state 'checking)
+        (condition-case _error
+            (setq flocal--share (flocal--share-for-file buffer-file-name)
+                  flocal--state
+                  (cond ((not flocal--share) 'outside)
+                        ((equal (flocal--report-source flocal--report) "stored") 'stored)
+                        (t 'guarded)))
+          (error
+           (setq flocal--share nil
+                 flocal--state 'cannot-verify)))))))
 
 (defun flocal--visit-file ()
   (flocal--classify-buffer)
