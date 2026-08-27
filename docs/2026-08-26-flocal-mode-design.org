@@ -1,0 +1,155 @@
+#+title: flocal-mode design
+#+date: 2026-08-26
+#+status: proposed
+
+* Purpose
+
+The existing Emacs package is named =flocal-guard= even though it already
+discovers shares, presents their state in the modeline, and has a status
+command.  Its only user-visible mode, =flocal-guard-mode=, makes the entire
+integration sound like a save hook.  Rename the user-facing package and global
+minor mode to =flocal= and =flocal-mode=, and make the read-only share-status
+experience a first-class part of that mode.  The existing save-conflict guard
+remains mandatory behavior for eligible buffers; this change does not broaden
+flocal control from Emacs.
+
+This is a pre-release repository feature: the package has not been released or
+documented as a stable external API.  A complete rename is smaller and clearer
+than retaining =flocal-guard= compatibility aliases, two customize groups, and
+two names for one global toggle.
+
+* User flow
+
+1. The user puts =emacs/= on =load-path=, then enables the companion with
+   =(require 'flocal)= and =(flocal-mode 1)=.  The mode begins its bounded,
+   asynchronous read-only status discovery exactly as the current guard does.
+2. A visiting file under an enabled, non-stopped share shows its flocal state
+   in the modeline.  A cold or stale discovery result says =checking= and
+   still blocks a modified guarded save rather than guessing.
+3. =M-x flocal-status= opens a read-only =*flocal status*= buffer.  It shows
+   the report source and observation time, daemon state and diagnostic, and
+   every reported configured share: root, enabled state, connection state,
+   scheduling state, role, initial-completion state, unsettled count, and any
+   bounded diagnostic.  Thus stopped and disabled shares are visible for
+   diagnosis but never protected as active shares.
+4. =g= in that buffer requests another asynchronous refresh and redraws the
+   same buffer when it finishes.  It gives prompt feedback that a refresh is
+   pending or failed and never runs a synchronous process or a control command.
+   The normal =flocal= CLI remains the place to pair, start, stop, or remove a
+   share.
+5. When a modified file under an eligible share differs from its saved
+   buffer-content baseline, the mode keeps the existing Ediff flow.  Resolving
+   with write-A succeeds only if the disk is still the compared snapshot;
+   abort leaves both versions intact.
+
+* Interface and state contract
+
+The Emacs file is renamed from =emacs/flocal-guard.el= to =emacs/flocal.el=,
+provides the feature =flocal=, and has the =flocal= customization group.  Its
+user-facing interface is:
+
+#+begin_src emacs-lisp
+(require 'flocal)
+(flocal-mode 1)
+(flocal-status)
+(flocal-refresh)
+#+end_src
+
+=flocal-mode= is the sole global mode.  =flocal-status= shows the status
+buffer; =flocal-refresh= requests a refresh and is also the =g= binding in
+that buffer.  Customizations become =flocal-executable=,
+=flocal-max-conflict-bytes=, =flocal-status-timeout=,
+=flocal-status-max-bytes=, and =flocal-refresh-interval=.  Rename all
+implementation-local variables and functions to the =flocal--= prefix as
+well, including test names and E2E forms.  The modeline marker stays
+=FLOCAL:=; its established state spelling stays unchanged.
+
+Keep two representations after validating the schema-1 response:
+
+- The complete validated share list is the status presentation cache.
+- The derived eligible list contains only enabled, non-stopped shares and is
+  the input to most-specific-root matching and save protection.
+
+This separation makes a stopped or disabled share observable without making it
+look protected.  A failed, malformed, oversized, or expired report invalidates
+both caches for classification.  The status buffer may retain its last
+successfully rendered information for explanation, but must mark it stale and
+show the error rather than calling it current.
+
+* Implementation plan
+
+1. Rename the Emacs library, feature, test library, symbols, customization
+   group, documentation examples, E2E batch forms, and README link from
+   =flocal-guard= to =flocal=.  Replace the global mode definition with
+   =flocal-mode=.  Do not leave aliases or duplicate loadable packages.
+2. Split status validation from guard eligibility.  Validate every schema-1
+   share once, retain its decoded canonical root and report fields for status,
+   then derive a filtered eligible share list for buffer classification.  Keep
+   the current most-specific-root rule.
+3. Turn the current status display into =flocal-status= and define a tiny
+   derived special mode for =*flocal status*=.  Give it a local =g= binding.
+   Render a deterministic, readable report from the cached validated data;
+   redraw it in the async sentinel if that buffer exists.  Refresh remains
+   coalesced: at most one process runs.
+4. Preserve every save-guard hook, advice, baseline rule, byte and timeout
+   limit, Ediff authorization check, and cleanup behavior.  Update their
+   names/comments only where the package rename makes the old wording false.
+5. Add ERT coverage for the renamed public load/mode/commands, full-status
+   display of a disabled or stopped share, status refresh/redraw behavior, and
+   the fact that those shares are excluded from guarding.  Rename the existing
+   save-conflict tests rather than duplicating them.  Update the real Emacs E2E
+   to load =flocal=, enable =flocal-mode=, and assert the renamed status path.
+6. Reconcile =emacs/README.org=, the root README, this design, and the final
+   implementation report with the shipped interface.  Run the full =make
+   check= gate and the Docker Emacs scenarios on Linux; CI continues to cover
+   Eldev on Linux and macOS.
+
+* Failure and security boundaries
+
+The CLI invocation remains =flocal status --list --json= with an absolute,
+regular, non-symlink executable and direct argv.  The one-process, three-second
+timeout and 64KiB output cap remain in force.  Validation remains all-or-
+nothing: malformed roots, fields, timestamps, or schema never become partial
+status or an unguarded classification.  The status buffer is presentation only
+and contains no action that starts a daemon or mutates flocal state.
+
+Only the eligible derived list may suppress Emacs's normal supersession prompt
+or activate the save guard.  A stale result, failed refresh, unverified local
+file, symlink, binary input, oversized input, custom writer, and Ediff disk
+change all preserve the current fail-closed guard behavior.  The mode does not
+claim filesystem compare-and-swap semantics; the documented final write race
+remains a limit.
+
+* Trade-offs and non-goals
+
+The status buffer reports full configured state because it makes the companion
+useful when a share is stopped, disabled, blocked, or reconnecting.  It remains
+read-only so it cannot duplicate CLI lifecycle policy, confirmation flows, or
+daemon ownership in Emacs.  A richer transient UI, share start/stop buttons,
+per-share logs, automatic conflict resolution, and changes to lockfiles,
+auto-saves, backups, or global file behavior are outside this change.
+
+The complete rename intentionally breaks an unpublished =(require
+'flocal-guard)= configuration.  That is preferable before release to
+perpetuating the misleading guard-only name.  If release evidence instead
+shows outside users, add a separate compatibility decision rather than silently
+shipping aliases that make the interface ambiguous.
+
+* Acceptance criteria
+
+- A fresh Emacs 28+ session can load =flocal= and enable =flocal-mode=; no
+  =flocal-guard= filename, feature, public symbol, or documentation example
+  remains.
+- =flocal-status= presents live or stored source, daemon diagnostic, and every
+  configured share, including disabled and stopped ones; =g= requests a
+  bounded asynchronous redraw.
+- Only enabled, non-stopped shares receive modeline guard state and the
+  content-aware save guard.  Nested eligible roots still select the most
+  specific root.
+- Every existing conflict-protection behavior still has passing ERT coverage:
+  stale-cache blocking, baseline preservation, identical replacement,
+  conflict/Ediff write-A and abort, nonregular and custom writers, and bounded
+  inputs.
+- The updated batch Emacs Docker scenarios pass, and =make check= passes with
+  whole-project and changed-line coverage at or above 90%; GitHub CI is green
+  on its Linux, macOS, coverage, and Docker jobs.
