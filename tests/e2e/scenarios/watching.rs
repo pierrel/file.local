@@ -80,12 +80,14 @@ fn watch_notices_an_atomic_rename_save() -> Result<()> {
     a.wait_absent(".notes.txt.tmp")?;
     b.wait_absent(".notes.txt.tmp")?;
     watch.wait_for_log("SETTLED")?;
+    let connector_status = a.status()?;
     anyhow::ensure!(
-        !a.status()?.pending_install && a.status()?.unsettled.is_empty(),
+        !connector_status.pending_install && connector_status.unsettled.is_empty(),
         "connector retained pending or unsettled state after atomic rename"
     );
+    let responder_status = b.status()?;
     anyhow::ensure!(
-        !b.status()?.pending_install && b.status()?.unsettled.is_empty(),
+        !responder_status.pending_install && responder_status.unsettled.is_empty(),
         "responder retained pending or unsettled state after atomic rename"
     );
     watch.stop()
