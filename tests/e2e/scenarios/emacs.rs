@@ -11,13 +11,13 @@ fn emacs_shows_an_active_flocal_share_as_guarded() -> Result<()> {
     let (a, _b) = e2e::managed_pair()?;
     a.write("emacs.txt", "base")?;
     let form = r#"(progn
-      (require 'flocal-guard)
-      (setq flocal-guard-executable "/usr/local/bin/flocal")
-      (flocal-guard-mode 1)
-      (while (process-live-p flocal-guard--refresh-process) (accept-process-output nil 0.1))
+      (require 'flocal)
+      (setq flocal-executable "/usr/local/bin/flocal")
+      (flocal-mode 1)
+      (while (process-live-p flocal--refresh-process) (accept-process-output nil 0.1))
       (find-file "/home/peer/share/emacs.txt")
-      (princ (flocal-guard--mode-line))
-      (flocal-guard-status)
+      (princ (flocal--mode-line))
+      (flocal-status)
       (princ (with-current-buffer "*flocal status*" (buffer-string))))"#;
     let output = a.emacs_ok(form)?;
     anyhow::ensure!(
@@ -41,10 +41,10 @@ fn emacs_snapshots_a_real_remote_change_before_saving() -> Result<()> {
     b.wait_for_file("emacs-conflict.txt", "base\n")?;
     let form = r#"(progn
       (require 'cl-lib)
-      (require 'flocal-guard)
-      (setq flocal-guard-executable "/usr/local/bin/flocal")
-      (flocal-guard-mode 1)
-      (while (process-live-p flocal-guard--refresh-process) (accept-process-output nil 0.1))
+      (require 'flocal)
+      (setq flocal-executable "/usr/local/bin/flocal")
+      (flocal-mode 1)
+      (while (process-live-p flocal--refresh-process) (accept-process-output nil 0.1))
       (find-file "/home/peer/share/emacs-conflict.txt")
       (goto-char (point-max))
       (insert "mine\n")

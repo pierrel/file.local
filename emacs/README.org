@@ -1,30 +1,39 @@
-#+title: flocal-guard
+#+title: flocal
 
-=flocal-guard= is an Emacs 28+ companion for local files synchronized by
-=flocal=. It is an affordance and protection layer, not a flocal control
-client: it has no commands to pair, start, stop, or synchronize shares.
+=flocal= is an Emacs 28+ companion for local files synchronized by
+=flocal=. Its global =flocal-mode= provides read-only share status and
+save-conflict protection. It has no commands to pair, start, stop, or
+synchronize shares.
 
 * Install and enable
 
 Put this directory on =load-path=, then enable the global mode:
 
 #+begin_src emacs-lisp
-(require 'flocal-guard)
-(flocal-guard-mode 1)
+(require 'flocal)
+(flocal-mode 1)
 #+end_src
 
 The mode discovers shares with =flocal status --list --json=. Set
-=flocal-guard-executable= to an absolute executable that resolves to a regular
-non-symlink file when the normal discovery does not find it. The command is
-read-only: it never starts a daemon.
+=flocal-executable= to an absolute, regular, executable non-symlink file when
+normal =PATH= discovery does not find it. The command is read-only: it never
+starts a daemon.
 
 * What it does
 
 For an enabled share not known to be stopped, visiting buffers show an
-=FLOCAL:= modeline item. =M-x flocal-guard-status= shows the same live or
-stored cache without offering controls. The cache expires after 15 seconds;
-a modified buffer waits for a fresh status result instead of guessing that it
-is outside a share.
+=FLOCAL:= modeline item. =M-x flocal-status= shows every configured share,
+including disabled and stopped ones, with the observation source, daemon state,
+connection, scheduling, role, completion, diagnostic, and unsettled count.
+Press =g= in that read-only buffer to start a bounded asynchronous refresh. The
+cache expires after 15 seconds; a modified buffer waits for a fresh status
+result instead of guessing that it is outside a share. A stale status view is
+marked as such and retains its last report only for explanation.
+
+Only enabled, non-stopped roots whose registered filesystem device and inode
+still match are guarded. A renamed, replaced, or symlinked root is still shown
+in status but is never treated as the configured share. Status fields are
+escaped before display, so unusual filenames or diagnostics cannot forge rows.
 
 On visit and after each successful save, the guard stores a SHA-256 hash of
 the visiting buffer's normal serialized content. Before a guarded modified
@@ -34,7 +43,7 @@ with the user buffer as A and a private, read-only =DISK:= snapshot as B.
 Writing A is allowed only while disk still equals that snapshot. Quitting Ediff
 leaves the conflict pending, so the next save opens it again.
 
-The guard refuses snapshots larger than =flocal-guard-max-conflict-bytes=
+The guard refuses snapshots larger than =flocal-max-conflict-bytes=
 (1 MiB by default), and refuses to save when it cannot verify a regular local
 file. This preserves the buffer and disk rather than silently choosing one.
 

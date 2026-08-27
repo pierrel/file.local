@@ -132,6 +132,9 @@ fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
 
 #[test]
 fn status_list_reads_stored_shares_without_starting_a_daemon() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
     let temporary = tempdir()?;
     let state_dir = temporary.path().join("state");
     let root = temporary.path().join("root");
@@ -165,6 +168,18 @@ fn status_list_reads_stored_shares_without_starting_a_daemon() -> Result<()> {
     assert_eq!(report["shares"][0]["share"], share.0);
     assert_eq!(report["shares"][0]["enabled"], true);
     assert_eq!(report["shares"][0]["connection_state"], "unknown");
+    #[cfg(unix)]
+    {
+        let metadata = std::fs::metadata(&root)?;
+        assert_eq!(
+            report["shares"][0]["root"]["device"],
+            metadata.dev().to_string()
+        );
+        assert_eq!(
+            report["shares"][0]["root"]["inode"],
+            metadata.ino().to_string()
+        );
+    }
     Ok(())
 }
 
@@ -307,6 +322,9 @@ fn status_list_falls_back_when_the_live_daemon_disconnects_or_times_out() -> Res
 
 #[test]
 fn status_list_reads_live_daemon_state() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
     let temporary = tempdir()?;
     let state_dir = temporary.path().join("state");
     let root = temporary.path().join("root");
@@ -351,6 +369,18 @@ fn status_list_reads_live_daemon_state() -> Result<()> {
     assert_eq!(report["daemon"]["state"], "live");
     assert_eq!(report["shares"][0]["share"], share.0);
     assert_eq!(report["shares"][0]["enabled"], true);
+    #[cfg(unix)]
+    {
+        let metadata = std::fs::metadata(&root)?;
+        assert_eq!(
+            report["shares"][0]["root"]["device"],
+            metadata.dev().to_string()
+        );
+        assert_eq!(
+            report["shares"][0]["root"]["inode"],
+            metadata.ino().to_string()
+        );
+    }
     Ok(())
 }
 

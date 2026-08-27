@@ -467,6 +467,8 @@ enum DaemonResponse {
 struct DaemonSync {
     share: String,
     root: DaemonPath,
+    root_device: String,
+    root_inode: String,
     host: Option<String>,
     remote_path: Option<DaemonPath>,
     enabled: bool,
@@ -492,9 +494,17 @@ struct DaemonSync {
 /// separate from `DaemonSync`: daemon control data grows for operations while
 /// this is a stable, read-only client contract.
 #[derive(serde::Serialize)]
+struct StatusListRoot {
+    encoding: String,
+    data: String,
+    device: String,
+    inode: String,
+}
+
+#[derive(serde::Serialize)]
 struct StatusListShare {
     share: String,
-    root: DaemonPath,
+    root: StatusListRoot,
     enabled: bool,
     connection_state: String,
     scheduling: String,
@@ -502,6 +512,15 @@ struct StatusListShare {
     initial_complete: bool,
     diagnostic: Option<String>,
     unsettled: usize,
+}
+
+fn status_list_root(path: DaemonPath, device: String, inode: String) -> StatusListRoot {
+    StatusListRoot {
+        encoding: path.encoding,
+        data: path.data,
+        device,
+        inode,
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1292,7 +1311,7 @@ fn status_list_stored(state_dir: &Path) -> Result<()> {
 fn status_share_live(sync: DaemonSync) -> StatusListShare {
     StatusListShare {
         share: sync.share,
-        root: sync.root,
+        root: status_list_root(sync.root, sync.root_device, sync.root_inode),
         enabled: sync.enabled,
         connection_state: sync.connection_state,
         scheduling: sync.scheduling,
@@ -1319,7 +1338,11 @@ fn status_share_stored(snapshot: flocal::state::ReadOnlyStatusShare) -> Option<S
     };
     Some(StatusListShare {
         share: managed.id.0,
-        root: daemon_path(&path_bytes(&managed.root)),
+        root: status_list_root(
+            daemon_path(&path_bytes(&managed.root)),
+            snapshot.root_identity.device.to_string(),
+            snapshot.root_identity.inode.to_string(),
+        ),
         enabled: managed.watch_enabled,
         connection_state: if managed.watch_enabled {
             "unknown"
@@ -2780,9 +2803,12 @@ fn daemon_syncs(
         } else {
             connection_state
         };
+        let root_identity = state.expected_root_identity(&share.id)?;
         syncs.push(DaemonSync {
             share: share.id.0.clone(),
             root: daemon_path(&path_bytes(&share.root)),
+            root_device: root_identity.device.to_string(),
+            root_inode: root_identity.inode.to_string(),
             host: match &share.binding {
                 EndpointBinding::Connector(peer) => Some(peer.host.clone()),
                 EndpointBinding::Responder { .. } | EndpointBinding::Unpaired => None,
@@ -8567,6 +8593,8 @@ mod tests {
                 encoding: "base64".into(),
                 data: "L3RtcA==".into(),
             },
+            root_device: "1".into(),
+            root_inode: "2".into(),
             host: None,
             remote_path: None,
             enabled: true,
@@ -8601,6 +8629,10 @@ mod tests {
                     watch_enabled: enabled,
                     blocked_diagnostic: None,
                     removing_relationship,
+                },
+                root_identity: flocal::state::RootIdentity {
+                    device: 1,
+                    inode: 2,
                 },
                 unsettled: 2,
             })

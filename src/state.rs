@@ -382,6 +382,7 @@ pub struct ManagedShare {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadOnlyStatusShare {
     pub managed: ManagedShare,
+    pub root_identity: RootIdentity,
     pub unsettled: usize,
 }
 
@@ -1443,7 +1444,7 @@ impl State {
         let mut statement = connection.prepare(
             "SELECT share_id, root, peer_json, initial_complete, watch_enabled,
                     blocked_diagnostic, bound_peer, bound_relationship,
-                    removing_relationship,
+                    removing_relationship, root_device, root_inode,
                     (SELECT COUNT(*) FROM unsettled_paths
                      WHERE unsettled_paths.share_id=shares.share_id)
              FROM shares ORDER BY share_id",
@@ -1451,15 +1452,26 @@ impl State {
         let shares = statement
             .query_map([], |row| {
                 let managed = managed_share_from_row(row)?;
-                let unsettled = row.get::<_, i64>(9)?;
+                let unsettled = row.get::<_, i64>(11)?;
                 let root = &managed.root;
                 if !root.is_absolute() || root.as_os_str().is_empty() {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
+                let root_identity = RootIdentity {
+                    device: row
+                        .get::<_, String>(9)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    inode: row
+                        .get::<_, String>(10)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                };
                 Ok(ReadOnlyStatusShare {
                     managed,
+                    root_identity,
                     unsettled: usize::try_from(unsettled)
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, unsettled))?,
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(11, unsettled))?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
