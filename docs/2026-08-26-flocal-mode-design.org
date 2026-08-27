@@ -1,6 +1,6 @@
 #+title: flocal-mode design
 #+date: 2026-08-26
-#+status: proposed
+#+status: implemented
 
 * Purpose
 
