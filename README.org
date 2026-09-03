@@ -124,8 +124,12 @@ Waiting for the peer to finish another synchronization (queue position 1)
 A broken local root, including a rename, deletion, replacement, or symlink, is
 =blocked= with its reason and is not adopted automatically. Restore the
 original directory and run =sync start --share SHARE= to retry it; =sync stop
---share SHARE= works even while its old path is gone. =sync list= also shows
-the durable enabled setting separately from connection and scheduling state.
+--share SHARE= works even while its old path is gone. To deliberately use a
+replacement directory, first record its target with =sync list=, detach the
+old relationship with =sync remove --share SHARE --yes=, then run =sync add
+PATH --host HOST --remote-path REMOTE_PATH=. Only that explicit fresh pairing
+records the replacement's identity. =sync list= also shows the durable enabled
+setting separately from connection and scheduling state.
 
 ** Relationship lifecycle
 
@@ -139,7 +143,10 @@ Normal removal runs on the connector. It stops that relationship's worker,
 asks the responder to detach the same relationship, then detaches locally. On a
 responder, the command identifies the connector on which to run it. An exact
 root path selects an available root; =--share= remains available when that root
-is missing or replaced.
+is missing or replaced. A changed path never selects removal by pathname alone:
+use =--share= to deliberately detach it, then a new =sync add= to adopt the
+replacement as a fresh relationship. A local-only detach does not make it safe
+to re-add the same responder until the other endpoint has also detached.
 
 The command previews the root, share, known peer, and scope. Confirmation
 defaults to no. Declining, entering an empty answer, or reaching end of input

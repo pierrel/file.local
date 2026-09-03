@@ -39,6 +39,117 @@ fn daemon_restart_restores_enabled_watches() -> Result<()> {
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
+fn abrupt_connector_restart_preserves_an_idle_managed_relationship() -> Result<()> {
+    let (a, b) = e2e::managed_pair()?;
+    a.abrupt_restart_machine()?;
+    a.assert_status(|status| status.relationship_state == "connector" && !status.removal_pending)?;
+    a.write(
+        "after-connector-restart.txt",
+        "connector retained its root identity",
+    )?;
+    b.wait_for_file(
+        "after-connector-restart.txt",
+        "connector retained its root identity",
+    )?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn abrupt_responder_restart_preserves_an_idle_managed_relationship() -> Result<()> {
+    let (a, b) = e2e::managed_pair()?;
+    b.abrupt_restart_machine()?;
+    b.assert_status(|status| status.relationship_state == "responder" && !status.removal_pending)?;
+    a.write(
+        "after-responder-restart.txt",
+        "responder retained its root identity",
+    )?;
+    b.wait_for_file(
+        "after-responder-restart.txt",
+        "responder retained its root identity",
+    )?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn abrupt_connector_restart_recovers_an_interrupted_apply() -> Result<()> {
+    let (a, b) = e2e::managed_pair()?;
+    a.arm_apply_stops(1)?;
+    b.write(
+        "during-connector-restart.txt",
+        "durable before connector restart",
+    )?;
+    let stopped = a.wait_for_stopped_apply_process()?;
+    anyhow::ensure!(
+        a.status()?.pending_install,
+        "connector did not record its install intent"
+    );
+    stopped.abandon_after_crash();
+    a.abrupt_restart_machine()?;
+    a.wait_for_file(
+        "during-connector-restart.txt",
+        "durable before connector restart",
+    )?;
+    a.assert_status(|status| !status.pending_install && status.relationship_state == "connector")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn replaced_connector_root_requires_explicit_detach_then_can_be_reinitialized() -> Result<()> {
+    let (a, b) = e2e::managed_pair()?;
+    let share = a.status()?.share;
+    let original_relationship = a.connector_relationship()?;
+
+    a.sync_stop()?;
+    a.replace_share_root()?;
+    a.write("must-survive-detach.txt", "replacement contents stay local")?;
+    let recovery = format!("flocal sync remove --share {share} --yes");
+    a.sync_start_expect_err(&recovery)?;
+    a.sync_remove_expect_err(&recovery)?;
+
+    a.sync_remove_by_share(&share)?;
+    a.assert_sync_list_empty()?;
+    b.assert_sync_list_empty()?;
+    a.assert_file("must-survive-detach.txt", "replacement contents stay local")?;
+
+    a.sync_add_to(&b)?;
+    anyhow::ensure!(
+        a.connector_relationship()? != original_relationship,
+        "replacement root retained the detached relationship id"
+    );
+    a.write("after-reinitialize.txt", "explicit replacement root")?;
+    b.wait_for_file("after-reinitialize.txt", "explicit replacement root")?;
+    e2e::assert_trees_equal(&a, &b)?;
+    a.sync_stop()
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn abrupt_responder_restart_recovers_an_interrupted_apply() -> Result<()> {
+    let (a, b) = e2e::managed_pair()?;
+    b.arm_apply_stops(1)?;
+    a.write(
+        "during-responder-restart.txt",
+        "durable before responder restart",
+    )?;
+    b.wait_for_stopped_protocol_server()?;
+    anyhow::ensure!(
+        b.status()?.pending_install,
+        "responder did not record its install intent"
+    );
+    b.abrupt_restart_machine()?;
+    b.wait_for_file(
+        "during-responder-restart.txt",
+        "durable before responder restart",
+    )?;
+    b.assert_status(|status| !status.pending_install && status.relationship_state == "responder")?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
 fn persistent_watch_reuses_one_ssh_session_while_idle() -> Result<()> {
     let (a, b) = e2e::pair_with(e2e::Config {
         watch_max_session_bytes: None,

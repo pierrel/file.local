@@ -328,7 +328,7 @@ fn run() -> Result<()> {
                 host,
                 remote_path,
             } => {
-                add_peer(&mut state, &path, &host, &remote_path)?;
+                add_peer(&mut state, &path, &host, &remote_path, false)?;
                 registered_line(&state, &state.find_share(&path)?.0)?;
             }
             PeerCommand::List { path, json } => list_peer(&state, &path, json)?,
@@ -665,16 +665,16 @@ fn sync_command(state: &mut State, command: SyncCommand) -> Result<()> {
                             );
                         }
                         if peer.peer_id.is_none() {
-                            add_peer(state, &path, &host, &remote_path)?;
+                            add_peer(state, &path, &host, &remote_path, true)?;
                         }
                     } else {
-                        add_peer(state, &path, &host, &remote_path)?;
+                        add_peer(state, &path, &host, &remote_path, true)?;
                     }
                     share
                 }
                 Err(_) => {
                     let share = state.init_share(&path)?;
-                    add_peer(state, &path, &host, &remote_path)?;
+                    add_peer(state, &path, &host, &remote_path, true)?;
                     share
                 }
             };
@@ -3215,7 +3215,13 @@ impl std::fmt::Display for InstallRecoveryBlocked {
 
 impl std::error::Error for InstallRecoveryBlocked {}
 
-fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> Result<()> {
+fn add_peer(
+    state: &mut State,
+    path: &Path,
+    host: &str,
+    remote_path: &Path,
+    allow_root_reinitialization: bool,
+) -> Result<()> {
     validate_host(host)?;
     if !remote_path.is_absolute() {
         bail!("--remote-path must be absolute");
@@ -3226,6 +3232,7 @@ fn add_peer(state: &mut State, path: &Path, host: &str, remote_path: &Path) -> R
     let registration = wait_for_installation(state, &share, SyncOperation::Registration, None)?;
     let prepared = state.prepare_connector_registration_locked(
         &share,
+        allow_root_reinitialization.then_some(path),
         &expected,
         host,
         &path_bytes(remote_path),
@@ -9423,6 +9430,74 @@ mod tests {
         let daemon = serve_test_daemon(&state.dir, 2)?;
         remove_sync_relationship(&mut state, None, Some(&share.0), true, true)?;
         daemon.join().expect("test daemon joins")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_root_removal_names_its_safe_share_selector() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        std::fs::rename(&root, temp.path().join("old-root"))?;
+        std::fs::create_dir(&root)?;
+
+        let error = select_share_for_removal(&state, Some(&root), None)
+            .expect_err("a changed root must not select a removal by path");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("flocal sync remove --share {} --yes", share.0))
+        );
+        assert_eq!(
+            select_share_for_removal(&state, None, Some(&share.0))?,
+            share
+        );
+        std::fs::rename(&root, temp.path().join("removed-root"))?;
+        let error = select_share_for_removal(&state, Some(&root), None)
+            .expect_err("a missing root must not select a removal by path");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("flocal sync remove --share {} --yes", share.0))
+        );
+        let error = state
+            .validate_root_identity(&share)
+            .expect_err("a missing root must retain its identity guard");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("flocal sync remove --share {} --yes", share.0))
+        );
+        let dotted = temp.path().join("old-root/../root");
+        let error = select_share_for_removal(&state, Some(&dotted), None)
+            .expect_err("a dotted missing root must not select removal by path");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("flocal sync remove --share {} --yes", share.0))
+        );
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target)?;
+        let target_share = state.init_share(&target)?;
+        let alias = temp.path().join("retargeted-alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &alias)?;
+        let error = select_share_for_removal(&state, Some(&alias), None)
+            .expect_err("a retargeted link must not select removal by path");
+        assert!(!error.to_string().contains(&format!(
+            "flocal sync remove --share {} --yes",
+            target_share.0
+        )));
+        let nonexistent_parent = temp.path().join("missing/../target");
+        let error = select_share_for_removal(&state, Some(&nonexistent_parent), None)
+            .expect_err("a missing path cannot collapse into a removal target");
+        assert!(!error.to_string().contains(&format!(
+            "flocal sync remove --share {} --yes",
+            target_share.0
+        )));
         Ok(())
     }
 

@@ -4371,13 +4371,46 @@ impl State {
 
     pub fn find_share_by_exact_root(&self, path: &Path) -> Result<(ShareId, PathBuf)> {
         let requested = std::path::absolute(path)?;
-        let identity = root_identity(&requested)?;
+        let identity = root_identity(&requested)
+            .map_err(|error| self.unavailable_root_removal_error(&requested, error))?;
         let root = canonical_registration_root(&requested, identity)?;
         let share = self.find_share_by_exact_root_identity(&root, identity)?;
         if root_identity(&requested)? != identity {
             bail!("relationship root identity changed while selecting it for removal");
         }
         Ok(share)
+    }
+
+    fn unavailable_root_removal_error(&self, root: &Path, error: anyhow::Error) -> anyhow::Error {
+        // This lookup only improves the recovery diagnostic.  It never selects
+        // a share for removal: a missing or retargeted path still cannot
+        // authorize a destructive operation by pathname.
+        let normalized = missing_root_path_without_links(root);
+        let share = [Some(root), normalized.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| {
+                self.conn
+                    .query_row(
+                        "SELECT share_id FROM shares WHERE root=?1",
+                        [path_bytes(candidate)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            });
+        let guidance = match share {
+            Some(share) => format!(
+                "; record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {share} --yes`"
+            ),
+            None => String::new(),
+        };
+        RootIdentityChanged::new(format!(
+            "configured root {} is unavailable: {error}; restore the original directory before retrying{guidance}",
+            root.display()
+        ))
+        .into()
     }
 
     fn find_share_by_exact_root_identity(
@@ -4396,7 +4429,11 @@ impl State {
         let (share, device, inode) = row.context(
             "removal PATH must name the configured sync root; use --share when it is unavailable",
         )?;
-        validate_identity_values(root, identity, &device, &inode)?;
+        validate_identity_values(root, identity, &device, &inode).with_context(|| {
+            format!(
+                "use `flocal sync remove --share {share} --yes` to deliberately detach this changed root"
+            )
+        })?;
         Ok((ShareId(share), root.to_path_buf()))
     }
 
@@ -4430,14 +4467,16 @@ impl State {
         let expected = self.expected_root_identity(id)?;
         let actual = root_identity(&root).map_err(|error| {
             RootIdentityChanged::new(format!(
-                "configured root {} is unavailable: {error}; restore the original directory before retrying",
-                root.display()
+                "configured root {} is unavailable: {error}; restore the original directory before retrying, or record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {} --yes`",
+                root.display(),
+                id.0
             ))
         })?;
         if actual != expected {
             return Err(RootIdentityChanged::new(format!(
-                "configured root identity changed at {}; restore the original directory or deliberately remove and reinitialize the share",
-                root.display()
+                "configured root identity changed at {}; restore the original directory, or record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {} --yes` before adding the replacement as a new relationship",
+                root.display(),
+                id.0
             ))
             .into());
         }
@@ -4573,26 +4612,50 @@ impl State {
         executable: &str,
     ) -> Result<PeerConfig> {
         self.scheduled_mutation(Some(id), SyncOperation::Registration, |state| {
-            state.prepare_connector_registration_locked(id, expected, host, remote_path, executable)
+            state.prepare_connector_registration_locked(
+                id,
+                None,
+                expected,
+                host,
+                remote_path,
+                executable,
+            )
         })
     }
 
     pub fn prepare_connector_registration_locked(
         &mut self,
         id: &ShareId,
+        registration_root: Option<&Path>,
         expected: &EndpointBinding,
         host: &str,
         remote_path: &[u8],
         executable: &str,
     ) -> Result<PeerConfig> {
         let _registration_lock = self.lock_registration()?;
-        self.validate_root_identity(id)?;
+        let identity_error = match self.validate_root_identity(id) {
+            Ok(_) => None,
+            Err(error) if error.downcast_ref::<RootIdentityChanged>().is_some() => Some(error),
+            Err(error) => return Err(error),
+        };
+        let reinitialization = match &identity_error {
+            None => None,
+            Some(_) => {
+                let root = registration_root.context(
+                    "configured root identity changed; rerun sync add with the exact configured root",
+                )?;
+                Some(self.open_reinitialization_root(id, root)?)
+            }
+        };
         let transaction = self.conn.transaction()?;
         let (binding, marker) = binding_and_marker(&transaction, id)?.context("share not found")?;
         if marker.is_some() {
             bail!("relationship removal is pending");
         }
         if let EndpointBinding::Connector(existing) = &binding {
+            if let Some(error) = identity_error {
+                return Err(error);
+            }
             if existing.relationship.is_some()
                 && existing.host == host
                 && existing.remote_path == remote_path
@@ -4602,7 +4665,22 @@ impl State {
             bail!("share already has a connector configuration");
         }
         if &binding != expected || !matches!(binding, EndpointBinding::Unpaired) {
+            if let Some(error) = identity_error {
+                return Err(error);
+            }
             bail!("share relationship changed since pairing preview");
+        }
+        if let Some((root, identity)) = &reinitialization {
+            ensure_unpaired_registration_state(&transaction, id)?;
+            transaction.execute(
+                "UPDATE shares SET root_device=?2,root_inode=?3 WHERE share_id=?1",
+                params![
+                    id.0,
+                    identity.device.to_string(),
+                    identity.inode.to_string()
+                ],
+            )?;
+            ensure_reinitialization_identity(root, *identity)?;
         }
         let config = PeerConfig {
             peer_id: None,
@@ -4617,8 +4695,37 @@ impl State {
              intent_generation=intent_generation+1 WHERE share_id=?1",
             params![id.0, serde_json::to_string(&config)?],
         )?;
+        if let Some((root, identity)) = &reinitialization {
+            ensure_reinitialization_identity_after_connector(root, *identity)?;
+        }
         transaction.commit()?;
         Ok(config)
+    }
+
+    fn open_reinitialization_root(
+        &self,
+        id: &ShareId,
+        requested_root: &Path,
+    ) -> Result<(PathBuf, RootIdentity)> {
+        let requested_root = std::path::absolute(requested_root)?;
+        let stored_root = self.root_for(id)?;
+        let resolved = resolve_registration_path(&requested_root)?;
+        if !resolved.missing.is_empty() {
+            bail!("replacement root must be an existing directory");
+        }
+        let metadata = fs::symlink_metadata(&requested_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("replacement root must be an existing directory, not a symbolic link");
+        }
+        let identity = file_root_identity(&resolved.ancestor, &resolved.canonical)?;
+        if root_identity(&requested_root)? != identity {
+            bail!("relationship root identity changed while preparing reinitialization");
+        }
+        let root = canonical_registration_root(&requested_root, identity)?;
+        if root != stored_root {
+            bail!("replacement root must be selected by its exact configured path");
+        }
+        Ok((root, identity))
     }
 
     pub fn complete_connector_registration(
@@ -6813,6 +6920,46 @@ fn root_identity(path: &Path) -> Result<RootIdentity> {
     file_root_identity(&file, path)
 }
 
+fn ensure_reinitialization_identity(root: &Path, identity: RootIdentity) -> Result<()> {
+    if root_identity(root)? != identity {
+        bail!("relationship root identity changed while reinitializing registration");
+    }
+    Ok(())
+}
+
+fn ensure_reinitialization_identity_after_connector(
+    root: &Path,
+    identity: RootIdentity,
+) -> Result<()> {
+    #[cfg(test)]
+    replace_reinitialization_root_before_identity_check()?;
+    ensure_reinitialization_identity(root, identity)
+}
+
+#[cfg(test)]
+static REINITIALIZATION_ROOT_RACE: std::sync::Mutex<Option<(PathBuf, PathBuf)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn arm_reinitialization_root_race(root: PathBuf, moved_root: PathBuf) {
+    *REINITIALIZATION_ROOT_RACE
+        .lock()
+        .expect("reinitialization test hook lock poisoned") = Some((root, moved_root));
+}
+
+#[cfg(test)]
+fn replace_reinitialization_root_before_identity_check() -> Result<()> {
+    let replacement = REINITIALIZATION_ROOT_RACE
+        .lock()
+        .expect("reinitialization test hook lock poisoned")
+        .take();
+    if let Some((root, moved_root)) = replacement {
+        fs::rename(&root, moved_root)?;
+        fs::create_dir(&root)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn file_root_identity(file: &File, path: &Path) -> Result<RootIdentity> {
     let metadata = file.metadata()?;
@@ -6831,6 +6978,45 @@ fn canonical_registration_root(root: &Path, identity: RootIdentity) -> Result<Pa
         bail!("relationship root identity changed while resolving its path");
     }
     Ok(canonical)
+}
+
+/// Produces a lexical equivalent of a missing path only when no existing
+/// component is a link.  This is diagnostic-only: following a link here could
+/// make a changed pathname suggest an unrelated share ID.
+fn missing_root_path_without_links(path: &Path) -> Option<PathBuf> {
+    if !matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == ErrorKind::NotFound
+    ) {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    let mut missing = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if missing {
+                    return None;
+                }
+                normalized.pop();
+            }
+            Component::Normal(name) => {
+                normalized.push(name);
+                if !missing {
+                    match fs::symlink_metadata(&normalized) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => return None,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => missing = true,
+                        Err(_) => return None,
+                    }
+                }
+            }
+        }
+    }
+    Some(normalized)
 }
 
 struct ResolvedRegistrationPath {
@@ -8134,6 +8320,161 @@ mod tests {
         assert!(state.finalize_connector_removal(&prepared).is_err());
         state.finalize_local_removal(&prepared)?;
         assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_registration_reinitializes_only_an_unpaired_exact_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let original = state.expected_root_identity(&share)?;
+        let config = state.prepare_connector_registration(
+            &share,
+            &EndpointBinding::Unpaired,
+            "host",
+            b"/remote",
+            "/flocal",
+        )?;
+        fs::rename(&root, temp.path().join("old-root"))?;
+        fs::create_dir(&root)?;
+
+        let error = state
+            .prepare_connector_registration_locked(
+                &share,
+                Some(&root),
+                &EndpointBinding::Connector(config.clone()),
+                "host",
+                b"/remote",
+                "/flocal",
+            )
+            .expect_err("a live connector cannot adopt a replacement root");
+        assert!(
+            error
+                .to_string()
+                .contains("configured root identity changed")
+        );
+        assert_eq!(
+            state.endpoint_binding(&share)?,
+            EndpointBinding::Connector(config.clone())
+        );
+
+        let removal = state.prepare_removal(&share, &EndpointBinding::Connector(config))?;
+        state.finalize_local_removal(&removal)?;
+
+        let prepared = state.prepare_connector_registration_locked(
+            &share,
+            Some(&root),
+            &EndpointBinding::Unpaired,
+            "host",
+            b"/remote",
+            "/flocal",
+        )?;
+        assert_ne!(state.expected_root_identity(&share)?, original);
+        state.validate_root_identity(&share)?;
+        assert_eq!(
+            state.endpoint_binding(&share)?,
+            EndpointBinding::Connector(prepared)
+        );
+
+        let second_root = temp.path().join("second-root");
+        fs::create_dir(&second_root)?;
+        let second = state.init_share(&second_root)?;
+        fs::rename(&second_root, temp.path().join("old-second-root"))?;
+        fs::create_dir_all(second_root.join("nested"))?;
+        let error = state
+            .prepare_connector_registration_locked(
+                &second,
+                Some(&second_root.join("nested")),
+                &EndpointBinding::Unpaired,
+                "host",
+                b"/remote",
+                "/flocal",
+            )
+            .expect_err("a descendant cannot authorize root reinitialization");
+        assert!(error.to_string().contains("exact configured path"));
+        assert!(state.validate_root_identity(&second).is_err());
+
+        let removing_root = temp.path().join("removing-root");
+        fs::create_dir(&removing_root)?;
+        let removing = state.init_share(&removing_root)?;
+        let removing_config = state.prepare_connector_registration(
+            &removing,
+            &EndpointBinding::Unpaired,
+            "host",
+            b"/remote",
+            "/flocal",
+        )?;
+        state.prepare_removal(&removing, &EndpointBinding::Connector(removing_config))?;
+        fs::rename(&removing_root, temp.path().join("old-removing-root"))?;
+        fs::create_dir(&removing_root)?;
+        let error = state
+            .prepare_connector_registration_locked(
+                &removing,
+                Some(&removing_root),
+                &EndpointBinding::Unpaired,
+                "host",
+                b"/remote",
+                "/flocal",
+            )
+            .expect_err("a pending removal cannot adopt a replacement root");
+        assert!(
+            error
+                .to_string()
+                .contains("relationship removal is pending")
+        );
+        assert!(state.validate_root_identity(&removing).is_err());
+
+        let recovering_root = temp.path().join("recovering-root");
+        fs::create_dir(&recovering_root)?;
+        let recovering = state.init_share(&recovering_root)?;
+        state.conn.execute(
+            "INSERT INTO install_intents(share_id,records_json) VALUES(?1,'{}')",
+            [&recovering.0],
+        )?;
+        fs::rename(&recovering_root, temp.path().join("old-recovering-root"))?;
+        fs::create_dir(&recovering_root)?;
+        let error = state
+            .prepare_connector_registration_locked(
+                &recovering,
+                Some(&recovering_root),
+                &EndpointBinding::Unpaired,
+                "host",
+                b"/remote",
+                "/flocal",
+            )
+            .expect_err("an install journal cannot adopt a replacement root");
+        assert!(error.to_string().contains("install_intents"));
+        assert!(state.validate_root_identity(&recovering).is_err());
+
+        let racing_root = temp.path().join("racing-root");
+        fs::create_dir(&racing_root)?;
+        let racing = state.init_share(&racing_root)?;
+        fs::rename(&racing_root, temp.path().join("old-racing-root"))?;
+        fs::create_dir(&racing_root)?;
+        arm_reinitialization_root_race(
+            racing_root.clone(),
+            temp.path().join("raced-reinitialization-root"),
+        );
+        let error = state
+            .prepare_connector_registration_locked(
+                &racing,
+                Some(&racing_root),
+                &EndpointBinding::Unpaired,
+                "host",
+                b"/remote",
+                "/flocal",
+            )
+            .expect_err("a root replaced before commit cannot be adopted");
+        assert!(
+            error
+                .to_string()
+                .contains("relationship root identity changed while reinitializing registration")
+        );
+        assert_eq!(state.endpoint_binding(&racing)?, EndpointBinding::Unpaired);
+        assert!(state.validate_root_identity(&racing).is_err());
         Ok(())
     }
 

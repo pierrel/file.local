@@ -1,0 +1,219 @@
+#+title: Root identity removal and reinitialization recovery
+#+date: 2026-09-03
+#+status: implemented and validated
+
+* 1. User outcome
+
+After a filesystem replacement changes a configured root's device/inode
+identity, =flocal sync start PATH= remains blocked.  That is the right safety
+result: file.local must never silently treat the new directory as the old
+synchronized tree.  A normal abrupt endpoint restart must *not* itself change
+that identity or block an otherwise unchanged share.
+
+The diagnostic must, however, give the user a complete deliberate recovery
+path:
+
+#+begin_example
+flocal sync list
+flocal sync remove --share SHARE_ID --yes
+flocal sync add PATH --host HOST --remote-path REMOTE_PATH
+#+end_example
+
+The first command detaches the old relationship without opening the changed
+root.  The second is an explicit fresh pairing action: after the relationship
+has been removed, it records the present, user-selected directory identity as
+the root for a new initial synchronization.  It does not revive prior sync
+state or silently resume the prior relationship.
+
+Before detaching, =sync list= supplies the saved host and remote-path values
+needed for the new =sync add=.  Local-only removal retains an unconfirmed peer
+relationship, so it is not a safe route to re-add the same responder until that
+endpoint has also been detached.
+
+=flocal sync remove PATH= continues to reject a changed, missing, or final
+symlink root.  A pathname that now resolves to another directory is not a safe
+authority to detach the old share.  Its error names the exact =--share=
+recovery command instead.  This is deliberately a UX and recovery-completion
+change, not a weakening of destructive path selection.
+
+* 2. Existing behavior and defect
+
+=State::find_share_by_exact_root= canonicalizes PATH, opens its final component
+without following a link, and compares its device/inode with the stored values.
+=sync remove PATH= uses this selector, so it correctly refuses a replacement
+directory.  =sync remove --share SHARE_ID= instead reads the durable row by
+opaque share ID and then =PrepareRemove= marks and stops the relationship; that
+path does not require the root identity.
+
+Two gaps make this safe mechanism unusable in practice:
+
+1. The identity-change error says to “deliberately remove and reinitialize the
+   share” but does not say that removal must use =--share=, even when the
+   failing command already knows the share ID.
+2. Relationship finalization intentionally retains =shares.root= and its stored
+   identity.  A subsequent =sync add PATH= finds that retained unpaired row,
+   but =prepare_connector_registration_locked= validates its obsolete identity
+   before it can create the fresh connector.  Thus successful removal alone
+   cannot actually reinitialize a permanently replaced root.
+
+The implementation must close both gaps while preserving the existing rule
+that ordinary start, watch, sync, registration retry, restore, and any install
+recovery never adopt a changed root.
+
+* 3. Chosen flow and interfaces
+
+1. Keep =select_share_for_removal= and
+   =State::find_share_by_exact_root= identity-strict for PATH.  Do not make a
+   changed directory select a share by textual path alone.  When its stored
+   identity comparison fails, return a bounded diagnostic that includes the
+   affected =ShareId= and says:
+
+   #+begin_example
+   configured root identity changed at PATH; restore the original directory,
+   or record its target with `flocal sync list`, then deliberately detach with
+   `flocal sync remove --share SHARE_ID --yes` before adding the replacement
+   as a new relationship
+   #+end_example
+
+   =State::validate_root_identity= has the same share ID and uses equivalent
+   wording, so =sync start --share= and worker failures lead to the same
+   recovery route.  No diagnostic exposes an unchecked path, a peer secret, or
+   a shell-interpretable value; existing escaped rendering remains responsible
+   for human output.
+
+2. Leave =select_share_for_removal(..., --share)= root-free.  It validates the
+   opaque ID and confirms the durable binding, then current
+   =PrepareRemove -> install recovery -> remote removal -> finalization= runs
+   unchanged.  The preview uses the stored root label only.  Neither daemon
+   preparation nor normal/local-only finalization opens, traverses, or modifies
+   the changed directory.
+
+3. Add one narrowly named state operation, conceptually
+   =reinitialize_unpaired_root_for_registration(share)=, used only by the
+   successful-user-intent branch of =sync add= immediately before creating a
+   new connector registration.  Under the existing registration lock and its
+   SQLite transaction it:
+
+   - receives the user PATH and resolves that exact final directory through the
+     existing descriptor-backed, no-follow registration path; it rejects a
+     descendant, final symlink, missing path, or a canonical path unequal to
+     =shares.root=;
+   - reads the adopted device/inode from that same opened descriptor, then
+     rechecks the user and stored paths immediately before commit;
+   - requires the durable binding to be =Unpaired=, no removal marker, and no
+     install intent; and
+   - updates only =shares.root_device= and =shares.root_inode= to that opened
+     identity before writing the new prepared connector binding.
+
+   This state transition itself, rather than a caller precondition, establishes
+   the exact-path authorization to adopt the replacement.  Connector/retry
+   bindings still call the ordinary identity validation and cannot rebase a
+   live or pending relationship.
+
+   The operation belongs beside
+   =prepare_connector_registration_locked= rather than in removal
+   finalization: =sync remove --share= must keep working when the root is
+   missing, and removal alone must not make a changed directory trusted.  The
+   later =sync add PATH= supplies both a real root and unambiguous user intent.
+
+4. If an =install_intents= journal exists, retain the current safety boundary.
+   Removal marks the relationship but recovery tries to finish the
+   already-committed filesystem action first.  A changed identity leaves that
+   journal classified and removal pending; it must not detach or rebase around
+   an unresolved install.  The error explains that the original root must be
+   restored to finish recovery.  Reinitialization is available only after a
+   successful finalization has proved the journal absent.
+
+5. On successful re-add, existing initial-sync code produces a new
+   relationship ID, clears the prior record/shared-head state already cleared
+   by removal, and computes a new initial plan.  Retained conflicts and
+   recovery objects keep their documented behavior; no prior records are
+   treated as a base for the new peer relationship.
+
+* 4. Failure, concurrency, and security boundaries
+
+- A root replacement is never adopted by a background daemon, =sync start=,
+  =sync=, =watch=, incoming synchronization, registration retry, or install
+  recovery.  Only a completed detach followed by an explicit exact-root
+  =sync add= can rebase it.
+- PATH removal still refuses a final symlink and identity mismatch, preventing
+  a replacement, alias retarget, or nested registered directory from selecting
+  a relationship by path.  =--share= is an opaque ID selected from private
+  state, and its removal changes relationship metadata only.
+- The reinitialization transaction compare-and-sets the unpaired/no-marker
+  state under the registration lock.  A concurrent new pairing, incoming
+  binding, pending removal, or install journal makes it fail rather than
+  rebasing the wrong incarnation.
+- The opened identity is obtained with no-follow directory access and is stored
+  in the same transaction that creates the connector configuration.  A later
+  rename is caught by the existing identity checks before any synchronization
+  accesses files.
+- Existing two-sided removal protocol authentication, relationship-ID matching,
+  peer binding checks, bounded daemon stop, and local-only warning remain
+  unchanged.  A remote error leaves the local relationship pending rather than
+  authorizing a rebase.
+
+* 5. Acceptance tests
+
+First add four real Docker endpoint-restart scenarios.  They use Docker's
+SIGKILL restart of the whole peer container, preserving the peer's =/home=
+volume and therefore its state directory and configured root:
+
+1. Restart the connector while its managed watch is idle; restart its daemon,
+   then prove the existing relationship stays enabled, unblocked, and
+   synchronizes a new edit.
+2. Repeat for the responder.
+3. Stop a real connector-side apply after its install intent is durable, kill
+   and restart the connector container, then prove recovery finishes and both
+   endpoints converge without a root-identity diagnostic.
+4. Repeat that interrupted-install restart from the responder side.
+
+The cases deliberately cover both endpoints and both no-transfer and
+mid-transfer restart.  An abrupt restart is distinct from an intentional root
+replacement: the retained Docker volume supplies the same root directory, so
+any identity mismatch is a defect to diagnose and fix rather than a recovery
+choice.
+
+Add a Docker E2E scenario in =tests/e2e/scenarios/watching.rs= using a
+real managed pair and the real daemon:
+
+1. Stop the connector daemon/watch, rename its configured share root aside,
+   and create a new ordinary directory at the same path.  This is the observed
+   identity-change condition, not a mocked state edit.
+2. Assert =sync start --share SHARE= fails and includes the exact
+   =sync remove --share SHARE= recovery command.  Assert =sync remove PATH
+   also fails with that command, proving the strict path-selector policy did
+   not regress.
+3. Run =sync remove --share SHARE --yes=.  Assert both endpoints become
+   unpaired, the replacement directory's contents are unchanged, and no daemon
+   worker remains.  This proves the deliberate root-free detach works.
+4. Run the normal =sync add PATH --host ... --remote-path ...= from the
+   connector.  Assert it completes initial synchronization, starts normally,
+   and a new edit propagates.  Assert the replacement's new identity is now
+   accepted by =sync start= and its relationship ID differs from the detached
+   relationship ID.
+
+Also reject =sync add ROOT/subdir= in the changed-root reinitialization branch.
+Use a test-only seam to replace the root after descriptor resolution and before
+the first commit-time identity check.  The registration transaction must roll
+back without a connector configuration, and the replacement must still fail
+ordinary identity validation.
+
+Keep focused state tests for the transaction cases: an unpaired changed root
+rebases during explicit registration; a live connector binding, removal marker,
+or durable install journal cannot rebase; and an ordinary changed-root
+validation still fails.  The exact-root selector test asserts that its error
+points to =--share= rather than accepting a retargeted directory.
+
+* 6. Documentation impact and non-goals
+
+Update README's broken-root and removal paragraphs to say that PATH removal is
+identity-strict, =--share= is the deliberate detach selector for a missing or
+replaced root, and a fresh =sync add= after successful detachment is the sole
+way to adopt the replacement.  Update the clean-removal design/final report
+where they currently imply that retained root identity alone permits recovery;
+the retained identity remains a guard until the explicit re-add transition.
+
+This change does not add a force flag, an automatic identity migration, root
+path mutation, recursive deletion, or a way to discard an interrupted install.
+It does not make =sync remove PATH= follow or trust a replacement root.

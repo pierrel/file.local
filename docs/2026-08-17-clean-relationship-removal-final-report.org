@@ -261,6 +261,12 @@ check on the final component and verifies the configured root identity before
 any prompt.  =--share= selects durable metadata even if the filesystem root is
 unavailable.  Both paths converge on the same preview and state transition.
 
+A later root-recovery follow-up makes the retained identity an explicit guard:
+when the old root has been replaced, remove by =--share= and then run a fresh
+=sync add= at the exact configured path to record the replacement and create a
+new relationship.  Removal alone never adopts the directory that now happens
+to occupy the old pathname.
+
 ** The isolated lifecycle protocol
 
 Lifecycle messages are closed, tagged Serde enums with unknown fields denied:
