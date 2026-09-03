@@ -31,7 +31,12 @@ jobs:
             https://raw.githubusercontent.com/doublep/eldev/92a46b48793e561b00189a06014df0d7bbeed3be/bin/eldev
           chmod +x "$HOME/.local/bin/eldev"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          eldev --version | grep -F 'eldev 1.11.2'
+          git clone --depth 1 --branch 1.11.2 https://github.com/doublep/eldev.git \
+            "$RUNNER_TEMP/eldev"
+          test "$(git -C "$RUNNER_TEMP/eldev" rev-parse HEAD)" = \
+            92a46b48793e561b00189a06014df0d7bbeed3be
+          echo "ELDEV_LOCAL=$RUNNER_TEMP/eldev" >> "$GITHUB_ENV"
+          ELDEV_LOCAL="$RUNNER_TEMP/eldev" "$HOME/.local/bin/eldev" --version | grep -F 'eldev 1.11.2'
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets -- --test-threads=1

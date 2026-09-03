@@ -1,0 +1,125 @@
+#+title: Root identity recovery and abrupt-restart resilience
+#+date: 2026-09-03
+#+status: implemented and validated
+
+* What users experience
+
+An abrupt restart of either endpoint now has explicit regression coverage.  An
+idle managed relationship survives, and a restart while an already-durable file
+installation is stopped recovers that installation after the peer returns.
+Neither case changes the root identity or requires repair.
+
+If a root really has been replaced, file.local still refuses to use its old
+pathname as authority.  The error now gives a complete deliberate recovery
+flow:
+
+#+begin_example
+flocal sync list
+flocal sync remove --share SHARE_ID --yes
+flocal sync add PATH --host HOST --remote-path REMOTE_PATH
+#+end_example
+
+=sync list= records the target before detach.  =--share= detaches durable
+metadata without opening the changed root.  The later =sync add= is the only
+operation that can accept the current exact directory as a replacement and it
+creates a new relationship ID.  A local-only detach is not enough to reuse the
+same responder until that responder has also detached.
+
+* Implementation
+
+** Safe removal guidance
+
+=State::validate_root_identity= now includes the opaque share ID in both
+replacement and unavailable-root diagnostics.  PATH removal remains strict:
+=find_share_by_exact_root= never returns a share after identity validation
+fails.  It only looks up an ID to improve its error message.
+
+The CLI records whether the selection came from PATH.  A PATH selection sends
+the distinct =PrepareRemovePath= request; after taking the daemon lifecycle
+lock, the daemon rechecks the stored root identity immediately before marking
+the relationship for removal.  An explicit =--share= selection keeps the
+root-free =PrepareRemove= request.  The distinct wire variants matter during
+an upgrade: an older daemon rejects =PrepareRemovePath= rather than ignoring a
+new field and detaching a root selected by a stale pathname.
+
+For a genuinely missing root, a small lexical normalizer recognizes a safe
+no-link =..= spelling.  It refuses links and refuses to collapse =..= after a
+missing component, so a retargeted alias cannot make the error recommend a
+different share.
+
+#+begin_src rust
+if missing {
+    return None;
+}
+normalized.pop();
+#+end_src
+
+=Option<PathBuf>= expresses “there is no safe equivalent spelling” without a
+special sentinel.  The early =return None= is Rust's normal value-level exit;
+the caller then emits an error without a share-specific recovery command.
+
+** Explicit reinitialization
+
+=add_peer= receives =allow_root_reinitialization=.  Legacy =peer add= passes
+=false=; only =sync add= passes =true=.  When the stored identity differs, the
+state layer accepts a supplied root only if it is the exact configured path,
+an existing non-symlink directory, unpaired, free of a removal marker, and free
+of an install journal.
+
+#+begin_src rust
+if let Some((root, identity)) = &reinitialization {
+    ensure_unpaired_registration_state(&transaction, id)?;
+    transaction.execute(
+        "UPDATE shares SET root_device=?2,root_inode=?3 WHERE share_id=?1",
+        params![id.0, identity.device.to_string(), identity.inode.to_string()],
+    )?;
+    ensure_reinitialization_identity(root, *identity)?;
+}
+#+end_src
+
+The =if let Some= pattern runs this branch only when reinitialization was
+explicitly authorized.  The =?= operator returns any failed database or
+filesystem check immediately, which rolls back the SQLite transaction.  The
+final identity check is repeated after writing the prepared connector and
+before commit.  A test-only one-shot seam swaps the directory at that point and
+proves the transaction leaves the share unpaired and the new directory blocked.
+
+** Abrupt restart tests
+
+The Docker harness restarts a complete peer container with SIGKILL, preserving
+the persistent =/home= volume, waits for SSH, then starts the per-user daemon.
+The four scenarios cover connector and responder during both idle managed watch
+and a stopped, durable apply.  The stopped-apply guard is disarmed before
+restart so an error path cannot resume a recycled PID in the new container.
+
+The replacement-root scenario stops the managed connector, replaces its root,
+checks that both =sync start= and PATH removal direct the user to =--share=,
+then detaches by ID.  A sentinel file proves detach does not mutate the
+replacement tree.  A fresh =sync add= synchronizes it and proves that it has a
+new relationship ID.
+
+* Validation and review
+
+- =make check= passed: 95.01% changed executable-line coverage, unit tests,
+  Emacs tests, formatting, and Clippy with warnings denied.
+- Focused Docker tests passed for all four abrupt-restart cases and explicit
+  replacement recovery.
+- The full Docker catalog initially exposed an ordering assumption in the
+  multi-share scheduling harness. The paired request in that scenario was
+  parked and therefore deliberately nonblocking; the test now observes durable
+  requeue and eventual convergence instead. The correction is documented with
+  the multi-share scheduler rather than treated as a product failure.
+- Independent design and code reviews covered correctness, liveness,
+  filesystem behavior, adversarial security, simplicity, readability, design
+  adherence, and documentation alignment.  Review findings added tests for
+  removal markers, install journals, commit-time rename races, recovery-file
+  preservation, legacy command authority, missing roots, retargeted links, and
+  nonexistent-parent =..= paths.
+
+* Operational note
+
+Install the same build on both endpoints before testing.  If the original
+directory still exists, restore it and start normally.  If it was deliberately
+replaced, record the host and remote path with =sync list= before using the
+explicit detach-and-add sequence above.  Do not use =--local-only= unless the
+other endpoint will be detached separately.

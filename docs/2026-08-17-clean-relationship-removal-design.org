@@ -151,11 +151,15 @@ itself.
 
 * 4. Connector and daemon flow
 
-After confirmation, the client sends
-=PrepareRemove { share, expected_binding }=, where =expected_binding= is the
-role/peer/optional relationship shown in the preview.  The expected value is an untrusted CAS,
-not authority: if the binding changed after confirmation, preparation rejects
-and requires a new preview.  The state transaction
+After confirmation, an explicit =--share= selector sends
+=PrepareRemove { share, expected_binding }=, while a PATH selector sends the
+distinct =PrepareRemovePath { share, expected_binding }=.  The latter makes
+the daemon recheck the stored root identity under its lifecycle lock before
+preparation; an older daemon rejects the unknown variant rather than treating
+it as root-free.  =expected_binding= is the role/peer/optional relationship
+shown in the preview.  The expected value is an untrusted CAS, not authority:
+if the binding changed after confirmation, preparation rejects and requires a
+new preview.  The state transaction
 derives the canonical ID from the durable connector or responder binding and
 generates it exactly once only for a legacy NULL binding.  It compare-and-sets
 that binding, writes the marker, disables watch, clears the old worker

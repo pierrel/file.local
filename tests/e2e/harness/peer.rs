@@ -653,6 +653,10 @@ impl Connector {
         self.peer.crash_and_restart_daemon()
     }
 
+    pub fn abrupt_restart_machine(&self) -> Result<()> {
+        self.peer.abrupt_restart_machine()
+    }
+
     pub fn wait_for_sync_diagnostic(&self, needle: &str) -> Result<()> {
         self.poll_until(
             &format!("managed sync did not report {needle:?}"),
@@ -852,6 +856,14 @@ impl Drop for StoppedInstallation<'_> {
 impl StoppedApply<'_> {
     pub fn resume(mut self) -> Result<()> {
         self.peer.resume_stopped_apply_process(self.pid)?;
+        self.resumed = true;
+        Ok(())
+    }
+
+    /// Prepare for an imminent container crash: its pid will no longer be
+    /// meaningful, so Drop must not resume a reused one after restart.
+    pub fn abandon_after_crash(mut self) -> Result<()> {
+        self.peer.remove_apply_stop_pidfile()?;
         self.resumed = true;
         Ok(())
     }
@@ -1531,6 +1543,11 @@ impl Peer {
             .map(|_| ())
     }
 
+    pub fn sync_remove_by_share(&self, share: &str) -> Result<()> {
+        self.flocal_ok(&["sync", "remove", "--share", share, "--yes"])
+            .map(|_| ())
+    }
+
     pub fn sync_remove_local_only(&self) -> Result<()> {
         let output = self.flocal_ok(&["sync", "remove", SHARE, "--local-only", "--yes"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1558,6 +1575,22 @@ impl Peer {
         Ok(())
     }
 
+    pub fn sync_start_expect_err(&self, needle: &str) -> Result<()> {
+        let output = self.flocal_raw(&["sync", "start", SHARE])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            return Err(self.fail(format!(
+                "managed sync start succeeded; expected an error containing {needle:?}"
+            )));
+        }
+        if !stderr.contains(needle) {
+            return Err(self.fail(format!(
+                "expected {needle:?} in sync-start stderr, got: {stderr}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn sync_add_to(&self, other: &Peer) -> Result<()> {
         self.flocal_ok(&[
             "sync",
@@ -1570,6 +1603,21 @@ impl Peer {
             "--yes",
         ])?;
         Ok(())
+    }
+
+    /// Replaces the registered path with a distinct empty directory while
+    /// keeping the path string stable, as an abrupt mount or restore can do.
+    pub fn replace_share_root(&self) -> Result<()> {
+        self.exec_ok(&["mv", "--", SHARE, "/home/peer/replaced-share"])?;
+        self.exec_ok(&["mkdir", "--", SHARE])?;
+        Ok(())
+    }
+
+    pub fn connector_relationship(&self) -> Result<String> {
+        self.status()?
+            .peer
+            .and_then(|peer| peer.get("relationship")?.as_str().map(str::to_owned))
+            .context("connector status did not contain a relationship id")
     }
 
     pub fn assert_sync_list_empty(&self) -> Result<()> {
@@ -1768,25 +1816,6 @@ impl Peer {
             DEADLINE,
             |peer| {
                 let Some(pid) = peer.stopped_apply_pid(None)? else {
-                    return Ok(None);
-                };
-                Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
-            },
-        )?;
-        Ok(StoppedApply {
-            peer: self,
-            pid,
-            resumed: false,
-        })
-    }
-
-    pub fn wait_for_stopped_apply_process_for(&self, share: &str) -> Result<StoppedApply<'_>> {
-        let share = share.to_owned();
-        let pid = self.poll_until(
-            "expected share did not stop at the apply boundary",
-            DEADLINE,
-            |peer| {
-                let Some(pid) = peer.stopped_apply_pid(Some(&share))? else {
                     return Ok(None);
                 };
                 Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
@@ -2429,6 +2458,19 @@ impl Peer {
         self.start_daemon()
     }
 
+    pub fn abrupt_restart_machine(&self) -> Result<()> {
+        self.context.docker_ok(&[
+            "restart",
+            "--signal",
+            "KILL",
+            "--time",
+            "0",
+            &self.container.name,
+        ])?;
+        self.wait_sshd_ready()?;
+        self.start_daemon()
+    }
+
     fn absent_condition(&self, path: &str) -> Result<Condition> {
         self.absent_condition_at(SHARE, path)
     }
@@ -2618,6 +2660,25 @@ impl Peer {
 
     fn remove_apply_stop_pidfile(&self) -> Result<()> {
         self.exec_ok(&["rm", "-f", "--", APPLY_STOP_PIDFILE])?;
+        Ok(())
+    }
+
+    pub fn assert_apply_stop_pidfile_absent(&self) -> Result<()> {
+        let output = self.exec_raw(&[
+            "test",
+            "!",
+            "-e",
+            APPLY_STOP_PIDFILE,
+            "-a",
+            "!",
+            "-L",
+            APPLY_STOP_PIDFILE,
+        ])?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}: interrupted-apply hook pidfile was not cleaned up before the simulated crash",
+            self.alias
+        );
         Ok(())
     }
 

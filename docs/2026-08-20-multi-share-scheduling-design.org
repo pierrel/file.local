@@ -475,7 +475,8 @@ The change is complete only when all of these hold:
    ID.
 3. =sync stop= cancels a queued managed start and it does not run after the
    active share releases.
-4. Repeated activity on share A cannot overtake an already queued share B.
+4. Repeated activity on share A durably requeues while an older paired share B
+   is parked; B remains nonblocking until eligible, and both changes converge.
 5. Killing a queued worker or daemon leaves no permanent head-of-line request;
    an enabled share is reconstructed after daemon restart.  Killing an active
    owner after it commits an install intent while another request is already
