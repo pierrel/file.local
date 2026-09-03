@@ -4404,7 +4404,7 @@ impl State {
             Some(share) => format!(
                 "; record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {share} --yes`"
             ),
-            None => String::new(),
+            None => "; record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share SHARE_ID --yes`".into(),
         };
         RootIdentityChanged::new(format!(
             "configured root {} is unavailable: {error}; restore the original directory before retrying{guidance}",

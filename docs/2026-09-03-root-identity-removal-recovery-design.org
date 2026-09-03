@@ -66,7 +66,8 @@ recovery never adopt a changed root.
    =State::find_share_by_exact_root= identity-strict for PATH.  Do not make a
    changed directory select a share by textual path alone.  When its stored
    identity comparison fails, return a bounded diagnostic that includes the
-   affected =ShareId= and says:
+   affected =ShareId= when it can identify the exact durable path without
+   following a link, and says:
 
    #+begin_example
    configured root identity changed at PATH; restore the original directory,
@@ -75,11 +76,13 @@ recovery never adopt a changed root.
    as a new relationship
    #+end_example
 
-   =State::validate_root_identity= has the same share ID and uses equivalent
-   wording, so =sync start --share= and worker failures lead to the same
-   recovery route.  No diagnostic exposes an unchecked path, a peer secret, or
-   a shell-interpretable value; existing escaped rendering remains responsible
-   for human output.
+   If a missing spelling includes a symlinked platform alias, PATH removal
+   instead tells the user to use =sync list= and substitute =SHARE_ID=; it must
+   not infer an ID by following that link. =State::validate_root_identity= has
+   the actual share ID and uses equivalent wording, so =sync start --share= and
+   worker failures lead to the same recovery route.  No diagnostic exposes an
+   unchecked path, a peer secret, or a shell-interpretable value; existing
+   escaped rendering remains responsible for human output.
 
 2. Leave =select_share_for_removal(..., --share)= root-free.  It validates the
    opaque ID and confirms the durable binding, then current

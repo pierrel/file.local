@@ -9458,11 +9458,7 @@ mod tests {
         std::fs::rename(&root, temp.path().join("removed-root"))?;
         let error = select_share_for_removal(&state, Some(&root), None)
             .expect_err("a missing root must not select a removal by path");
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("flocal sync remove --share {} --yes", share.0))
-        );
+        assert!(error.to_string().contains("flocal sync remove --share "));
         let error = state
             .validate_root_identity(&share)
             .expect_err("a missing root must retain its identity guard");
@@ -9474,11 +9470,7 @@ mod tests {
         let dotted = temp.path().join("old-root/../root");
         let error = select_share_for_removal(&state, Some(&dotted), None)
             .expect_err("a dotted missing root must not select removal by path");
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("flocal sync remove --share {} --yes", share.0))
-        );
+        assert!(error.to_string().contains("flocal sync remove --share "));
         let target = temp.path().join("target");
         std::fs::create_dir(&target)?;
         let target_share = state.init_share(&target)?;
@@ -9491,6 +9483,12 @@ mod tests {
             "flocal sync remove --share {} --yes",
             target_share.0
         )));
+        assert!(error.to_string().contains("flocal sync list"));
+        assert!(
+            error
+                .to_string()
+                .contains("flocal sync remove --share SHARE_ID --yes")
+        );
         let nonexistent_parent = temp.path().join("missing/../target");
         let error = select_share_for_removal(&state, Some(&nonexistent_parent), None)
             .expect_err("a missing path cannot collapse into a removal target");
@@ -9498,6 +9496,12 @@ mod tests {
             "flocal sync remove --share {} --yes",
             target_share.0
         )));
+        assert!(error.to_string().contains("flocal sync list"));
+        assert!(
+            error
+                .to_string()
+                .contains("flocal sync remove --share SHARE_ID --yes")
+        );
         Ok(())
     }
 
