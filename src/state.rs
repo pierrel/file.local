@@ -3438,6 +3438,10 @@ impl State {
                 return Err(error);
             }
         };
+        #[cfg(feature = "e2e-test-hooks")]
+        if operation == SyncOperation::Watch {
+            self.observe_e2e_managed_watch_enqueue(share)?;
+        }
         Ok((
             QueueRequest {
                 state_dir: self.dir.clone(),
@@ -9092,6 +9096,24 @@ mod tests {
         fs::write(&other_marker, [])?;
 
         state.enqueue_sync(Some(&share), SyncOperation::Watch, Some(1))?;
+
+        assert!(!marker.exists());
+        assert!(observed.is_file());
+        assert!(other_marker.is_file());
+        assert!(!other_observed.exists());
+
+        fs::remove_file(&observed)?;
+        fs::write(&marker, [])?;
+        let authority = state.peer_id()?;
+        state.enqueue_authoritative_sync(
+            &share,
+            &RelationshipId::generate(),
+            SyncOperation::Watch,
+            Some(2),
+            &authority,
+            "nonce",
+            "predecessor",
+        )?;
 
         assert!(!marker.exists());
         assert!(observed.is_file());
