@@ -4379,13 +4379,31 @@ impl State {
             .map_err(|error| self.unavailable_root_removal_error(&requested, error))?;
         let root = canonical_registration_root(&requested, identity)?;
         let share = self.find_share_by_exact_root_identity(&root, identity)?;
-        if root_identity(&requested)
-            .map_err(|error| self.unavailable_root_removal_error(&requested, error))?
-            != identity
-        {
-            bail!("relationship root identity changed while selecting it for removal");
-        }
+        self.recheck_exact_removal_root_identity(&requested, identity, &share.0)?;
         Ok(share)
+    }
+
+    fn recheck_exact_removal_root_identity(
+        &self,
+        root: &Path,
+        expected: RootIdentity,
+        share: &ShareId,
+    ) -> Result<()> {
+        let actual = root_identity(root).map_err(|error| {
+            RootIdentityChanged::new(format!(
+                "configured root {} is unavailable: {error}; restore the original directory before retrying, or record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {} --yes` before adding the replacement as a new relationship",
+                root.display(),
+                share.0
+            ))
+        })?;
+        if actual != expected {
+            return Err(RootIdentityChanged::new(format!(
+                "configured root identity changed while selecting it for removal; restore the original directory, or record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {} --yes` before adding the replacement as a new relationship",
+                share.0
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     fn unavailable_root_removal_error(&self, root: &Path, error: anyhow::Error) -> anyhow::Error {
@@ -8931,6 +8949,52 @@ mod tests {
         );
         assert_ne!(first_share, second_share);
         assert!(canonical_registration_root(&first_root, opened_identity).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn removal_identity_recheck_names_the_safe_share_after_a_race() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let selected = root_identity(&root)?;
+
+        fs::rename(&root, temp.path().join("replaced-root"))?;
+        fs::create_dir(&root)?;
+
+        let error = state
+            .recheck_exact_removal_root_identity(&root, selected, &share)
+            .expect_err("a replaced root must not remain selected for removal");
+        let error = format!("{error:#}");
+        assert!(error.contains("restore the original directory"));
+        assert!(error.contains(&format!("flocal sync remove --share {} --yes", share.0)));
+        assert!(error.contains("before adding the replacement as a new relationship"));
+        Ok(())
+    }
+
+    #[test]
+    fn removal_identity_recheck_names_the_safe_share_when_an_alias_path_disappears() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let real_parent = temp.path().join("real");
+        let root = real_parent.join("root");
+        let alias_parent = temp.path().join("alias");
+        fs::create_dir_all(&root)?;
+        std::os::unix::fs::symlink(&real_parent, &alias_parent)?;
+        let alias_root = alias_parent.join("root");
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&alias_root)?;
+        let selected = root_identity(&alias_root)?;
+
+        fs::remove_dir(&root)?;
+
+        let error = state
+            .recheck_exact_removal_root_identity(&alias_root, selected, &share)
+            .expect_err("a missing root must not remain selected for removal");
+        assert!(
+            format!("{error:#}").contains(&format!("flocal sync remove --share {} --yes", share.0))
+        );
         Ok(())
     }
 
