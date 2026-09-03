@@ -4375,7 +4375,10 @@ impl State {
             .map_err(|error| self.unavailable_root_removal_error(&requested, error))?;
         let root = canonical_registration_root(&requested, identity)?;
         let share = self.find_share_by_exact_root_identity(&root, identity)?;
-        if root_identity(&requested)? != identity {
+        if root_identity(&requested)
+            .map_err(|error| self.unavailable_root_removal_error(&requested, error))?
+            != identity
+        {
             bail!("relationship root identity changed while selecting it for removal");
         }
         Ok(share)

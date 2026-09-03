@@ -34,6 +34,14 @@ replacement and unavailable-root diagnostics.  PATH removal remains strict:
 =find_share_by_exact_root= never returns a share after identity validation
 fails.  It only looks up an ID to improve its error message.
 
+The CLI records whether the selection came from PATH.  A PATH selection sends
+the distinct =PrepareRemovePath= request; after taking the daemon lifecycle
+lock, the daemon rechecks the stored root identity immediately before marking
+the relationship for removal.  An explicit =--share= selection keeps the
+root-free =PrepareRemove= request.  The distinct wire variants matter during
+an upgrade: an older daemon rejects =PrepareRemovePath= rather than ignoring a
+new field and detaching a root selected by a stale pathname.
+
 For a genuinely missing root, a small lexical normalizer recognizes a safe
 no-link =..= spelling.  It refuses links and refuses to collapse =..= after a
 missing component, so a retargeted alias cannot make the error recommend a

@@ -445,6 +445,10 @@ enum DaemonRequest {
         share: String,
         expected_binding: EndpointBinding,
     },
+    PrepareRemovePath {
+        share: String,
+        expected_binding: EndpointBinding,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -918,16 +922,18 @@ fn select_share_for_removal(
     state: &State,
     path: Option<&Path>,
     share: Option<&str>,
-) -> Result<ShareId> {
+) -> Result<(ShareId, bool)> {
     match (path, share) {
         (Some(_), Some(_)) | (None, None) => bail!("provide exactly one of PATH or --share"),
         (None, Some(share)) => {
             validate_share_id(share)?;
             state
                 .managed_share(&ShareId(share.into()))
-                .map(|share| share.id)
+                .map(|share| (share.id, false))
         }
-        (Some(path), None) => state.find_share_by_exact_root(path).map(|(share, _)| share),
+        (Some(path), None) => state
+            .find_share_by_exact_root(path)
+            .map(|(share, _)| (share, true)),
     }
 }
 
@@ -938,7 +944,7 @@ fn remove_sync_relationship(
     local_only: bool,
     yes: bool,
 ) -> Result<()> {
-    let share = select_share_for_removal(state, path, share)?;
+    let (share, require_root_identity) = select_share_for_removal(state, path, share)?;
     let root = state.root_for(&share)?;
     let binding = state.endpoint_binding(&share)?;
     if matches!(&binding, EndpointBinding::Unpaired) {
@@ -1009,13 +1015,18 @@ fn remove_sync_relationship(
     }
 
     ensure_daemon(state)?;
-    let response = daemon_request(
-        state,
+    let request = if require_root_identity {
+        DaemonRequest::PrepareRemovePath {
+            share: share.0.clone(),
+            expected_binding: binding.clone(),
+        }
+    } else {
         DaemonRequest::PrepareRemove {
             share: share.0.clone(),
             expected_binding: binding.clone(),
-        },
-    )?;
+        }
+    };
+    let response = daemon_request(state, request)?;
     let DaemonResponse::Prepared { removal } = response else {
         bail!("daemon returned an invalid removal response")
     };
@@ -1234,7 +1245,10 @@ fn daemon_request(state: &State, request: DaemonRequest) -> Result<DaemonRespons
 fn daemon_request_inner(socket: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("cannot connect to {}", socket.display()))?;
-    let read_timeout = if matches!(request, DaemonRequest::PrepareRemove { .. }) {
+    let read_timeout = if matches!(
+        request,
+        DaemonRequest::PrepareRemove { .. } | DaemonRequest::PrepareRemovePath { .. }
+    ) {
         Duration::from_secs(20)
     } else {
         Duration::from_secs(10)
@@ -2722,9 +2736,26 @@ fn handle_daemon_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("daemon lifecycle state is poisoned"));
             let share = ShareId(share);
-            match _lifecycle
-                .and_then(|_| prepare_managed_removal(state, workers, &share, &expected_binding))
-            {
+            match _lifecycle.and_then(|_| {
+                prepare_managed_removal(state, workers, &share, &expected_binding, false)
+            }) {
+                Ok(removal) => DaemonResponse::Prepared { removal },
+                Err(error) => DaemonResponse::Error {
+                    message: format!("{error:#}"),
+                },
+            }
+        }
+        Ok(DaemonRequest::PrepareRemovePath {
+            share,
+            expected_binding,
+        }) => {
+            let _lifecycle = lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon lifecycle state is poisoned"));
+            let share = ShareId(share);
+            match _lifecycle.and_then(|_| {
+                prepare_managed_removal(state, workers, &share, &expected_binding, true)
+            }) {
                 Ok(removal) => DaemonResponse::Prepared { removal },
                 Err(error) => DaemonResponse::Error {
                     message: format!("{error:#}"),
@@ -2750,7 +2781,11 @@ fn prepare_managed_removal(
     workers: &Arc<Mutex<std::collections::HashMap<ShareId, DaemonWorker>>>,
     share: &ShareId,
     expected_binding: &EndpointBinding,
+    require_root_identity: bool,
 ) -> Result<PreparedRemoval> {
+    if require_root_identity {
+        state.validate_root_identity(share)?;
+    }
     let prepared = state.prepare_removal(share, expected_binding)?;
     let ownership = stop_worker_and_wait(workers, share)
         .and_then(|()| state.lock_share_session(share).map(drop));
@@ -9376,10 +9411,13 @@ mod tests {
         let mut state = State::open(temp.path().join("state"))?;
         let share = state.init_share(&root)?;
 
-        assert_eq!(select_share_for_removal(&state, Some(&root), None)?, share);
+        assert_eq!(
+            select_share_for_removal(&state, Some(&root), None)?,
+            (share.clone(), true)
+        );
         assert_eq!(
             select_share_for_removal(&state, None, Some(&share.0))?,
-            share
+            (share.clone(), false)
         );
         assert!(select_share_for_removal(&state, None, None).is_err());
         assert!(select_share_for_removal(&state, Some(&root), Some(&share.0)).is_err());
@@ -9453,7 +9491,7 @@ mod tests {
         );
         assert_eq!(
             select_share_for_removal(&state, None, Some(&share.0))?,
-            share
+            (share.clone(), false)
         );
         std::fs::rename(&root, temp.path().join("removed-root"))?;
         let error = select_share_for_removal(&state, Some(&root), None)
@@ -9502,6 +9540,36 @@ mod tests {
                 .to_string()
                 .contains("flocal sync remove --share SHARE_ID --yes")
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_selected_removal_rechecks_identity_in_the_daemon() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let mut connector = test_connector("peer-removing");
+        connector.relationship = Some(RelationshipId::generate());
+        state.set_peer(&share, &connector)?;
+        let binding = state.endpoint_binding(&share)?;
+        std::fs::rename(&root, temp.path().join("old-root"))?;
+        std::fs::create_dir(&root)?;
+        let workers = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let error = prepare_managed_removal(&mut state, &workers, &share, &binding, true)
+            .expect_err("PATH removal must recheck a root replaced after confirmation");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("flocal sync remove --share {} --yes", share.0))
+        );
+        assert!(state.removing_relationship(&share)?.is_none());
+
+        prepare_managed_removal(&mut state, &workers, &share, &binding, false)?;
+        assert!(state.removing_relationship(&share)?.is_some());
         Ok(())
     }
 

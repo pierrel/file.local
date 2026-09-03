@@ -84,12 +84,15 @@ recovery never adopt a changed root.
    unchecked path, a peer secret, or a shell-interpretable value; existing
    escaped rendering remains responsible for human output.
 
-2. Leave =select_share_for_removal(..., --share)= root-free.  It validates the
-   opaque ID and confirms the durable binding, then current
-   =PrepareRemove -> install recovery -> remote removal -> finalization= runs
-   unchanged.  The preview uses the stored root label only.  Neither daemon
-   preparation nor normal/local-only finalization opens, traverses, or modifies
-   the changed directory.
+2. Keep =select_share_for_removal(..., --share)= root-free.  It validates the
+   opaque ID and confirms the durable binding, then =PrepareRemove -> install
+   recovery -> remote removal -> finalization= runs without opening the changed
+   directory.  PATH selection instead sends the distinct
+   =PrepareRemovePath= daemon request.  Under the daemon lifecycle lock, that
+   request rechecks the stored root identity immediately before the durable
+   removal preparation.  A daemon from before this change rejects the unknown
+   request variant instead of silently treating it as the root-free request.
+   The preview uses the stored root label only.
 
 3. Add one narrowly named state operation, conceptually
    =reinitialize_unpaired_root_for_registration(share)=, used only by the
@@ -139,10 +142,11 @@ recovery never adopt a changed root.
   =sync=, =watch=, incoming synchronization, registration retry, or install
   recovery.  Only a completed detach followed by an explicit exact-root
   =sync add= can rebase it.
-- PATH removal still refuses a final symlink and identity mismatch, preventing
-  a replacement, alias retarget, or nested registered directory from selecting
-  a relationship by path.  =--share= is an opaque ID selected from private
-  state, and its removal changes relationship metadata only.
+- PATH removal still refuses a final symlink and identity mismatch, both during
+  selection and at daemon preparation, preventing a replacement, alias
+  retarget, or nested registered directory from selecting a relationship by
+  path.  =--share= is an opaque ID selected from private state, and its removal
+  changes relationship metadata only.
 - The reinitialization transaction compare-and-sets the unpaired/no-marker
   state under the registration lock.  A concurrent new pairing, incoming
   binding, pending removal, or install journal makes it fail rather than

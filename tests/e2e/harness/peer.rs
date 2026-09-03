@@ -860,10 +860,12 @@ impl StoppedApply<'_> {
         Ok(())
     }
 
-    /// The target process died with its container, so its pid is no longer
-    /// meaningful and Drop must not resume a reused one after restart.
-    pub fn abandon_after_crash(mut self) {
+    /// Prepare for an imminent container crash: its pid will no longer be
+    /// meaningful, so Drop must not resume a reused one after restart.
+    pub fn abandon_after_crash(mut self) -> Result<()> {
+        self.peer.remove_apply_stop_pidfile()?;
         self.resumed = true;
+        Ok(())
     }
 }
 
@@ -2677,6 +2679,25 @@ impl Peer {
 
     fn remove_apply_stop_pidfile(&self) -> Result<()> {
         self.exec_ok(&["rm", "-f", "--", APPLY_STOP_PIDFILE])?;
+        Ok(())
+    }
+
+    pub fn assert_apply_stop_pidfile_absent(&self) -> Result<()> {
+        let output = self.exec_raw(&[
+            "test",
+            "!",
+            "-e",
+            APPLY_STOP_PIDFILE,
+            "-a",
+            "!",
+            "-L",
+            APPLY_STOP_PIDFILE,
+        ])?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}: interrupted-apply hook pidfile was not cleaned up before the simulated crash",
+            self.alias
+        );
         Ok(())
     }
 

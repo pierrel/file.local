@@ -85,13 +85,25 @@ fn abrupt_connector_restart_recovers_an_interrupted_apply() -> Result<()> {
         a.status()?.pending_install,
         "connector did not record its install intent"
     );
-    stopped.abandon_after_crash();
+    stopped.abandon_after_crash()?;
+    a.assert_apply_stop_pidfile_absent()?;
     a.abrupt_restart_machine()?;
     a.wait_for_file(
         "during-connector-restart.txt",
         "durable before connector restart",
     )?;
     a.assert_status(|status| !status.pending_install && status.relationship_state == "connector")?;
+
+    a.arm_apply_stops(1)?;
+    b.write(
+        "after-connector-restart.txt",
+        "a second interrupted apply after restart",
+    )?;
+    a.wait_for_stopped_apply_process()?.resume()?;
+    a.wait_for_file(
+        "after-connector-restart.txt",
+        "a second interrupted apply after restart",
+    )?;
     e2e::assert_trees_equal(&a, &b)
 }
 
