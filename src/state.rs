@@ -4641,15 +4641,6 @@ impl State {
             Err(error) if error.downcast_ref::<RootIdentityChanged>().is_some() => Some(error),
             Err(error) => return Err(error),
         };
-        let reinitialization = match &identity_error {
-            None => None,
-            Some(_) => {
-                let root = registration_root.context(
-                    "configured root identity changed; rerun sync add with the exact configured root",
-                )?;
-                Some(self.open_reinitialization_root(id, root)?)
-            }
-        };
         let transaction = self.conn.transaction()?;
         let (binding, marker) = binding_and_marker(&transaction, id)?.context("share not found")?;
         if marker.is_some() {
@@ -4673,6 +4664,23 @@ impl State {
             }
             bail!("share relationship changed since pairing preview");
         }
+        let reinitialization = match &identity_error {
+            None => None,
+            Some(_) => {
+                let root = registration_root.context(
+                    "configured root identity changed; rerun sync add with the exact configured root",
+                )?;
+                let stored_root: Vec<u8> = transaction.query_row(
+                    "SELECT root FROM shares WHERE share_id=?1",
+                    [&id.0],
+                    |row| row.get(0),
+                )?;
+                Some(Self::open_reinitialization_root(
+                    &bytes_path(stored_root),
+                    root,
+                )?)
+            }
+        };
         if let Some((root, identity)) = &reinitialization {
             ensure_unpaired_registration_state(&transaction, id)?;
             transaction.execute(
@@ -4706,12 +4714,10 @@ impl State {
     }
 
     fn open_reinitialization_root(
-        &self,
-        id: &ShareId,
+        stored_root: &Path,
         requested_root: &Path,
     ) -> Result<(PathBuf, RootIdentity)> {
         let requested_root = std::path::absolute(requested_root)?;
-        let stored_root = self.root_for(id)?;
         let resolved = resolve_registration_path(&requested_root)?;
         if !resolved.missing.is_empty() {
             bail!("replacement root must be an existing directory");
@@ -8347,7 +8353,7 @@ mod tests {
         let error = state
             .prepare_connector_registration_locked(
                 &share,
-                Some(&root),
+                Some(&root.join("missing-registration-root")),
                 &EndpointBinding::Connector(config.clone()),
                 "host",
                 b"/remote",
@@ -8416,7 +8422,7 @@ mod tests {
         let error = state
             .prepare_connector_registration_locked(
                 &removing,
-                Some(&removing_root),
+                Some(&removing_root.join("missing-registration-root")),
                 &EndpointBinding::Unpaired,
                 "host",
                 b"/remote",
