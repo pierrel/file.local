@@ -104,11 +104,11 @@ new relationship ID.
   Emacs tests, formatting, and Clippy with warnings denied.
 - Focused Docker tests passed for all four abrupt-restart cases and explicit
   replacement recovery.
-- The full Docker catalog ran 58 scenarios: 57 passed.  An untouched
-  multi-share scheduling scenario,
-  =persistent_watch_requeues_behind_an_older_managed_start=, timed out twice;
-  it is outside this root/restart change and is recorded rather than folded
-  into this feature.
+- The full Docker catalog initially exposed an ordering assumption in the
+  multi-share scheduling harness. The paired request in that scenario was
+  parked and therefore deliberately nonblocking; the test now observes durable
+  requeue and eventual convergence instead. The correction is documented with
+  the multi-share scheduler rather than treated as a product failure.
 - Independent design and code reviews covered correctness, liveness,
   filesystem behavior, adversarial security, simplicity, readability, design
   adherence, and documentation alignment.  Review findings added tests for

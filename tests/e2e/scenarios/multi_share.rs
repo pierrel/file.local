@@ -117,15 +117,14 @@ fn queued_managed_stop_cancels_before_release() -> Result<()> {
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
-fn persistent_watch_requeues_behind_an_older_managed_start() -> Result<()> {
+fn persistent_watch_requeues_while_an_older_managed_start_is_parked() -> Result<()> {
     let (a, b) = e2e::managed_pair()?;
     a.sync_stop()?;
     a.init_second_share()?;
-    a.write_second("bootstrap.txt", "confirmed before fairness check")?;
+    a.write_second("bootstrap.txt", "confirmed before parked-request check")?;
     a.sync_add_second_to(&b)?;
     a.sync_stop_second()?;
-    a.write_second("fairness.txt", "older queued share runs first")?;
-    let second_share = a.second_status()?.share;
+    a.write_second("parked.txt", "older parked share eventually converges")?;
 
     let watch = a.watch_start_with_apply_stops(2)?;
     a.write("round-one.txt", "first watch round")?;
@@ -134,21 +133,21 @@ fn persistent_watch_requeues_behind_an_older_managed_start() -> Result<()> {
     a.wait_for_second_sync_queued_behind("/home/peer/share")?;
 
     // Round two becomes pending while round one still owns the installation.
-    // The persistent watch must rejoin behind the already-queued second share.
+    // The persistent watch must durably requeue. The older second-share
+    // request is still parked across peers, so it deliberately remains
+    // nonblocking until it becomes eligible.
     let primary_share = a.status()?.share;
     a.arm_managed_watch_enqueue_observation(&primary_share)?;
     a.write("round-two.txt", "second watch round")?;
 
     watch.resume_for_next_apply_stop()?;
     a.wait_for_managed_watch_enqueue(&primary_share)?;
-    let older = a.wait_for_stopped_apply_process_for(&second_share)?;
-    b.assert_absent("round-two.txt")?;
-
-    older.resume()?;
-    b.wait_for_second_file("fairness.txt", "older queued share runs first")?;
+    let first_ready = a.wait_for_stopped_apply_process()?;
+    first_ready.resume()?;
     a.wait_for_second_sync_idle()?;
     b.wait_for_file("round-one.txt", "first watch round")?;
     b.wait_for_file("round-two.txt", "second watch round")?;
+    b.wait_for_second_file("parked.txt", "older parked share eventually converges")?;
     watch.stop()?;
     a.sync_stop_second()
 }

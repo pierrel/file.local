@@ -1828,25 +1828,6 @@ impl Peer {
         })
     }
 
-    pub fn wait_for_stopped_apply_process_for(&self, share: &str) -> Result<StoppedApply<'_>> {
-        let share = share.to_owned();
-        let pid = self.poll_until(
-            "expected share did not stop at the apply boundary",
-            DEADLINE,
-            |peer| {
-                let Some(pid) = peer.stopped_apply_pid(Some(&share))? else {
-                    return Ok(None);
-                };
-                Ok(peer.is_stopped_flocal(pid)?.then_some(pid))
-            },
-        )?;
-        Ok(StoppedApply {
-            peer: self,
-            pid,
-            resumed: false,
-        })
-    }
-
     fn resume_stopped_apply_process(&self, pid: u32) -> Result<()> {
         anyhow::ensure!(
             self.is_stopped_flocal(pid)?,
