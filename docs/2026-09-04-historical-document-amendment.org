@@ -42,12 +42,12 @@ supersession named by the historical documents themselves.
 * Process
 
 Future changes leave existing dated documents byte-for-byte intact. A new dated
-document records each direct invalidation in a `Historical supersessions`
+document records each direct invalidation in a =Historical supersessions=
 section, while README and current operational documentation continue to describe
 the present product.
 
 * Validation
 
 The restored historical files match their pre-PR #20 contents. The focused
-Docker E2E named above and the complete `make check` gate passed before this
+Docker E2E named above and the complete =make check= gate passed before this
 documentation-only follow-up.
