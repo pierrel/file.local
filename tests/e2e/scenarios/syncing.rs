@@ -3,8 +3,34 @@
 //! content).
 
 use anyhow::Result;
+use std::time::{Duration, Instant};
 
 use crate::harness as e2e;
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn long_initial_remote_scan_stays_alive_with_progress() -> Result<()> {
+    let (a, b) = e2e::managed_containers()?;
+    for index in 0..4 {
+        b.write(&format!("slow-{index}.txt"), "content")?;
+    }
+    b.arm_slow_initial_scan()?;
+
+    let started = Instant::now();
+    let stderr = a.sync_add_observed_to(&b)?;
+
+    let elapsed = started.elapsed();
+    anyhow::ensure!(
+        elapsed > Duration::from_secs(30),
+        "slow initial scan completed in {elapsed:?}; expected it to cross the peer timeout"
+    );
+    let reports = stderr.matches("remote scan in progress").count();
+    anyhow::ensure!(
+        reports >= 3,
+        "expected repeated remote scan progress, got {reports} reports in: {stderr}"
+    );
+    e2e::assert_trees_equal(&a, &b)
+}
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]

@@ -13,6 +13,7 @@ const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(30);
 const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 const SETUP_COMMAND_DEADLINE: &str = "30s";
+const SLOW_SCAN_COMMAND_DEADLINE: &str = "45s";
 const START_COMMAND_DEADLINE: &str = "5s";
 const TARGET_COMMAND_KILL_AFTER: &str = "1s";
 /// Where a started watcher records its pid inside the container. One watch
@@ -46,6 +47,7 @@ const DAEMON_PIDFILE: &str = "/home/peer/.flocal-daemon.pid";
 const KILL_DAEMON_ON_STOP_MARKER: &str = "/home/peer/.flocal-kill-daemon-on-stop";
 const MIGRATION_FAILURE_MARKER: &str =
     "/home/peer/.local/state/file.local/.e2e-fail-state-migration";
+const SLOW_INITIAL_SCAN_MARKER: &str = "/home/peer/.local/state/file.local/.e2e-slow-initial-scan";
 
 fn is_flocal_executable(executable: &[u8]) -> bool {
     executable.ends_with(b"/flocal-real") || executable.ends_with(b"/.local/bin/flocal")
@@ -392,9 +394,7 @@ pub fn pair() -> Result<(Connector, Peer)> {
 /// sockets that real user services own without pretending the containers have
 /// login-service integration.
 pub fn managed_pair() -> Result<(Connector, Peer)> {
-    let (a, b) = containers()?;
-    a.start_daemon()?;
-    b.start_daemon()?;
+    let (a, b) = managed_containers()?;
     let output = a.peer.flocal_ok(&[
         "sync",
         "add",
@@ -413,6 +413,13 @@ pub fn managed_pair() -> Result<(Connector, Peer)> {
         },
         b.peer,
     ))
+}
+
+pub fn managed_containers() -> Result<(PeerBox, PeerBox)> {
+    let (a, b) = containers()?;
+    a.start_daemon()?;
+    b.start_daemon()?;
+    Ok((a, b))
 }
 
 /// The knobs `pair_with` accepts beyond the standard opening.
@@ -1592,7 +1599,11 @@ impl Peer {
     }
 
     pub fn sync_add_to(&self, other: &Peer) -> Result<()> {
-        self.flocal_ok(&[
+        self.sync_add_observed_to(other).map(|_| ())
+    }
+
+    pub fn sync_add_observed_to(&self, other: &Peer) -> Result<String> {
+        let arguments = [
             "sync",
             "add",
             SHARE,
@@ -1601,7 +1612,23 @@ impl Peer {
             "--remote-path",
             SHARE,
             "--yes",
-        ])?;
+        ];
+        let output = self.bounded_flocal_raw(&arguments, SLOW_SCAN_COMMAND_DEADLINE)?;
+        reject_target_timeout(&output, &arguments, SLOW_SCAN_COMMAND_DEADLINE)?;
+        if !output.status.success() {
+            return Err(self.fail(format!(
+                "{}: flocal {} failed: {}",
+                self.alias,
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    pub fn arm_slow_initial_scan(&self) -> Result<()> {
+        self.exec_ok(&["mkdir", "-p", "/home/peer/.local/state/file.local"])?;
+        self.exec_ok(&["touch", "--", SLOW_INITIAL_SCAN_MARKER])?;
         Ok(())
     }
 
