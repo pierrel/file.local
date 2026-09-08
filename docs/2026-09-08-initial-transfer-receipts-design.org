@@ -290,10 +290,17 @@ and object-state tests run on both supported platforms.
    least three =remote apply in progress= lines, and equal trees.  Captured
    stdout must contain exactly the normal final =Connected ...= line; stderr
    must contain no =Connected= line (it normally contains the expected progress
-   lines).  Add a controlled process-boundary delayed-=Connected= test, reusing
-   the current harness where possible: keep final initial completion pending
-   while observing stdout and prove it has no =Connected=, then release that
-   completion and prove exactly one normal final line.  A separate focused recovery
+   lines).  Make =connected_line= lock stdout, write the final line through
+   that lock,
+   and explicitly flush it, propagating both write and flush failures.  This
+   gives an interactive user immediate completion visibility and avoids relying
+   on non-TTY stdout buffering.  Add a controlled process-boundary
+   delayed-=Connected= test, reusing the current harness where possible: run
+   the command in the background with stdout redirected to a harness file,
+   hold final installation/apply, poll that file and prove it has no
+   =Connected=, then release completion and poll for exactly one normal final
+   line.  Add a focused injected-writer test that a flush error from this
+   private output path reaches the command result.  A separate focused recovery
    scenario creates an incomplete initial installation with the existing
    process-interruption harness, then invokes the established =flocal sync
    PATH --yes= route and proves it settles without deleting state or inventing
