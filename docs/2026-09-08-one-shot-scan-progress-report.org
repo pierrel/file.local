@@ -214,13 +214,15 @@ backslashes and control characters larger on the wire, so the final helper
 budgets the serialized representation and the display layer terminal-escapes
 the received string.
 
-Five local review rounds covered correctness, liveness, error paths,
+Six local review rounds covered correctness, liveness, error paths,
 interfaces, readability, existing patterns, design adherence, simplicity,
 shared logic, cross-platform filesystem behavior, adversarial security, and
 documentation alignment. Findings fixed during those rounds included the
 pre-scan cleanup silence, JSON expansion and terminal injection, missing
 negative timeout and cumulative-byte tests, request ordering, duplicated hash
-logic, and stale design claims about frame decoding and teardown scope.
+logic, stale design claims about frame decoding and teardown scope, a clock
+read on every non-reporting scan checkpoint, and a duplicated error-size
+constant.
 
 The 2 MiB generic pre-decode cap was retained deliberately. A separate scan
 wire marker solely to select a smaller allocation cap would add protocol state
@@ -244,7 +246,7 @@ Fast regression coverage includes:
 - protocol version 7 encoding and mixed-version rejection;
 - the existing initial-sync and delayed-=Connected= behavior.
 
-The full local gate passed with 90.63% changed-line coverage and at least 90%
+The full local gate passed with 90.96% changed-line coverage and at least 90%
 whole-project coverage. It exercised all Rust targets and features, Clippy with
 warnings denied, formatting, the Emacs tests, the SSH process-boundary
 integration test, and the repository's other unit and integration suites. The

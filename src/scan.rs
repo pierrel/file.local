@@ -150,6 +150,9 @@ impl<P: FnMut(ScanProgress) -> Result<()>> ProgressReporter<'_, P> {
     }
 
     fn checkpoint(&mut self) -> Result<()> {
+        if self.cadence == Duration::MAX {
+            return Ok(());
+        }
         if self.last_report.elapsed() >= self.cadence {
             (self.report)(self.progress)?;
             self.last_report = Instant::now();

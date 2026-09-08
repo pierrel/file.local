@@ -1221,7 +1221,11 @@ pub struct RemoteScanError {
 
 impl std::fmt::Display for RemoteScanError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message: String = self.message.escape_default().take(4096).collect();
+        let message: String = self
+            .message
+            .escape_default()
+            .take(MAX_SCAN_ERROR_BYTES)
+            .collect();
         write!(formatter, "remote file scan failed: {message}")
     }
 }
