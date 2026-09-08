@@ -1,0 +1,295 @@
+#+title: One-shot remote-scan progress implementation report
+#+date: 2026-09-08
+#+status: implemented
+
+* What shipped
+
+An explicit =flocal sync= no longer treats a remote initial scan as a silent
+peer. After the local scan completes, the connector requests the remote scan.
+The responder immediately opens a bounded scan phase, reports real work at
+most every five seconds, and then sends its snapshot. A scan of thousands of
+changed files can therefore take longer than the 30-second no-byte interval
+without being mistaken for a stalled protocol.
+
+The visible sequence remains:
+
+#+begin_example
+flocal: scanning local files
+flocal: waiting for the remote file scan
+flocal: remote scan in progress: 1372 entries, 84.0 MiB read
+flocal: comparing file lists
+#+end_example
+
+=Connected= is still printed only after the initial plan is confirmed and
+fully applied. A real remote scan failure is reported as =remote file scan
+failed: ...=. A genuinely silent scan still times out, but the connector no
+longer presents the SIGKILL from its own SSH cleanup as a second remote error.
+
+This changes explicit one-shot synchronization from protocol version 6 to
+version 7. Persistent watch is also numbered 7, but remains a separate wire
+family. Both endpoints must be upgraded before the next explicit sync.
+
+* Final design
+
+** Ordering and liveness
+
+The connector retains local-scan-first ordering. It completes its local
+refresh, sends =ScanRequest=, and immediately begins consuming scan-phase
+frames. The responder waits for that request before producing output, which
+prevents its SSH stdout window from filling while the connector is busy with
+its own tree.
+
+The first responder frame is always =ScanProgress { entries: 0, bytes_read: 0 }=.
+Pre-scan collection emits opaque =ScanPreparing= pulses after actual metadata
+or object work. They reveal no global count to a share-scoped peer. The root
+scan then reports its own entries and every actual source byte read while
+hashing or copying an object. No timer invents progress. If one filesystem call
+itself blocks, the normal 30-second no-byte limit still detects it.
+
+Progress is limited to one frame per five seconds, 1,024 frames, and 64 KiB of
+raw scan-control bodies per session. Individual accepted progress and
+preparation frames are at most 256 bytes and scan errors at most 4 KiB. The established 2 MiB generic
+frame cap is checked before allocation and JSON decoding; the tighter
+scan-specific limits are checked before a decoded frame is accepted.
+
+The grammar is deliberately narrow:
+
+#+begin_example
+ScanProgress(0, 0)
+ScanPreparing*
+ScanProgress*
+(Error | SnapshotChunk* SnapshotEnd)
+#+end_example
+
+Later counters must be componentwise nondecreasing and every progress frame
+must advance at least one counter. Progress and errors are invalid after the
+first snapshot chunk.
+
+** Deadlines and failure reporting
+
+=ProtocolLimits= snapshots =FLOCAL_MAX_SESSION_SECONDS= once for a process-side
+one-shot session. The default remains one hour, with a fixed 30-second no-byte
+read interval and five-second progress cadence. Reservation operations,
+=ScanRequest=, responder progress, error, and snapshot writes all share one
+absolute responder deadline rather than renewing it per frame.
+
+Remote scan failures and connector-side timeouts take different teardown
+paths. The remote-error path waits for the responder's clean bounded exit. The
+local timeout path kills and reaps SSH but returns the original timeout without
+including that locally caused signal status. Peer-provided diagnostics are
+bounded after JSON escaping and escaped again for terminal-safe display.
+
+The existing post-snapshot one-shot transfer writer is not redesigned here.
+Responder input remains covered by the timed reader; making every legacy
+post-snapshot output write deadline-aware is a separate transport change.
+
+* Code walkthrough
+
+** Versioned scan frames and strict reader
+
+The one-shot message enum gains the request and progress forms:
+
+#+begin_src rust
+ScanRequest,
+ScanPreparing,
+ScanProgress {
+    entries: u64,
+    bytes_read: u64,
+},
+#+end_src
+
+The enum uses Serde's internally tagged representation, so these Rust variants
+become JSON objects with a =type= field. =u64= makes the counters nonnegative on
+the wire. The reader keeps the previous counters in an =Option=: =None= means
+the mandatory opening frame has not arrived, while =Some((entries, bytes))=
+holds the validated prior state.
+
+#+begin_src rust
+match prior_progress {
+    None if entries == 0 && bytes_read == 0 => {}
+    None => bail!("remote scan progress must start at zero"),
+    Some((prior_entries, prior_bytes))
+        if entries >= prior_entries
+            && bytes_read >= prior_bytes
+            && (entries > prior_entries || bytes_read > prior_bytes) => {}
+    Some(_) => bail!("remote scan progress counters did not advance"),
+}
+#+end_src
+
+Rust match guards put the whole counter invariant next to the state transition.
+=bail!= returns an =anyhow::Error= immediately, so an invalid frame cannot
+partially update the stored counters.
+
+** Real scan accounting
+
+The scanner owns a small reporter. Both entry discovery and source reads reach
+the same cadence check:
+
+#+begin_src rust
+fn entry(&mut self) -> Result<()> {
+    self.progress.entries = self.progress.entries.saturating_add(1);
+    self.checkpoint()
+}
+
+fn bytes(&mut self, bytes: u64) -> Result<()> {
+    self.progress.bytes_read = self.progress.bytes_read.saturating_add(bytes);
+    self.checkpoint()
+}
+#+end_src
+
+=&mut self= gives each scan exclusive access to its reporter. =saturating_add=
+cannot wrap a hostile or unexpectedly enormous workload back to a smaller
+counter. Each method returns =Result<()>= because writing a progress frame can
+fail; the =?= operator propagates that failure and stops the scan cleanly.
+
+Object hashing and object capture share one read-accounting callback:
+
+#+begin_src rust
+let read = input.read(&mut buffer)?;
+if read == 0 {
+    break;
+}
+hasher.update(&buffer[..read]);
+size += read as u64;
+progress(read as u64)?;
+#+end_src
+
+The callback is =FnMut= because it updates counters and the next report time.
+It is passed as a mutable borrow, so it cannot outlive the scan or run on a
+second thread without an explicit synchronization design. Existing metadata
+snapshots, no-follow opens, capacity accounting, and temporary-object cleanup
+remain on the same paths.
+
+An interrupted earlier scan may leave many unreferenced objects. Collection is
+therefore part of the observable preparation phase. It invokes a callback for
+each metadata row and each stored object-directory entry. The responder
+rate-limits those callbacks into count-free =ScanPreparing= pulses. Root-entry
+counters remain scoped to the synchronized share.
+
+** Absolute limits and cleanup
+
+The timed reader now owns a copied limit value:
+
+#+begin_src rust
+#[derive(Clone, Copy)]
+struct ProtocolLimits {
+    session: Duration,
+    idle: Duration,
+    scan_progress: Duration,
+}
+#+end_src
+
+=Clone, Copy= are derived because the structure contains only =Duration=
+values, which are themselves copyable. Copying this value snapshots the
+environment-derived session duration; later environment changes cannot alter
+an active session. =Instant= supplies monotonic deadlines, so wall-clock
+adjustments do not extend or shorten them.
+
+The connector preserves typed peer errors with =downcast_ref=:
+
+#+begin_src rust
+Err(error) if error.downcast_ref::<sync::RemoteScanError>().is_some() => {
+    return Err(remote.finish_remote_scan_error(error));
+}
+#+end_src
+
+=anyhow= carries concrete error types through contextual layers.
+=downcast_ref= checks that concrete type without consuming the error, allowing
+the original diagnostic chain to be handed to the matching finalizer.
+
+* Difficult parts and review-driven changes
+
+The primary liveness trap was output ordering. Starting the responder scan
+while the connector was still scanning locally looked faster, but could fill
+SSH's reverse-direction window. =ScanRequest= makes the safe ordering explicit.
+
+The second trap appeared only after adversarial review: retry cleanup can walk
+global metadata and the objects directory before a new scan. Sending the zero
+frame before cleanup was not sufficient by itself; a large cleanup could still
+be silent for 30 seconds. Counted cleanup progress would disclose unrelated
+share activity, so collection now emits a bounded opaque activity pulse.
+
+The initial error truncation counted source UTF-8 bytes. JSON escaping can make
+backslashes and control characters larger on the wire, so the final helper
+budgets the serialized representation and the display layer terminal-escapes
+the received string.
+
+Eight local review rounds covered correctness, liveness, error paths,
+interfaces, readability, existing patterns, design adherence, simplicity,
+shared logic, cross-platform filesystem behavior, adversarial security, and
+documentation alignment. Findings fixed during those rounds included the
+pre-scan cleanup silence, JSON expansion and terminal injection, missing
+negative timeout and cumulative-byte tests, request ordering, duplicated hash
+logic, stale design claims about frame decoding and teardown scope, a clock
+read on every non-reporting scan checkpoint, and a duplicated error-size
+constant. The final security-bound repair charges declared snapshot frame
+lengths so JSON padding cannot evade the cumulative metadata limit.
+
+The 2 MiB generic pre-decode cap was retained deliberately. A separate scan
+wire marker solely to select a smaller allocation cap would add protocol state
+without changing the existing bounded-memory threat model; scan-specific caps
+instead govern which decoded control frames are accepted.
+
+* Validation
+
+Fast regression coverage includes:
+
+- a silent Unix-stream peer crossing the scaled idle limit;
+- progress frames keeping the same reader alive past that limit;
+- exact zero opener, monotonic counters, phase ordering, individual frame caps,
+  opaque preparation ordering, cumulative frame and byte caps, and padded JSON
+  control and snapshot bodies;
+- serialized-size and terminal-safe error handling;
+- a real capability-based scan proving entry and actual hash/copy byte counts;
+- real object collection proving stored entries report progress;
+- an absolute session deadline clamping a longer reservation-frame deadline;
+- distinct clean peer-error and local kill/reap behavior;
+- protocol version 7 encoding and mixed-version rejection;
+- the existing initial-sync and delayed-=Connected= behavior.
+
+The full local gate passed with 91.11% changed-line coverage and at least 90%
+whole-project coverage. It exercised all Rust targets and features, Clippy with
+warnings denied, formatting, the Emacs tests, the SSH process-boundary
+integration test, and the repository's other unit and integration suites. The
+ordinary Docker E2E suite passed all 58 selected scenarios in 418.70 seconds,
+including abrupt connector and responder restarts both while idle and during
+an interrupted apply. No artificial 5,000-file delay hook or long dedicated
+E2E was added because CI already has hard time limits and the protocol boundary
+is covered deterministically in process.
+
+* Remaining limits and operations
+
+A single directory, metadata, database, lock, or file syscall can still block
+without a counter update. If it produces no protocol byte for 30 seconds, the
+connector intentionally reports a stopped remote scan rather than inventing a
+heartbeat. This includes indivisible state preparation such as acquiring the
+object lock, deleting pending-object rows atomically, and loading an install
+intent or prior-record set. Making those established state transactions
+incremental is outside the observed large-root-scan failure. The absolute
+configured session duration also remains a hard cap,
+even while real progress continues.
+
+Install this build on both peers before retrying an explicit sync because the
+one-shot protocol version changed. A normal local development deployment is:
+
+#+begin_src sh
+make install
+#+end_src
+
+Then upgrade the remote installation through its normal trusted deployment
+path and rerun =flocal sync PATH= or the original =flocal sync add= command.
+No share removal, state deletion, or relationship reinitialization is required
+for this timeout failure.
+
+* Historical supersessions
+
+This report directly supersedes only these historical claims:
+
+1. [[file:2026-08-24-initial-scan-object-budget-design.org::*2. Completion message and visible phases][Initial scan object-store budget design, section 2]] says that one-shot sync
+   changes neither version nor wire and has no remote progress frame. Explicit
+   protocol 7 replaces that conclusion.
+2. [[file:2026-07-29-state-of-the-union.org::*Current operational limitations and sharp edges][State of the union, current operational limitations]] says explicit one-shot
+   synchronization uses version 6. It now uses version 7.
+
+No historical document was edited, and this report does not chase older
+references already superseded by those documents.

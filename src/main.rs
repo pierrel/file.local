@@ -3625,6 +3625,7 @@ fn reservation_into_v1(frame: ReservationFrame) -> Message {
 struct V1ReservationWire<'a, I, O> {
     input: &'a I,
     output: &'a O,
+    session_deadline: std::time::Instant,
 }
 
 impl<I: AsFd, O: AsFd> ReservationWire for V1ReservationWire<'_, I, O> {
@@ -3633,11 +3634,18 @@ impl<I: AsFd, O: AsFd> ReservationWire for V1ReservationWire<'_, I, O> {
         frame: ReservationFrame,
         deadline: std::time::Instant,
     ) -> Result<()> {
-        sync::write_v1_message_until(self.output, &reservation_into_v1(frame), deadline)
+        sync::write_v1_message_until(
+            self.output,
+            &reservation_into_v1(frame),
+            deadline.min(self.session_deadline),
+        )
     }
 
     fn recv_reservation(&mut self, deadline: std::time::Instant) -> Result<ReservationFrame> {
-        reservation_from_v1(sync::read_v1_message_until(self.input, deadline)?)
+        reservation_from_v1(sync::read_v1_message_until(
+            self.input,
+            deadline.min(self.session_deadline),
+        )?)
     }
 }
 
@@ -4455,6 +4463,7 @@ fn run_sync_attempt(
         let mut wire = V1ReservationWire {
             input: &remote.output,
             output: &remote.input,
+            session_deadline: remote.output.session_deadline()?,
         };
         match binding.order {
             std::cmp::Ordering::Less => reserve_as_authority(
@@ -4496,7 +4505,44 @@ fn run_sync_attempt(
         sync::refresh(state, &share)?
     };
     sync_phase(report, "waiting for the remote file scan");
-    let remote_records = sync::read_snapshot(&mut remote.output)?;
+    sync::write_message(&mut remote.input, &Message::ScanRequest)?;
+    let remote_records = match sync::read_scan_snapshot(&mut remote.output, |event| {
+        if report == PlanReport::Full {
+            match event {
+                sync::ScanProgressEvent::Preparing => {
+                    eprintln!("flocal: remote scan preparation in progress");
+                }
+                sync::ScanProgressEvent::Scanning {
+                    entries,
+                    bytes_read,
+                } if entries != 0 || bytes_read != 0 => {
+                    eprintln!(
+                        "flocal: remote scan in progress: {entries} entries, {} read",
+                        format_bytes(bytes_read)
+                    );
+                }
+                sync::ScanProgressEvent::Scanning { .. } => {}
+            }
+        }
+    }) {
+        Ok(records) => records,
+        Err(error) if error.downcast_ref::<sync::RemoteScanError>().is_some() => {
+            return Err(remote.finish_remote_scan_error(error));
+        }
+        Err(error) => {
+            let error = if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+            {
+                anyhow::anyhow!(
+                    "stopped receiving remote file scan progress before the peer protocol deadline"
+                )
+            } else {
+                error
+            };
+            return Err(remote.abort_after_local_error(error));
+        }
+    };
     sync_phase(report, "comparing file lists");
     state.validate_remote_records(&share, &local, &remote_records)?;
     let mut plan = sync::plan(&local, &remote_records);
@@ -4918,6 +4964,10 @@ fn serve_initial(
     mut input: &mut (impl Read + AsFd),
     mut output: &mut (impl Write + AsFd),
 ) -> Result<()> {
+    let limits = ProtocolLimits::production();
+    let session_deadline = std::time::Instant::now()
+        .checked_add(limits.session)
+        .context("configured peer protocol duration exceeds the supported range")?;
     match initial {
         InitialMessage::Register {
             protocol,
@@ -4997,6 +5047,7 @@ fn serve_initial(
                 let mut wire = V1ReservationWire {
                     input: &*input,
                     output: &*output,
+                    session_deadline,
                 };
                 match binding.order {
                     std::cmp::Ordering::Less => {
@@ -5054,14 +5105,73 @@ fn serve_initial(
                 )?;
                 return Ok(());
             }
-            state.clear_pending_objects(&share)?;
-            state.prune_unreferenced_objects()?;
-            let records = if dry_run {
-                sync::preview_refresh(state, &share)?
-            } else {
-                sync::refresh(state, &share)?
+            match sync::read_v1_message_until(&*input, session_deadline)? {
+                Message::ScanRequest => {}
+                other => bail!("expected remote scan request, got {other:?}"),
+            }
+            sync::write_v1_message_until(
+                &*output,
+                &Message::ScanProgress {
+                    entries: 0,
+                    bytes_read: 0,
+                },
+                session_deadline,
+            )?;
+            let mut next_preparation_report = std::time::Instant::now() + limits.scan_progress;
+            let preparation = state.clear_pending_objects(&share).and_then(|()| {
+                state.prune_unreferenced_objects_with_progress(&mut || {
+                    if std::time::Instant::now() >= next_preparation_report {
+                        sync::write_v1_message_until(
+                            &*output,
+                            &Message::ScanPreparing,
+                            session_deadline,
+                        )?;
+                        next_preparation_report = std::time::Instant::now() + limits.scan_progress;
+                    }
+                    Ok(())
+                })
+            });
+            let mut report_progress = |entries, bytes_read| {
+                sync::write_v1_message_until(
+                    &*output,
+                    &Message::ScanProgress {
+                        entries,
+                        bytes_read,
+                    },
+                    session_deadline,
+                )
             };
-            sync::write_snapshot(&mut output, &records)?;
+            let scan = preparation.and_then(|()| {
+                if dry_run {
+                    sync::preview_refresh_with_progress(
+                        state,
+                        &share,
+                        limits.scan_progress,
+                        &mut report_progress,
+                    )
+                } else {
+                    sync::refresh_with_progress(
+                        state,
+                        &share,
+                        limits.scan_progress,
+                        &mut report_progress,
+                    )
+                }
+            });
+            let records = match scan {
+                Ok(records) => records,
+                Err(error) => {
+                    sync::write_v1_message_until(
+                        &*output,
+                        &Message::Error {
+                            message: sync::bounded_scan_error(&format!("{error:#}"))?,
+                        },
+                        session_deadline,
+                    )?;
+                    return Ok(());
+                }
+            };
+            sync::write_snapshot_until(&*output, &records, session_deadline)?;
             serve_sync(
                 state,
                 &share,
@@ -5071,7 +5181,7 @@ fn serve_initial(
                 &mut output,
             )?;
             installation.finish()?;
-            sync::write_message(&mut output, &Message::Done)?;
+            sync::write_v1_message_until(&*output, &Message::Done, session_deadline)?;
         }
         InitialMessage::WatchOpen { .. } => {
             bail!("persistent watch requires a descriptor-backed protocol transport")
@@ -8351,6 +8461,50 @@ impl Remote {
             escaped(&String::from_utf8_lossy(&stderr))
         )
     }
+
+    fn finish_remote_scan_error(mut self, error: anyhow::Error) -> anyhow::Error {
+        let status = wait_protocol_child(
+            &mut self.child,
+            std::time::Instant::now() + Duration::from_secs(10),
+            "remote scan process exceeded its exit deadline",
+        );
+        if status.is_ok() {
+            self.finished = true;
+        }
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default();
+        match status {
+            Ok(status) if status.success() && stderr.is_empty() => error,
+            Ok(status) => anyhow::anyhow!(
+                "{error:#}; ssh exited with {status}: {}",
+                escaped(&String::from_utf8_lossy(&stderr))
+            ),
+            Err(exit_error) => anyhow::anyhow!("{error:#}; {exit_error:#}"),
+        }
+    }
+
+    fn abort_after_local_error(mut self, error: anyhow::Error) -> anyhow::Error {
+        let _ = self.child.kill();
+        if self.child.wait().is_ok() {
+            self.finished = true;
+        }
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or_default();
+        if stderr.is_empty() {
+            error
+        } else {
+            anyhow::anyhow!(
+                "{error:#}; remote stderr: {}",
+                escaped(&String::from_utf8_lossy(&stderr))
+            )
+        }
+    }
 }
 
 impl Drop for Remote {
@@ -8466,6 +8620,24 @@ impl Drop for RelationshipRemote {
 struct TimedReader<R> {
     inner: R,
     started: std::time::Instant,
+    limits: ProtocolLimits,
+}
+
+#[derive(Clone, Copy)]
+struct ProtocolLimits {
+    session: Duration,
+    idle: Duration,
+    scan_progress: Duration,
+}
+
+impl ProtocolLimits {
+    fn production() -> Self {
+        Self {
+            session: max_peer_session_duration(),
+            idle: Duration::from_secs(30),
+            scan_progress: Duration::from_secs(5),
+        }
+    }
 }
 
 struct DirectReader<'a, R: AsFd>(&'a R);
@@ -8514,15 +8686,20 @@ impl<W: AsFd> Write for DirectWriter<'_, W> {
 
 impl<R> TimedReader<R> {
     fn new(inner: R) -> Self {
+        Self::with_limits(inner, ProtocolLimits::production())
+    }
+
+    fn with_limits(inner: R, limits: ProtocolLimits) -> Self {
         Self {
             inner,
             started: std::time::Instant::now(),
+            limits,
         }
     }
 
     fn session_deadline(&self) -> Result<std::time::Instant> {
         self.started
-            .checked_add(max_peer_session_duration())
+            .checked_add(self.limits.session)
             .context("configured peer protocol duration exceeds the supported range")
     }
 }
@@ -8536,14 +8713,14 @@ impl<R: AsFd> AsFd for TimedReader<R> {
 impl<R: Read + AsFd> Read for TimedReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        let total = max_peer_session_duration();
+        let total = self.limits.session;
         let Some(remaining) = total.checked_sub(self.started.elapsed()) else {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "peer protocol session exceeded its configured duration",
             ));
         };
-        let wait = remaining.min(Duration::from_secs(30));
+        let wait = remaining.min(self.limits.idle);
         let mut descriptors = [PollFd::new(&self.inner, PollFlags::IN)];
         let timeout = Timespec {
             tv_sec: wait.as_secs() as i64,
@@ -8626,6 +8803,71 @@ fn bytes_path(bytes: &[u8]) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_scan_progress_keeps_the_snapshot_read_alive() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let (silent_peer, connector) = UnixStream::pair()?;
+        let limits = ProtocolLimits {
+            session: Duration::from_millis(500),
+            idle: Duration::from_millis(30),
+            scan_progress: Duration::from_millis(10),
+        };
+        let mut connector = TimedReader::with_limits(connector, limits);
+        let error = sync::read_scan_snapshot(&mut connector, |_| {})
+            .expect_err("a silent scan must retain the idle timeout");
+        assert!(
+            error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        );
+        drop(silent_peer);
+
+        let (mut responder, connector) = UnixStream::pair()?;
+        let limits = ProtocolLimits {
+            session: Duration::from_secs(5),
+            idle: Duration::from_secs(1),
+            scan_progress: Duration::from_millis(300),
+        };
+        let started = std::time::Instant::now();
+        let mut connector = TimedReader::with_limits(connector, limits);
+        let writer = std::thread::spawn(move || -> Result<()> {
+            sync::write_message(
+                &mut responder,
+                &Message::ScanProgress {
+                    entries: 0,
+                    bytes_read: 0,
+                },
+            )?;
+            std::thread::sleep(limits.scan_progress);
+            sync::write_message(&mut responder, &Message::ScanPreparing)?;
+            std::thread::sleep(limits.scan_progress);
+            sync::write_message(
+                &mut responder,
+                &Message::ScanProgress {
+                    entries: 1,
+                    bytes_read: 1024,
+                },
+            )?;
+            std::thread::sleep(limits.scan_progress);
+            sync::write_message(
+                &mut responder,
+                &Message::ScanProgress {
+                    entries: 2,
+                    bytes_read: 1024,
+                },
+            )?;
+            std::thread::sleep(limits.scan_progress);
+            sync::write_snapshot(&mut responder, &[])
+        });
+
+        assert!(sync::read_scan_snapshot(&mut connector, |_| {})?.is_empty());
+        assert!(started.elapsed() > limits.idle);
+        writer.join().expect("scan responder joins")?;
+        Ok(())
+    }
 
     #[test]
     fn status_list_projection_distinguishes_live_and_stored_roles() {
@@ -9178,6 +9420,32 @@ mod tests {
             .stderr(Stdio::null())
             .status()?;
         assert!(!status.success(), "Remote::drop left child {pid} alive");
+
+        let make_remote = |command: &str| -> Result<Remote> {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let input = child.stdin.take().context("test child stdin")?;
+            let output = child.stdout.take().context("test child stdout")?;
+            let stderr = drain_bounded_stderr(child.stderr.take().context("test child stderr")?);
+            Ok(Remote {
+                child,
+                input,
+                output: TimedReader::new(output),
+                stderr: Some(stderr),
+                finished: false,
+            })
+        };
+        let error =
+            make_remote("sleep 30")?.abort_after_local_error(anyhow::anyhow!("scan timed out"));
+        assert_eq!(error.to_string(), "scan timed out");
+        let error = make_remote("true")?
+            .finish_remote_scan_error(anyhow::anyhow!("remote file scan failed: denied"));
+        assert_eq!(error.to_string(), "remote file scan failed: denied");
         Ok(())
     }
 
@@ -9283,6 +9551,26 @@ mod tests {
         assert!(error.to_string().contains("test wire closed"));
         assert!(state.scheduling_snapshot()?.queued.is_empty());
         blocker.finish()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_reservation_wire_clamps_frame_deadlines_to_the_session() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let (local, _peer) = UnixStream::pair()?;
+        let started = std::time::Instant::now();
+        let mut wire = V1ReservationWire {
+            input: &local,
+            output: &local,
+            session_deadline: started + Duration::from_millis(30),
+        };
+        let error = wire
+            .recv_reservation(started + Duration::from_secs(1))
+            .expect_err("the session deadline must cap a longer frame deadline");
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(started.elapsed() < Duration::from_millis(300));
         Ok(())
     }
 
@@ -11179,7 +11467,8 @@ mod tests {
             sync::read_v1_message_until(&client, deadline())?,
             Message::SyncAccepted(accepted) if accepted == reservation
         ));
-        assert!(sync::read_snapshot(&mut client)?.is_empty());
+        sync::write_message(&mut client, &Message::ScanRequest)?;
+        assert!(sync::read_scan_snapshot(&mut client, |_| {})?.is_empty());
         sync::write_message(&mut client, &Message::Cancel)?;
         assert!(matches!(
             sync::read_v1_message_until(&client, deadline())?,
