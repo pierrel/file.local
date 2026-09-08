@@ -9761,7 +9761,7 @@ mod tests {
 
     #[test]
     fn remote_cleanup_is_bounded_and_drop_reaps_unfinished_children() -> Result<()> {
-        let mut timed = Command::new("sh").arg("-c").arg("sleep 30").spawn()?;
+        let mut timed = Command::new("sh").arg("-c").arg("exec sleep 30").spawn()?;
         let started = std::time::Instant::now();
         let error = wait_protocol_child(
             &mut timed,
@@ -9775,7 +9775,7 @@ mod tests {
 
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg("sleep 30")
+            .arg("exec sleep 30")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -9817,14 +9817,14 @@ mod tests {
                 finished: false,
             })
         };
-        let error =
-            make_remote("sleep 30")?.abort_after_local_error(anyhow::anyhow!("scan timed out"));
+        let error = make_remote("exec sleep 30")?
+            .abort_after_local_error(anyhow::anyhow!("scan timed out"));
         assert_eq!(error.to_string(), "scan timed out");
         let error = make_remote("true")?
             .finish_remote_scan_error(anyhow::anyhow!("remote file scan failed: denied"));
         assert_eq!(error.to_string(), "remote file scan failed: denied");
 
-        let error = make_remote("sleep 30")?
+        let error = make_remote("exec sleep 30")?
             .finish_transfer_phase_error(sync::ProtocolDeadlineExpired.into());
         assert!(
             error
@@ -9832,15 +9832,15 @@ mod tests {
                 .contains("stopped sending or receiving remote file-transfer batch progress")
         );
         assert!(!error.to_string().contains("remote exited"));
-        let error =
-            make_remote("sleep 30")?.finish_apply_phase_error(sync::ProtocolDeadlineExpired.into());
+        let error = make_remote("exec sleep 30")?
+            .finish_apply_phase_error(sync::ProtocolDeadlineExpired.into());
         assert!(
             error
                 .to_string()
                 .contains("stopped receiving remote apply progress")
         );
         assert!(!error.to_string().contains("remote exited"));
-        let error = make_remote("sleep 30")?.finish_local_apply_phase_error(
+        let error = make_remote("exec sleep 30")?.finish_local_apply_phase_error(
             anyhow::Error::new(sync::ProtocolDeadlineExpired).context("writing progress"),
         );
         assert!(
@@ -9850,7 +9850,7 @@ mod tests {
         );
         assert!(!error.to_string().contains("remote exited"));
 
-        let mut remote = make_remote("sleep 30")?;
+        let mut remote = make_remote("exec sleep 30")?;
         remote.output.limits.idle = Duration::from_millis(20);
         remote.output.limits.session = Duration::from_secs(1);
         let started = Instant::now();
@@ -9865,7 +9865,7 @@ mod tests {
         assert!(!error.to_string().contains("remote exited"));
         assert!(started.elapsed() < Duration::from_secs(2));
 
-        let mut remote = make_remote("cat")?;
+        let mut remote = make_remote("exec cat")?;
         sync::write_message(
             &mut remote.input,
             &Message::Error {

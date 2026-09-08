@@ -227,7 +227,7 @@ apply.  Captured stdout contained no =Connected= while stopped; after resume,
 the command completed with equal trees and exactly one flushed line.
 
 The Rust suite, Clippy with warnings denied, formatting, Makefile prefix test,
-and all 27 Emacs tests pass.  Coverage is 90.56% on changed executable lines
+and all 27 Emacs tests pass.  Coverage is 90.75% on changed executable lines
 and at least 90% project-wide.  All 61 applicable Docker scenarios pass,
 including abrupt initiator and responder restarts both during apply and while
 idle.  The independent local review lenses converged with no findings.  The
