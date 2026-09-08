@@ -8826,8 +8826,14 @@ mod tests {
         drop(silent_peer);
 
         let (mut responder, connector) = UnixStream::pair()?;
+        let limits = ProtocolLimits {
+            session: Duration::from_secs(5),
+            idle: Duration::from_secs(1),
+            scan_progress: Duration::from_millis(300),
+        };
+        let started = std::time::Instant::now();
+        let mut connector = TimedReader::with_limits(connector, limits);
         let writer = std::thread::spawn(move || -> Result<()> {
-            std::thread::sleep(Duration::from_millis(60));
             sync::write_message(
                 &mut responder,
                 &Message::ScanProgress {
@@ -8835,9 +8841,9 @@ mod tests {
                     bytes_read: 0,
                 },
             )?;
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(limits.scan_progress);
             sync::write_message(&mut responder, &Message::ScanPreparing)?;
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(limits.scan_progress);
             sync::write_message(
                 &mut responder,
                 &Message::ScanProgress {
@@ -8845,17 +8851,20 @@ mod tests {
                     bytes_read: 1024,
                 },
             )?;
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(limits.scan_progress);
+            sync::write_message(
+                &mut responder,
+                &Message::ScanProgress {
+                    entries: 2,
+                    bytes_read: 1024,
+                },
+            )?;
+            std::thread::sleep(limits.scan_progress);
             sync::write_snapshot(&mut responder, &[])
         });
-        let limits = ProtocolLimits {
-            session: Duration::from_millis(500),
-            idle: Duration::from_millis(100),
-            scan_progress: Duration::from_millis(10),
-        };
-        let mut connector = TimedReader::with_limits(connector, limits);
 
         assert!(sync::read_scan_snapshot(&mut connector, |_| {})?.is_empty());
+        assert!(started.elapsed() > limits.idle);
         writer.join().expect("scan responder joins")?;
         Ok(())
     }

@@ -189,17 +189,18 @@ boundary can be proved much faster in process.
 Factor the existing reader's production limits into a private =ProtocolLimits=
 value. It snapshots the configured =FLOCAL_MAX_SESSION_SECONDS= total-session
 duration while retaining fixed production values of 30 seconds without a byte
-and a five-second scan-progress cadence. Test-only constructors supply scaled
-idle/cadence values, for example a 100-millisecond idle limit and a
-10-millisecond progress cadence, and an explicit configured session duration.
+and a five-second scan-progress cadence. Test-only constructors supply shorter
+idle and progress intervals with ample scheduler margin, plus an explicit
+configured session duration.
 
 The fail-to-pass test uses a real Unix-stream pair and responder thread. It
 first demonstrates, against the pre-frame behavior, that a scan held past the
 scaled idle interval causes the same timed-read failure. Its final assertion
-uses the new =ScanRequest=/=ScanProgress= exchange: real progress arrives at
-the scaled cadence before the idle deadline, then the snapshot completes. It
-therefore exercises framing, flushing, =TimedReader= polling, and the actual
-timeout boundary without sleeping for 30 seconds or mocking transport reads.
+uses the new scan-control exchange: scripted preparation and progress frames
+arrive at bounded intervals before the idle deadline, the total exchange lasts
+longer than that deadline, and the snapshot completes. It therefore exercises
+framing, flushing, =TimedReader= polling, and the actual timeout boundary
+without sleeping for 30 seconds or mocking transport reads.
 
 A separate real temporary-tree scan/accounting test creates regular files,
 runs the ordinary capability-based scanner and =ObjectStoreBudget= path with a
