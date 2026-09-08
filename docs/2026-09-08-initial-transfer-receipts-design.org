@@ -150,9 +150,12 @@ connector bytes while each actual apply is in progress, cross the original
 
 4. In responder =serve_sync=, retain cumulative received-object and byte
    counters beside the existing transfer-limit accounting.  A valid batch end
-   writes exactly one cumulative receipt, resets only the batch-local counters,
-   and then resumes reading.  It does not scan, hash, or synthesize a timer
-   event.  Expose only the two V1 length-returning decoders required for this:
+   writes exactly one cumulative receipt through the descriptor-aware writer
+   with =min(session_deadline, now + 30 seconds)=, removes that expected batch
+   endpoint, and then resumes reading.  A connector which stops draining
+   receipts therefore cannot hold the responder indefinitely.  The responder
+   does not scan, hash, or synthesize a timer event.  Expose only the two V1
+   length-returning decoders required for this:
    =read_v1_message_with_len(reader)= for ordinary =Read= callers and
    =read_v1_message_until_with_len(reader, deadline)= for descriptor/deadline
    callers.  Each applies the existing 2-MiB pre-decode frame ceiling, then
@@ -195,15 +198,17 @@ connector bytes while each actual apply is in progress, cross the original
    emitted for the invalidated record and no terminal success follows it.
 
    =serve_initial= takes a shared =output: &impl AsFd=.  It makes one
-   =DirectWriter(output)= for ordinary sequential =serve_sync= output, and its
-   responder apply callback independently calls =write_v1_message_until(output,
-   ..., session_deadline)= on the same shared descriptor.  It then passes that
-   writer and callback to =serve_sync=.  The connector's matching callback
-   writes to =Remote.input= through the same deadline-aware primitive.  No
-   unsafe raw descriptor, =RefCell=, or overlapping mutable borrow is needed;
-   calls are sequential and each output uses one capability.  Direct
-   =serve_sync= Vec unit callers use a no-op callback or a test closure and
-   need no descriptor abstraction.
+   =DirectWriter(output)= for ordinary sequential =serve_sync= output and a
+   private =ServeSyncProgress= containing two narrow callbacks.  The receipt
+   callback calls =write_v1_message_until= with its fixed 30-second deadline;
+   the responder apply callback calls the same primitive with the absolute
+   session deadline.  It passes the writer and callback pair to =serve_sync=.
+   The connector's matching apply callback writes to =Remote.input= through
+   the same deadline-aware primitive.  No unsafe raw descriptor, =RefCell=, or
+   overlapping mutable borrow is needed; calls are sequential and each output
+   uses one capability.  Direct =serve_sync= Vec unit callers use no-op receipt
+   callbacks and a no-op or test apply closure, and need no descriptor
+   abstraction.
 
 6. On the connector, extend the existing post-=Done= read loop to accept only
    strictly increasing, nonzero responder =ApplyProgress.records= values before
@@ -256,9 +261,12 @@ connector bytes while each actual apply is in progress, cross the original
    transfer-batch expiry, =stopped receiving remote apply progress before the
    peer protocol deadline= for a responder-apply read expiry, or =stopped
    sending local apply progress before the peer protocol deadline= for a
-   connector callback expiry.  It may append bounded remote stderr, but neither
-   route goes through =finish_after_error= nor appends the connector-caused
-   SIGKILL status.  There is no string matching or elapsed-time inference. A
+   connector callback expiry.  The final responder =Done= also has one fixed
+   =min(session_deadline, now + 30 seconds)= read deadline; its expiry reports
+   =stopped receiving final synchronization confirmation before the peer
+   protocol deadline=.  It may append bounded remote stderr, but none of these
+   routes goes through =finish_after_error= or appends the connector-caused
+   SIGKILL status.  There is no string matching or elapsed-time inference.  A
    clean, bounded peer =Error= retains its peer-error wording.
 
 * 4. Bounded hostile-peer behavior and failure modes
@@ -270,9 +278,12 @@ connector bytes while each actual apply is in progress, cross the original
   =TransferBatchEnd=, =TransferReceipt=, =ApplyProgress=, and =Applied= are
   each limited to 256 bytes; every version-8 one-shot =Error= is serialized
   through a byte-safe 4-KiB truncator and the receiver enforces that 4-KiB
-  declared-length limit.  =HeadChunk= retains =MAX_FRAME=, its established
-  record-shape bound, cumulative =MAX_RECORDS_PER_SESSION=, and metadata-byte
-  accounting.  The connector accepts at most 2,048 receipts and each side
+  declared-length limit.  Unexpected or oversized decoded messages are named
+  only by phase and declared length, never debug-formatted, so an attacker
+  cannot copy a payload into operator diagnostics.  =HeadChunk= retains
+  =MAX_FRAME=, its established record-shape bound, cumulative
+  =MAX_RECORDS_PER_SESSION=, and metadata-byte accounting.  The connector
+  accepts at most 2,048 receipts and each side
   accepts at most 1,024 apply-progress frames in its own direction; a sender
   enforces its report cap before writing another frame.  With the default
   10-GiB transfer limit, 1,024-object and 16-MiB boundaries require at most

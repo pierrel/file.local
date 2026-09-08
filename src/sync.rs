@@ -3654,6 +3654,29 @@ mod tests {
         )
         .expect_err("a non-reading peer must bound an object write");
         assert!(error.is::<ProtocolDeadlineExpired>(), "{error:#}");
+
+        let (receipt_writer, _receipt_reader) = UnixStream::pair()?;
+        let original = rustix::fs::fcntl_getfl(&receipt_writer)?;
+        rustix::fs::fcntl_setfl(&receipt_writer, original | rustix::fs::OFlags::NONBLOCK)?;
+        let fill = [0u8; 8 * 1024];
+        loop {
+            match rustix::io::write(&receipt_writer, &fill) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        rustix::fs::fcntl_setfl(&receipt_writer, original)?;
+        let error = write_v1_message_until(
+            &receipt_writer,
+            &Message::TransferReceipt {
+                objects: 1,
+                bytes: 5,
+            },
+            Instant::now() + Duration::from_millis(20),
+        )
+        .expect_err("a receipt to a non-reading peer must expire");
+        assert!(error.is::<ProtocolDeadlineExpired>(), "{error:#}");
         Ok(())
     }
 

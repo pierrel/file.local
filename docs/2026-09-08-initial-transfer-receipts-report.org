@@ -131,15 +131,20 @@ now also returns the declared frame length so callers can apply narrow limits
 after decoding the tagged message.  The universal pre-decode allocation limit
 remains 2 MiB; progress and receipt controls are limited to 256 bytes, errors
 to 4 KiB, and head chunks retain their existing larger limit and cumulative
-metadata accounting.
+metadata accounting.  Unexpected or oversized decoded messages are reported
+only by protocol phase and declared length, so attacker-controlled payloads
+are not copied into diagnostics.
 
 Deadline expiry is represented by =ProtocolDeadlineExpired= rather than found
 by matching error text.  Rust's =std::error::Error= implementations allow
 =anyhow= to retain that concrete source through context.  The connector uses
-the type to select one of three useful diagnostics: transfer-turn silence,
-remote-apply silence, or inability to send local-apply progress.  It kills and
-reaps its SSH child but does not present that cleanup signal as a second remote
-failure.  OS errors such as a closed pipe keep their actual cause.
+the type to select one of four useful diagnostics: transfer-turn silence,
+remote-apply silence, inability to send local-apply progress, or silence while
+waiting for the final synchronization confirmation.  The responder's receipt
+write and the connector's final-confirmation read each use a fixed 30-second
+deadline clamped to the absolute session deadline.  It kills and reaps its SSH
+child but does not present that cleanup signal as a second remote failure.  OS
+errors such as a closed pipe keep their actual cause.
 
 ** Final completion output
 
@@ -211,7 +216,8 @@ cleanup, while unrelated failures remain unchanged.
 
 The bug-first Docker scenario reproduced the exact failure on the prior
 protocol.  On the implementation it completed 5,000 real files through public
-=flocal sync add= in 370.65 seconds.  It emitted five transfer receipts,
+=flocal sync add= in 359.35 seconds on the final reviewed code.  It emitted
+five transfer receipts,
 repeated progress throughout both applies, left =pending_install=false= on
 both endpoints, set connector =initial_complete=true=, produced equal trees,
 and emitted exactly one final =Connected= line.
@@ -221,10 +227,12 @@ apply.  Captured stdout contained no =Connected= while stopped; after resume,
 the command completed with equal trees and exactly one flushed line.
 
 The Rust suite, Clippy with warnings denied, formatting, Makefile prefix test,
-and all 27 Emacs tests pass.  Coverage is 90.71% on changed executable lines
-and at least 90% project-wide.  The full Docker suite, independent local review
-lenses, installation, GitHub CI, and external review are recorded in the pull
-request once those gates complete.
+and all 27 Emacs tests pass.  Coverage is 91.90% on changed executable lines
+and at least 90% project-wide.  All 61 applicable Docker scenarios pass,
+including abrupt initiator and responder restarts both during apply and while
+idle.  The independent local review lenses converged with no findings.  The
+installation, GitHub CI, and external review are recorded in the pull request
+once those gates complete.
 
 * Remaining limits and operations
 
