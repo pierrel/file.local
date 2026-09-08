@@ -9,6 +9,24 @@ use crate::harness as e2e;
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
+fn five_thousand_initial_changes_do_not_timeout_after_scan() -> Result<()> {
+    e2e::known_failure(|| {
+        let (a, b) = e2e::managed_containers()?;
+        a.write_numbered_files(5_000)?;
+
+        let started = Instant::now();
+        let stderr = a.sync_add_large_observed_to(&b)?;
+        eprintln!(
+            "large initial sync completed in {:?}:\n{stderr}",
+            started.elapsed()
+        );
+
+        e2e::assert_trees_equal(&a, &b)
+    })
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
 fn long_initial_remote_scan_stays_alive_with_progress() -> Result<()> {
     let (a, b) = e2e::managed_containers()?;
     for index in 0..4 {

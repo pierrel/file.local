@@ -14,6 +14,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 const SETUP_COMMAND_DEADLINE: &str = "30s";
 const SLOW_SCAN_COMMAND_DEADLINE: &str = "45s";
+const LARGE_INITIAL_SYNC_COMMAND_DEADLINE: &str = "5m";
 const START_COMMAND_DEADLINE: &str = "5s";
 const TARGET_COMMAND_KILL_AFTER: &str = "1s";
 /// Where a started watcher records its pid inside the container. One watch
@@ -1603,6 +1604,14 @@ impl Peer {
     }
 
     pub fn sync_add_observed_to(&self, other: &Peer) -> Result<String> {
+        self.sync_add_observed_to_with_deadline(other, SLOW_SCAN_COMMAND_DEADLINE)
+    }
+
+    pub fn sync_add_large_observed_to(&self, other: &Peer) -> Result<String> {
+        self.sync_add_observed_to_with_deadline(other, LARGE_INITIAL_SYNC_COMMAND_DEADLINE)
+    }
+
+    fn sync_add_observed_to_with_deadline(&self, other: &Peer, deadline: &str) -> Result<String> {
         let arguments = [
             "sync",
             "add",
@@ -1613,8 +1622,8 @@ impl Peer {
             SHARE,
             "--yes",
         ];
-        let output = self.bounded_flocal_raw(&arguments, SLOW_SCAN_COMMAND_DEADLINE)?;
-        reject_target_timeout(&output, &arguments, SLOW_SCAN_COMMAND_DEADLINE)?;
+        let output = self.bounded_flocal_raw(&arguments, deadline)?;
+        reject_target_timeout(&output, &arguments, deadline)?;
         if !output.status.success() {
             return Err(self.fail(format!(
                 "{}: flocal {} failed: {}",
@@ -2083,6 +2092,26 @@ impl Peer {
 
     pub fn write(&self, path: &str, content: &str) -> Result<()> {
         self.write_bytes(path, content.as_bytes())
+    }
+
+    pub fn write_numbered_files(&self, count: u32) -> Result<()> {
+        let count = count.to_string();
+        self.exec_ok(&[
+            "sh",
+            "-c",
+            r#"set -eu
+root=$1
+count=$2
+i=0
+while [ "$i" -lt "$count" ]; do
+    printf '%s\n' "$i" >"$root/file-$i.txt"
+    i=$((i + 1))
+done"#,
+            "write-numbered-files",
+            SHARE,
+            &count,
+        ])?;
+        Ok(())
     }
 
     pub fn write_bytes(&self, path: &str, content: &[u8]) -> Result<()> {
