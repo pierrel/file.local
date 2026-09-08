@@ -1627,7 +1627,7 @@ impl Peer {
 : >\"$2\"
 : >\"$3\"
 rm -f -- \"$4\"
-/usr/bin/timeout --kill-after 1s 45s flocal sync add /home/peer/share \
+/usr/bin/timeout --kill-after \"$5\" \"$6\" flocal sync add /home/peer/share \
     --host \"$1\" --remote-path /home/peer/share --yes >\"$2\" 2>\"$3\"
 printf '%s\\n' \"$?\" >\"$4\"";
         self.context.docker_ok(&[
@@ -1644,6 +1644,8 @@ printf '%s\\n' \"$?\" >\"$4\"";
             SYNC_ADD_STDOUT,
             SYNC_ADD_STDERR,
             SYNC_ADD_STATUS,
+            TARGET_COMMAND_KILL_AFTER,
+            SLOW_SCAN_COMMAND_DEADLINE,
         ])?;
         Ok(())
     }

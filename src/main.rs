@@ -9865,6 +9865,27 @@ mod tests {
         assert!(!error.to_string().contains("remote exited"));
         assert!(started.elapsed() < Duration::from_secs(2));
 
+        let mut remote = make_remote("cat")?;
+        sync::write_message(
+            &mut remote.input,
+            &Message::Error {
+                message: "attacker-controlled-final-payload".into(),
+            },
+        )?;
+        let error = remote
+            .finish()
+            .expect_err("a non-Done final synchronization frame must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid remote synchronization completion")
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("attacker-controlled-final-payload")
+        );
+
         for error in [
             make_remote("true")?
                 .finish_transfer_phase_error(anyhow::anyhow!("transfer pipe closed")),

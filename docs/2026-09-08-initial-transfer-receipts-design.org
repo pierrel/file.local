@@ -338,12 +338,12 @@ and object-state tests run on both supported platforms.
    nonzero result or outer ten-minute target timeout as a failure.
 2. Implement version 8, promote that identical Docker scenario by removing
    =known_failure=, raise its external safety deadline to ten minutes for the
-   measured two-sided apply, and assert
-   successful =sync add=, elapsed time above 120 seconds while the natural
-   timing holds, at least three =remote file transfer in progress= lines, at
-   least three =remote apply in progress= lines, at least three =local apply in
-   progress= lines, responder and connector =pending_install: false= completion,
-   and equal trees.
+   measured two-sided apply, and assert successful =sync add=, at least three
+   =remote file transfer in progress= lines, and at least seven five-second
+   progress reports in each apply direction.  The latter proves each apply
+   phase itself crosses the old 30-second idle boundary without depending on
+   total command wall time.  Also assert responder and connector
+   =pending_install: false= completion and equal trees.
    Captured
    stdout must contain exactly the normal final =Connected ...= line; stderr
    must contain no =Connected= line (it normally contains the expected progress

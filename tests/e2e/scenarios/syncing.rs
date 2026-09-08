@@ -18,19 +18,15 @@ fn five_thousand_initial_changes_do_not_timeout_after_scan() -> Result<()> {
     let elapsed = started.elapsed();
     eprintln!("large initial sync completed in {elapsed:?}:\n{stderr}");
 
-    anyhow::ensure!(
-        elapsed > Duration::from_secs(120),
-        "large initial sync did not cross the measured apply boundary: {elapsed:?}"
-    );
-    for phase in [
-        "remote file transfer in progress:",
-        "remote apply in progress:",
-        "local apply in progress:",
+    for (phase, minimum) in [
+        ("remote file transfer in progress:", 3),
+        ("remote apply in progress:", 7),
+        ("local apply in progress:", 7),
     ] {
         let reports = stderr.matches(phase).count();
         anyhow::ensure!(
-            reports >= 3,
-            "expected repeated {phase} reports, got {reports} in: {stderr}"
+            reports >= minimum,
+            "expected at least {minimum} {phase} reports, got {reports} in: {stderr}"
         );
     }
     let connected: Vec<_> = stdout
