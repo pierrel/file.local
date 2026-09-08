@@ -20,7 +20,7 @@ use crate::state::{
 };
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
-pub const SYNC_PROTOCOL_VERSION: u32 = 7;
+pub const SYNC_PROTOCOL_VERSION: u32 = 8;
 pub const WATCH_PROTOCOL_VERSION: u32 = 7;
 pub const RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION: u32 = 1;
 pub const RELATIONSHIP_REMOVAL_PROTOCOL_VERSION: u32 = 1;
@@ -41,6 +41,8 @@ const MAX_SCAN_CONTROL_FRAMES: usize = 1024;
 const MAX_SCAN_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_SCAN_PROGRESS_BYTES: usize = 256;
 const MAX_SCAN_ERROR_BYTES: usize = 4096;
+pub const MAX_ONE_SHOT_CONTROL_BYTES: usize = 256;
+pub const MAX_ONE_SHOT_ERROR_BYTES: usize = 4096;
 pub const MAX_MERGE_CANDIDATES_PER_ROUND: usize = 64;
 pub const MAX_MERGE_WORK_PER_ROUND: usize = 32_000_000;
 pub const MAX_MERGE_HUNKS_PER_ROUND: usize = 4_096;
@@ -513,12 +515,20 @@ pub enum V1Message {
         data: Vec<u8>,
     },
     ObjectEnd,
+    TransferBatchEnd,
+    TransferReceipt {
+        objects: u64,
+        bytes: u64,
+    },
     ApplyChunk {
         records: Vec<Record>,
         conflicts: Vec<crate::reconcile::Conflict>,
         merges: Vec<crate::reconcile::MergeCandidate>,
     },
     ApplyEnd,
+    ApplyProgress {
+        records: u64,
+    },
     Applied,
     HeadChunk {
         records: Vec<Record>,
@@ -840,6 +850,14 @@ fn read_frame_with_len<T: DeserializeOwned>(reader: &mut impl Read) -> Result<(T
 }
 
 fn read_frame_until<T: DeserializeOwned>(reader: &impl AsFd, deadline: Instant) -> Result<T> {
+    let (frame, _) = read_frame_until_with_len(reader, deadline)?;
+    Ok(frame)
+}
+
+fn read_frame_until_with_len<T: DeserializeOwned>(
+    reader: &impl AsFd,
+    deadline: Instant,
+) -> Result<(T, usize)> {
     let mut length = [0u8; 4];
     read_exact_until(reader, &mut length, deadline)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -848,7 +866,7 @@ fn read_frame_until<T: DeserializeOwned>(reader: &impl AsFd, deadline: Instant) 
     }
     let mut bytes = vec![0u8; length];
     read_exact_until(reader, &mut bytes, deadline)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok((serde_json::from_slice(&bytes)?, length))
 }
 
 fn write_frame_until(writer: &impl AsFd, frame: &impl Serialize, deadline: Instant) -> Result<()> {
@@ -971,19 +989,30 @@ fn write_all_until(writer: &impl AsFd, mut bytes: &[u8], deadline: Instant) -> R
 }
 
 fn wait_fd(fd: &impl AsFd, flags: rustix::event::PollFlags, deadline: Instant) -> Result<()> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .context("persistent protocol frame deadline exceeded")?;
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(ProtocolDeadlineExpired.into());
+    };
     let mut descriptors = [rustix::event::PollFd::new(fd, flags)];
     let timeout = rustix::event::Timespec {
         tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
         tv_nsec: remaining.subsec_nanos() as i64,
     };
     if rustix::event::poll(&mut descriptors, Some(&timeout))? == 0 {
-        bail!("persistent protocol frame deadline exceeded");
+        return Err(ProtocolDeadlineExpired.into());
     }
     Ok(())
 }
+
+#[derive(Debug)]
+pub struct ProtocolDeadlineExpired;
+
+impl std::fmt::Display for ProtocolDeadlineExpired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("peer protocol frame deadline expired")
+    }
+}
+
+impl std::error::Error for ProtocolDeadlineExpired {}
 
 pub fn default_frame_deadline() -> Duration {
     Duration::from_secs(30)
@@ -1024,7 +1053,7 @@ pub fn read_v1_message(reader: &mut impl Read) -> Result<V1Message> {
     read_frame(reader)
 }
 
-fn read_v1_message_with_len(reader: &mut impl Read) -> Result<(V1Message, usize)> {
+pub fn read_v1_message_with_len(reader: &mut impl Read) -> Result<(V1Message, usize)> {
     read_frame_with_len(reader)
 }
 
@@ -1038,6 +1067,13 @@ pub fn write_v1_message_until(
 
 pub fn read_v1_message_until(reader: &impl AsFd, deadline: Instant) -> Result<V1Message> {
     read_frame_until(reader, deadline)
+}
+
+pub fn read_v1_message_until_with_len(
+    reader: &impl AsFd,
+    deadline: Instant,
+) -> Result<(V1Message, usize)> {
+    read_frame_until_with_len(reader, deadline)
 }
 
 pub fn write_initial_message(writer: &mut impl Write, message: &InitialMessage) -> Result<()> {
@@ -1239,11 +1275,19 @@ pub enum ScanProgressEvent {
 }
 
 pub fn bounded_scan_error(message: &str) -> Result<String> {
+    bounded_one_shot_error_with_limit(message, MAX_SCAN_ERROR_BYTES)
+}
+
+pub fn bounded_one_shot_error(message: &str) -> Result<String> {
+    bounded_one_shot_error_with_limit(message, MAX_ONE_SHOT_ERROR_BYTES)
+}
+
+fn bounded_one_shot_error_with_limit(message: &str, limit: usize) -> Result<String> {
     let envelope = serde_json::to_vec(&Message::Error {
         message: String::new(),
     })?
     .len();
-    let mut remaining = MAX_SCAN_ERROR_BYTES.saturating_sub(envelope);
+    let mut remaining = limit.saturating_sub(envelope);
     let mut bounded = String::new();
     for character in message.chars() {
         let encoded = serde_json::to_vec(&character.to_string())?;
@@ -1608,17 +1652,45 @@ pub fn apply_plan(state: &mut State, share: &ShareId, records: &[Record]) -> Res
 }
 
 pub fn apply_complete_plan(state: &mut State, share: &ShareId, plan: &Plan) -> Result<()> {
+    let mut progress = |_| Ok(());
+    apply_complete_plan_with_progress(state, share, plan, &mut progress)
+}
+
+pub fn apply_complete_plan_with_progress(
+    state: &mut State,
+    share: &ShareId,
+    plan: &Plan,
+    progress: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<()> {
     let root = ShareRoot::open(state, share)?;
     apply_complete_plan_with_root_skipping_inner(
         state,
         share,
         &root,
         plan,
-        &std::collections::HashSet::new(),
-        None,
-        &[],
+        CompletePlanOptions {
+            retained_paths: &std::collections::HashSet::new(),
+            managed_generation: None,
+            local_snapshot: &[],
+            progress,
+        },
     )?;
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct ApplyProgressWriteError(anyhow::Error);
+
+impl std::fmt::Display for ApplyProgressWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "writing apply progress: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for ApplyProgressWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 pub fn apply_complete_plan_and_enable_managed(
@@ -1627,15 +1699,35 @@ pub fn apply_complete_plan_and_enable_managed(
     plan: &Plan,
     expected_generation: i64,
 ) -> Result<QueueRequest> {
+    let mut progress = |_| Ok(());
+    apply_complete_plan_and_enable_managed_with_progress(
+        state,
+        share,
+        plan,
+        expected_generation,
+        &mut progress,
+    )
+}
+
+pub fn apply_complete_plan_and_enable_managed_with_progress(
+    state: &mut State,
+    share: &ShareId,
+    plan: &Plan,
+    expected_generation: i64,
+    progress: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<QueueRequest> {
     let root = ShareRoot::open(state, share)?;
     apply_complete_plan_with_root_skipping_inner(
         state,
         share,
         &root,
         plan,
-        &std::collections::HashSet::new(),
-        Some(expected_generation),
-        &[],
+        CompletePlanOptions {
+            retained_paths: &std::collections::HashSet::new(),
+            managed_generation: Some(expected_generation),
+            local_snapshot: &[],
+            progress,
+        },
     )?
     .context("managed initial apply did not publish its queue request")
 }
@@ -1697,14 +1789,18 @@ fn recover_install_plan(state: &mut State, share: &ShareId, intent: &InstallInte
         _ => None,
     };
     let root = ShareRoot::open(state, share)?;
+    let mut progress = |_| Ok(());
     match apply_complete_plan_with_root_skipping_inner(
         state,
         share,
         &root,
         &plan,
-        &std::collections::HashSet::new(),
-        managed_generation,
-        &[],
+        CompletePlanOptions {
+            retained_paths: &std::collections::HashSet::new(),
+            managed_generation,
+            local_snapshot: &[],
+            progress: &mut progress,
+        },
     ) {
         Ok(Some(request)) => {
             request.release_for_reclaim();
@@ -1795,14 +1891,18 @@ pub fn apply_complete_plan_with_root_skipping(
     plan: &Plan,
     retained_paths: &std::collections::HashSet<Vec<u8>>,
 ) -> Result<()> {
+    let mut progress = |_| Ok(());
     apply_complete_plan_with_root_skipping_inner(
         state,
         share,
         root,
         plan,
-        retained_paths,
-        None,
-        &[],
+        CompletePlanOptions {
+            retained_paths,
+            managed_generation: None,
+            local_snapshot: &[],
+            progress: &mut progress,
+        },
     )?;
     Ok(())
 }
@@ -1817,16 +1917,27 @@ pub fn apply_complete_plan_with_root_skipping_guarding_snapshot(
     retained_paths: &std::collections::HashSet<Vec<u8>>,
     local_snapshot: &[Record],
 ) -> Result<()> {
+    let mut progress = |_| Ok(());
     apply_complete_plan_with_root_skipping_inner(
         state,
         share,
         root,
         plan,
-        retained_paths,
-        None,
-        local_snapshot,
+        CompletePlanOptions {
+            retained_paths,
+            managed_generation: None,
+            local_snapshot,
+            progress: &mut progress,
+        },
     )?;
     Ok(())
+}
+
+struct CompletePlanOptions<'a> {
+    retained_paths: &'a std::collections::HashSet<Vec<u8>>,
+    managed_generation: Option<i64>,
+    local_snapshot: &'a [Record],
+    progress: &'a mut dyn FnMut(u64) -> Result<()>,
 }
 
 fn apply_complete_plan_with_root_skipping_inner(
@@ -1834,9 +1945,7 @@ fn apply_complete_plan_with_root_skipping_inner(
     share: &ShareId,
     root: &ShareRoot,
     plan: &Plan,
-    retained_paths: &std::collections::HashSet<Vec<u8>>,
-    managed_generation: Option<i64>,
-    local_snapshot: &[Record],
+    options: CompletePlanOptions<'_>,
 ) -> Result<Option<QueueRequest>> {
     let records = &plan.records;
     validate_unique_paths(records)?;
@@ -1848,7 +1957,8 @@ fn apply_complete_plan_with_root_skipping_inner(
         .iter()
         .map(|record| (record.path.as_bytes().to_vec(), record))
         .collect();
-    let local_snapshot: std::collections::HashMap<_, _> = local_snapshot
+    let local_snapshot: std::collections::HashMap<_, _> = options
+        .local_snapshot
         .iter()
         .map(|record| (record.path.as_bytes(), record))
         .collect();
@@ -1863,7 +1973,7 @@ fn apply_complete_plan_with_root_skipping_inner(
             }
         }
     }
-    let (intent, _) = match managed_generation {
+    let (intent, _) = match options.managed_generation {
         Some(generation) => {
             state.set_managed_plan_install_intent(share, records, &plan.conflicts, generation)?
         }
@@ -1908,7 +2018,7 @@ fn apply_complete_plan_with_root_skipping_inner(
     let mut ordered = Vec::new();
     for record in &accepted {
         if !ignored_cached(&matcher, record, &mut ignore_cache)
-            && !retained_paths.contains(record.path.as_bytes())
+            && !options.retained_paths.contains(record.path.as_bytes())
         {
             ordered.push(record.clone());
         }
@@ -2033,9 +2143,10 @@ fn apply_complete_plan_with_root_skipping_inner(
         sync_applied_record(root_dir, record)
             .with_context(|| format!("making applied path durable: {}", record.path.display()))?;
         completed.push(record.clone());
+        (options.progress)(completed.len() as u64).map_err(ApplyProgressWriteError)?;
     }
     root.validate(state, share)?;
-    match managed_generation {
+    match options.managed_generation {
         Some(generation) => state
             .finish_install_and_enable_managed(share, &intent, &accepted, generation)
             .map(Some),
@@ -3191,6 +3302,39 @@ pub fn send_object(state: &State, hash: &ObjectHash, writer: &mut impl Write) ->
     write_message(writer, &Message::ObjectEnd)
 }
 
+pub fn send_object_until(
+    state: &State,
+    hash: &ObjectHash,
+    writer: &impl AsFd,
+    deadline: Instant,
+) -> Result<()> {
+    let mut file = state.open_verified_object(hash)?;
+    let size = file.metadata()?.len();
+    write_v1_message_until(
+        writer,
+        &Message::ObjectStart {
+            hash: hash.clone(),
+            size,
+        },
+        deadline,
+    )?;
+    let mut buffer = vec![0; CHUNK];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        write_v1_message_until(
+            writer,
+            &Message::ObjectChunk {
+                data: buffer[..read].to_vec(),
+            },
+            deadline,
+        )?;
+    }
+    write_v1_message_until(writer, &Message::ObjectEnd, deadline)
+}
+
 pub fn receive_object(
     state: &State,
     hash: ObjectHash,
@@ -3414,9 +3558,200 @@ mod tests {
 
     #[test]
     fn scheduling_protocol_versions_are_incremented() {
-        assert_eq!(SYNC_PROTOCOL_VERSION, 7);
+        assert_eq!(SYNC_PROTOCOL_VERSION, 8);
         assert_eq!(WATCH_PROTOCOL_VERSION, 7);
         assert_eq!(PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn one_shot_progress_frames_round_trip_with_declared_lengths() -> Result<()> {
+        for message in [
+            Message::TransferBatchEnd,
+            Message::TransferReceipt {
+                objects: 1_024,
+                bytes: 16 * 1024 * 1024,
+            },
+            Message::ApplyProgress { records: 37 },
+        ] {
+            let mut wire = Vec::new();
+            write_message(&mut wire, &message)?;
+            let declared = u32::from_be_bytes(wire[..4].try_into()?) as usize;
+            let (decoded, bytes) = read_v1_message_with_len(&mut wire.as_slice())?;
+            assert_eq!(decoded, message);
+            assert_eq!(bytes, declared);
+            assert!(bytes <= MAX_ONE_SHOT_CONTROL_BYTES);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_errors_are_bounded_by_encoded_bytes() -> Result<()> {
+        let message = bounded_one_shot_error(&"\n".repeat(MAX_ONE_SHOT_ERROR_BYTES))?;
+        let encoded = serde_json::to_vec(&Message::Error { message })?;
+        assert!(encoded.len() <= MAX_ONE_SHOT_ERROR_BYTES);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_length_reader_and_object_writer_share_fixed_deadlines() -> Result<()> {
+        use std::os::unix::net::UnixStream;
+
+        let (writer, reader) = UnixStream::pair()?;
+        write_v1_message_until(
+            &writer,
+            &Message::TransferReceipt {
+                objects: 1,
+                bytes: 3,
+            },
+            Instant::now() + Duration::from_secs(1),
+        )?;
+        let (message, bytes) =
+            read_v1_message_until_with_len(&reader, Instant::now() + Duration::from_secs(1))?;
+        assert!(matches!(
+            message,
+            Message::TransferReceipt {
+                objects: 1,
+                bytes: 3
+            }
+        ));
+        assert!(bytes <= MAX_ONE_SHOT_CONTROL_BYTES);
+
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let small_hash = ObjectHash::from_blake3(blake3::hash(b"small"));
+        state.import_object(&small_hash, b"small")?;
+        let (object_writer, mut object_reader) = UnixStream::pair()?;
+        send_object_until(
+            &state,
+            &small_hash,
+            &object_writer,
+            Instant::now() + Duration::from_secs(1),
+        )?;
+        assert!(matches!(
+            read_message(&mut object_reader)?,
+            Message::ObjectStart { hash, size } if hash == small_hash && size == 5
+        ));
+        assert!(matches!(
+            read_message(&mut object_reader)?,
+            Message::ObjectChunk { data } if data == b"small"
+        ));
+        assert!(matches!(
+            read_message(&mut object_reader)?,
+            Message::ObjectEnd
+        ));
+
+        let hash = ObjectHash::from_blake3(blake3::hash(&vec![7; MAX_FRAME]));
+        state.import_object(&hash, &vec![7; MAX_FRAME])?;
+        let (blocked_writer, _blocked_reader) = UnixStream::pair()?;
+        let error = send_object_until(
+            &state,
+            &hash,
+            &blocked_writer,
+            Instant::now() + Duration::from_millis(20),
+        )
+        .expect_err("a non-reading peer must bound an object write");
+        assert!(error.is::<ProtocolDeadlineExpired>(), "{error:#}");
+
+        let (receipt_writer, _receipt_reader) = UnixStream::pair()?;
+        let original = rustix::fs::fcntl_getfl(&receipt_writer)?;
+        rustix::fs::fcntl_setfl(&receipt_writer, original | rustix::fs::OFlags::NONBLOCK)?;
+        let fill = [0u8; 8 * 1024];
+        loop {
+            match rustix::io::write(&receipt_writer, &fill) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        rustix::fs::fcntl_setfl(&receipt_writer, original)?;
+        let error = write_v1_message_until(
+            &receipt_writer,
+            &Message::TransferReceipt {
+                objects: 1,
+                bytes: 5,
+            },
+            Instant::now() + Duration::from_millis(20),
+        )
+        .expect_err("a receipt to a non-reading peer must expire");
+        assert!(error.is::<ProtocolDeadlineExpired>(), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_progress_follows_durable_records_and_failure_keeps_recovery() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let record = |name: &[u8], sequence| Record {
+            path: RelativePath::from_bytes(name.to_vec()).unwrap(),
+            version: Version {
+                peer: PeerId("peer".into()),
+                sequence,
+                id_authenticator: None,
+                timestamp_ns: sequence as i64,
+                seen: Vec::new(),
+                merge_base: None,
+                version_authenticator: None,
+                base_authenticator: None,
+                entry: Entry::Directory,
+            },
+        };
+        let plan = Plan {
+            records: vec![record(b"one", 1), record(b"two", 2)],
+            conflicts: Vec::new(),
+            merges: Vec::new(),
+        };
+        let mut reports = Vec::new();
+        let error =
+            apply_complete_plan_with_progress(&mut state, &share, &plan, &mut |completed| {
+                reports.push(completed);
+                if completed == 2 {
+                    bail!("closed progress output")
+                }
+                Ok(())
+            })
+            .expect_err("the second progress write must fail");
+        let progress_error = error
+            .downcast_ref::<ApplyProgressWriteError>()
+            .expect("progress errors remain typed");
+        assert!(
+            progress_error
+                .to_string()
+                .contains("closed progress output")
+        );
+        assert!(std::error::Error::source(progress_error).is_some());
+        assert_eq!(reports, vec![1, 2]);
+        assert!(root.join("one").is_dir() && root.join("two").is_dir());
+        assert!(state.install_intent(&share)?.is_some());
+        recover_installs_locked(&mut state)?;
+        assert!(state.install_intent(&share)?.is_none());
+        apply_complete_plan(
+            &mut state,
+            &share,
+            &Plan {
+                records: Vec::new(),
+                conflicts: Vec::new(),
+                merges: Vec::new(),
+            },
+        )?;
+        let generation = state.watch_intent_generation(&share)?;
+        apply_complete_plan_and_enable_managed(
+            &mut state,
+            &share,
+            &Plan {
+                records: Vec::new(),
+                conflicts: Vec::new(),
+                merges: Vec::new(),
+            },
+            generation,
+        )?
+        .cancel()?;
+        Ok(())
     }
 
     #[test]
@@ -4241,7 +4576,7 @@ mod tests {
             Duration::from_millis(20),
         )
         .expect_err("an incomplete prefix must time out");
-        assert!(prefix_error.to_string().contains("deadline exceeded"));
+        assert!(prefix_error.is::<ProtocolDeadlineExpired>());
 
         let (mut body_writer, body_reader) = UnixStream::pair()?;
         body_writer.write_all(&1u32.to_be_bytes())?;
@@ -4251,7 +4586,7 @@ mod tests {
             Duration::from_millis(20),
         )
         .expect_err("an incomplete body must time out");
-        assert!(body_error.to_string().contains("deadline exceeded"));
+        assert!(body_error.is::<ProtocolDeadlineExpired>());
         Ok(())
     }
 
@@ -4285,7 +4620,7 @@ mod tests {
             Duration::from_millis(40),
         )
         .expect_err("body bytes must not renew the frame deadline");
-        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(error.is::<ProtocolDeadlineExpired>());
         drop(reader);
         sender.join().expect("sender did not panic");
         Ok(())

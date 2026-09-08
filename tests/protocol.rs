@@ -32,7 +32,7 @@ fn record(path: &[u8], entry: Entry) -> Result<Record> {
 }
 
 #[test]
-fn explicit_v7_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
+fn explicit_v8_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
     let message = Message::Sync {
         protocol: sync::SYNC_PROTOCOL_VERSION,
         share: flocal::model::ShareId("share".into()),
@@ -44,11 +44,11 @@ fn explicit_v7_wire_format_and_initial_dispatch_are_versioned() -> Result<()> {
     sync::write_message(&mut wire, &message)?;
     assert_eq!(
         &wire[4..],
-        br#"{"type":"sync","protocol":7,"share":"share","peer":"peer","relationship":"relationship","dry_run":false}"#
+        br#"{"type":"sync","protocol":8,"share":"share","peer":"peer","relationship":"relationship","dry_run":false}"#
     );
     assert!(matches!(
         sync::read_message(&mut wire.as_slice())?,
-        Message::Sync { protocol: 7, .. }
+        Message::Sync { protocol: 8, .. }
     ));
 
     let initial = InitialMessage::Sync {
@@ -645,10 +645,7 @@ fn persistent_frames_have_absolute_slow_read_and_blocked_write_deadlines() -> Re
     let error =
         sync::read_v2_envelope_until(&slow_reader, Instant::now() + Duration::from_millis(20))
             .expect_err("a slow-dripped prefix must time out absolutely");
-    assert!(
-        format!("{error:#}").contains("deadline exceeded"),
-        "{error:#}"
-    );
+    assert!(error.is::<sync::ProtocolDeadlineExpired>(), "{error:#}");
     drip.join().expect("slow writer joins");
 
     let (blocked_writer, _blocked_reader) = UnixStream::pair()?;
@@ -664,10 +661,7 @@ fn persistent_frames_have_absolute_slow_read_and_blocked_write_deadlines() -> Re
         Instant::now() + Duration::from_millis(20),
     )
     .expect_err("a peer that stops reading must not block a frame forever");
-    assert!(
-        format!("{error:#}").contains("deadline exceeded"),
-        "{error:#}"
-    );
+    assert!(error.is::<sync::ProtocolDeadlineExpired>(), "{error:#}");
 
     let (writer, reader) = UnixStream::pair()?;
     let envelope = V2Envelope::Session {

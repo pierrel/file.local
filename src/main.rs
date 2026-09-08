@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use flocal::model::{Entry, PeerConfig, PeerId, RelationshipId, ShareId};
+use flocal::model::{Entry, ObjectHash, PeerConfig, PeerId, RelationshipId, ShareId};
 use flocal::state::{
     EndpointBinding, IncomingRemoval, InstallationPermit, PairedQueueState, PreparedRemoval,
     QueuePosition, QueueRequest, RegistrationOutcome, RemovalFailureState, SchedulingSnapshot,
@@ -839,16 +839,24 @@ fn validate_sync_add_path(path: &Path) -> Result<()> {
 }
 
 fn connected_line(state: &State, share: &ShareId) -> Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_connected_line(state, share, &mut output)
+}
+
+fn write_connected_line(state: &State, share: &ShareId, output: &mut impl Write) -> Result<()> {
     let peer = state
         .peer(share)?
         .context("managed connector is missing its peer")?;
     peer.completed_peer_id()?;
-    println!(
+    writeln!(
+        output,
         "Connected {} to {}:{}",
         escaped(&share.0),
         escaped(&peer.host),
         escaped(&bytes_path(&peer.remote_path).to_string_lossy())
-    );
+    )?;
+    output.flush()?;
     Ok(())
 }
 
@@ -4427,6 +4435,95 @@ fn sync_phase(report: PlanReport, message: &str) {
     }
 }
 
+const TRANSFER_BATCH_OBJECTS: usize = 1_024;
+const TRANSFER_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TRANSFER_RECEIPTS: usize = 2_048;
+const MAX_APPLY_PROGRESS_FRAMES: usize = 1_024;
+
+fn transfer_batch_ends(objects: &[(ObjectHash, u64)]) -> Result<Vec<usize>> {
+    let mut ends = Vec::new();
+    let mut batch_start = 0usize;
+    let mut batch_bytes = 0u64;
+    for (index, (_, size)) in objects.iter().enumerate() {
+        if index > batch_start
+            && (index - batch_start == TRANSFER_BATCH_OBJECTS
+                || batch_bytes.saturating_add(*size) > TRANSFER_BATCH_BYTES)
+        {
+            ends.push(index);
+            batch_start = index;
+            batch_bytes = 0;
+        }
+        batch_bytes = batch_bytes.saturating_add(*size);
+    }
+    if batch_start < objects.len() {
+        ends.push(objects.len());
+    }
+    if ends.len() > MAX_TRANSFER_RECEIPTS {
+        bail!("object transfer requires too many receipt batches");
+    }
+    Ok(ends)
+}
+
+fn validate_transfer_receipt(
+    message: Message,
+    frame_bytes: usize,
+    expected_objects: u64,
+    expected_bytes: u64,
+) -> Result<(u64, u64)> {
+    match message {
+        Message::TransferReceipt { objects, bytes }
+            if frame_bytes <= sync::MAX_ONE_SHOT_CONTROL_BYTES
+                && objects == expected_objects
+                && bytes == expected_bytes =>
+        {
+            Ok((objects, bytes))
+        }
+        Message::Error { message } if frame_bytes <= sync::MAX_ONE_SHOT_ERROR_BYTES => {
+            bail!("remote file transfer failed: {}", escaped(&message))
+        }
+        message => Err(invalid_remote_phase_frame(
+            "file-transfer receipt",
+            message,
+            frame_bytes,
+        )),
+    }
+}
+
+fn invalid_remote_phase_frame(phase: &str, _message: Message, frame_bytes: usize) -> anyhow::Error {
+    anyhow::anyhow!("invalid remote {phase} ({frame_bytes} bytes)")
+}
+
+struct ApplyProgressValidator {
+    records: u64,
+    frames: usize,
+    record_limit: u64,
+}
+
+impl ApplyProgressValidator {
+    fn new(record_limit: usize) -> Self {
+        Self {
+            records: 0,
+            frames: 0,
+            record_limit: record_limit as u64,
+        }
+    }
+
+    fn accept(&mut self, records: u64, frame_bytes: usize, source: &str) -> Result<()> {
+        if frame_bytes > sync::MAX_ONE_SHOT_CONTROL_BYTES {
+            bail!("{source} apply progress exceeds protocol limit");
+        }
+        if records == 0 || records <= self.records || records > self.record_limit {
+            bail!("{source} apply progress is outside the expected record sequence");
+        }
+        self.frames += 1;
+        if self.frames > MAX_APPLY_PROGRESS_FRAMES {
+            bail!("{source} apply progress exceeds session frame limit");
+        }
+        self.records = records;
+        Ok(())
+    }
+}
+
 fn run_sync_attempt(
     state: &mut State,
     path: &Path,
@@ -4648,48 +4745,160 @@ fn run_sync_attempt(
     let mut allowed_outbound = sync::authorized_hashes(&local);
     allowed_outbound.extend(sync::authorized_hashes(&plan.records));
     let mut outbound_bytes = 0u64;
+    let mut requested = Vec::with_capacity(remote_needs.len());
     for hash in remote_needs {
         if !allowed_outbound.contains(&hash) {
             bail!("peer requested an object outside this share");
         }
-        outbound_bytes =
-            outbound_bytes.saturating_add(state.open_verified_object(&hash)?.metadata()?.len());
+        let size = state.open_verified_object(&hash)?.metadata()?.len();
+        outbound_bytes = outbound_bytes.saturating_add(size);
         if outbound_bytes > transfer_limit {
             return Err(remote.finish_after_error(anyhow::anyhow!(
                 "outbound object transfer exceeds session byte limit"
             )));
         }
-        sync::send_object(state, &hash, &mut remote.input)?;
+        requested.push((hash, size));
     }
-    sync::write_message(&mut remote.input, &Message::Done)?;
-    let mut remote_heads = Vec::new();
-    loop {
-        let response = match sync::read_message(&mut remote.output) {
+    let batch_ends = transfer_batch_ends(&requested)?;
+    let session_deadline = remote.output.session_deadline()?;
+    let mut batch_start = 0usize;
+    let mut expected_receipt_bytes = 0u64;
+    let mut last_transfer_report = Instant::now() - Duration::from_secs(5);
+    for end in batch_ends {
+        let deadline = session_deadline.min(Instant::now() + Duration::from_secs(30));
+        for (hash, _) in &requested[batch_start..end] {
+            if let Err(error) = sync::send_object_until(state, hash, &remote.input, deadline) {
+                return Err(remote.finish_transfer_phase_error(error));
+            }
+        }
+        if let Err(error) =
+            sync::write_v1_message_until(&remote.input, &Message::TransferBatchEnd, deadline)
+        {
+            return Err(remote.finish_transfer_phase_error(error));
+        }
+        let response = match sync::read_v1_message_until_with_len(&remote.output, deadline) {
             Ok(response) => response,
-            Err(error) => return Err(remote.finish_after_error(error)),
+            Err(error) => return Err(remote.finish_transfer_phase_error(error)),
+        };
+        expected_receipt_bytes = expected_receipt_bytes.saturating_add(
+            requested[batch_start..end]
+                .iter()
+                .map(|(_, size)| *size)
+                .sum::<u64>(),
+        );
+        let (message, frame_bytes) = response;
+        let (objects, bytes) =
+            validate_transfer_receipt(message, frame_bytes, end as u64, expected_receipt_bytes)?;
+        if last_transfer_report.elapsed() >= Duration::from_secs(5) || end == requested.len() {
+            sync_phase(
+                report,
+                &format!(
+                    "remote file transfer in progress: {objects} objects, {} received",
+                    format_bytes(bytes)
+                ),
+            );
+            last_transfer_report = Instant::now();
+        }
+        batch_start = end;
+    }
+    if let Err(error) =
+        sync::write_v1_message_until(&remote.input, &Message::Done, session_deadline)
+    {
+        return Err(remote.finish_transfer_phase_error(error));
+    }
+    let mut remote_heads = Vec::new();
+    let mut remote_head_bytes = 0usize;
+    let mut head_started = false;
+    let mut apply_progress = ApplyProgressValidator::new(plan.records.len());
+    let mut last_remote_apply_report = Instant::now() - Duration::from_secs(5);
+    loop {
+        let deadline = session_deadline.min(Instant::now() + Duration::from_secs(30));
+        let response = match sync::read_v1_message_until_with_len(&remote.output, deadline) {
+            Ok(response) => response,
+            Err(error) => return Err(remote.finish_apply_phase_error(error)),
         };
         match response {
-            Message::HeadChunk { records } => remote_heads.extend(records),
-            Message::Applied => break,
-            Message::Error { message } => bail!("remote apply failed: {}", escaped(&message)),
-            other => bail!("expected apply acknowledgement, got {other:?}"),
+            (Message::ApplyProgress { records }, frame_bytes) if !head_started => {
+                apply_progress.accept(records, frame_bytes, "remote")?;
+                if last_remote_apply_report.elapsed() >= Duration::from_secs(5) {
+                    sync_phase(
+                        report,
+                        &format!("remote apply in progress: {records} records completed"),
+                    );
+                    last_remote_apply_report = Instant::now();
+                }
+            }
+            (Message::HeadChunk { records }, frame_bytes) => {
+                head_started = true;
+                remote_head_bytes = remote_head_bytes.saturating_add(frame_bytes);
+                if remote_head_bytes > sync::MAX_METADATA_BYTES_PER_SESSION {
+                    bail!("peer acknowledged-head manifest exceeds metadata limit");
+                }
+                remote_heads.extend(records);
+            }
+            (Message::Applied, frame_bytes) if frame_bytes <= sync::MAX_ONE_SHOT_CONTROL_BYTES => {
+                break;
+            }
+            (Message::Error { message }, frame_bytes)
+                if !head_started && frame_bytes <= sync::MAX_ONE_SHOT_ERROR_BYTES =>
+            {
+                bail!("remote apply failed: {}", escaped(&message))
+            }
+            (message, frame_bytes) => {
+                return Err(invalid_remote_phase_frame(
+                    "apply acknowledgement",
+                    message,
+                    frame_bytes,
+                ));
+            }
         }
         if remote_heads.len() > sync::MAX_RECORDS_PER_SESSION {
             bail!("peer acknowledged-head manifest exceeds record limit");
         }
     }
-    let managed_request = if operation == SyncOperation::Initial {
+    let mut next_local_apply_report = Instant::now() + Duration::from_secs(5);
+    let mut local_apply_reports = 0usize;
+    let mut report_local_apply = |records| {
+        if Instant::now() < next_local_apply_report {
+            return Ok(());
+        }
+        local_apply_reports += 1;
+        if local_apply_reports > MAX_APPLY_PROGRESS_FRAMES {
+            bail!("local apply progress exceeds session frame limit");
+        }
+        sync::write_v1_message_until(
+            &remote.input,
+            &Message::ApplyProgress { records },
+            session_deadline,
+        )?;
+        sync_phase(
+            report,
+            &format!("local apply in progress: {records} records completed"),
+        );
+        next_local_apply_report = Instant::now() + Duration::from_secs(5);
+        Ok(())
+    };
+    let local_apply = if operation == SyncOperation::Initial {
         if let Some(generation) = managed_initial_generation {
-            Some(sync::apply_complete_plan_and_enable_managed(
-                state, &share, &plan, generation,
-            )?)
+            sync::apply_complete_plan_and_enable_managed_with_progress(
+                state,
+                &share,
+                &plan,
+                generation,
+                &mut report_local_apply,
+            )
+            .map(Some)
         } else {
-            sync::apply_complete_plan(state, &share, &plan)?;
-            None
+            sync::apply_complete_plan_with_progress(state, &share, &plan, &mut report_local_apply)
+                .map(|()| None)
         }
     } else {
-        sync::apply_complete_plan(state, &share, &plan)?;
-        None
+        sync::apply_complete_plan_with_progress(state, &share, &plan, &mut report_local_apply)
+            .map(|()| None)
+    };
+    let managed_request = match local_apply {
+        Ok(request) => request,
+        Err(error) => return Err(remote.finish_local_apply_phase_error(error)),
     };
     let post_commit = (|| -> Result<(Option<Vec<u8>>, Result<()>)> {
         let current = state.records(&share)?;
@@ -4979,7 +5188,9 @@ fn serve_initial(
                 sync::write_message(
                     &mut output,
                     &Message::Error {
-                        message: format!("unsupported protocol version {protocol}"),
+                        message: format!(
+                            "unsupported protocol version {protocol}; upgrade flocal on both peers"
+                        ),
                     },
                 )?;
                 return Ok(());
@@ -4990,7 +5201,7 @@ fn serve_initial(
                 sync::write_message(
                     &mut output,
                     &Message::Error {
-                        message: format!("{error:#}"),
+                        message: sync::bounded_one_shot_error(&format!("{error:#}"))?,
                     },
                 )?;
                 return Ok(());
@@ -5014,7 +5225,9 @@ fn serve_initial(
                 sync::write_message(
                     &mut output,
                     &Message::Error {
-                        message: format!("unsupported protocol version {protocol}"),
+                        message: format!(
+                            "unsupported protocol version {protocol}; upgrade flocal on both peers"
+                        ),
                     },
                 )?;
                 return Ok(());
@@ -5025,7 +5238,7 @@ fn serve_initial(
                     sync::write_message(
                         &mut output,
                         &Message::Error {
-                            message: format!("{error:#}"),
+                            message: sync::bounded_one_shot_error(&format!("{error:#}"))?,
                         },
                     )?;
                     return Ok(());
@@ -5037,7 +5250,7 @@ fn serve_initial(
                     sync::write_message(
                         &mut output,
                         &Message::Error {
-                            message: format!("{error:#}"),
+                            message: sync::bounded_one_shot_error(&format!("{error:#}"))?,
                         },
                     )?;
                     return Ok(());
@@ -5100,7 +5313,7 @@ fn serve_initial(
                 sync::write_message(
                     &mut output,
                     &Message::Error {
-                        message: format!("{error:#}"),
+                        message: sync::bounded_one_shot_error(&format!("{error:#}"))?,
                     },
                 )?;
                 return Ok(());
@@ -5172,16 +5385,50 @@ fn serve_initial(
                 }
             };
             sync::write_snapshot_until(&*output, &records, session_deadline)?;
+            let output = &*output;
+            let mut direct_output = DirectWriter(output);
+            let mut report_transfer = |objects, bytes| {
+                let deadline =
+                    session_deadline.min(Instant::now() + sync::default_frame_deadline());
+                sync::write_v1_message_until(
+                    output,
+                    &Message::TransferReceipt { objects, bytes },
+                    deadline,
+                )
+            };
+            let mut next_apply_report = Instant::now() + Duration::from_secs(5);
+            let mut apply_reports = 0usize;
+            let mut report_apply = |records| {
+                if Instant::now() < next_apply_report {
+                    return Ok(());
+                }
+                apply_reports += 1;
+                if apply_reports > MAX_APPLY_PROGRESS_FRAMES {
+                    bail!("apply progress exceeds session frame limit");
+                }
+                sync::write_v1_message_until(
+                    output,
+                    &Message::ApplyProgress { records },
+                    session_deadline,
+                )?;
+                next_apply_report = Instant::now() + Duration::from_secs(5);
+                Ok(())
+            };
+            let mut progress = ServeSyncProgress {
+                transfer_receipt: &mut report_transfer,
+                apply: &mut report_apply,
+            };
             serve_sync(
                 state,
                 &share,
                 &binding.remote_peer,
                 &records,
                 &mut input,
-                &mut output,
+                &mut direct_output,
+                &mut progress,
             )?;
             installation.finish()?;
-            sync::write_v1_message_until(&*output, &Message::Done, session_deadline)?;
+            sync::write_v1_message_until(output, &Message::Done, session_deadline)?;
         }
         InitialMessage::WatchOpen { .. } => {
             bail!("persistent watch requires a descriptor-backed protocol transport")
@@ -6057,6 +6304,11 @@ fn serve_v2_round(
     }
 }
 
+struct ServeSyncProgress<'a> {
+    transfer_receipt: &'a mut dyn FnMut(u64, u64) -> Result<()>,
+    apply: &'a mut dyn FnMut(u64) -> Result<()>,
+}
+
 fn serve_sync(
     state: &mut State,
     share: &ShareId,
@@ -6064,6 +6316,7 @@ fn serve_sync(
     advertised: &[flocal::model::Record],
     input: &mut impl io::Read,
     output: &mut impl Write,
+    progress: &mut ServeSyncProgress<'_>,
 ) -> Result<()> {
     let mut pending = flocal::reconcile::Plan {
         records: Vec::new(),
@@ -6085,11 +6338,16 @@ fn serve_sync(
     }
     let mut outbound_bytes = 0u64;
     let mut need_served = false;
-    let mut requested_inbound = std::collections::HashMap::new();
-    let mut applied_records = None;
+    let mut requested_inbound = std::collections::VecDeque::new();
+    let mut batch_ends = std::collections::VecDeque::new();
+    let mut received_objects = 0usize;
+    let mut applied = None;
+    let mut acknowledged_heads_started = false;
+    let mut acknowledged_head_bytes = 0usize;
     let mut acknowledged_heads = Vec::new();
     loop {
-        match sync::read_message(input)? {
+        let (message, frame_bytes) = sync::read_v1_message_with_len(input)?;
+        match message {
             Message::Need { hashes } => {
                 if need_served || peer_snapshot_done || plan_ready {
                     bail!("object request received out of order");
@@ -6116,9 +6374,15 @@ fn serve_sync(
                 if !plan_ready {
                     bail!("object received before a validated apply plan");
                 }
-                let Some(expected_size) = requested_inbound.remove(&hash) else {
+                if batch_ends.front() == Some(&received_objects) {
+                    bail!("object received before required transfer batch end");
+                }
+                let Some((expected_hash, expected_size)) = requested_inbound.pop_front() else {
                     bail!("unsolicited or duplicate object received");
                 };
+                if hash != expected_hash {
+                    bail!("object received out of requested order");
+                }
                 if size != expected_size {
                     bail!("object size differs from the validated plan");
                 }
@@ -6126,7 +6390,18 @@ fn serve_sync(
                 if received_bytes > sync::max_transfer_bytes_per_session() {
                     bail!("object transfer exceeds session byte limit");
                 }
-                sync::receive_object_for_share(state, share, hash, size, input)?
+                sync::receive_object_for_share(state, share, hash, size, input)?;
+                received_objects += 1;
+            }
+            Message::TransferBatchEnd => {
+                if frame_bytes > sync::MAX_ONE_SHOT_CONTROL_BYTES {
+                    bail!("transfer batch end exceeds protocol limit");
+                }
+                if !plan_ready || batch_ends.front() != Some(&received_objects) {
+                    bail!("transfer batch ended outside its required boundary");
+                }
+                batch_ends.pop_front();
+                (progress.transfer_receipt)(received_objects as u64, received_bytes)?;
             }
             Message::SnapshotChunk { records } => {
                 if peer_snapshot_done || plan_ready {
@@ -6188,7 +6463,7 @@ fn serve_sync(
                     sync::write_message(
                         output,
                         &Message::Error {
-                            message: format!("{error:#}"),
+                            message: sync::bounded_one_shot_error(&format!("{error:#}"))?,
                         },
                     )?;
                     return Ok(());
@@ -6197,7 +6472,7 @@ fn serve_sync(
                 let mut required_records = sync::plan_records_with_inputs(&expected);
                 required_records.extend(pending.records.clone());
                 let hashes = sync::required_hashes_for_share(state, share, &required_records)?;
-                requested_inbound.clear();
+                let mut requested = Vec::with_capacity(hashes.len());
                 for hash in &hashes {
                     let size = required_records
                         .iter()
@@ -6210,44 +6485,79 @@ fn serve_sync(
                             _ => None,
                         })
                         .context("requested hash is missing from the validated plan")?;
-                    requested_inbound.insert(hash.clone(), size);
+                    requested.push((hash.clone(), size));
                 }
+                batch_ends = transfer_batch_ends(&requested)?.into();
+                requested_inbound = requested.into();
+                received_objects = 0;
+                received_bytes = 0;
                 sync::write_message(output, &Message::Need { hashes })?;
             }
             Message::Done if plan_ready => {
-                if !requested_inbound.is_empty() {
-                    bail!("peer ended object transfer before satisfying requested hashes")
+                if !requested_inbound.is_empty() || !batch_ends.is_empty() {
+                    bail!("peer ended object transfer before satisfying requested batches")
                 }
                 let expected = sync::plan(advertised, &peer_records);
                 sync::verify_materialized_plan(state, &pending, &expected)?;
-                match sync::apply_complete_plan(state, share, &pending) {
+                match sync::apply_complete_plan_with_progress(
+                    state,
+                    share,
+                    &pending,
+                    progress.apply,
+                ) {
                     Ok(()) => {
                         state.prune_unreferenced_objects()?;
                         let heads = sync::regular_file_heads(&state.records(share)?);
                         sync::write_heads(output, &heads)?;
                         sync::write_message(output, &Message::Applied)?;
-                        applied_records = Some(state.records(share)?);
+                        applied = Some((
+                            state.records(share)?,
+                            ApplyProgressValidator::new(pending.records.len()),
+                        ));
                         pending.records.clear();
                         pending.conflicts.clear();
                         pending.merges.clear();
                         plan_ready = false;
                     }
+                    Err(error)
+                        if error
+                            .downcast_ref::<sync::ApplyProgressWriteError>()
+                            .is_some() =>
+                    {
+                        return Err(error);
+                    }
                     Err(error) => sync::write_message(
                         output,
                         &Message::Error {
-                            message: format!("{error:#}"),
+                            message: sync::bounded_one_shot_error(&format!("{error:#}"))?,
                         },
                     )?,
                 }
             }
-            Message::HeadChunk { records } if applied_records.is_some() => {
+            Message::ApplyProgress { records }
+                if applied.is_some() && !acknowledged_heads_started =>
+            {
+                applied.as_mut().expect("checked above").1.accept(
+                    records,
+                    frame_bytes,
+                    "connector",
+                )?;
+            }
+            Message::HeadChunk { records } if applied.is_some() => {
+                acknowledged_heads_started = true;
+                acknowledged_head_bytes = acknowledged_head_bytes.saturating_add(frame_bytes);
+                if acknowledged_head_bytes > sync::MAX_METADATA_BYTES_PER_SESSION {
+                    bail!("acknowledged-head manifest exceeds metadata limit");
+                }
                 acknowledged_heads.extend(records);
                 if acknowledged_heads.len() > sync::MAX_RECORDS_PER_SESSION {
                     bail!("acknowledged-head manifest exceeds record limit");
                 }
             }
-            Message::CommitAck if applied_records.is_some() => {
-                let current = applied_records.take().expect("checked above");
+            Message::CommitAck
+                if applied.is_some() && frame_bytes <= sync::MAX_ONE_SHOT_CONTROL_BYTES =>
+            {
+                let (current, _) = applied.take().expect("checked above");
                 sync::validate_ack_heads(&current, &acknowledged_heads)?;
                 state.acknowledge_shared_heads(share, &acknowledged_heads)?;
                 break;
@@ -8418,9 +8728,24 @@ impl Remote {
         })
     }
     fn finish(mut self) -> Result<()> {
-        match sync::read_v1_message_until(&self.output, self.output.session_deadline()?)? {
+        let deadline = self
+            .output
+            .session_deadline()?
+            .min(Instant::now() + self.output.limits.idle);
+        let (message, frame_bytes) =
+            match sync::read_v1_message_until_with_len(&self.output, deadline) {
+                Ok(message) => message,
+                Err(error) => return Err(self.finish_confirmation_phase_error(error)),
+            };
+        match message {
             Message::Done => {}
-            other => bail!("expected synchronization completion, got {other:?}"),
+            message => {
+                return Err(self.abort_after_local_error(invalid_remote_phase_frame(
+                    "synchronization completion",
+                    message,
+                    frame_bytes,
+                )));
+            }
         }
         let status = wait_protocol_child(
             &mut self.child,
@@ -8503,6 +8828,58 @@ impl Remote {
                 "{error:#}; remote stderr: {}",
                 escaped(&String::from_utf8_lossy(&stderr))
             )
+        }
+    }
+
+    fn finish_transfer_phase_error(self, error: anyhow::Error) -> anyhow::Error {
+        if error
+            .downcast_ref::<sync::ProtocolDeadlineExpired>()
+            .is_some()
+        {
+            self.abort_after_local_error(anyhow::anyhow!(
+                "stopped sending or receiving remote file-transfer batch progress before the peer protocol deadline"
+            ))
+        } else {
+            self.finish_after_error(error)
+        }
+    }
+
+    fn finish_apply_phase_error(self, error: anyhow::Error) -> anyhow::Error {
+        if error
+            .downcast_ref::<sync::ProtocolDeadlineExpired>()
+            .is_some()
+        {
+            self.abort_after_local_error(anyhow::anyhow!(
+                "stopped receiving remote apply progress before the peer protocol deadline"
+            ))
+        } else {
+            self.finish_after_error(error)
+        }
+    }
+
+    fn finish_local_apply_phase_error(self, error: anyhow::Error) -> anyhow::Error {
+        if error
+            .chain()
+            .any(|cause| cause.is::<sync::ProtocolDeadlineExpired>())
+        {
+            self.abort_after_local_error(anyhow::anyhow!(
+                "stopped sending local apply progress before the peer protocol deadline"
+            ))
+        } else {
+            self.finish_after_error(error)
+        }
+    }
+
+    fn finish_confirmation_phase_error(self, error: anyhow::Error) -> anyhow::Error {
+        if error
+            .downcast_ref::<sync::ProtocolDeadlineExpired>()
+            .is_some()
+        {
+            self.abort_after_local_error(anyhow::anyhow!(
+                "stopped receiving final synchronization confirmation before the peer protocol deadline"
+            ))
+        } else {
+            self.abort_after_local_error(error)
         }
     }
 }
@@ -9384,7 +9761,7 @@ mod tests {
 
     #[test]
     fn remote_cleanup_is_bounded_and_drop_reaps_unfinished_children() -> Result<()> {
-        let mut timed = Command::new("sh").arg("-c").arg("sleep 30").spawn()?;
+        let mut timed = Command::new("sh").arg("-c").arg("exec sleep 30").spawn()?;
         let started = std::time::Instant::now();
         let error = wait_protocol_child(
             &mut timed,
@@ -9398,7 +9775,7 @@ mod tests {
 
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg("sleep 30")
+            .arg("exec sleep 30")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -9440,12 +9817,84 @@ mod tests {
                 finished: false,
             })
         };
-        let error =
-            make_remote("sleep 30")?.abort_after_local_error(anyhow::anyhow!("scan timed out"));
+        let error = make_remote("exec sleep 30")?
+            .abort_after_local_error(anyhow::anyhow!("scan timed out"));
         assert_eq!(error.to_string(), "scan timed out");
         let error = make_remote("true")?
             .finish_remote_scan_error(anyhow::anyhow!("remote file scan failed: denied"));
         assert_eq!(error.to_string(), "remote file scan failed: denied");
+
+        let error = make_remote("exec sleep 30")?
+            .finish_transfer_phase_error(sync::ProtocolDeadlineExpired.into());
+        assert!(
+            error
+                .to_string()
+                .contains("stopped sending or receiving remote file-transfer batch progress")
+        );
+        assert!(!error.to_string().contains("remote exited"));
+        let error = make_remote("exec sleep 30")?
+            .finish_apply_phase_error(sync::ProtocolDeadlineExpired.into());
+        assert!(
+            error
+                .to_string()
+                .contains("stopped receiving remote apply progress")
+        );
+        assert!(!error.to_string().contains("remote exited"));
+        let error = make_remote("exec sleep 30")?.finish_local_apply_phase_error(
+            anyhow::Error::new(sync::ProtocolDeadlineExpired).context("writing progress"),
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("stopped sending local apply progress")
+        );
+        assert!(!error.to_string().contains("remote exited"));
+
+        let mut remote = make_remote("exec sleep 30")?;
+        remote.output.limits.idle = Duration::from_millis(20);
+        remote.output.limits.session = Duration::from_secs(1);
+        let started = Instant::now();
+        let error = remote
+            .finish()
+            .expect_err("a silent final synchronization confirmation must expire");
+        assert!(
+            error
+                .to_string()
+                .contains("stopped receiving final synchronization confirmation")
+        );
+        assert!(!error.to_string().contains("remote exited"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let mut remote = make_remote("exec cat")?;
+        sync::write_message(
+            &mut remote.input,
+            &Message::Error {
+                message: "attacker-controlled-final-payload".into(),
+            },
+        )?;
+        let error = remote
+            .finish()
+            .expect_err("a non-Done final synchronization frame must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid remote synchronization completion")
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("attacker-controlled-final-payload")
+        );
+
+        for error in [
+            make_remote("true")?
+                .finish_transfer_phase_error(anyhow::anyhow!("transfer pipe closed")),
+            make_remote("true")?.finish_apply_phase_error(anyhow::anyhow!("invalid apply frame")),
+            make_remote("true")?
+                .finish_local_apply_phase_error(anyhow::anyhow!("local object read failed")),
+        ] {
+            assert!(error.to_string().contains("remote exited"), "{error:#}");
+        }
         Ok(())
     }
 
@@ -9569,7 +10018,7 @@ mod tests {
         let error = wire
             .recv_reservation(started + Duration::from_secs(1))
             .expect_err("the session deadline must cap a longer frame deadline");
-        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(error.is::<sync::ProtocolDeadlineExpired>());
         assert!(started.elapsed() < Duration::from_millis(300));
         Ok(())
     }
@@ -10119,6 +10568,14 @@ mod tests {
     }
 
     fn serve_messages(messages: &[Message]) -> Result<(Result<()>, Vec<u8>)> {
+        let mut apply_progress = |_| Ok(());
+        serve_messages_with_progress(messages, &mut apply_progress)
+    }
+
+    fn serve_messages_with_progress(
+        messages: &[Message],
+        apply_progress: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<(Result<()>, Vec<u8>)> {
         let temp = tempdir()?;
         let root = temp.path().join("root");
         std::fs::create_dir_all(&root)?;
@@ -10129,6 +10586,11 @@ mod tests {
             sync::write_message(&mut input, message)?;
         }
         let mut output = Vec::new();
+        let mut transfer_receipt = |_, _| Ok(());
+        let mut progress = ServeSyncProgress {
+            transfer_receipt: &mut transfer_receipt,
+            apply: apply_progress,
+        };
         let result = serve_sync(
             &mut state,
             &share,
@@ -10136,6 +10598,7 @@ mod tests {
             &[],
             &mut input.as_slice(),
             &mut output,
+            &mut progress,
         );
         Ok((result, output))
     }
@@ -10175,6 +10638,39 @@ mod tests {
     }
 
     #[test]
+    fn serve_sync_propagates_apply_progress_failure_after_durable_apply() -> Result<()> {
+        let record = test_record(b"directory", "connector", Entry::Directory);
+        let plan = sync::plan(&[], std::slice::from_ref(&record));
+        let messages = [
+            Message::Need { hashes: Vec::new() },
+            Message::SnapshotChunk {
+                records: vec![record],
+            },
+            Message::SnapshotEnd,
+            Message::ApplyChunk {
+                records: plan.records,
+                conflicts: plan.conflicts,
+                merges: plan.merges,
+            },
+            Message::ApplyEnd,
+            Message::Done,
+        ];
+        let mut reported = Vec::new();
+        let (result, _) = serve_messages_with_progress(&messages, &mut |records| {
+            reported.push(records);
+            bail!("progress output closed")
+        })?;
+        let error = result.expect_err("progress failure must abort responder completion");
+        assert!(
+            error
+                .downcast_ref::<sync::ApplyProgressWriteError>()
+                .is_some()
+        );
+        assert_eq!(reported, [1]);
+        Ok(())
+    }
+
+    #[test]
     fn serve_sync_rejects_out_of_order_and_untrusted_messages() -> Result<()> {
         let hash = flocal::model::ObjectHash::from_blake3(blake3::hash(b"x"));
         let cases = vec![
@@ -10195,6 +10691,12 @@ mod tests {
                 merges: Vec::new(),
             }],
             vec![Message::ApplyEnd],
+            vec![Message::TransferBatchEnd],
+            vec![Message::TransferReceipt {
+                objects: 1,
+                bytes: 1,
+            }],
+            vec![Message::ApplyProgress { records: 1 }],
             vec![Message::Accepted {
                 protocol: sync::PROTOCOL_VERSION,
                 peer: flocal::model::PeerId("unexpected".into()),
@@ -10203,6 +10705,177 @@ mod tests {
         for messages in cases {
             assert!(serve_messages(&messages)?.0.is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn transfer_batches_bound_object_count_bytes_and_receipts() -> Result<()> {
+        let hash = ObjectHash::from_blake3(blake3::hash(b"object"));
+        let objects = vec![(hash.clone(), 1); TRANSFER_BATCH_OBJECTS + 1];
+        assert_eq!(
+            transfer_batch_ends(&objects)?,
+            [TRANSFER_BATCH_OBJECTS, 1_025]
+        );
+
+        let by_bytes = vec![
+            (hash.clone(), TRANSFER_BATCH_BYTES / 2),
+            (hash.clone(), TRANSFER_BATCH_BYTES / 2),
+            (hash.clone(), 1),
+        ];
+        assert_eq!(transfer_batch_ends(&by_bytes)?, [2, 3]);
+        assert_eq!(
+            transfer_batch_ends(&[(hash.clone(), TRANSFER_BATCH_BYTES + 1), (hash.clone(), 1),])?,
+            [1, 2]
+        );
+        assert!(transfer_batch_ends(&[]).unwrap().is_empty());
+        assert!(
+            transfer_batch_ends(&vec![
+                (hash, TRANSFER_BATCH_BYTES + 1);
+                MAX_TRANSFER_RECEIPTS + 1
+            ])
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transfer_receipts_and_apply_progress_are_exact_and_bounded() -> Result<()> {
+        assert_eq!(
+            validate_transfer_receipt(
+                Message::TransferReceipt {
+                    objects: 2,
+                    bytes: 7,
+                },
+                sync::MAX_ONE_SHOT_CONTROL_BYTES,
+                2,
+                7,
+            )?,
+            (2, 7)
+        );
+        for message in [
+            Message::TransferReceipt {
+                objects: 1,
+                bytes: 7,
+            },
+            Message::TransferReceipt {
+                objects: 2,
+                bytes: 8,
+            },
+            Message::Applied,
+        ] {
+            assert!(validate_transfer_receipt(message, 1, 2, 7).is_err());
+        }
+        assert!(
+            validate_transfer_receipt(
+                Message::TransferReceipt {
+                    objects: 2,
+                    bytes: 7,
+                },
+                sync::MAX_ONE_SHOT_CONTROL_BYTES + 1,
+                2,
+                7,
+            )
+            .is_err()
+        );
+        let error = validate_transfer_receipt(
+            Message::Error {
+                message: "receiver failed".into(),
+            },
+            sync::MAX_ONE_SHOT_ERROR_BYTES,
+            2,
+            7,
+        )
+        .expect_err("a bounded peer error is still a transfer failure");
+        assert!(format!("{error:#}").contains("receiver failed"));
+        let error = validate_transfer_receipt(
+            Message::Error {
+                message: "attacker-controlled-payload".into(),
+            },
+            sync::MAX_ONE_SHOT_ERROR_BYTES + 1,
+            2,
+            7,
+        );
+        let error = error.expect_err("an oversized peer error must be rejected");
+        assert!(!error.to_string().contains("attacker-controlled-payload"));
+
+        let error = invalid_remote_phase_frame(
+            "apply acknowledgement",
+            Message::ObjectChunk {
+                data: b"attacker-controlled-payload".to_vec(),
+            },
+            sync::MAX_ONE_SHOT_CONTROL_BYTES + 1,
+        );
+        assert!(!error.to_string().contains("attacker-controlled-payload"));
+
+        let mut progress = ApplyProgressValidator::new(3);
+        progress.accept(1, sync::MAX_ONE_SHOT_CONTROL_BYTES, "remote")?;
+        progress.accept(3, 1, "remote")?;
+        assert!(progress.accept(3, 1, "remote").is_err());
+        assert!(
+            ApplyProgressValidator::new(3)
+                .accept(0, 1, "remote")
+                .is_err()
+        );
+        assert!(
+            ApplyProgressValidator::new(3)
+                .accept(4, 1, "remote")
+                .is_err()
+        );
+        assert!(
+            ApplyProgressValidator::new(3)
+                .accept(1, sync::MAX_ONE_SHOT_CONTROL_BYTES + 1, "remote")
+                .is_err()
+        );
+        let mut too_many = ApplyProgressValidator::new(MAX_APPLY_PROGRESS_FRAMES + 1);
+        for records in 1..=MAX_APPLY_PROGRESS_FRAMES as u64 {
+            too_many.accept(records, 1, "connector")?;
+        }
+        assert!(
+            too_many
+                .accept(MAX_APPLY_PROGRESS_FRAMES as u64 + 1, 1, "connector")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn connected_output_is_flushed_and_flush_failures_propagate() -> Result<()> {
+        struct FlushFailure(Vec<u8>);
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("flush failed"))
+            }
+        }
+        struct WriteFailure;
+        impl Write for WriteFailure {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("write failed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        state.set_peer(&share, &test_connector("remote"))?;
+
+        let mut output = Vec::new();
+        write_connected_line(&state, &share, &mut output)?;
+        assert_eq!(String::from_utf8(output)?.matches("Connected ").count(), 1);
+        let error = write_connected_line(&state, &share, &mut FlushFailure(Vec::new()))
+            .expect_err("flush failure must fail the completion report");
+        assert!(error.to_string().contains("flush failed"));
+        let error = write_connected_line(&state, &share, &mut WriteFailure)
+            .expect_err("write failure must fail the completion report");
+        assert!(error.to_string().contains("write failed"));
         Ok(())
     }
 
@@ -11362,7 +12035,7 @@ mod tests {
             result?;
             assert!(matches!(
                 sync::read_message(&mut output.as_slice())?,
-                Message::Error { .. }
+                Message::Error { message } if message.contains("upgrade flocal on both peers")
             ));
         }
         let (result, output) = initial_message(Message::Sync {
