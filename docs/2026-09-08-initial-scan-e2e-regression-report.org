@@ -1,0 +1,199 @@
+#+title: Initial remote-scan E2E regression implementation report
+#+date: 2026-09-08
+#+status: implemented and validated
+
+* Intended user experience and final design
+
+An initial =flocal sync add= must remain alive while the remote side is making
+observable scan progress, even when the complete scan takes longer than the
+30-second no-byte protocol deadline. This follow-up does not change that
+version-7 behavior. It proves it through the same public CLI, daemon, SSH, and
+protocol path that failed for the reported roughly 5,000-file initial scan.
+
+The regression uses four tiny responder files and an E2E-only scanner delay of
+eight seconds per file. The remote scan therefore lasts more than 30 seconds
+without making the test depend on file count, machine speed, or object size.
+Current code emits three intermediate progress frames and completes normally.
+The pre-fix protocol emits no bytes during the same work and reaches its own
+30-second read timeout.
+
+The delay hook is compiled only with =e2e-test-hooks=. A fixed empty marker in
+the responder's private state directory arms one scan. The scanner atomically
+claims and removes it before sleeping, so the watcher started after setup
+cannot inherit the delay. Production builds contain no marker check or delay.
+
+* Code changes
+
+** One-shot scanner delay
+
+=src/scan.rs= adds a fixed, test-feature-gated delay at the real regular-file
+capture boundary:
+
+#+begin_src rust
+#[cfg(feature = "e2e-test-hooks")]
+if slow_scan {
+    std::thread::sleep(E2E_SCAN_ENTRY_DELAY);
+}
+let input = open_regular_nofollow(root_dir, &relative)?;
+#+end_src
+
+Rust's =#[cfg(...)] attribute removes the guarded statement from builds where
+the Cargo feature is disabled. The =if= therefore has no runtime production
+branch. =Duration= gives the delay a typed unit, and the =?= operator returns
+an error immediately while preserving its context instead of requiring nested
+error-handling control flow.
+
+The marker is claimed before validation:
+
+#+begin_src rust
+match std::fs::rename(&marker, &claimed) {
+    Ok(()) => {}
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+    Err(error) => return Err(error).context("claiming E2E slow-scan marker"),
+}
+let metadata = std::fs::symlink_metadata(&claimed)?;
+if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 0 {
+    anyhow::bail!("E2E slow-scan marker is not an empty regular file");
+}
+#+end_src
+
+The =match= exhaustively distinguishes a successful atomic rename, an unarmed
+scan, and a real filesystem error. Its guarded =Err= arm handles only
+=NotFound=. =symlink_metadata= inspects a link itself instead of following its
+target. The accepted marker is consequently an empty regular non-symlink with
+no peer-controlled path, content, or duration.
+
+** Public-command harness support
+
+=tests/e2e/harness/peer.rs= factors daemon startup into =managed_containers=,
+adds the narrow marker-arm operation, and centralizes the primary-share
+=sync add= command in an observed variant:
+
+#+begin_src rust
+let output = self.bounded_flocal_raw(&arguments, SLOW_SCAN_COMMAND_DEADLINE)?;
+reject_target_timeout(&output, &arguments, SLOW_SCAN_COMMAND_DEADLINE)?;
+if !output.status.success() {
+    return Err(self.fail(format!(
+        "{}: flocal {} failed: {}",
+        self.alias,
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    )));
+}
+Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+#+end_src
+
+The distinct 45-second command backstop leaves room for the intended
+32-second scan while still bounding a wedged test. =String::from_utf8_lossy=
+keeps diagnostics readable even if a child process emits invalid UTF-8;
+=into_owned= returns an independent =String= after the process output is
+dropped. The existing unobserved helper delegates to this method, so there is
+only one construction of the public CLI arguments.
+
+** Docker regression scenario
+
+=tests/e2e/scenarios/syncing.rs= invokes =flocal sync add ... --yes= through
+the managed containers and checks elapsed time, repeated progress, and final
+tree equality:
+
+#+begin_src rust
+let reports = stderr.matches("remote scan in progress").count();
+anyhow::ensure!(
+    reports >= 3,
+    "expected repeated remote scan progress, got {reports} reports in: {stderr}"
+);
+e2e::assert_trees_equal(&a, &b)
+#+end_src
+
+=ensure!= is an =anyhow= macro that returns a descriptive error when its
+condition is false. Counting at least three messages pins repeated liveness,
+not a single frame that happens to arrive near the timeout. The existing tree
+comparison then proves that the command did not merely stay alive; it finished
+the initial synchronization correctly.
+
+* Difficult parts
+
+The failure depends on silence at a process boundary rather than overall work
+duration. Generating thousands of real files would be machine-dependent and
+slow. Sleeping once for more than 30 seconds would correctly time out even on
+version 7 because no truthful progress was made. Four eight-second capture
+delays create three real, separately observed progress opportunities while the
+total scan still crosses the unchanged deadline.
+
+The harness also needed two distinct timeout meanings. The product's
+30-second no-byte deadline is what the old version must hit. The test runner's
+45-second backstop exists only to stop a wedged command. A baseline failure is
+accepted only when the product exits on its own with =peer protocol read timed
+out=, never when the outer =timeout= command returns 124 or 137.
+
+* Validation and review
+
+The exact scenario was run against pre-fix commit =d3a4f28= with only the
+test hook and harness support added. The public command exited after 30.6
+seconds with:
+
+#+begin_example
+flocal: scanning local files
+flocal: waiting for the remote file scan
+flocal: peer protocol read timed out
+#+end_example
+
+The same scenario on current protocol v7 passed in 35.92 seconds. It crossed
+the 30-second boundary, observed at least three =remote scan in progress=
+messages, and ended with equal trees. The marker's focused unit test also
+passes and verifies one-shot behavior plus rejection of a symlink without
+changing its target.
+
+The complete =make check= gate passed. Whole-project line coverage was 91.92%
+(21,256 of 23,124 executable lines), and changed executable-line coverage was
+93.94% (31 of 33), both above the required 90%. It included 110 library tests,
+80 CLI tests, the integration suites, 27 Emacs tests, formatting, and Clippy
+with warnings denied.
+
+The isolated full =make e2e= selection passed all 59 selected scenarios in
+387.48 seconds, including the new long-scan case. An earlier concurrent run was
+invalidated when a separate reviewer invocation started another E2E process;
+the harness's startup sweep deliberately removed the first process's labeled
+containers. Running the suite alone removed that infrastructure interference.
+
+One complete code-review round covered correctness and error handling,
+interfaces and readability, concurrency and liveness, design adherence,
+simplicity and shared logic, filesystem correctness, Linux and macOS fit,
+adversarial security, existing patterns, end-to-end intent, and documentation
+alignment. Every lens returned clear with no blocker, important, or minor
+finding. No review-driven code change was required.
+
+* Remaining limits
+
+The Docker scenario uses four delayed tiny files, not a large real directory.
+It deliberately tests the mechanism that matters: repeated protocol bytes
+during a remote scan whose total duration exceeds 30 seconds. Existing scanner
+and protocol tests retain coverage of ordinary file counts, byte progress,
+timeouts, and macOS-compatible code paths. The Docker runner itself remains
+Linux infrastructure.
+
+* Upgrade and testing note
+
+There is no new production behavior or state migration in this follow-up. The
+version-7 progress fix still requires both endpoints to run compatible current
+binaries. Developers can run the focused regression with:
+
+#+begin_src sh
+cargo test --test e2e scenarios::syncing::long_initial_remote_scan_stays_alive_with_progress -- --ignored --nocapture --test-threads=1
+#+end_src
+
+It takes about 36 seconds after the Docker image is built.
+
+* Historical supersessions
+
+This report directly supersedes only these newly invalidated statements:
+
+1. [[file:2026-09-08-one-shot-scan-progress-design.org::*5. Fast deterministic fail-to-pass test][One-shot remote-scan progress design, section 5]] rejected a dedicated delayed
+   Docker scenario. This follow-up adds a bounded four-file scenario because
+   the requested completion proof requires the installed process boundary.
+2. [[file:2026-09-08-one-shot-scan-progress-report.org::*Validation][One-shot remote-scan progress implementation report, Validation]] says no
+   artificial delay hook or long dedicated E2E was added. The narrow
+   compile-time-gated regression described here invalidates only that claim.
+
+No historical document is edited, and these references are intentionally one
+level deep.

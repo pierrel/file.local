@@ -1,0 +1,158 @@
+#+title: Initial remote-scan E2E regression design
+#+date: 2026-09-08
+#+status: accepted
+
+* 1. Outcome
+
+Prove the reported initial-sync failure at the real Docker, SSH, process, and
+protocol boundary before considering the existing version-7 progress fix
+complete. The regression is deliberately small: it delays four tiny responder
+files, not thousands of files or a large transfer. Its responder scan lasts
+just over the unchanged 30-second no-byte limit; current code must complete
+because it emits real scan progress, while the pre-fix code must time out.
+
+* 2. User flow
+
+1. The E2E scenario creates two ordinary synthetic roots, initializes the
+   endpoints needed for a public =flocal sync add= initial relationship, and
+   writes four distinct small regular files only on the responder.
+2. Before the command starts, the harness arms a responder-private E2E scan
+   delay marker. It invokes the public =flocal sync add ... --yes= path, not a
+   unit-level protocol surrogate or an in-process socket pair.
+3. The responder waits eight seconds for each of the four regular-file
+   captures. Its total real scanner work is at least 32 seconds. On version 7,
+   the first nonzero scan report follows each delayed capture, so each observed
+   no-byte interval is about eight seconds, below 30 seconds. Four entries
+   produce three nonterminal progress reports before the final capture, proving
+   repeated liveness rather than merely one lucky frame near the deadline.
+4. The current scenario asserts successful initial sync, the expected remote
+   scan-progress output, and equal final trees. Existing initial-completion
+   coverage remains the authority for the delayed =Connected= contract.
+
+The added scenario therefore costs roughly 35 seconds of E2E wall time,
+including process overhead, and transfers only four tiny objects.
+
+* 3. Concrete interfaces
+
+1. Add an =e2e-test-hooks=-gated scan hook in =src/scan.rs=, adjacent to the
+   regular-file capture path. A responder-local, fixed-name marker under its
+   private state directory enables a fixed eight-second delay once per regular
+   file after that root entry has been examined and before its capture reads.
+   The production build has no marker lookup, delay, environment variable, or
+   protocol change.
+2. Keep the marker capability narrow: the harness creates it only in the
+   responder test container's private state directory. The scan atomically
+   renames the fixed marker to a fixed claimed name, checks the claim with
+   =symlink_metadata=, accepts only an empty regular non-symlink, removes it,
+   and retains the enabled delay in memory for that scan. This makes the hook
+   one-shot so the managed watch started after =sync add= cannot inherit the
+   delay. No path, content, or duration is supplied by the peer. A malformed
+   marker is a local test error, not a synchronization behavior. A focused
+   test must reject a symlink marker without following its target.
+3. Add one named =Peer= harness primitive that arms this marker on a selected
+   peer. It must use only the harness's existing container command boundary;
+   scenarios do not know the state-directory spelling or marker internals.
+   Add a primary-share observed =sync add= primitive that runs the public
+   command behind a distinct 45-second target-command backstop, returns its
+   captured stderr, and is used by the scenario to assert =remote scan in
+   progress=. It must not reuse the existing 30-second setup-command deadline,
+   which would kill the intended 32-second success. As with other bounded
+   harness commands, exit 124 or 137 is an infrastructure-style test failure;
+   the pre-fix product instead exits on its own at the 30-second protocol
+   deadline. The existing unobserved primitive may delegate to the observed
+   one so command construction remains single-sourced.
+4. Add one ignored Docker scenario in =tests/e2e/scenarios/syncing.rs=. It uses
+   the public command and existing tree assertions. The scenario remains a
+   normal passing test on current main, so =make e2e= selects it with ordinary
+   scenarios.
+5. Do not add a production delay option, a test-only wire frame, a different
+   timeout, a 5,000-file fixture, or a long special Docker command. The
+   existing Docker image already compiles =e2e-test-hooks=.
+
+* 4. Exact fail-to-pass validation
+
+The committed test is a plain success scenario because current main already
+contains the fix. Establish its failure proof before landing it as follows:
+
+1. Create a temporary worktree at =d3a4f28=. Prepare a minimal test-only patch
+   based on that tree containing the same E2E-only marker hook, harness arm
+   primitive, and scenario, with no protocol/progress implementation changes.
+2. Run only that ignored scenario under Docker with =--nocapture=. The scenario
+   still expects a successful =sync add=, so its process-boundary command fails
+   on the old responder after about 30 seconds. Preserve the test log and
+   require =peer protocol read timed out= in it. A different error is not a
+   valid baseline reproduction.
+3. Apply the same test/hook shape to current main, without a =known_failure=
+   wrapper, and run the same selected ignored scenario. It must exit zero,
+   show at least one truthful remote scan-progress line, and prove identical
+   final trees. This is the pass half of the same product boundary.
+4. Run the ordinary full =make e2e= suite after the selected test. The new
+   scenario adds about 35 seconds to the normal suite; there is no second
+   baseline run in CI. The baseline worktree run is release-validation evidence
+   for this already-fixed objective, not a permanent duplicate CI job.
+
+The latest successful main E2E job completed in 13 minutes 16 seconds. The
+added scenario therefore has observed room rather than relying on a guessed
+CI budget. If the actual PR job reaches its hard timeout, the user's stated
+fallback permits abandoning this Docker scenario and retaining the existing
+deterministic in-process proof; until that happens, the active objective calls
+for attempting the process-boundary reproduction.
+
+This preserves the repository's fail-to-pass intent without committing an
+inverted =known_failure= test that would fail on the already-correct head.
+
+* 5. Failure, timing, and security boundaries
+
+- The hook delays only scanner regular-file work. It does not write a timer
+  heartbeat, synthesize progress, change the 30-second no-byte limit, or alter
+  object hashing, capacity, source-snapshot checks, no-follow opens, or apply
+  behavior.
+- The first v7 scan progress can arrive after roughly eight seconds, then
+  repeats after each completed delayed capture. A blocking operation longer
+  than 30 seconds still yields the ordinary no-progress timeout, as intended.
+- The E2E marker is compile-time excluded from normal Linux and macOS builds.
+  Within the Docker image it is private to the target container and is not
+  peer-provided or synchronized. Atomic rename plus =symlink_metadata=
+  validation avoids following a symlink and gives only one scan the delay.
+- Four files at eight seconds creates scheduling room under the 30-second
+  limit while retaining a 32-second total and three repeated progress reports.
+  Two longer delays would prove only one intermediate frame; three entries
+  leave less timing margin. Do not lower the delay so far that the total falls
+  below the boundary, and do not raise file count or payload size merely to
+  imitate the observed 5,000-file tree.
+- Docker is Linux-only test infrastructure. The protocol/scan unit tests still
+  cover the supported macOS code paths; this scenario specifically proves the
+  installed SSH process boundary that they cannot.
+
+* 6. Acceptance criteria
+
+1. On the temporary =d3a4f28= worktree with only the test hook/scenario patch,
+   the selected test exits nonzero and its captured output contains exactly the
+   expected =peer protocol read timed out= diagnosis.
+2. On current main, the same scenario completes in normal success mode after
+   more than 30 seconds, prints remote scan progress, and has equal trees.
+3. Each planned responder progress interval is below 30 seconds; the test does
+   not depend on a larger timeout or a background daemon shortcut.
+4. The standard =make e2e= selection includes the test and the added CI time is
+   approximately 35 seconds. The full ordinary suite remains green.
+5. The only production-facing behavior asserted is the existing v7 progress
+   contract. The hook is absent without =e2e-test-hooks=, and no old dated
+   document is modified.
+
+* Historical supersessions
+
+This record directly supersedes only the narrow no-dedicated-E2E conclusions
+in today's earlier records:
+
+1. [[file:2026-09-08-one-shot-scan-progress-design.org::*5. Fast deterministic fail-to-pass test][One-shot remote-scan progress design, section 5]] rejected an artificial delay
+   hook and a dedicated Docker scenario because it considered the fast
+   in-process boundary sufficient. The observed objective now requires this
+   bounded process-boundary proof; it still rejects an oversized 5,000-file CI
+   scenario.
+2. [[file:2026-09-08-one-shot-scan-progress-report.org::*Validation][One-shot remote-scan progress implementation report, Validation]] records that no
+   artificial delay hook or long dedicated E2E was added. This follow-up adds
+   the narrowly bounded four-file regression and does not alter the reported
+   implementation's other conclusions.
+
+No historical document is edited, and these references do not chase any older
+history.

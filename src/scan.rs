@@ -9,6 +9,13 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use crate::model::{Entry, Record, RelativePath, ShareId};
 use crate::state::{State, file_record};
 
+#[cfg(feature = "e2e-test-hooks")]
+const E2E_SLOW_SCAN_MARKER: &str = ".e2e-slow-initial-scan";
+#[cfg(feature = "e2e-test-hooks")]
+const E2E_SLOW_SCAN_CLAIMED: &str = ".e2e-slow-initial-scan-claimed";
+#[cfg(feature = "e2e-test-hooks")]
+const E2E_SCAN_ENTRY_DELAY: Duration = Duration::from_secs(8);
+
 pub fn scan(
     state: &State,
     share: &ShareId,
@@ -170,6 +177,8 @@ fn scan_mode(
     advance_sequence: bool,
     progress: (Duration, &mut impl FnMut(ScanProgress) -> Result<()>),
 ) -> Result<(Vec<Record>, IgnoreMatcher)> {
+    #[cfg(feature = "e2e-test-hooks")]
+    let slow_scan = claim_e2e_slow_scan(state)?;
     let (cadence, report) = progress;
     let mut progress = ProgressReporter {
         progress: ScanProgress {
@@ -242,6 +251,10 @@ fn scan_mode(
                 Entry::Directory
             } else if metadata.is_file() {
                 progress.entry()?;
+                #[cfg(feature = "e2e-test-hooks")]
+                if slow_scan {
+                    std::thread::sleep(E2E_SCAN_ENTRY_DELAY);
+                }
                 let input = open_regular_nofollow(root_dir, &relative)?;
                 let (hash, size) = objects
                     .store_object_with_progress(state, input, &mut |bytes| progress.bytes(bytes))
@@ -368,6 +381,23 @@ fn scan_mode(
             scopes: loaded_scopes,
         },
     ))
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn claim_e2e_slow_scan(state: &State) -> Result<bool> {
+    let marker = state.dir.join(E2E_SLOW_SCAN_MARKER);
+    let claimed = state.dir.join(E2E_SLOW_SCAN_CLAIMED);
+    match std::fs::rename(&marker, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("claiming E2E slow-scan marker"),
+    }
+    let metadata = std::fs::symlink_metadata(&claimed)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 0 {
+        anyhow::bail!("E2E slow-scan marker is not an empty regular file");
+    }
+    std::fs::remove_file(claimed)?;
+    Ok(true)
 }
 
 struct IgnoreScope {
@@ -587,6 +617,25 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[cfg(all(feature = "e2e-test-hooks", unix))]
+    #[test]
+    fn e2e_slow_scan_marker_is_one_shot_and_rejects_a_symlink() -> Result<()> {
+        let temp = tempdir()?;
+        let state = State::open(temp.path().join("state"))?;
+        let marker = state.dir.join(E2E_SLOW_SCAN_MARKER);
+        fs::write(&marker, b"")?;
+        assert!(claim_e2e_slow_scan(&state)?);
+        assert!(!claim_e2e_slow_scan(&state)?);
+
+        let target = temp.path().join("target");
+        fs::write(&target, b"untouched")?;
+        std::os::unix::fs::symlink(&target, &marker)?;
+        let error = claim_e2e_slow_scan(&state).unwrap_err();
+        assert!(error.to_string().contains("not an empty regular file"));
+        assert_eq!(fs::read(target)?, b"untouched");
+        Ok(())
+    }
 
     #[test]
     fn scan_progress_counts_entries_and_actual_source_reads() -> Result<()> {
