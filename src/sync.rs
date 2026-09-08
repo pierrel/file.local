@@ -1291,7 +1291,7 @@ fn read_scan_snapshot_with_metadata_limit(
                 if control_frames > MAX_SCAN_CONTROL_FRAMES
                     || control_bytes > MAX_SCAN_CONTROL_BYTES
                 {
-                    bail!("scan progress exceeds session control limit");
+                    bail!("remote scan control exceeds session limit");
                 }
                 match prior_progress {
                     None if entries == 0 && bytes_read == 0 => {}
@@ -1320,7 +1320,7 @@ fn read_scan_snapshot_with_metadata_limit(
                 if control_frames > MAX_SCAN_CONTROL_FRAMES
                     || control_bytes > MAX_SCAN_CONTROL_BYTES
                 {
-                    bail!("scan progress exceeds session control limit");
+                    bail!("remote scan control exceeds session limit");
                 }
                 progress(ScanProgressEvent::Preparing);
             }
@@ -3598,7 +3598,7 @@ mod tests {
             read_scan_snapshot(&mut flooding.as_slice(), |_| {})
                 .unwrap_err()
                 .to_string()
-                .contains("session control limit")
+                .contains("scan control exceeds session limit")
         );
 
         let mut padded_flooding = Vec::new();
@@ -3615,7 +3615,7 @@ mod tests {
             read_scan_snapshot(&mut padded_flooding.as_slice(), |_| {})
                 .unwrap_err()
                 .to_string()
-                .contains("session control limit")
+                .contains("scan control exceeds session limit")
         );
 
         let mut padded_snapshot = Vec::new();

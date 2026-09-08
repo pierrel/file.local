@@ -214,7 +214,7 @@ backslashes and control characters larger on the wire, so the final helper
 budgets the serialized representation and the display layer terminal-escapes
 the received string.
 
-Seven local review rounds covered correctness, liveness, error paths,
+Eight local review rounds covered correctness, liveness, error paths,
 interfaces, readability, existing patterns, design adherence, simplicity,
 shared logic, cross-platform filesystem behavior, adversarial security, and
 documentation alignment. Findings fixed during those rounds included the
@@ -247,7 +247,7 @@ Fast regression coverage includes:
 - protocol version 7 encoding and mixed-version rejection;
 - the existing initial-sync and delayed-=Connected= behavior.
 
-The full local gate passed with 91.52% changed-line coverage and at least 90%
+The full local gate passed with 91.11% changed-line coverage and at least 90%
 whole-project coverage. It exercised all Rust targets and features, Clippy with
 warnings denied, formatting, the Emacs tests, the SSH process-boundary
 integration test, and the repository's other unit and integration suites. The
