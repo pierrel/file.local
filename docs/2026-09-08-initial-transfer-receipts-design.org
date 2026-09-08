@@ -124,11 +124,11 @@ boundary, and complete with equal trees.
    descriptor-aware =write_v1_message_until=; =main.rs= sends
    =TransferBatchEnd= by the same writer and same unchanged deadline.  It then
    reads exactly one receipt with a new narrowly exposed
-   =read_v1_message_until_with_len(reader, deadline, max_body)= using that
-   unchanged deadline and =max_body= set to 256 before writing another object.  No
-   chunk, partial write, partial read, or receipt renews this deadline.  Thus a
-   silent or deliberately trickle-reading responder cannot keep the connector
-   blocked in =send_object= indefinitely before a receipt boundary.
+   =read_v1_message_until_with_len(reader, deadline)= using that unchanged
+   deadline before writing another object.  No chunk, partial write, partial
+   read, or receipt renews this deadline.  Thus a silent or deliberately
+   trickle-reading responder cannot keep the connector blocked in
+   =send_object= indefinitely before a receipt boundary.
 
    The receipt counters must equal the connector's cumulative batches sent,
    rather than merely be monotonic.  A received =Error= is a peer transfer
@@ -140,16 +140,18 @@ boundary, and complete with equal trees.
    counters beside the existing transfer-limit accounting.  A valid batch end
    writes exactly one cumulative receipt, resets only the batch-local counters,
    and then resumes reading.  It does not scan, hash, or synthesize a timer
-   event.  The frame layer must read its raw declared length, reject a body
-   above 256 bytes, and only then deserialize each control message, so JSON
-   padding cannot evade the cap.  Expose only the two V1 length-returning
-   decoders required for this: =read_v1_message_with_len(reader, max_body)=
-   for ordinary =Read= callers and
-   =read_v1_message_until_with_len(reader, deadline, max_body)= for
-   descriptor/deadline callers.  They return =(message, declared_body_bytes)=
-   only after that pre-decode check; both retain the existing pre-decode 2-MiB
-   frame limit.  The branch which serves objects to the connector is unchanged:
-   the connector is already reading continuously while receiving that direction.
+   event.  Expose only the two V1 length-returning decoders required for this:
+   =read_v1_message_with_len(reader)= for ordinary =Read= callers and
+   =read_v1_message_until_with_len(reader, deadline)= for descriptor/deadline
+   callers.  Each applies the existing 2-MiB pre-decode frame ceiling, then
+   returns =(message, declared_body_bytes)= so its caller applies the cap for
+   the decoded variant.  JSON padding is therefore visible and rejected even
+   though the tagged V1 enum cannot choose a variant-specific raw limit before
+   decoding.  In this receipt-only phase, =TransferBatchEnd= and
+   =TransferReceipt= are at most 256 declared bytes; a peer =Error= is allowed
+   only up to the separately bounded 4-KiB one-shot-error encoding.  The branch
+   which serves objects to the connector is unchanged: the connector is already
+   reading continuously while receiving that direction.
 
 5. In =src/sync.rs=, add =apply_complete_plan_with_progress= and thread a
    small completion callback through the existing
@@ -185,38 +187,53 @@ boundary, and complete with equal trees.
 6. On the connector, extend the existing post-=Done= read loop to accept only
    strictly increasing, nonzero =ApplyProgress.records= values before the
    existing terminal response.  Each value is at most the validated plan's
-   record count.  It uses the length-returning deadline decoder with its
-   256-byte pre-decode body limit.  At most 1,024 apply-progress frames are
-   accepted, and progress after =Applied= or a head chunk is a protocol error.
-   A local five-second logger may suppress display while it still validates and
-   drains every frame, so accepted frames cannot flood foreground output; they
-   do not mutate local records or acknowledge heads.
+   record count.  Its post-=Done= grammar is
+   =ApplyProgress* (Error | HeadChunk* Applied)=, with progress forbidden after
+   the first head.  Each loop read first uses the 2-MiB global ceiling and
+   returns the declared body size; it then permits =ApplyProgress= and
+   =Applied= only up to 256 bytes, =Error= only up to the bounded 4-KiB
+   one-shot-error encoding, and =HeadChunk= up to the existing =MAX_FRAME=.
+   A head chunk is still checked against the existing per-frame record shape,
+   cumulative =MAX_RECORDS_PER_SESSION=, and metadata-byte limits before it is
+   retained.  This keeps a valid five-thousand-record terminal manifest legal
+   while detecting padding after decode.  At most 1,024 apply-progress frames
+   are accepted.  A local five-second logger may suppress display while it
+   still validates and drains every frame, so accepted frames cannot flood
+   foreground output; they do not mutate local records or acknowledge heads.
 
-7. Factor local expiry cleanup into a phase-aware =Remote= helper used by the
-   whole transfer-batch send/receipt phase and apply-progress reads.  On a
-   bounded write or receipt-read expiry it kills and reaps SSH and returns
-   =stopped sending or receiving remote file-transfer batch progress before
-   the peer protocol deadline=; on apply-read expiry it returns =stopped
-   receiving remote apply progress before the peer protocol deadline=.  Each
-   may append bounded remote stderr, but neither routes through
-   =finish_after_error= nor appends the connector-caused SIGKILL status.  A
-   clean, bounded peer =Error= retains its peer-error wording.
+7. Make deadline expiry typed at the framing boundary.  The descriptor-aware
+   read/write helpers return a narrow =sync::ProtocolDeadlineExpired= only
+   when their fixed deadline actually expires; they preserve an OS write error
+   such as =EPIPE=, an object-read error, or malformed JSON as its original
+   error.  A phase-aware =Remote= helper downcasts only that type.  It kills
+   and reaps SSH, then reports =stopped sending or receiving remote
+   file-transfer batch progress before the peer protocol deadline= for a
+   transfer-batch expiry or =stopped receiving remote apply progress before the
+   peer protocol deadline= for an apply-read expiry.  It may append bounded
+   remote stderr, but neither route goes through =finish_after_error= nor
+   appends the connector-caused SIGKILL status.  There is no string matching or
+   elapsed-time inference.  A clean, bounded peer =Error= retains its peer-error
+   wording.
 
 * 4. Bounded hostile-peer behavior and failure modes
 
-- The existing 2-MiB pre-decode frame cap remains.  A
-  =TransferBatchEnd=, =TransferReceipt=, or =ApplyProgress= raw declared body is capped at
-  256 raw declared bytes *before deserialization*.  The narrowly exposed
-  length-returning decoders report that declared body length even when JSON
-  would otherwise accept padding.  The connector accepts at most 2,048
-  receipts and 1,024 apply-progress frames per one-shot session; the responder
-  enforces the corresponding count before writing another frame.  With the
-  default 10-GiB transfer limit, 1,024-object and 16-MiB boundaries require at
-  most 1,617 batches (977 count-driven plus 640 byte-driven), so valid
-  default-limit work remains below the cap.  A locally configured larger
-  transfer allowance does not silently create an unlimited keepalive channel:
-  a session needing more receipts fails clearly before exceeding the fixed
-  control-frame cap.
+- The existing 2-MiB =MAX_FRAME= ceiling is the only pre-decode bound for this
+  tagged V1 enum.  The narrowly exposed length-returning decoders report the
+  raw declared body length alongside the decoded message, so JSON padding is
+  rejected by the receiver's decoded-variant limit rather than overlooked.
+  =TransferBatchEnd=, =TransferReceipt=, =ApplyProgress=, and =Applied= are
+  each limited to 256 bytes; every version-8 one-shot =Error= is serialized
+  through a byte-safe 4-KiB truncator and the receiver enforces that 4-KiB
+  declared-length limit.  =HeadChunk= retains =MAX_FRAME=, its established
+  record-shape bound, cumulative =MAX_RECORDS_PER_SESSION=, and metadata-byte
+  accounting.  The connector accepts at most 2,048 receipts and 1,024
+  apply-progress frames per one-shot session; the responder enforces the
+  corresponding count before writing another frame.  With the default 10-GiB
+  transfer limit, 1,024-object and 16-MiB boundaries require at most 1,617
+  batches (977 count-driven plus 640 byte-driven), so valid default-limit work
+  remains below the cap.  A locally configured larger transfer allowance does
+  not silently create an unlimited keepalive channel: a session needing more
+  receipts fails clearly before exceeding the fixed control-frame cap.
 - Every receipt is caused by a connector-supplied, validated batch boundary;
   the responder cannot send unsolicited receipts and the connector cannot
   cause one per object.  The connector validates exact cumulative counters and
@@ -272,9 +289,11 @@ and object-state tests run on both supported platforms.
    timing holds, at least three =remote file transfer in progress= lines, at
    least three =remote apply in progress= lines, and equal trees.  Captured
    stdout must contain exactly the normal final =Connected ...= line; stderr
-   must contain none.  Retain the existing delayed-=Connected= CLI contract
-   test to prove that line is emitted only after final completion, not merely
-   present in a completed process capture.  A separate focused recovery
+   must contain no =Connected= line (it normally contains the expected progress
+   lines).  Add a controlled process-boundary delayed-=Connected= test, reusing
+   the current harness where possible: keep final initial completion pending
+   while observing stdout and prove it has no =Connected=, then release that
+   completion and prove exactly one normal final line.  A separate focused recovery
    scenario creates an incomplete initial installation with the existing
    process-interruption harness, then invokes the established =flocal sync
    PATH --yes= route and proves it settles without deleting state or inventing
@@ -290,10 +309,12 @@ and object-state tests run on both supported platforms.
    out-of-order/duplicate objects; unsolicited, malformed, padded, oversized,
    over-cap, and counter-mismatching receipts; exact request-order validation;
    valid completed-record progress; zero, repeated, regressing, out-of-range,
-   post-terminal, padded, and over-cap apply progress; and transfer/session-
-   limit interaction.  Apply tests prove the callback follows durable record
+   post-terminal, padded, and over-cap apply progress; a large legal
+   =HeadChunk= after accepted apply progress; and transfer/session-limit
+   interaction.  Apply tests prove the callback follows durable record
    completion, a callback write failure leaves the durable intent recoverable,
-   and invalidation emits no completion for its failing record.
+   and invalidation emits no completion for its failing record.  Include
+   bounded one-shot =Error= serialization and receive-limit tests.
 4. Add real Unix-stream tests for a whole descriptor-aware batch phase.  A
    peer which never reads must make a large =send_object_until= batch expire on
    its one scaled deadline before any receipt is possible.  A peer which
@@ -303,8 +324,10 @@ and object-state tests run on both supported platforms.
    deadline over multiple frames, and succeed. Pair each with a silent-phase
    test that returns its truthful phase diagnostic and verifies no
    locally-caused exit-status suffix.  Add raw-length padding tests for both
-   direction-specific control readers. Keep the existing scan-progress timeout
-   test unchanged.
+   direction-specific control readers.  Add focused typed-error tests proving
+   only =ProtocolDeadlineExpired= selects phase timeout cleanup while =EPIPE=,
+   local object-read failure, and malformed JSON retain their real causes.
+   Keep the existing scan-progress timeout test unchanged.
 5. Run the focused promoted Docker scenario, normal =make e2e= selection,
    =make check= (including whole-project and changed-line coverage), formatting
    and Clippy, Linux CI Docker coverage, and macOS native tests.  Update
