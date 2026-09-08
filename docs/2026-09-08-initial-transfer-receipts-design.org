@@ -46,11 +46,13 @@ not a speculative extension of the transfer fix.
 2. When the responder's validated plan needs connector objects, it sends its
    existing ordered =Need { hashes }=.  The connector sends those objects in
    bounded batches instead of one unbroken stream.
-3. After each complete batch, the connector sends =TransferBatchEnd= and waits
-   for the responder's exact cumulative =TransferReceipt { objects, bytes }=.
-   The responder emits that receipt only after =receive_object_for_share= has
-   finished every object in the batch, including verification and its durable
-   receiving/verified state transition.
+3. Each nonempty batch is one fixed, bounded phase: the connector sends every
+   object and =TransferBatchEnd=, then waits for the responder's exact
+   cumulative =TransferReceipt { objects, bytes }=.  The responder emits that
+   receipt only after =receive_object_for_share= has finished every object in
+   the batch, including verification and its durable receiving/verified state
+   transition.  A peer which stops reading therefore has the same truthful
+   phase deadline as a peer which stops replying.
 4. The connector prints a rate-limited foreground line only from an accepted
    receipt, for example =flocal: remote file transfer in progress: 2048
    objects, 2.0 KiB received=.  This says what is known: the remote peer
@@ -89,39 +91,65 @@ boundary, and complete with equal trees.
    the current version handshake and tells the user to upgrade both peers. V2
    persistent watch remains version 7 and its wire family is untouched.
 
-2. In =src/sync.rs=, add one shared, internal batch-boundary helper.  A batch
-   contains at most 1,024 objects or 16 MiB of declared validated object size,
-   whichever is reached first; an oversized single object forms its own batch.
-   The final nonempty remainder is a batch.  The same helper is used by the
-   connector sender and responder validator, so a peer cannot choose tiny
-   batches to manufacture receipt traffic.  Before its first =ObjectStart=,
-   the connector plans the complete ordered request with that helper and
-   rejects a request requiring more than 2,048 receipts; the responder
-   independently enforces the same count while receiving.
+2. Keep batch policy private to =src/main.rs=: both the connector sender and
+   =serve_sync= receiver already live there.  One private
+   =TransferBatchState= primitive consumes the ordered validated
+   =(hash, size)= request, exposes the current batch boundary, and tracks the
+   expected cumulative object and byte totals.  A batch contains at most
+   1,024 objects or 16 MiB of declared validated object size, whichever is
+   reached first; an oversized single object forms its own batch, and the
+   final nonempty remainder is a batch.  The connector plans that same
+   ordered request before its first =ObjectStart= and rejects more than 2,048
+   receipts; the responder independently advances the same state while
+   receiving.  It is not a public =sync.rs= API.
 
    The responder's ordered =Need= is already the connector's send order.  In
    =serve_sync= replace the unordered post-plan requested-input map with an
    ordered queue of expected =(hash, size)= values.  Each =ObjectStart= must
    match its queue head and the existing size and total-transfer checks still
    run.  The receiver therefore knows exactly when a batch must end.  It
-   rejects an early, empty, late, or extra =TransferBatchEnd=, an object after a
-   due boundary, a receipt in the wrong direction, and =Done= before the final
-   required boundary.  This is a narrow tightening: the existing connector
-   already sends the responder's requested hashes in order.
+   rejects an early, empty, late, or extra =TransferBatchEnd=, an object after
+   a due boundary, a receipt in the wrong direction, and =Done= before the
+   final required boundary.  An explicit empty =Need= has no batches and no
+   receipts: the connector writes =Done= immediately and the responder
+   accepts only that transition before verification/apply.  This is a narrow
+   tightening: the existing connector already sends the responder's requested
+   hashes in order.
 
-3. In =src/main.rs=, after each connector batch write, read exactly one
-   =TransferReceipt= from =Remote.output= before writing another object.  Its
-   counters must equal the connector's cumulative batches sent, rather than
-   merely be monotonic.  A received =Error= is a peer transfer failure; any
-   other V1 message is a protocol error.  A small local receipt-reporter owns
-   the five-second stderr cadence and never alters protocol cadence or state.
+3. In =src/main.rs=, every nonempty batch gets one deadline at its first
+   =ObjectStart=: =min(session_deadline, now + 30 seconds)=.  Add the narrow
+   public =sync::send_object_until(state, hash, writer: &impl AsFd, deadline)=
+   for the existing verified-object framing only.  It sends every
+   =ObjectStart=, =ObjectChunk=, and =ObjectEnd= through the existing
+   descriptor-aware =write_v1_message_until=; =main.rs= sends
+   =TransferBatchEnd= by the same writer and same unchanged deadline.  It then
+   reads exactly one receipt with a new narrowly exposed
+   =read_v1_message_until_with_len(reader, deadline, max_body)= using that
+   unchanged deadline and =max_body= set to 256 before writing another object.  No
+   chunk, partial write, partial read, or receipt renews this deadline.  Thus a
+   silent or deliberately trickle-reading responder cannot keep the connector
+   blocked in =send_object= indefinitely before a receipt boundary.
+
+   The receipt counters must equal the connector's cumulative batches sent,
+   rather than merely be monotonic.  A received =Error= is a peer transfer
+   failure; any other V1 message is a protocol error.  A small local
+   receipt-reporter owns the five-second stderr cadence and never alters
+   protocol cadence or state.
 
 4. In responder =serve_sync=, retain cumulative received-object and byte
    counters beside the existing transfer-limit accounting.  A valid batch end
    writes exactly one cumulative receipt, resets only the batch-local counters,
    and then resumes reading.  It does not scan, hash, or synthesize a timer
-   event.  The branch which serves objects to the connector is unchanged: the
-   connector is already reading continuously while receiving that direction.
+   event.  The frame layer must read its raw declared length, reject a body
+   above 256 bytes, and only then deserialize each control message, so JSON
+   padding cannot evade the cap.  Expose only the two V1 length-returning
+   decoders required for this: =read_v1_message_with_len(reader, max_body)=
+   for ordinary =Read= callers and
+   =read_v1_message_until_with_len(reader, deadline, max_body)= for
+   descriptor/deadline callers.  They return =(message, declared_body_bytes)=
+   only after that pre-decode check; both retain the existing pre-decode 2-MiB
+   frame limit.  The branch which serves objects to the connector is unchanged:
+   the connector is already reading continuously while receiving that direction.
 
 5. In =src/sync.rs=, add =apply_complete_plan_with_progress= and thread a
    small completion callback through the existing
@@ -133,71 +161,86 @@ boundary, and complete with equal trees.
    record, a failed record, or an invalidated record.
 
    The durable install intent stays in place until the existing final
-   =finish_install= transaction.  If writing a progress frame fails after a
-   callback, return that write error directly: do not run ordinary local-error
-   recovery or retire the intent.  The already durable paths and intent are
-   then recovered by the established interrupted-install path, exactly as on a
-   process crash.  If =ApplyInvalidated= occurs, its existing recovery uses
-   the same completed baseline; no success frame is emitted for the invalidated
-   record and no =Applied= follows it.
+   =finish_install= transaction.  A callback failure is wrapped in the narrow
+   =sync::ApplyProgressWriteError=.  =serve_sync= recognizes that type and
+   returns it directly, without attempting its ordinary apply-failure
+   =Message::Error= write on the already failed output.  Ordinary apply errors
+   retain the existing peer =Error= path.  The already durable paths and intent
+   after a progress-write failure are recovered by the established
+   interrupted-install path, exactly as on a process crash.  If
+   =ApplyInvalidated= occurs, its existing recovery uses the same completed
+   baseline; no success frame is emitted for the invalidated record and no
+   =Applied= follows it.
 
-   At =serve_initial=, give that callback a five-second reporter which writes
-   =ApplyProgress= through =write_v1_message_until= using the responder's
-   existing absolute session deadline.  This keeps the new output bounded even
-   if a peer stops reading, while =serve_sync= unit callers retain a no-op
-   callback and need no descriptor abstraction.
+   =serve_initial= takes a shared =output: &impl AsFd=.  It makes one
+   =DirectWriter(output)= for ordinary sequential =serve_sync= output, and its
+   apply callback independently calls =write_v1_message_until(output, ...,
+   session_deadline)= on the same shared descriptor.  It then passes that
+   writer and callback to =serve_sync=.  No unsafe raw descriptor, =RefCell=,
+   or overlapping mutable borrow is needed; the calls are sequential and both
+   use the same capability.  This keeps new output bounded if a peer stops
+   reading.  Direct =serve_sync= Vec unit callers use a no-op callback or a
+   test closure and need no descriptor abstraction.
 
 6. On the connector, extend the existing post-=Done= read loop to accept only
    strictly increasing, nonzero =ApplyProgress.records= values before the
    existing terminal response.  Each value is at most the validated plan's
-   record count.  The raw declared body is capped at 256 bytes, at most 1,024
-   apply-progress frames are accepted, and progress after =Applied= or a head
-   chunk is a protocol error.  A local five-second logger may suppress display
-   while it still validates and drains every frame, so accepted frames cannot
-   flood foreground output; they do not mutate local records or acknowledge
-   heads.
+   record count.  It uses the length-returning deadline decoder with its
+   256-byte pre-decode body limit.  At most 1,024 apply-progress frames are
+   accepted, and progress after =Applied= or a head chunk is a protocol error.
+   A local five-second logger may suppress display while it still validates and
+   drains every frame, so accepted frames cannot flood foreground output; they
+   do not mutate local records or acknowledge heads.
 
-7. Factor the local timeout cleanup into a phase-aware =Remote= helper used by
-   transfer-receipt and apply-progress reads.  If either timed read expires,
-   it kills and reaps SSH but returns only =stopped receiving remote file
-   transfer progress before the peer protocol deadline= or =stopped receiving
-   remote apply progress before the peer protocol deadline= (plus bounded
-   remote stderr if any).  It must not route through =finish_after_error= or
-   append the connector-caused SIGKILL status.  A clean, bounded peer =Error=
-   retains its peer-error wording.
+7. Factor local expiry cleanup into a phase-aware =Remote= helper used by the
+   whole transfer-batch send/receipt phase and apply-progress reads.  On a
+   bounded write or receipt-read expiry it kills and reaps SSH and returns
+   =stopped sending or receiving remote file-transfer batch progress before
+   the peer protocol deadline=; on apply-read expiry it returns =stopped
+   receiving remote apply progress before the peer protocol deadline=.  Each
+   may append bounded remote stderr, but neither routes through
+   =finish_after_error= nor appends the connector-caused SIGKILL status.  A
+   clean, bounded peer =Error= retains its peer-error wording.
 
 * 4. Bounded hostile-peer behavior and failure modes
 
-- The existing 2-MiB pre-decode frame cap remains.  A decoded
-  =TransferBatchEnd=, =TransferReceipt=, or =ApplyProgress= body is capped at
-  256 raw declared bytes.  The connector accepts at most 2,048 receipts and
-  1,024 apply-progress frames per one-shot session; the responder enforces the
-  corresponding count before writing another frame.  With the default 10-GiB
-  transfer limit, 1,024-object and 16-MiB boundaries require at most 1,617
-  batches (977 count-driven plus 640 byte-driven), so valid default-limit work
-  remains below the cap.  A locally configured larger transfer allowance does
-  not silently create an unlimited keepalive channel: a session needing more
-  receipts fails clearly before exceeding the fixed control-frame cap.
+- The existing 2-MiB pre-decode frame cap remains.  A
+  =TransferBatchEnd=, =TransferReceipt=, or =ApplyProgress= raw declared body is capped at
+  256 raw declared bytes *before deserialization*.  The narrowly exposed
+  length-returning decoders report that declared body length even when JSON
+  would otherwise accept padding.  The connector accepts at most 2,048
+  receipts and 1,024 apply-progress frames per one-shot session; the responder
+  enforces the corresponding count before writing another frame.  With the
+  default 10-GiB transfer limit, 1,024-object and 16-MiB boundaries require at
+  most 1,617 batches (977 count-driven plus 640 byte-driven), so valid
+  default-limit work remains below the cap.  A locally configured larger
+  transfer allowance does not silently create an unlimited keepalive channel:
+  a session needing more receipts fails clearly before exceeding the fixed
+  control-frame cap.
 - Every receipt is caused by a connector-supplied, validated batch boundary;
   the responder cannot send unsolicited receipts and the connector cannot
   cause one per object.  The connector validates exact cumulative counters and
   the phase grammar.  Receipt and apply counters disclose only total object
   counts and bytes, never paths, names, hashes, root names, or state outside
   the share.
-- Receipts and completed-record frames refresh the same 30-second no-byte read
-  wait but never the absolute =FLOCAL_MAX_SESSION_SECONDS= deadline or the
-  existing transfer, metadata, record, authorization, object-hash, no-follow,
-  capacity, source-snapshot, install-intent, or final-transaction limits.  A
-  silent receiver or applier, malformed frame, wrong count, early/late batch
-  marker, duplicate request, or oversized control frame fails rather than
-  retaining a live session.
+- Each receipt and completed-record frame refreshes the established
+  30-second no-byte read wait but never the absolute
+  =FLOCAL_MAX_SESSION_SECONDS= deadline or the existing transfer, metadata,
+  record, authorization, object-hash, no-follow, capacity, source-snapshot,
+  install-intent, or final-transaction limits.  Separately, every nonempty
+  outbound connector batch has its fixed 30-second send-and-receipt deadline,
+  clamped to that same absolute deadline.  It covers every object and batch-end
+  write plus its receipt, and is never renewed by a chunk, partial write, or
+  trickle read.  A silent receiver or applier, malformed frame, wrong count,
+  early/late batch marker, duplicate request, or oversized control frame fails
+  rather than retaining a live session.
 - The responder's existing generic post-snapshot output writer is not
-  redesigned here.  The new receipt and apply report are sent only while the
-  connector is waiting and drains them; the apply report additionally has the
-  absolute-deadline writer described above.  They add no unsolicited output
-  stream or output-window flood.  A peer that stops reading can already block
-  an existing one-shot response write; making every legacy writer
-  deadline-aware remains a separate transport change.
+  redesigned here.  New receipts are written only at an accepted bounded
+  connector batch boundary, while the connector is already awaiting and
+  draining them; apply reports use the absolute-deadline writer described
+  above.  They add no unsolicited output stream or output-window flood.
+  Making every unrelated legacy one-shot response write deadline-aware remains
+  a separate transport change.
 - A single blocked object read, record installation, SQLite operation, or final
   install transaction can still produce no frame for 30 seconds.  That is
   intentionally a timeout, not a fictitious progress message.  In particular,
@@ -219,16 +262,31 @@ and object-state tests run on both supported platforms.
    failure).  The 5,000-file scenario must cross 30 seconds and match both
    =peer protocol read timed out= and the current cleanup suffix.  Any other
    error, an outer 5-minute target timeout, or a fast result fails the pin.
+   Replace the stderr-only observed-command helper with a narrow result that
+   retains exit status, stdout, and stderr.  The known failure asserts that
+   neither stream contains =Connected=, preserving the contract that an
+   incomplete initial installation is never presented as complete.
 2. Implement version 8, promote that identical Docker scenario by removing
    =known_failure=, retain its five-minute external safety deadline, and assert
    successful =sync add=, elapsed time above 120 seconds while the natural
    timing holds, at least three =remote file transfer in progress= lines, at
-   least three =remote apply in progress= lines, and equal trees.  It must not
-   use an artificial delay, a test-only wire frame, a raised product timeout,
-   or a background-daemon shortcut.
+   least three =remote apply in progress= lines, and equal trees.  Captured
+   stdout must contain exactly the normal final =Connected ...= line; stderr
+   must contain none.  Retain the existing delayed-=Connected= CLI contract
+   test to prove that line is emitted only after final completion, not merely
+   present in a completed process capture.  A separate focused recovery
+   scenario creates an incomplete initial installation with the existing
+   process-interruption harness, then invokes the established =flocal sync
+   PATH --yes= route and proves it settles without deleting state or inventing
+   a repair command.  The README acceptance update tells users that a truthful
+   timeout prints no =Connected= and to rerun that ordinary foreground sync
+   after connectivity is restored.  It must not use an artificial delay, a
+   test-only wire frame, a raised product timeout, or a background-daemon
+   shortcut.
 3. Add fast V1 unit tests for version-8 round trips and mixed-version
    rejection; valid one-object, count-boundary, byte-boundary, oversized-single
-   object, and final-short batch grammars; empty/early/late/extra batch ends;
+   object, final-short batch, and explicit empty-=Need= (zero batches,
+   zero receipts, immediate =Done=) grammars; empty/early/late/extra batch ends;
    out-of-order/duplicate objects; unsolicited, malformed, padded, oversized,
    over-cap, and counter-mismatching receipts; exact request-order validation;
    valid completed-record progress; zero, repeated, regressing, out-of-range,
@@ -236,17 +294,24 @@ and object-state tests run on both supported platforms.
    limit interaction.  Apply tests prove the callback follows durable record
    completion, a callback write failure leaves the durable intent recoverable,
    and invalidation emits no completion for its failing record.
-4. Add real Unix-stream timed-reader tests which separately send receipts and
-   apply progress below the scaled idle deadline, run beyond that deadline over
-   multiple frames, and succeed. Pair each with a silent-phase test that
-   returns its truthful timeout and verifies no locally-caused exit-status
-   suffix. Keep the existing scan-progress timeout test unchanged.
+4. Add real Unix-stream tests for a whole descriptor-aware batch phase.  A
+   peer which never reads must make a large =send_object_until= batch expire on
+   its one scaled deadline before any receipt is possible.  A peer which
+   trickle-reads chunks must also expire at that same fixed phase deadline,
+   proving partial write/read activity cannot renew it.  Separately send
+   receipts and apply progress below the scaled idle deadline, run beyond that
+   deadline over multiple frames, and succeed. Pair each with a silent-phase
+   test that returns its truthful phase diagnostic and verifies no
+   locally-caused exit-status suffix.  Add raw-length padding tests for both
+   direction-specific control readers. Keep the existing scan-progress timeout
+   test unchanged.
 5. Run the focused promoted Docker scenario, normal =make e2e= selection,
    =make check= (including whole-project and changed-line coverage), formatting
    and Clippy, Linux CI Docker coverage, and macOS native tests.  Update
    =README.org= in the implementation change to name explicit protocol 8,
-   upgrade-both-peers behavior, the transfer-progress line, and the truthful
-   local timeout.  Do not change dated historical documents.
+   upgrade-both-peers behavior, transfer/apply-progress lines, the truthful
+   local timeout with no premature =Connected=, and the ordinary =flocal sync
+   PATH --yes= recovery guidance.  Do not change dated historical documents.
 
 * 6. Alternatives rejected
 
