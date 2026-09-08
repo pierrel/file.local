@@ -10,19 +10,74 @@ use crate::harness as e2e;
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
 fn five_thousand_initial_changes_do_not_timeout_after_scan() -> Result<()> {
-    e2e::known_failure(|| {
-        let (a, b) = e2e::managed_containers()?;
-        a.write_numbered_files(5_000)?;
+    let (a, b) = e2e::managed_containers()?;
+    a.write_numbered_files(5_000)?;
 
-        let started = Instant::now();
-        let stderr = a.sync_add_large_observed_to(&b)?;
-        eprintln!(
-            "large initial sync completed in {:?}:\n{stderr}",
-            started.elapsed()
+    let started = Instant::now();
+    let (stdout, stderr) = a.sync_add_large_observed_to(&b)?;
+    let elapsed = started.elapsed();
+    eprintln!("large initial sync completed in {elapsed:?}:\n{stderr}");
+
+    anyhow::ensure!(
+        elapsed > Duration::from_secs(120),
+        "large initial sync did not cross the measured apply boundary: {elapsed:?}"
+    );
+    for phase in [
+        "remote file transfer in progress:",
+        "remote apply in progress:",
+        "local apply in progress:",
+    ] {
+        let reports = stderr.matches(phase).count();
+        anyhow::ensure!(
+            reports >= 3,
+            "expected repeated {phase} reports, got {reports} in: {stderr}"
         );
+    }
+    let connected: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("Connected "))
+        .collect();
+    anyhow::ensure!(
+        connected.len() == 1,
+        "expected exactly one final Connected line, got {connected:?} in: {stdout}"
+    );
+    anyhow::ensure!(!stderr.contains("Connected "), "{stderr}");
+    let a_status = a.status()?;
+    let b_status = b.status()?;
+    anyhow::ensure!(
+        a_status.initial_complete && !a_status.pending_install && !b_status.pending_install,
+        "large initial sync left incomplete state: connector={a_status:?}, responder={b_status:?}"
+    );
+    e2e::assert_trees_equal(&a, &b)
+}
 
-        e2e::assert_trees_equal(&a, &b)
-    })
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn connected_is_emitted_only_after_the_initial_apply_finishes() -> Result<()> {
+    let (a, b) = e2e::managed_containers()?;
+    a.write("held.txt", "not connected until both sides finish")?;
+    b.arm_apply_stops(1)?;
+
+    a.start_sync_add_captured_to(&b)?;
+    let stopped = b.wait_for_stopped_apply_process()?;
+    let stdout_while_applying = a.captured_sync_add_stdout()?;
+    anyhow::ensure!(
+        !stdout_while_applying.contains("Connected "),
+        "Connected was emitted while the responder apply was stopped: {stdout_while_applying}"
+    );
+
+    stopped.resume()?;
+    let (stdout, stderr) = a.wait_for_captured_sync_add()?;
+    anyhow::ensure!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("Connected "))
+            .count()
+            == 1,
+        "expected exactly one final Connected line in: {stdout}"
+    );
+    anyhow::ensure!(!stderr.contains("Connected "), "{stderr}");
+    e2e::assert_trees_equal(&a, &b)
 }
 
 #[test]

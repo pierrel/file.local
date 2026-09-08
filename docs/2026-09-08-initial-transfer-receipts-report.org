@@ -1,0 +1,254 @@
+#+title: Large initial synchronization timeout implementation report
+#+date: 2026-09-08
+#+status: implemented
+
+* What changed for the user
+
+A first synchronization with 5,000 small changed files used to look healthy
+through scanning and comparison, then fail while useful work was still happening:
+
+#+begin_example
+peer protocol read timed out
+remote exited with Some(ExitStatus(unix_wait_status(9)))
+#+end_example
+
+The transfer and both filesystem installations can each take longer than the
+30-second no-byte deadline.  They now produce bounded receipts for completed
+work.  A foreground run can show lines like:
+
+#+begin_example
+flocal: remote file transfer in progress: 2048 objects, 9.5 KiB received
+flocal: remote apply in progress: 2318 records completed
+flocal: local apply in progress: 2323 records completed
+#+end_example
+
+These are not time-based heartbeats.  Every number describes an object the peer
+has received and verified or a record already made visible and durable.  A
+truly stalled operation still times out.
+
+The command prints and flushes =Connected ...= only after both sides have
+applied the plan, exchanged their acknowledged heads, committed the session,
+and completed the managed-watch handoff.  A failed or interrupted installation
+prints no =Connected=.  Once the peer is reachable, rerunning =flocal sync PATH
+--yes= uses the existing durable recovery path.
+
+Both endpoints must run this version for an explicit sync.  The explicit V1
+wire protocol is now version 8.  Persistent watch remains protocol version 7
+in its separate wire family.
+
+* Final design
+
+** Transfer turns
+
+The connector used to write every requested object before reading from the
+responder.  With thousands of files, that made a healthy receiver
+indistinguishable from a dead one.  The connector now divides the responder's
+ordered object request at 1,024 objects or 16 MiB of declared content,
+whichever comes first.  A single larger object is its own batch.
+
+Each batch is one fixed-deadline turn:
+
+1. The connector writes the batch's object frames.
+2. It writes =TransferBatchEnd=.
+3. The responder verifies and durably records every object, then replies with
+   exact cumulative =TransferReceipt { objects, bytes }= counters.
+4. The connector validates those counters before starting another batch.
+
+The same deadline covers the whole turn.  Partial writes and a slowly dripped
+receipt cannot renew it.  There are at most 2,048 receipt turns per session.
+
+The private boundary calculation is deliberately small:
+
+#+begin_src rust
+for (index, (_, size)) in objects.iter().enumerate() {
+    if index > batch_start
+        && (index - batch_start == TRANSFER_BATCH_OBJECTS
+            || batch_bytes.saturating_add(*size) > TRANSFER_BATCH_BYTES)
+    {
+        ends.push(index);
+        batch_start = index;
+        batch_bytes = 0;
+    }
+    batch_bytes = batch_bytes.saturating_add(*size);
+}
+#+end_src
+
+=enumerate()= is a Rust iterator adapter which supplies each borrowed element
+and its index without copying the vector.  =saturating_add= clamps at the
+integer maximum instead of wrapping if hostile declared sizes overflow.  The
+boundary is recorded before adding the current object, so an object which
+would exceed a nonempty batch begins the next one.
+
+** Durable apply progress in both directions
+
+The responder applies its plan after the final transfer receipt.  Later, the
+connector applies its own plan after receiving the responder's =Applied=
+message.  Both were independently capable of exceeding the silent deadline,
+so the shared apply core accepts a callback used in either direction:
+
+#+begin_src rust
+sync_applied_record(root_dir, record)
+    .with_context(|| format!("making applied path durable: {}", record.path.display()))?;
+completed.push(record.clone());
+(options.progress)(completed.len() as u64).map_err(ApplyProgressWriteError)?;
+#+end_src
+
+The ordering is the contract.  The path is made durable first, then added to
+the recovery baseline, then reported.  If writing progress fails, the install
+intent remains and the already completed records remain recoverable.
+
+The callback has the Rust trait-object type =dyn FnMut(u64) -> Result<()>=.
+=FnMut= means it may update captured state, which the five-second reporter uses
+for its next report time and frame count.  A mutable trait-object reference
+lets ordinary, managed, responder, and connector callers share one apply loop
+without making the loop generic or duplicating it.  =map_err= changes only the
+callback error into the typed =ApplyProgressWriteError=; filesystem errors keep
+their existing types and recovery behavior.
+
+Incoming progress is checked by one validator shared by both directions:
+
+#+begin_src rust
+if records == 0 || records <= self.records || records > self.record_limit {
+    bail!("{source} apply progress is outside the expected record sequence");
+}
+self.frames += 1;
+if self.frames > MAX_APPLY_PROGRESS_FRAMES {
+    bail!("{source} apply progress exceeds session frame limit");
+}
+self.records = records;
+#+end_src
+
+This rejects zero, repeated, regressing, out-of-range, and excessive reports.
+The caller also rejects progress after terminal head data begins.  The control
+frame's declared encoded size is limited to 256 bytes, preventing harmless JSON
+padding from becoming an unbounded keepalive channel.
+
+** Deadline-aware framing and truthful errors
+
+=send_object_until= writes =ObjectStart=, every =ObjectChunk=, and =ObjectEnd=
+through the existing Unix-descriptor deadline primitive.  The read-side helper
+now also returns the declared frame length so callers can apply narrow limits
+after decoding the tagged message.  The universal pre-decode allocation limit
+remains 2 MiB; progress and receipt controls are limited to 256 bytes, errors
+to 4 KiB, and head chunks retain their existing larger limit and cumulative
+metadata accounting.
+
+Deadline expiry is represented by =ProtocolDeadlineExpired= rather than found
+by matching error text.  Rust's =std::error::Error= implementations allow
+=anyhow= to retain that concrete source through context.  The connector uses
+the type to select one of three useful diagnostics: transfer-turn silence,
+remote-apply silence, or inability to send local-apply progress.  It kills and
+reaps its SSH child but does not present that cleanup signal as a second remote
+failure.  OS errors such as a closed pipe keep their actual cause.
+
+** Final completion output
+
+The completion line now uses a locked stdout writer and propagates both write
+and flush failures:
+
+#+begin_src rust
+writeln!(
+    output,
+    "Connected {} to {}:{}",
+    escaped(&share.0),
+    escaped(&peer.host),
+    escaped(&bytes_path(&peer.remote_path).to_string_lossy())
+)?;
+output.flush()?;
+#+end_src
+
+The =?= operator returns early if the =io::Result= is an error and converts it
+into the function's =anyhow::Result=.  Explicit =flush()= matters when stdout is
+redirected and block-buffered.  It does not move the line earlier: the caller
+still reaches it only after successful synchronization completion.
+
+* Component-by-component changes
+
+- =src/sync.rs= advances only the explicit synchronization protocol to version
+  8, adds the three receipt/progress messages, exposes length-aware V1 readers,
+  adds fixed-deadline object writes and a typed deadline error, bounds one-shot
+  error encoding by bytes, and threads the completion callback through one
+  apply implementation.
+- =src/main.rs= plans and validates transfer turns, validates both directions
+  of apply progress, reports the three long-running phases, retains metadata
+  and frame caps, selects typed phase diagnostics, and flushes the final
+  connection line.
+- =tests/e2e/scenarios/syncing.rs= promotes the real 5,000-file public SSH
+  reproduction from expected failure to success and adds a controlled stopped-
+  apply test proving =Connected= is absent before completion.
+- =tests/e2e/harness/peer.rs= raises only the external safety backstop for the
+  measured large scenario to ten minutes, captures stdout and stderr
+  separately, exposes =initial_complete= from status, and supplies the
+  background-command observation used by the completion-order test.
+- =tests/protocol.rs= pins the version-8 wire value and the typed fixed-deadline
+  failure.
+- =README.org= documents progress meaning, upgrade requirements, recovery, and
+  final connection-output timing.
+
+* Difficult parts
+
+The first difficulty was locating the real silent boundary.  The original
+30-second failure happened near the end of object reception.  Raising a
+diagnostic deadline showed that all 5,000 objects arrived at about 36 seconds,
+but the responder then remained silent for more than another 120 seconds while
+installing them.  After responder progress was added, the exact scenario still
+exceeded its outer five-minute bound because the connector's later local apply
+had the same problem.  The protocol therefore needed truthful progress in
+both directions, not a larger timeout or one receiver-side heartbeat.
+
+The second difficulty was preserving recovery ordering.  Reporting a record
+before durability would make the peer trust work which could still disappear.
+Reporting after durability but before adding it to the recovery baseline would
+make a progress-write failure harder to recover.  Keeping the callback inside
+the existing apply core makes the required order structural.
+
+The third difficulty was distinguishing product failure from cleanup.  The
+=unix_wait_status(9)= text was the connector observing the SSH child it had
+killed after its own timeout.  Typed deadline sources now choose phase-specific
+cleanup, while unrelated failures remain unchanged.
+
+* Validation and review status
+
+The bug-first Docker scenario reproduced the exact failure on the prior
+protocol.  On the implementation it completed 5,000 real files through public
+=flocal sync add= in 370.65 seconds.  It emitted five transfer receipts,
+repeated progress throughout both applies, left =pending_install=false= on
+both endpoints, set connector =initial_complete=true=, produced equal trees,
+and emitted exactly one final =Connected= line.
+
+The controlled completion-order Docker scenario stopped the responder inside
+apply.  Captured stdout contained no =Connected= while stopped; after resume,
+the command completed with equal trees and exactly one flushed line.
+
+The Rust suite, Clippy with warnings denied, formatting, Makefile prefix test,
+and all 27 Emacs tests pass.  Coverage is 90.71% on changed executable lines
+and at least 90% project-wide.  The full Docker suite, independent local review
+lenses, installation, GitHub CI, and external review are recorded in the pull
+request once those gates complete.
+
+* Remaining limits and operations
+
+A single indivisible filesystem operation, object read, SQLite transaction, or
+final commit can still exceed 30 seconds without producing a truthful receipt.
+That remains a timeout by design.  Progress frames do not reveal paths or
+hashes and do not extend the absolute session duration.
+
+Upgrade both endpoints before starting another explicit synchronization.  If
+an older attempt left an install intent, do not delete state or re-pair the
+directories.  Rerun =flocal sync PATH --yes= after the peer is reachable.
+
+* Historical supersessions
+
+This implementation report directly supersedes only the claims newly changed
+by this work:
+
+1. [[file:2026-09-08-one-shot-scan-progress-report.org::*Final design][One-shot remote-scan progress report, Final design]] says the post-snapshot
+   transfer writer was not redesigned by that earlier fix.  Protocol 8 now
+   adds bounded transfer turns and durable apply progress for the measured
+   post-snapshot phases.
+2. [[file:2026-09-08-initial-scan-e2e-regression-design.org::*6. Acceptance criteria][Initial remote-scan E2E regression design, section 6]] limits that earlier
+   regression to version-7 remote-scan progress.  The promoted 5,000-file case
+   now also requires version-8 transfer and two-sided apply receipts.
+
+No historical dated document was edited, and these references intentionally do
+not chase documents superseded by those earlier records.

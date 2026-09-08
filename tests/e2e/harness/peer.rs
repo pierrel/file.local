@@ -14,9 +14,12 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const PROMPT_DEADLINE: Duration = Duration::from_secs(5);
 const SETUP_COMMAND_DEADLINE: &str = "30s";
 const SLOW_SCAN_COMMAND_DEADLINE: &str = "45s";
-const LARGE_INITIAL_SYNC_COMMAND_DEADLINE: &str = "5m";
+const LARGE_INITIAL_SYNC_COMMAND_DEADLINE: &str = "10m";
 const START_COMMAND_DEADLINE: &str = "5s";
 const TARGET_COMMAND_KILL_AFTER: &str = "1s";
+const SYNC_ADD_STDOUT: &str = "/home/peer/.flocal-sync-add.stdout";
+const SYNC_ADD_STDERR: &str = "/home/peer/.flocal-sync-add.stderr";
+const SYNC_ADD_STATUS: &str = "/home/peer/.flocal-sync-add.status";
 /// Where a started watcher records its pid inside the container. One watch
 /// per scenario container, so a fixed path suffices — and keeps the start
 /// command a constant string with nothing interpolated into it.
@@ -142,6 +145,8 @@ pub struct Status {
     pub removal_pending: bool,
     pub removal_error: Option<String>,
     pub entries: u64,
+    #[serde(default)]
+    pub initial_complete: bool,
     pub pending_install: bool,
     pub unsettled: Vec<Vec<u8>>,
     #[serde(default)]
@@ -1604,14 +1609,78 @@ impl Peer {
     }
 
     pub fn sync_add_observed_to(&self, other: &Peer) -> Result<String> {
-        self.sync_add_observed_to_with_deadline(other, SLOW_SCAN_COMMAND_DEADLINE)
+        let output = self.sync_add_observed_to_with_deadline(other, SLOW_SCAN_COMMAND_DEADLINE)?;
+        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
     }
 
-    pub fn sync_add_large_observed_to(&self, other: &Peer) -> Result<String> {
-        self.sync_add_observed_to_with_deadline(other, LARGE_INITIAL_SYNC_COMMAND_DEADLINE)
+    pub fn sync_add_large_observed_to(&self, other: &Peer) -> Result<(String, String)> {
+        let output =
+            self.sync_add_observed_to_with_deadline(other, LARGE_INITIAL_SYNC_COMMAND_DEADLINE)?;
+        Ok((
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
     }
 
-    fn sync_add_observed_to_with_deadline(&self, other: &Peer, deadline: &str) -> Result<String> {
+    pub fn start_sync_add_captured_to(&self, other: &Peer) -> Result<()> {
+        const SCRIPT: &str = "\
+: >\"$2\"
+: >\"$3\"
+rm -f -- \"$4\"
+/usr/bin/timeout --kill-after 1s 45s flocal sync add /home/peer/share \
+    --host \"$1\" --remote-path /home/peer/share --yes >\"$2\" 2>\"$3\"
+printf '%s\\n' \"$?\" >\"$4\"";
+        self.context.docker_ok(&[
+            "exec",
+            "-d",
+            "-u",
+            "peer",
+            &self.container.name,
+            "sh",
+            "-c",
+            SCRIPT,
+            "sh",
+            &other.alias,
+            SYNC_ADD_STDOUT,
+            SYNC_ADD_STDERR,
+            SYNC_ADD_STATUS,
+        ])?;
+        Ok(())
+    }
+
+    pub fn captured_sync_add_stdout(&self) -> Result<String> {
+        let output = self.exec_ok(&["cat", "--", SYNC_ADD_STDOUT])?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    pub fn wait_for_captured_sync_add(&self) -> Result<(String, String)> {
+        let status = self.poll_until("captured sync add did not finish", DEADLINE, |peer| {
+            let output = peer.exec_raw(&["cat", "--", SYNC_ADD_STATUS])?;
+            if !output.status.success() {
+                return Ok(None);
+            }
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<i32>()
+                .ok())
+        })?;
+        let stdout = self.captured_sync_add_stdout()?;
+        let stderr =
+            String::from_utf8_lossy(&self.exec_ok(&["cat", "--", SYNC_ADD_STDERR])?.stdout)
+                .into_owned();
+        anyhow::ensure!(
+            status == 0,
+            "{}: captured sync add exited {status}: {stderr}",
+            self.alias
+        );
+        Ok((stdout, stderr))
+    }
+
+    fn sync_add_observed_to_with_deadline(
+        &self,
+        other: &Peer,
+        deadline: &str,
+    ) -> Result<std::process::Output> {
         let arguments = [
             "sync",
             "add",
@@ -1632,7 +1701,7 @@ impl Peer {
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
-        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+        Ok(output)
     }
 
     pub fn arm_slow_initial_scan(&self) -> Result<()> {

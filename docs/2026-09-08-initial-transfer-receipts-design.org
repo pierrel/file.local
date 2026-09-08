@@ -104,9 +104,10 @@ connector bytes while each actual apply is in progress, cross the original
 
 2. Keep batch policy private to =src/main.rs=: both the connector sender and
    =serve_sync= receiver already live there.  One private
-   =TransferBatchState= primitive consumes the ordered validated
-   =(hash, size)= request, exposes the current batch boundary, and tracks the
-   expected cumulative object and byte totals.  A batch contains at most
+   =transfer_batch_ends= helper consumes the ordered validated =(hash, size)=
+   request and returns its batch boundaries; the connector tracks expected
+   cumulative object and byte totals while traversing those boundaries.  A
+   batch contains at most
    1,024 objects or 16 MiB of declared validated object size, whichever is
    reached first; an oversized single object forms its own batch, and the
    final nonempty remainder is a batch.  The connector plans that same
@@ -319,16 +320,11 @@ and object-state tests run on both supported platforms.
 
 * 5. Acceptance and fail-to-pass validation
 
-1. Strengthen the committed known failure before implementation.  Give the
-   harness's expected-failure wrapper a narrow expected-error predicate (its
-   current unrestricted form cannot distinguish this timeout from an unrelated
-   failure).  The 5,000-file scenario must cross 30 seconds and match both
-   =peer protocol read timed out= and the current cleanup suffix.  Any other
-   error, an outer 10-minute target timeout, or a fast result fails the pin.
-   Replace the stderr-only observed-command helper with a narrow result that
-   retains exit status, stdout, and stderr.  The known failure asserts that
-   neither stream contains =Connected=, preserving the contract that an
-   incomplete initial installation is never presented as complete.
+1. The committed known failure and its baseline run establish the exact public
+   symptom: the 5,000-file scenario crosses 30 seconds and fails with =peer
+   protocol read timed out= plus the connector-caused cleanup suffix.  The
+   promoted test retains exit status, stdout, and stderr and treats any
+   nonzero result or outer ten-minute target timeout as a failure.
 2. Implement version 8, promote that identical Docker scenario by removing
    =known_failure=, raise its external safety deadline to ten minutes for the
    measured two-sided apply, and assert
@@ -350,47 +346,29 @@ and object-state tests run on both supported platforms.
    hold final installation/apply, poll that file and prove it has no
    =Connected=, then release completion and poll for exactly one normal final
    line.  Add a focused injected-writer test that a flush error from this
-   private output path reaches the command result.  A separate focused recovery
-   scenario creates an incomplete initial installation with the existing
-   process-interruption harness, then invokes the established =flocal sync
-   PATH --yes= route and proves it settles without deleting state or inventing
-   a repair command.  The README acceptance update tells users that a truthful
+   private output path reaches the command result.  Focused apply tests prove a
+   failed progress write retains a recoverable durable install intent, and the
+   existing interruption-recovery coverage continues to prove that the next
+   ordinary sync/watch settles that state.  The README acceptance update tells users that a truthful
    timeout prints no =Connected= and to rerun that ordinary foreground sync
    after connectivity is restored.  It must not use an artificial delay, a
    test-only wire frame, a raised product timeout, or a background-daemon
    shortcut.
-3. Add fast V1 unit tests for version-8 round trips and mixed-version
-   rejection; valid one-object, count-boundary, byte-boundary, oversized-single
-   object, final-short batch, and explicit empty-=Need= (zero batches,
-   zero receipts, immediate =Done=) grammars; empty/early/late/extra batch ends;
-   out-of-order/duplicate objects; unsolicited, malformed, padded, oversized,
-   over-cap, and counter-mismatching receipts; exact request-order validation;
-   valid completed-record progress; zero, repeated, regressing, out-of-range,
-   post-terminal, padded, and over-cap apply progress; a large legal
-   =HeadChunk= after accepted apply progress; and transfer/session-limit
-   interaction.  Add the symmetric commit grammar: valid connector progress
-   before a large head manifest, zero/repeated/regressing/out-of-range/padded/
-   over-cap values, and progress after the first head all fail.  Apply tests
-   prove the callback follows durable record completion in both ordinary and
-   managed wrappers without duplicated inner behavior; a callback write failure
-   leaves the durable intent recoverable and does not publish the managed
-   generation handoff; and invalidation emits no completion for its failing
-   record.  Include bounded one-shot =Error= serialization and receive-limit
-   tests.
-4. Add real Unix-stream tests for a whole descriptor-aware batch phase.  A
-   peer which never reads must make a large =send_object_until= batch expire on
-   its one scaled deadline before any receipt is possible.  A peer which
-   trickle-reads chunks must also expire at that same fixed phase deadline,
-   proving partial write/read activity cannot renew it.  Separately send
-   receipts and apply progress below the scaled idle deadline, run beyond that
-   deadline over multiple frames, and succeed. Pair each with a silent-phase
-   test that returns its truthful phase diagnostic and verifies no
-   locally-caused exit-status suffix.  Add raw-length padding tests for both
-   direction-specific control readers.  Add focused typed-error tests proving
-   only =ProtocolDeadlineExpired= selects phase timeout cleanup while =EPIPE=,
-   local object-read failure, and malformed JSON retain their real causes,
-   including connector local-apply progress writes. Keep the existing
-   scan-progress timeout test unchanged.
+3. Add fast V1 unit tests for protocol-version advancement and new-message
+   round trips; count, byte, oversized-single-object, short-final, empty, and
+   receipt-cap batch boundaries; exact receipt counters and raw-size bounds;
+   zero, repeated, regressing, out-of-range, padded, and over-cap apply
+   progress; out-of-phase new messages; bounded one-shot errors; callback
+   ordering after durability; recoverable callback failure; ordinary and
+   managed no-progress wrappers; and responder propagation of the typed
+   callback failure.
+4. Add real Unix-stream tests showing successful length-aware receipt and
+   object framing and a non-reading peer expiring a large
+   =send_object_until= operation at its fixed deadline.  Retain the existing
+   slow-drip absolute read/write deadline coverage.  Add focused cleanup tests
+   proving only typed deadline expiry selects each new phase diagnostic, that
+   those diagnostics omit the connector-caused exit-status suffix, and that
+   unrelated transfer, apply, and local errors retain their ordinary cause.
 5. Run the focused promoted Docker scenario, normal =make e2e= selection,
    =make check= (including whole-project and changed-line coverage), formatting
    and Clippy, Linux CI Docker coverage, and macOS native tests.  Update

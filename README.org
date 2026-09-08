@@ -91,13 +91,19 @@ During long retry cleanup it reports that remote scan preparation is still in
 progress without exposing global object counts. An individual state transaction
 or lock wait remains subject to the same no-progress timeout. During a long root scan it
 periodically reports the number of share entries examined and source bytes
-actually read. A remote scan that fails is reported
-as such; if it stops producing real progress, the connector retains the
-bounded no-progress timeout without presenting its own SSH cleanup signal as a
-second peer failure. It then asks before changing file content in either
-directory. Pairing may create the missing remote root
-directory first. Only after that confirmed initial synchronization succeeds
-does it report the connection and start the initiating peer's managed watch.
+actually read. During a large initial transfer and its two-sided installation,
+it also reports remotely received objects, remotely completed records, and
+locally completed records. These are receipts for work already completed, not
+timer heartbeats, and a stalled individual operation retains the bounded
+no-progress timeout. A remote scan or later phase failure is reported as such
+without presenting the connector's own SSH cleanup signal as a second peer
+failure. It then asks before changing file content in either directory.
+Pairing may create the missing remote root directory first. Only after that
+confirmed initial synchronization and final acknowledgement succeed does it
+flush the =Connected ...= line and start the initiating peer's managed watch.
+An interrupted initial installation prints no =Connected= line; after the peer
+is reachable again, rerun =flocal sync PATH --yes= to recover the durable
+installation and finish the relationship.
 The responder accepts incoming sessions but cannot initiate them. Inspect or
 control local syncs with:
 
@@ -392,12 +398,13 @@ so stable sibling paths can finish. A later full round reports =SETTLED=.
 =flocal status= and =sync list= expose durable unsettled state across daemon
 restarts.
 
-Persistent watch and explicit =flocal sync= each use protocol version 7 in
-their separate wire families, so install or upgrade =flocal= on both peers
-before adding or synchronizing a managed sync. A persistent protocol mismatch keeps the
-worker reconnecting with bounded upgrade reports until both peers support
-version 7; it never silently falls back to polling. Downgrading does not change
-synchronized state, though persistent watch remains unavailable until both
+Explicit =flocal sync= uses protocol version 8; persistent watch remains on
+version 7 in its separate wire family. Install or upgrade =flocal= on both
+peers before adding or synchronizing a managed sync. A persistent protocol
+mismatch keeps the worker reconnecting with bounded upgrade reports until both
+peers support version 7; it never silently falls back to polling. Downgrading
+does not change synchronized state, though explicit synchronization requires
+version 8 on both peers and persistent watch remains unavailable until both
 peers support version 7.
 
 Relationship registration and removal capabilities each start at
