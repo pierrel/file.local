@@ -80,7 +80,9 @@ rather than silently replacing it with a fixed one-hour limit.
    frame is accepted against a 1,024-frame/64-KiB cumulative budget shared by
    progress, preparation, and a terminal error. Thus whitespace or other JSON padding cannot
    bypass acceptance accounting, while malformed input retains the established
-   one-frame 2-MiB decode bound. Add a
+   one-frame 2-MiB decode bound. Snapshot chunks likewise charge their declared
+   body length against the existing cumulative metadata limit, so padding and
+   empty chunks cannot bypass it. Add a
    scan-specific snapshot reader rather than weakening =read_snapshot=. Its
    exact grammar is =ScanProgress(0,0) ScanPreparing* ScanProgress* (Error |
    SnapshotChunk* SnapshotEnd)=. The mandatory first frame has exact zero
@@ -211,7 +213,7 @@ directory traversal/hash/copy work rather than a synthetic timer.
 
 The final tests also cover version rejection; exact scan grammar (including no
 progress after the first snapshot chunk and missing/wrong opening =(0,0)=
-progress); raw-length acceptance accounting; padded progress/error frames;
+progress); raw-length acceptance accounting; padded progress/error/snapshot frames;
 each per-frame cap and the
 1,024-frame/64-KiB cumulative caps; componentwise counter regression or a
 repeated zero frame; each cumulative frame and byte cap; a one-shot reservation wire whose longer frame deadline is

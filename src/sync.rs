@@ -1259,7 +1259,15 @@ pub fn bounded_scan_error(message: &str) -> Result<String> {
 
 pub fn read_scan_snapshot(
     reader: &mut impl Read,
+    progress: impl FnMut(ScanProgressEvent),
+) -> Result<Vec<Record>> {
+    read_scan_snapshot_with_metadata_limit(reader, progress, MAX_METADATA_BYTES_PER_SESSION)
+}
+
+fn read_scan_snapshot_with_metadata_limit(
+    reader: &mut impl Read,
     mut progress: impl FnMut(ScanProgressEvent),
+    metadata_limit: usize,
 ) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     let mut metadata_bytes = 0usize;
@@ -1334,8 +1342,8 @@ pub fn read_scan_snapshot(
             }
             Message::SnapshotChunk { records: chunk } if prior_progress.is_some() => {
                 snapshot_started = true;
-                metadata_bytes = metadata_bytes.saturating_add(serde_json::to_vec(&chunk)?.len());
-                if metadata_bytes > MAX_METADATA_BYTES_PER_SESSION {
+                metadata_bytes = metadata_bytes.saturating_add(frame_bytes);
+                if metadata_bytes > metadata_limit {
                     bail!("snapshot exceeds session metadata limit");
                 }
                 records.extend(chunk);
@@ -3608,6 +3616,32 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("session control limit")
+        );
+
+        let mut padded_snapshot = Vec::new();
+        write_message(
+            &mut padded_snapshot,
+            &Message::ScanProgress {
+                entries: 0,
+                bytes_read: 0,
+            },
+        )?;
+        let mut body = serde_json::to_vec(&Message::SnapshotChunk {
+            records: Vec::new(),
+        })?;
+        body.resize(MAX_SCAN_PROGRESS_BYTES, b' ');
+        padded_snapshot.extend((body.len() as u32).to_be_bytes());
+        padded_snapshot.extend(body);
+        write_message(&mut padded_snapshot, &Message::SnapshotEnd)?;
+        assert!(
+            read_scan_snapshot_with_metadata_limit(
+                &mut padded_snapshot.as_slice(),
+                |_| {},
+                MAX_SCAN_PROGRESS_BYTES - 1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot exceeds session metadata limit")
         );
         Ok(())
     }
