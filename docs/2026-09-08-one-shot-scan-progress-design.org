@@ -43,6 +43,7 @@ The explicit one-shot protocol advances from version 6 to version 7.  Its
 
 #+begin_src rust
 ScanRequest,
+ScanPreparing,
 ScanProgress { entries: u64, bytes_read: u64 },
 #+end_src
 
@@ -54,31 +55,34 @@ The persistent-watch protocol remains version 7, despite the coincidental
 number, because it is a distinct V2 wire family.
 
 The responder waits for =ScanRequest= under the existing absolute peer-session
-deadline.  This sequencing is intentional: the connector is already reading
+deadline. This sequencing is intentional: the connector is already reading
 when the responder begins progress output, so a long local scan cannot fill an
-SSH stdout window with reverse-direction progress frames.  It trades an
+SSH stdout window with reverse-direction progress frames. It trades an
 initial-round parallel scan for a bounded, observable phase.
 
 At =serve_initial= entry, parse =FLOCAL_MAX_SESSION_SECONDS= exactly as today
 (default one hour), snapshot that value into the session limits, and create one
 absolute responder deadline. The same =Instant= is threaded through the V1
-reservation wire, =ScanRequest= read, and every progress, error, snapshot, and
-completion write; no reservation, frame, or progress byte renews it. Deadline
+reservation wire, =ScanRequest= read, every scan-phase progress, error, and
+snapshot write, and the final completion write; no reservation, frame, or
+progress byte renews it. Deadline
 expiry closes the protocol and releases the reservation permits through their
 existing RAII drops. This preserves an explicitly configured session limit
 rather than silently replacing it with a fixed one-hour limit.
 
 * 3. Interfaces and implementation plan
 
-1. In =src/sync.rs=, increment =SYNC_PROTOCOL_VERSION= and add the two strict
-   enum variants. The framed reader returns each raw declared body length before
-   deserializing or accepting its message. A scan-progress body is at most 256
-   bytes, a scan-error body at most 4 KiB, and the reader charges that raw
-   length before parsing against a 1,024-frame/64-KiB cumulative scan-control
-   budget shared by progress and a terminal error.
-   Thus whitespace or other JSON padding cannot bypass accounting. Add a
+1. In =src/sync.rs=, increment =SYNC_PROTOCOL_VERSION= and add the three strict
+   enum variants. The existing 2-MiB declared frame cap is enforced before
+   allocation or deserialization. After the closed message enum identifies a
+   scan-control frame, a scan-progress or preparation body is limited to 256 bytes and a
+   scan-error body to 4 KiB, and its raw declared length is charged before the
+   frame is accepted against a 1,024-frame/64-KiB cumulative budget shared by
+   progress, preparation, and a terminal error. Thus whitespace or other JSON padding cannot
+   bypass acceptance accounting, while malformed input retains the established
+   one-frame 2-MiB decode bound. Add a
    scan-specific snapshot reader rather than weakening =read_snapshot=. Its
-   exact grammar is =ScanProgress(0,0) ScanProgress* (Error |
+   exact grammar is =ScanProgress(0,0) ScanPreparing* ScanProgress* (Error |
    SnapshotChunk* SnapshotEnd)=. The mandatory first frame has exact zero
    counters; later progress follows the monotonic rule below. After the first
    chunk, another progress frame or =Error= is invalid. Thus a bounded =Error=
@@ -87,20 +91,23 @@ rather than silently replacing it with a fixed one-hour limit.
 2. In =src/main.rs=, create the responder deadline at =serve_initial= entry and
    thread it through every V1 reservation-wire read/write before moving the
    responder's one-shot refresh to after a bounded
-   =ScanRequest= read.  Send the initial zero-progress frame, run the refresh,
+   =ScanRequest= read. Send the initial zero-progress frame, run the refresh,
    and write the existing snapshot.  On the connector, send =ScanRequest=
    immediately after local refresh and use the scan-specific reader to render
    progress before plan construction.
 3. In =src/scan.rs=, add an internal progress checkpoint to the shared scan
    walk.  It owns elapsed-time throttling and calls a supplied closure at most
    once every five seconds, plus the explicit initial checkpoint.  It reports
-   supported, non-ignored entries examined and total source bytes read; neither
-   value is an estimate of a completed snapshot. Every supported non-ignored
-   entry advances the entry counter and reaches this same checkpoint, while
-   =ObjectStoreBudget= advances =bytes_read= for every real hash/copy read;
-   both inputs feed one shared throttle.
+   work entries examined and total source bytes read; neither value is an
+   estimate of a completed snapshot. Every supported non-ignored root entry
+   advances the entry count. =ObjectStoreBudget= advances =bytes_read= for
+   every real hash/copy read; both scanner inputs feed one shared throttle.
 4. In =src/state.rs=, let only the scan-local =ObjectStoreBudget= capture path
    invoke that checkpoint for each one-MiB hashing and object-copy read.
+   Let object collection report each metadata row or stored
+   object entry as an opaque =ScanPreparing= pulse so the responder can send
+   the mandatory zero before collection without becoming silent during a large
+   retry cleanup. The pulse exposes no global count to a share-scoped peer.
    Existing callers keep the simple no-progress method.  The exclusive object
    lock, remaining-capacity accounting, duplicate/source-snapshot checks, and
    temporary-object cleanup do not change.
@@ -118,19 +125,22 @@ rather than silently replacing it with a fixed one-hour limit.
 
 * 4. Failure and security bounds
 
-- The initial =ScanProgress= is exactly =(0, 0)=. Later counters are
+- The initial =ScanProgress= is exactly =(0, 0)=. Opaque =ScanPreparing= pulses
+  may follow while global retry cleanup makes real progress; they carry no
+  count and are invalid after the first nonzero scan counter. Later counters are
   componentwise nondecreasing and each later frame must increase at least one
   component. The reader admits at most 1,024 scan-control frames and 64 KiB of
-  raw declared control-frame metadata in a scan phase; each progress body is
-  at most 256 bytes and each scan-error body at most 4 KiB before
-  deserialization.
+  raw declared control-frame metadata in a scan phase; each accepted progress
+  or preparation body is at most 256 bytes and each accepted scan-error body at most 4 KiB.
+  The established 2-MiB generic cap remains the pre-deserialization bound.
   These frames reset only the existing no-byte read wait; they never extend
   either endpoint's configured absolute session deadline.
 - The existing =MAX_FRAME=, snapshot-record, snapshot-metadata, and
   transfer-byte limits remain in force. A flooding, malformed, out-of-order,
   non-monotonic, or stalled peer fails the protocol rather than gaining an
   unbounded keepalive channel.
-- Progress contains only counts. It exposes no paths, names, object hashes,
+- Progress contains only share-root counts, while preparation is an opaque
+  activity pulse. It exposes no paths, names, object hashes, global counts,
   roots, share IDs, queue positions, or peer-private scheduling information.
   The frames are accepted only after the existing authenticated binding and
   reservation checks.
@@ -140,13 +150,21 @@ rather than silently replacing it with a fixed one-hour limit.
   seconds without a byte the connector reports the ordinary remote-scan
   no-progress timeout and tears down the session. The fix does not raise that
   boundary merely to hide an unresponsive filesystem.
-- The responder uses its one absolute deadline for =ScanRequest= and every
-  progress/error/snapshot write. A disappeared or non-reading connector thus
-  cannot hold its share or installation permit indefinitely; deadline/error
-  return drops both permits before the protocol process exits.
-- For a remote =Message::Error=, the connector closes stdin and waits for the
-  responder's clean exit through a dedicated remote-error finalizer; it returns
-  the peer's scan error unchanged when exit status is successful. A local
+- Preparation pulses likewise occur only between completed metadata and object
+  work items. Acquiring the object lock, the atomic pending-object deletion,
+  loading an install intent or prior-record set, and any individual SQLite call
+  remain indivisible operations. If one produces no byte for 30 seconds, that
+  is intentionally a no-progress timeout. Splitting these established state
+  transactions or emitting a timer heartbeat is outside this observed
+  large-root-scan fix; the scaled silent-peer test pins the retained boundary.
+- The responder uses its one absolute deadline for reservation, =ScanRequest=,
+  and every new scan-phase progress, error, and snapshot write. The existing
+  timed reader retains the same total-session and no-byte bounds for later
+  input. Bounding every post-snapshot output write is a separate existing
+  one-shot transport concern and is not expanded by this scan fix.
+- For a remote =Message::Error=, the connector waits for the responder's clean
+  exit through a dedicated remote-error finalizer; it returns a bounded,
+  terminal-safe rendering of the peer's scan error when exit is clean. A local
   no-progress timeout instead uses a dedicated abort/reap path. Neither path
   calls generic =finish_after_error=, so a connector-caused SIGKILL is never
   appended as a misleading remote-exit failure.
@@ -192,12 +210,13 @@ directory traversal/hash/copy work rather than a synthetic timer.
 
 The final tests also cover version rejection; exact scan grammar (including no
 progress after the first snapshot chunk and missing/wrong opening =(0,0)=
-progress); raw-length accounting before
-deserialization; padded progress/error frames; each per-frame cap and the
+progress); raw-length acceptance accounting; padded progress/error frames;
+each per-frame cap and the
 1,024-frame/64-KiB cumulative caps; componentwise counter regression or a
-repeated zero frame; a configured responder session deadline exhausted during
-reservation before scanning and clean permit release; truthful timeout versus
-clean remote-error finalization; and delayed =Connected=. Run these fast tests
+repeated zero frame; each cumulative frame and byte cap; a one-shot reservation wire whose longer frame deadline is
+clamped by the configured session deadline; truthful timeout versus
+clean remote-error finalization. Existing sync-add tests retain the invariant
+that =Connected= appears only after confirmed initial completion. Run these fast tests
 with =make check= and retain the normal complete Docker E2E suite as part of
 full validation; there is no focused long-running Docker test.
 
@@ -210,7 +229,7 @@ full validation; there is no focused long-running Docker test.
   concurrent local scan.
 - Keeping both scans concurrent and merely rate-limiting progress is not a
   proof of liveness: a slow connector scan can stop draining the responder's
-  output.  The explicit request is the small ordering boundary that makes
+  output. The explicit request is the small ordering boundary that makes
   progress deliverable.
 - Per-file paths or object identifiers would add noisy output and unnecessary
   remote filesystem disclosure.  Counts are sufficient to show that work is

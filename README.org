@@ -86,12 +86,20 @@ flocal sync add ~/src/example --host buildbox --remote-path /srv/work/example
 
 The =--host= value can be a hostname, address, or =~/.ssh/config= alias.
 =sync add= reports when it is scanning local files, waiting for the remote
-file scan, and comparing the two file lists while it builds the first plan. It then
-asks before changing file content in either directory. Pairing may create the
-missing remote root directory first. After that confirmed initial
-synchronization succeeds, it reports the connection and starts the initiating
-peer's managed watch. The responder accepts incoming sessions but cannot
-initiate them. Inspect or control local syncs with:
+file scan, and comparing the two file lists while it builds the first plan.
+During long retry cleanup it reports that remote scan preparation is still in
+progress without exposing global object counts. An individual state transaction
+or lock wait remains subject to the same no-progress timeout. During a long root scan it
+periodically reports the number of share entries examined and source bytes
+actually read. A remote scan that fails is reported
+as such; if it stops producing real progress, the connector retains the
+bounded no-progress timeout without presenting its own SSH cleanup signal as a
+second peer failure. It then asks before changing file content in either
+directory. Pairing may create the missing remote root
+directory first. Only after that confirmed initial synchronization succeeds
+does it report the connection and start the initiating peer's managed watch.
+The responder accepts incoming sessions but cannot initiate them. Inspect or
+control local syncs with:
 
 #+begin_src sh
 flocal sync list
@@ -384,9 +392,9 @@ so stable sibling paths can finish. A later full round reports =SETTLED=.
 =flocal status= and =sync list= expose durable unsettled state across daemon
 restarts.
 
-Persistent watch uses protocol version 7, so install or upgrade =flocal= on both
-peers before adding a managed sync. Explicit =flocal sync= uses protocol
-version 6. A persistent protocol mismatch keeps the
+Persistent watch and explicit =flocal sync= each use protocol version 7 in
+their separate wire families, so install or upgrade =flocal= on both peers
+before adding or synchronizing a managed sync. A persistent protocol mismatch keeps the
 worker reconnecting with bounded upgrade reports until both peers support
 version 7; it never silently falls back to polling. Downgrading does not change
 synchronized state, though persistent watch remains unavailable until both

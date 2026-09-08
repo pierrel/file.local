@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -45,7 +46,35 @@ pub(crate) fn scan_cap_with_ignores(
     root: &cap_std::fs::Dir,
     previous: &[Record],
 ) -> Result<(Vec<Record>, IgnoreMatcher)> {
-    scan_mode(state, share, display_root, root, previous, true)
+    scan_mode(
+        state,
+        share,
+        display_root,
+        root,
+        previous,
+        true,
+        (Duration::MAX, &mut |_| Ok(())),
+    )
+}
+
+pub(crate) fn scan_cap_with_ignores_progress(
+    state: &State,
+    share: &ShareId,
+    display_root: &Path,
+    root: &cap_std::fs::Dir,
+    previous: &[Record],
+    cadence: Duration,
+    progress: &mut impl FnMut(ScanProgress) -> Result<()>,
+) -> Result<(Vec<Record>, IgnoreMatcher)> {
+    scan_mode(
+        state,
+        share,
+        display_root,
+        root,
+        previous,
+        true,
+        (cadence, progress),
+    )
 }
 
 pub fn preview_cap(
@@ -65,7 +94,68 @@ pub(crate) fn preview_cap_with_ignores(
     root: &cap_std::fs::Dir,
     previous: &[Record],
 ) -> Result<(Vec<Record>, IgnoreMatcher)> {
-    scan_mode(state, share, display_root, root, previous, false)
+    scan_mode(
+        state,
+        share,
+        display_root,
+        root,
+        previous,
+        false,
+        (Duration::MAX, &mut |_| Ok(())),
+    )
+}
+
+pub(crate) fn preview_cap_with_ignores_progress(
+    state: &State,
+    share: &ShareId,
+    display_root: &Path,
+    root: &cap_std::fs::Dir,
+    previous: &[Record],
+    cadence: Duration,
+    progress: &mut impl FnMut(ScanProgress) -> Result<()>,
+) -> Result<(Vec<Record>, IgnoreMatcher)> {
+    scan_mode(
+        state,
+        share,
+        display_root,
+        root,
+        previous,
+        false,
+        (cadence, progress),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScanProgress {
+    pub entries: u64,
+    pub bytes_read: u64,
+}
+
+struct ProgressReporter<'a, P> {
+    progress: ScanProgress,
+    last_report: Instant,
+    cadence: Duration,
+    report: &'a mut P,
+}
+
+impl<P: FnMut(ScanProgress) -> Result<()>> ProgressReporter<'_, P> {
+    fn entry(&mut self) -> Result<()> {
+        self.progress.entries = self.progress.entries.saturating_add(1);
+        self.checkpoint()
+    }
+
+    fn bytes(&mut self, bytes: u64) -> Result<()> {
+        self.progress.bytes_read = self.progress.bytes_read.saturating_add(bytes);
+        self.checkpoint()
+    }
+
+    fn checkpoint(&mut self) -> Result<()> {
+        if self.last_report.elapsed() >= self.cadence {
+            (self.report)(self.progress)?;
+            self.last_report = Instant::now();
+        }
+        Ok(())
+    }
 }
 
 fn scan_mode(
@@ -75,7 +165,18 @@ fn scan_mode(
     root_dir: &cap_std::fs::Dir,
     previous: &[Record],
     advance_sequence: bool,
+    progress: (Duration, &mut impl FnMut(ScanProgress) -> Result<()>),
 ) -> Result<(Vec<Record>, IgnoreMatcher)> {
+    let (cadence, report) = progress;
+    let mut progress = ProgressReporter {
+        progress: ScanProgress {
+            entries: 0,
+            bytes_read: 0,
+        },
+        last_report: Instant::now(),
+        cadence,
+        report,
+    };
     let peer = state.peer_id()?;
     let shared_heads = state.shared_heads(share)?;
     let mut preview_sequence = previous
@@ -128,17 +229,22 @@ fn scan_mode(
             }
             seen.insert(path.as_bytes().to_vec());
             let entry = if metadata.file_type().is_symlink() {
+                progress.entry()?;
                 Entry::Symlink {
                     target: path_bytes(&root_dir.read_link_contents(&relative)?),
                 }
             } else if metadata.is_dir() {
+                progress.entry()?;
                 directories.push((relative.clone(), scope.clone()));
                 Entry::Directory
             } else if metadata.is_file() {
+                progress.entry()?;
                 let input = open_regular_nofollow(root_dir, &relative)?;
-                let (hash, size) = objects.store_object(state, input).with_context(|| {
-                    format!("capturing {}", display_root.join(&relative).display())
-                })?;
+                let (hash, size) = objects
+                    .store_object_with_progress(state, input, &mut |bytes| progress.bytes(bytes))
+                    .with_context(|| {
+                        format!("capturing {}", display_root.join(&relative).display())
+                    })?;
                 Entry::File {
                     hash,
                     size,
@@ -478,6 +584,40 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn scan_progress_counts_entries_and_actual_source_reads() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("file"), b"contents")?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let root_dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority())?;
+        let mut progress = Vec::new();
+
+        scan_cap_with_ignores_progress(
+            &state,
+            &share,
+            &root,
+            &root_dir,
+            &[],
+            Duration::ZERO,
+            &mut |current| {
+                progress.push(current);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(progress.first().map(|value| value.entries), Some(1));
+        assert_eq!(progress.last().map(|value| value.bytes_read), Some(16));
+        assert!(progress.windows(2).all(|pair| {
+            pair[1].entries >= pair[0].entries
+                && pair[1].bytes_read >= pair[0].bytes_read
+                && pair[1] != pair[0]
+        }));
+        Ok(())
+    }
 
     #[test]
     fn honors_gitignore_and_excludes_git() -> Result<()> {

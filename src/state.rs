@@ -586,25 +586,73 @@ impl ObjectSink {
     }
 }
 
+fn hash_object_with_progress(
+    mut input: File,
+    progress: &mut impl FnMut(u64) -> Result<()>,
+) -> Result<(ObjectHash, u64)> {
+    let before = input.metadata()?;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size += read as u64;
+        progress(read as u64)?;
+    }
+    if !same_file_snapshot(&before, &input.metadata()?)? {
+        bail!("file changed while it was being hashed");
+    }
+    Ok((ObjectHash::from_blake3(hasher.finalize()), size))
+}
+
 impl ObjectStoreBudget {
-    pub(crate) fn store_object(
+    #[cfg(test)]
+    pub(crate) fn store_object(&mut self, state: &State, input: File) -> Result<(ObjectHash, u64)> {
+        self.store_object_with_progress(state, input, &mut |_| Ok(()))
+    }
+
+    pub(crate) fn store_object_with_progress(
         &mut self,
         state: &State,
         mut input: File,
+        progress: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<(ObjectHash, u64)> {
         let metadata_before = input.metadata()?;
-        let (hash, size) = state.hash_object(input.try_clone()?)?;
+        let (hash, size) = hash_object_with_progress(input.try_clone()?, progress)?;
         input.rewind()?;
-        self.store_hashed_object(state, input, metadata_before, hash, size)
+        self.store_hashed_object_with_progress(state, input, metadata_before, hash, size, progress)
     }
 
     fn store_hashed_object(
+        &mut self,
+        state: &State,
+        input: File,
+        metadata_before: fs::Metadata,
+        hash: ObjectHash,
+        size: u64,
+    ) -> Result<(ObjectHash, u64)> {
+        self.store_hashed_object_with_progress(
+            state,
+            input,
+            metadata_before,
+            hash,
+            size,
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn store_hashed_object_with_progress(
         &mut self,
         state: &State,
         mut input: File,
         metadata_before: fs::Metadata,
         hash: ObjectHash,
         size: u64,
+        progress: &mut impl FnMut(u64) -> Result<()>,
     ) -> Result<(ObjectHash, u64)> {
         let mut sink = state.begin_object_with_budget(hash.clone(), size, &mut self.remaining)?;
         if sink.already_present() {
@@ -620,6 +668,7 @@ impl ObjectStoreBudget {
                 break;
             }
             sink.write_chunk(&buffer[..read])?;
+            progress(read as u64)?;
         }
         if !same_file_snapshot(&metadata_before, &input.metadata()?)? {
             bail!("file changed while it was being captured");
@@ -5477,9 +5526,12 @@ impl State {
         excluded_conflict_ids: Option<(&ShareId, &HashSet<String>)>,
         table: &str,
     ) -> Result<()> {
-        self.visit_global_object_refs(excluded_conflict_share, excluded_conflict_ids, |hash| {
-            insert_temp_hash(&self.conn, table, hash)
-        })
+        self.visit_global_object_refs(
+            excluded_conflict_share,
+            excluded_conflict_ids,
+            |hash| insert_temp_hash(&self.conn, table, hash),
+            || Ok(()),
+        )
     }
 
     fn visit_global_object_refs(
@@ -5487,10 +5539,12 @@ impl State {
         excluded_conflict_share: Option<&ShareId>,
         excluded_conflict_ids: Option<(&ShareId, &HashSet<String>)>,
         mut visit: impl FnMut(&ObjectHash) -> Result<()>,
+        mut progress: impl FnMut() -> Result<()>,
     ) -> Result<()> {
         {
             let mut statement = self.conn.prepare("SELECT version_json FROM records")?;
             for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                progress()?;
                 let version: Version = serde_json::from_str(&row?)?;
                 visit_entry_object(&version.entry, &mut visit)?;
                 if let Some(base) = version.merge_base {
@@ -5501,6 +5555,7 @@ impl State {
         {
             let mut statement = self.conn.prepare("SELECT base_json FROM shared_heads")?;
             for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                progress()?;
                 let base: crate::model::BaseVersion = serde_json::from_str(&row?)?;
                 visit_entry_object(&base.entry, &mut visit)?;
             }
@@ -5519,6 +5574,7 @@ impl State {
                 ))
             })?;
             for row in rows {
+                progress()?;
                 let (id, share, winner, loser, document) = row?;
                 if excluded_conflict_share == Some(&share) {
                     continue;
@@ -5536,9 +5592,11 @@ impl State {
         }
         for (_, intent) in self.install_intents()? {
             for record in intent.records {
+                progress()?;
                 visit_entry_object(&record.version.entry, &mut visit)?;
             }
             for conflict in intent.conflicts {
+                progress()?;
                 for entry in conflict_entries(&conflict) {
                     visit_entry_object(entry, &mut visit)?;
                 }
@@ -5546,6 +5604,7 @@ impl State {
         }
         let mut statement = self.conn.prepare("SELECT hash FROM pending_objects")?;
         for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            progress()?;
             let hash = ObjectHash::parse(row?)?;
             visit(&hash)?;
         }
@@ -5802,10 +5861,15 @@ impl State {
         selected_share: &ShareId,
         selected_ids: &HashSet<String>,
     ) -> Result<()> {
-        self.visit_global_object_refs(None, Some((selected_share, selected_ids)), |hash| {
-            candidates.remove(hash);
-            Ok(())
-        })
+        self.visit_global_object_refs(
+            None,
+            Some((selected_share, selected_ids)),
+            |hash| {
+                candidates.remove(hash);
+                Ok(())
+            },
+            || Ok(()),
+        )
     }
 
     fn raw_conflicts_for_prune(
@@ -6056,23 +6120,8 @@ impl State {
             .store_hashed_object(self, input, metadata_before, hash, size)
     }
 
-    pub fn hash_object(&self, mut input: File) -> Result<(ObjectHash, u64)> {
-        let before = input.metadata()?;
-        let mut hasher = blake3::Hasher::new();
-        let mut size = 0u64;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
-            let read = input.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-            size += read as u64;
-        }
-        if !same_file_snapshot(&before, &input.metadata()?)? {
-            bail!("file changed while it was being hashed");
-        }
-        Ok((ObjectHash::from_blake3(hasher.finalize()), size))
+    pub fn hash_object(&self, input: File) -> Result<(ObjectHash, u64)> {
+        hash_object_with_progress(input, &mut |_| Ok(()))
     }
 
     fn available_object_bytes(&self) -> Result<u64> {
@@ -6217,11 +6266,25 @@ impl State {
     }
 
     pub fn prune_unreferenced_objects(&self) -> Result<()> {
+        self.prune_unreferenced_objects_with_progress(&mut || Ok(()))
+    }
+
+    pub fn prune_unreferenced_objects_with_progress(
+        &self,
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         let _lock = self.lock_objects()?;
-        self.prune_unreferenced_objects_locked()
+        self.prune_unreferenced_objects_locked_with_progress(progress)
     }
 
     fn prune_unreferenced_objects_locked(&self) -> Result<()> {
+        self.prune_unreferenced_objects_locked_with_progress(&mut || Ok(()))
+    }
+
+    fn prune_unreferenced_objects_locked_with_progress(
+        &self,
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         #[cfg(feature = "e2e-test-hooks")]
         if self.dir.join(".e2e-collector-fail").exists() {
             bail!("injected object collection failure");
@@ -6231,10 +6294,16 @@ impl State {
              CREATE TEMP TABLE collector_refs(hash TEXT PRIMARY KEY) WITHOUT ROWID;",
         )?;
         let result = (|| {
-            self.stream_global_object_refs(None, None, "collector_refs")?;
+            self.visit_global_object_refs(
+                None,
+                None,
+                |hash| insert_temp_hash(&self.conn, "collector_refs", hash),
+                &mut *progress,
+            )?;
             let mut removed = false;
             for entry in fs::read_dir(self.dir.join("objects"))? {
                 let entry = entry?;
+                progress()?;
                 let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
@@ -10375,6 +10444,30 @@ mod tests {
         budget.store_object(&state, File::open(second)?)?;
         assert_eq!(budget.remaining, 0);
         assert!(budget.store_object(&state, File::open(third)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn object_collection_reports_each_stored_entry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("directory-only"))?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let records = crate::scan::scan(&state, &share, &root, &[])?;
+        state.replace_records(&share, &records)?;
+        let source = temp.path().join("source");
+        fs::write(&source, b"unreferenced")?;
+        let (hash, _) = state.store_object(File::open(source)?)?;
+        let mut entries = 0;
+
+        state.prune_unreferenced_objects_with_progress(&mut || {
+            entries += 1;
+            Ok(())
+        })?;
+
+        assert_eq!(entries, 2);
+        assert!(state.open_verified_object(&hash).is_err());
         Ok(())
     }
 

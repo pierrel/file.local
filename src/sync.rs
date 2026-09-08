@@ -10,14 +10,17 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::model::{Entry, ObjectHash, PeerId, Record, RelationshipId, RelativePath, ShareId};
 use crate::reconcile::{MergeCandidate, Plan, reconcile};
-use crate::scan::{IgnoreMatcher, preview_cap_with_ignores, scan_cap, scan_cap_with_ignores};
+use crate::scan::{
+    IgnoreMatcher, preview_cap_with_ignores, preview_cap_with_ignores_progress, scan_cap,
+    scan_cap_with_ignores, scan_cap_with_ignores_progress,
+};
 pub use crate::state::RootIdentityChanged;
 use crate::state::{
     InstallIntent, InstallTempPhase, QueueRejoin, QueueRequest, RootIdentity, State,
 };
 
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
-pub const SYNC_PROTOCOL_VERSION: u32 = 6;
+pub const SYNC_PROTOCOL_VERSION: u32 = 7;
 pub const WATCH_PROTOCOL_VERSION: u32 = 7;
 pub const RELATIONSHIP_REGISTRATION_PROTOCOL_VERSION: u32 = 1;
 pub const RELATIONSHIP_REMOVAL_PROTOCOL_VERSION: u32 = 1;
@@ -34,6 +37,10 @@ pub const MAX_PEER_ID_BYTES: usize = 128;
 pub const PROTOCOL_VERSION: u32 = SYNC_PROTOCOL_VERSION;
 pub const MAX_RECORDS_PER_SESSION: usize = 1_000_000;
 pub const MAX_METADATA_BYTES_PER_SESSION: usize = 256 * 1024 * 1024;
+const MAX_SCAN_CONTROL_FRAMES: usize = 1024;
+const MAX_SCAN_CONTROL_BYTES: usize = 64 * 1024;
+const MAX_SCAN_PROGRESS_BYTES: usize = 256;
+const MAX_SCAN_ERROR_BYTES: usize = 4096;
 pub const MAX_MERGE_CANDIDATES_PER_ROUND: usize = 64;
 pub const MAX_MERGE_WORK_PER_ROUND: usize = 32_000_000;
 pub const MAX_MERGE_HUNKS_PER_ROUND: usize = 4_096;
@@ -485,6 +492,12 @@ pub enum V1Message {
     SyncReserved(Reservation),
     SyncStart(SyncStart),
     SyncAccepted(Reservation),
+    ScanRequest,
+    ScanPreparing,
+    ScanProgress {
+        entries: u64,
+        bytes_read: u64,
+    },
     SnapshotChunk {
         records: Vec<Record>,
     },
@@ -810,6 +823,11 @@ fn write_frame(writer: &mut impl Write, frame: &impl Serialize) -> Result<()> {
 }
 
 fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+    let (frame, _) = read_frame_with_len(reader)?;
+    Ok(frame)
+}
+
+fn read_frame_with_len<T: DeserializeOwned>(reader: &mut impl Read) -> Result<(T, usize)> {
     let mut length = [0u8; 4];
     reader.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
@@ -818,7 +836,7 @@ fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     }
     let mut bytes = vec![0u8; length];
     reader.read_exact(&mut bytes)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok((serde_json::from_slice(&bytes)?, length))
 }
 
 fn read_frame_until<T: DeserializeOwned>(reader: &impl AsFd, deadline: Instant) -> Result<T> {
@@ -1006,6 +1024,10 @@ pub fn read_v1_message(reader: &mut impl Read) -> Result<V1Message> {
     read_frame(reader)
 }
 
+fn read_v1_message_with_len(reader: &mut impl Read) -> Result<(V1Message, usize)> {
+    read_frame_with_len(reader)
+}
+
 pub fn write_v1_message_until(
     writer: &impl AsFd,
     message: &V1Message,
@@ -1150,6 +1172,27 @@ pub fn write_snapshot(writer: &mut impl Write, records: &[Record]) -> Result<()>
     write_message(writer, &Message::SnapshotEnd)
 }
 
+pub fn write_snapshot_until(
+    writer: &impl AsFd,
+    records: &[Record],
+    deadline: Instant,
+) -> Result<()> {
+    let envelope = serde_json::to_vec(&Message::SnapshotChunk {
+        records: Vec::new(),
+    })?
+    .len();
+    for chunk in bounded_chunks(records, envelope, "snapshot record")? {
+        write_v1_message_until(
+            writer,
+            &Message::SnapshotChunk {
+                records: chunk.to_vec(),
+            },
+            deadline,
+        )?;
+    }
+    write_v1_message_until(writer, &Message::SnapshotEnd, deadline)
+}
+
 pub fn read_snapshot(reader: &mut impl Read) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     let mut metadata_bytes = 0usize;
@@ -1164,6 +1207,137 @@ pub fn read_snapshot(reader: &mut impl Read) -> Result<Vec<Record>> {
             }
             Message::SnapshotEnd => return Ok(records),
             other => bail!("expected snapshot, got {other:?}"),
+        }
+        if records.len() > MAX_RECORDS_PER_SESSION {
+            bail!("snapshot exceeds session record limit");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RemoteScanError {
+    message: String,
+}
+
+impl std::fmt::Display for RemoteScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message: String = self.message.escape_default().take(4096).collect();
+        write!(formatter, "remote file scan failed: {message}")
+    }
+}
+
+impl std::error::Error for RemoteScanError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanProgressEvent {
+    Preparing,
+    Scanning { entries: u64, bytes_read: u64 },
+}
+
+pub fn bounded_scan_error(message: &str) -> Result<String> {
+    let envelope = serde_json::to_vec(&Message::Error {
+        message: String::new(),
+    })?
+    .len();
+    let mut remaining = MAX_SCAN_ERROR_BYTES.saturating_sub(envelope);
+    let mut bounded = String::new();
+    for character in message.chars() {
+        let encoded = serde_json::to_vec(&character.to_string())?;
+        let encoded_len = encoded.len().saturating_sub(2);
+        if encoded_len > remaining {
+            break;
+        }
+        bounded.push(character);
+        remaining -= encoded_len;
+    }
+    Ok(bounded)
+}
+
+pub fn read_scan_snapshot(
+    reader: &mut impl Read,
+    mut progress: impl FnMut(ScanProgressEvent),
+) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    let mut metadata_bytes = 0usize;
+    let mut control_frames = 0usize;
+    let mut control_bytes = 0usize;
+    let mut prior_progress = None;
+    let mut scan_started = false;
+    let mut snapshot_started = false;
+    loop {
+        let (message, frame_bytes) = read_v1_message_with_len(reader)?;
+        match message {
+            Message::ScanProgress {
+                entries,
+                bytes_read,
+            } if !snapshot_started => {
+                if frame_bytes > MAX_SCAN_PROGRESS_BYTES {
+                    bail!("scan progress frame exceeds protocol limit");
+                }
+                control_frames += 1;
+                control_bytes = control_bytes.saturating_add(frame_bytes);
+                if control_frames > MAX_SCAN_CONTROL_FRAMES
+                    || control_bytes > MAX_SCAN_CONTROL_BYTES
+                {
+                    bail!("scan progress exceeds session control limit");
+                }
+                match prior_progress {
+                    None if entries == 0 && bytes_read == 0 => {}
+                    None => bail!("remote scan progress must start at zero"),
+                    Some((prior_entries, prior_bytes))
+                        if entries >= prior_entries
+                            && bytes_read >= prior_bytes
+                            && (entries > prior_entries || bytes_read > prior_bytes) => {}
+                    Some(_) => bail!("remote scan progress counters did not advance"),
+                }
+                prior_progress = Some((entries, bytes_read));
+                scan_started = scan_started || entries != 0 || bytes_read != 0;
+                progress(ScanProgressEvent::Scanning {
+                    entries,
+                    bytes_read,
+                });
+            }
+            Message::ScanPreparing
+                if !snapshot_started && prior_progress == Some((0, 0)) && !scan_started =>
+            {
+                if frame_bytes > MAX_SCAN_PROGRESS_BYTES {
+                    bail!("scan preparation frame exceeds protocol limit");
+                }
+                control_frames += 1;
+                control_bytes = control_bytes.saturating_add(frame_bytes);
+                if control_frames > MAX_SCAN_CONTROL_FRAMES
+                    || control_bytes > MAX_SCAN_CONTROL_BYTES
+                {
+                    bail!("scan progress exceeds session control limit");
+                }
+                progress(ScanProgressEvent::Preparing);
+            }
+            Message::Error { message } if !snapshot_started => {
+                if frame_bytes > MAX_SCAN_ERROR_BYTES {
+                    bail!("remote scan error frame exceeds protocol limit");
+                }
+                control_frames += 1;
+                control_bytes = control_bytes.saturating_add(frame_bytes);
+                if control_frames > MAX_SCAN_CONTROL_FRAMES
+                    || control_bytes > MAX_SCAN_CONTROL_BYTES
+                {
+                    bail!("remote scan control exceeds session limit");
+                }
+                if prior_progress.is_none() {
+                    bail!("remote scan did not begin with progress");
+                }
+                return Err(RemoteScanError { message }.into());
+            }
+            Message::SnapshotChunk { records: chunk } if prior_progress.is_some() => {
+                snapshot_started = true;
+                metadata_bytes = metadata_bytes.saturating_add(serde_json::to_vec(&chunk)?.len());
+                if metadata_bytes > MAX_METADATA_BYTES_PER_SESSION {
+                    bail!("snapshot exceeds session metadata limit");
+                }
+                records.extend(chunk);
+            }
+            Message::SnapshotEnd if prior_progress.is_some() => return Ok(records),
+            other => bail!("expected remote scan progress or snapshot, got {other:?}"),
         }
         if records.len() > MAX_RECORDS_PER_SESSION {
             bail!("snapshot exceeds session record limit");
@@ -1350,6 +1524,29 @@ pub fn refresh_with_root(
     Ok(advertised_records(&matcher, &records))
 }
 
+pub fn refresh_with_progress(
+    state: &mut State,
+    share: &ShareId,
+    cadence: Duration,
+    progress: &mut impl FnMut(u64, u64) -> Result<()>,
+) -> Result<Vec<Record>> {
+    let root = ShareRoot::open(state, share)?;
+    root.validate(state, share)?;
+    let previous = state.records(share)?;
+    let (records, matcher) = scan_cap_with_ignores_progress(
+        state,
+        share,
+        &root.path,
+        &root.directory,
+        &previous,
+        cadence,
+        &mut |scan_progress| progress(scan_progress.entries, scan_progress.bytes_read),
+    )?;
+    root.validate(state, share)?;
+    state.replace_records(share, &records)?;
+    Ok(advertised_records(&matcher, &records))
+}
+
 pub fn preview_refresh(state: &State, share: &ShareId) -> Result<Vec<Record>> {
     let root = ShareRoot::open(state, share)?;
     root.validate(state, share)?;
@@ -1359,6 +1556,27 @@ pub fn preview_refresh(state: &State, share: &ShareId) -> Result<Vec<Record>> {
         &root.path,
         &root.directory,
         &state.records(share)?,
+    )?;
+    root.validate(state, share)?;
+    Ok(advertised_records(&matcher, &records))
+}
+
+pub fn preview_refresh_with_progress(
+    state: &State,
+    share: &ShareId,
+    cadence: Duration,
+    progress: &mut impl FnMut(u64, u64) -> Result<()>,
+) -> Result<Vec<Record>> {
+    let root = ShareRoot::open(state, share)?;
+    root.validate(state, share)?;
+    let (records, matcher) = preview_cap_with_ignores_progress(
+        state,
+        share,
+        &root.path,
+        &root.directory,
+        &state.records(share)?,
+        cadence,
+        &mut |scan_progress| progress(scan_progress.entries, scan_progress.bytes_read),
     )?;
     root.validate(state, share)?;
     Ok(advertised_records(&matcher, &records))
@@ -3184,9 +3402,210 @@ mod tests {
 
     #[test]
     fn scheduling_protocol_versions_are_incremented() {
-        assert_eq!(SYNC_PROTOCOL_VERSION, 6);
+        assert_eq!(SYNC_PROTOCOL_VERSION, 7);
         assert_eq!(WATCH_PROTOCOL_VERSION, 7);
         assert_eq!(PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn snapshot_reader_accepts_scan_progress_before_snapshot() -> Result<()> {
+        let mut wire = Vec::new();
+        write_message(
+            &mut wire,
+            &Message::ScanProgress {
+                entries: 0,
+                bytes_read: 0,
+            },
+        )?;
+        write_message(&mut wire, &Message::ScanPreparing)?;
+        write_message(
+            &mut wire,
+            &Message::ScanProgress {
+                entries: 1,
+                bytes_read: 1024,
+            },
+        )?;
+        write_snapshot(&mut wire, &[])?;
+
+        let mut events = Vec::new();
+        assert!(read_scan_snapshot(&mut wire.as_slice(), |event| events.push(event)).is_ok());
+        assert_eq!(
+            events,
+            vec![
+                ScanProgressEvent::Scanning {
+                    entries: 0,
+                    bytes_read: 0,
+                },
+                ScanProgressEvent::Preparing,
+                ScanProgressEvent::Scanning {
+                    entries: 1,
+                    bytes_read: 1024,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scan_snapshot_reader_enforces_progress_grammar_and_bounds() -> Result<()> {
+        let scan = |messages: &[Message]| -> Result<Vec<Record>> {
+            let mut wire = Vec::new();
+            for message in messages {
+                write_message(&mut wire, message)?;
+            }
+            read_scan_snapshot(&mut wire.as_slice(), |_| {})
+        };
+        assert!(
+            scan(&[Message::ScanProgress {
+                entries: 1,
+                bytes_read: 0,
+            }])
+            .unwrap_err()
+            .to_string()
+            .contains("start at zero")
+        );
+        assert!(scan(&[Message::ScanPreparing]).is_err());
+        assert!(
+            scan(&[
+                Message::ScanProgress {
+                    entries: 0,
+                    bytes_read: 0,
+                },
+                Message::ScanProgress {
+                    entries: 0,
+                    bytes_read: 0,
+                },
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("did not advance")
+        );
+        assert!(
+            scan(&[
+                Message::ScanProgress {
+                    entries: 0,
+                    bytes_read: 0,
+                },
+                Message::ScanProgress {
+                    entries: 1,
+                    bytes_read: 0,
+                },
+                Message::ScanPreparing,
+            ])
+            .is_err()
+        );
+        let error = scan(&[
+            Message::ScanProgress {
+                entries: 0,
+                bytes_read: 0,
+            },
+            Message::Error {
+                message: "capture failed".into(),
+            },
+        ])
+        .unwrap_err();
+        assert!(error.downcast_ref::<RemoteScanError>().is_some());
+        let hostile = bounded_scan_error(&"\\\n\r\t".repeat(5000))?;
+        let encoded = serde_json::to_vec(&Message::Error {
+            message: hostile.clone(),
+        })?;
+        assert!(encoded.len() <= MAX_SCAN_ERROR_BYTES);
+        let display = RemoteScanError { message: hostile }.to_string();
+        assert!(!display.contains('\n'));
+        assert!(!display.contains('\r'));
+
+        let mut out_of_order = Vec::new();
+        write_message(
+            &mut out_of_order,
+            &Message::ScanProgress {
+                entries: 0,
+                bytes_read: 0,
+            },
+        )?;
+        write_message(
+            &mut out_of_order,
+            &Message::SnapshotChunk {
+                records: Vec::new(),
+            },
+        )?;
+        write_message(
+            &mut out_of_order,
+            &Message::ScanProgress {
+                entries: 1,
+                bytes_read: 0,
+            },
+        )?;
+        assert!(read_scan_snapshot(&mut out_of_order.as_slice(), |_| {}).is_err());
+
+        let mut body = serde_json::to_vec(&Message::ScanProgress {
+            entries: 0,
+            bytes_read: 0,
+        })?;
+        body.resize(MAX_SCAN_PROGRESS_BYTES + 1, b' ');
+        let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+        wire.extend(body);
+        assert!(
+            read_scan_snapshot(&mut wire.as_slice(), |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("frame exceeds protocol limit")
+        );
+
+        let mut oversized_error = Vec::new();
+        write_message(
+            &mut oversized_error,
+            &Message::ScanProgress {
+                entries: 0,
+                bytes_read: 0,
+            },
+        )?;
+        let mut body = serde_json::to_vec(&Message::Error {
+            message: "failed".into(),
+        })?;
+        body.resize(MAX_SCAN_ERROR_BYTES + 1, b' ');
+        oversized_error.extend((body.len() as u32).to_be_bytes());
+        oversized_error.extend(body);
+        assert!(
+            read_scan_snapshot(&mut oversized_error.as_slice(), |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("error frame exceeds protocol limit")
+        );
+
+        let mut flooding = Vec::new();
+        for entries in 0..=MAX_SCAN_CONTROL_FRAMES {
+            write_message(
+                &mut flooding,
+                &Message::ScanProgress {
+                    entries: entries as u64,
+                    bytes_read: 0,
+                },
+            )?;
+        }
+        assert!(
+            read_scan_snapshot(&mut flooding.as_slice(), |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("session control limit")
+        );
+
+        let mut padded_flooding = Vec::new();
+        for entries in 0..=MAX_SCAN_CONTROL_BYTES / MAX_SCAN_PROGRESS_BYTES {
+            let mut body = serde_json::to_vec(&Message::ScanProgress {
+                entries: entries as u64,
+                bytes_read: 0,
+            })?;
+            body.resize(MAX_SCAN_PROGRESS_BYTES, b' ');
+            padded_flooding.extend((body.len() as u32).to_be_bytes());
+            padded_flooding.extend(body);
+        }
+        assert!(
+            read_scan_snapshot(&mut padded_flooding.as_slice(), |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("session control limit")
+        );
+        Ok(())
     }
 
     #[test]
@@ -3272,6 +3691,12 @@ mod tests {
             V1Message::SyncReserved(reservation()),
             V1Message::SyncStart(sync_start()),
             V1Message::SyncAccepted(reservation()),
+            V1Message::ScanRequest,
+            V1Message::ScanPreparing,
+            V1Message::ScanProgress {
+                entries: 17,
+                bytes_read: 4096,
+            },
         ];
         for message in messages {
             let encoded = serde_json::to_vec(&message)?;
