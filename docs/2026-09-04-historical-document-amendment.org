@@ -1,0 +1,53 @@
+#+title: Historical document amendment for root recovery and parked scheduling
+#+date: 2026-09-04
+#+status: implemented and validated
+
+* Decision
+
+Dated design and report files are historical records, not mutable current-state
+documentation. This amendment restores the documents that PR #20 rewrote for
+root-recovery and parked multi-share E2E corrections. The test and scheduler
+behavior remain unchanged: a parked paired request is nonblocking until it is
+eligible, so a ready watch request may run first; the scenario proves durable
+requeue and eventual convergence.
+
+* Historical supersessions
+
+This document supersedes only these direct, point-in-time claims:
+
+1. [[file:2026-07-16-e2e-harness-design.org::*Update 2026-08-20: multi-share scheduling acceptance][The E2E harness design's second focused scenario]] assumed that an older
+   paired sibling must reach apply first. A parked paired request is instead
+   nonblocking until eligible; the current E2E observes durable watch requeue,
+   releases a ready apply, and requires both shares to converge.
+2. [[file:2026-08-17-clean-relationship-removal-design.org::*4. Connector and daemon flow][The clean-removal design's connector and daemon flow]] records only
+   =PrepareRemove=. PATH removal now uses =PrepareRemovePath= to recheck root
+   identity under the daemon lifecycle lock; explicit =--share= remains
+   intentionally root-free.
+3. [[file:2026-08-17-clean-relationship-removal-final-report.org::*CLI and daemon orchestration][The clean-removal report's CLI and daemon orchestration]] implies that
+   selection has the original two-path behavior. A replacement root is now
+   never adopted by removal: recovery is detach by ID, then a fresh =sync add=.
+4. [[file:2026-08-20-multi-share-scheduling-design.org::*Acceptance and safety gates][The scheduling design's acceptance gate 4]] treats an older paired request
+   as an eligible FIFO predecessor. Ready work may pass it while it is parked
+   to prevent cross-peer deadlock; the parked request must still converge.
+5. [[file:2026-08-20-multi-share-scheduling-final-report.org::*Tests and harness][The scheduling final report's test 4 and later E2E narrative]] claim
+   older-sibling-first ordering. The test now validates durable requeue and
+   eventual convergence under either ready-order outcome.
+6. [[file:2026-08-20-multi-share-scheduling-reproduction-final-report.org::*How the reproduction works][The scheduling reproduction report's persistent-watch fairness section]]
+   requires a share-tagged older apply stop. The hook now releases either ready
+   request after observing durable requeue.
+
+These are direct links only. This amendment does not restate or chase any
+supersession named by the historical documents themselves.
+
+* Process
+
+Future changes leave existing dated documents byte-for-byte intact. A new dated
+document records each direct invalidation in a =Historical supersessions=
+section, while README and current operational documentation continue to describe
+the present product.
+
+* Validation
+
+The restored historical files match their pre-PR #20 contents. The focused
+Docker E2E named above and the complete =make check= gate passed before this
+documentation-only follow-up.

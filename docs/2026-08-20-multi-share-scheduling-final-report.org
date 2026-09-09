@@ -338,8 +338,7 @@ real processes, SSH, two filesystems, and the installed daemon path:
 1. =sync add --yes= waits behind an active sibling and completes once.
 2. A confirmed =sync start= returns queued and later converges.
 3. =sync stop= cancels queued work before release.
-4. A new persistent-watch round durably requeues while an older sibling request
-   is parked, and both shares converge.
+4. A new persistent-watch round rejoins behind an older sibling request.
 5. Daemon death reconstructs an enabled queued start.
 6. Opposite-direction starts are both durable before either proxy submission;
    the higher-ID connector receives the earlier intent, and an unrelated
@@ -584,15 +583,16 @@ post-commit database work.  The complete CI E2E job then exposed the
 same-share client-to-daemon lock race described above.  Review of that fix
 found and closed the early-return queue cancellation path, the two-sided
 foreground-watch/removal start race, and a missing durable ownership
-diagnostic. A later hosted E2E run found a harness-only ordering assumption in
-the persistent-watch scenario. The test treated an older paired request as an
-eligible FIFO predecessor even though it was deliberately parked while its
-remote peer prepared. The scheduler permits ready work to pass such a request
-to avoid cross-peer deadlock. The corrected scenario observes the new watch
-round's durable enqueue, releases whichever ready request reaches the apply
-boundary, and then requires both watch changes and the parked sibling change to
-converge. This tests liveness without inventing an ordering guarantee for
-parked work.
+diagnostic.  A later hosted E2E run found one more harness-only ordering
+assumption in the fairness scenario.  The apply-stop hook can legitimately
+catch a no-op watch round that was already beginning when the test wrote its
+first file.  The scheduler still put that watch behind the older managed
+request, but the test waited for the first file on the peer while deliberately
+holding the older request stopped.  The corrected scenario polls for the full,
+valid queued status naming the blocking second-share root, proves the younger
+second change cannot overtake it, proves the older share completes first, and
+then requires both watch changes to converge.  This tests the scheduling
+contract without assuming which watch round first scanned the file.
 Each substantive fix was followed by focused tests, the complete deterministic
 gate, and another affected review pass.  The twelfth round ended with zero
 blocker, important, or minor findings across all lenses.  Three additional

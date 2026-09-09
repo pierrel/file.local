@@ -7,6 +7,16 @@ architecture contract. Update it in the same pull request whenever a design or
 implementation change no longer aligns with it. Dated files in `docs/` retain
 the detailed decisions and state for individual features.
 
+## Historical documentation
+
+Dated documents in `docs/` are point-in-time records. Never edit an existing
+dated document to make it describe later behavior, even when correcting a
+claim that is now known to be wrong. Write a new dated design, report, or
+amendment instead. Every such new document that invalidates an older claim must
+have a `Historical supersessions` section linking only to the directly
+invalidated document and its section, and state the replacement fact. Do not
+restate transitive supersessions: one link deep is sufficient.
+
 ## Development cycle
 
 Every non-trivial feature follows this sequence:
@@ -49,7 +59,9 @@ Every non-trivial feature follows this sequence:
 5. **Review.** Run the complete local review loop to convergence. Reconcile the
    design document and `README.org` against the actual diff, run the complete
    local test and lint suite, reconcile the final report against the reviewed
-   head, and record any changed decision and why. Then push the feature branch
+   head, and record any changed decision and why. Preserve every pre-existing
+   dated document unchanged; record any direct historical supersession in the
+   new dated document instead. Then push the feature branch
    and open a draft pull request. Address review feedback by rerunning the
    affected local-review lenses before pushing. After the fix is pushed, resolve
    each GitHub thread that it fully addresses. If a thread needs a user decision
