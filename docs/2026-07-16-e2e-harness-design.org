@@ -1357,9 +1357,9 @@ Four focused scenarios extend that boundary:
 1. =sync stop= removes a queued managed start before the active owner releases,
    and a later completed permit proves the canceled payload cannot run.
 2. A second watch event becomes pending while round one still owns the
-   installation. It durably queues a new managed request for round two. The
-   older sibling is still parked across peers, so the watch may proceed once
-   ready; both shares then converge without losing either change.
+   installation.  It queues a new managed request for round two, then the
+   older sibling reaches a real apply stop; only then does the watch complete
+   round two.
 3. SIGKILL of the daemon discards request liveness but preserves enabled intent;
    restart reconstructs the still-queued managed start before release.
 4. Two connectors on opposite relationship directions each commit their local
@@ -1376,12 +1376,11 @@ row or final OS-lock acquisition reports =WouldBlock=, because the relationship
 is not yet configured and therefore cannot appear in =sync list=.  After
 release it also asserts the command's captured human path and queue position.
 Configured-share scenarios assert scheduling through list/status instead.  The
-persistent-watch liveness scenario above uses a one-shot observation for the primary share when
-it queues the second watch round, then accepts the next real apply stop from
-whichever ready request wins. This proves the watch's next request was durably
-queued before normal scheduling continues, without pretending that an older
-parked cross-peer request blocks ready work. Default production builds contain
-no marker behavior.
+fairness scenario above uses a one-shot observation for the primary share when
+it queues the second watch round, then accepts only an
+apply-stop record tagged with the older second share.  This proves the older
+sibling reaches apply first without reading SQLite while its deliberate stop
+holds the database.  Default production builds contain no marker behavior.
 
 The opposite-direction scenario uses a hidden, E2E-only protocol command to
 hold an unrelated real maintenance permit.  Its RAII guard resumes the stopped

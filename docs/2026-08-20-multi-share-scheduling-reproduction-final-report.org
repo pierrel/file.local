@@ -71,7 +71,7 @@ non-files, and nonempty files.  It cannot weaken or release the lock, and
 =#[cfg(feature = "e2e-test-hooks")]= removes the entire hook from ordinary
 builds.
 
-The later persistent-watch liveness test uses a separate marker namespaced by
+The later persistent-watch fairness test uses a separate marker namespaced by
 the primary share.  It is published only after that share has durably queued
 its managed watch request for round two:
 
@@ -85,17 +85,16 @@ Ok(QueueRequest { /* committed request */ })
 #+end_src
 
 That distinct marker cannot be consumed by the older share's enqueue or by a
-worker retrying the global lock. The harness then releases the next real apply
-stop, whether it is the older second share or the now-ready primary watch. The
-older second-share reservation remains parked until both peers are ready; by
-design it does not block ready local work, because that would allow cross-peer
-queue deadlock. The scenario requires both primary changes and the older
-sibling change to converge.
+worker retrying the global lock.  The harness then waits for an apply-stop
+record tagged with the older second share, proving that the older request
+reached apply before the newly queued watch round.
 
-The setup scenario needs a scoped observer thread because =sync add= may
-eventually wait for A and continue. Rust's =std::thread::scope= lets that
-thread safely borrow the peer and watch handles; the compiler guarantees the
-thread is joined before those borrowed values can go away.
+Once the harness sees the observed marker, it checks that B has not applied and
+is not enabled, then resumes A.  The setup scenario needs a scoped observer
+thread because =sync add= may eventually wait for A and continue.  Rust's
+=std::thread::scope= lets that thread safely borrow the peer and watch handles;
+the compiler guarantees the thread is joined before those borrowed values can
+go away.
 
 Both target commands run synchronously through the container's bounded
 wrapper:
