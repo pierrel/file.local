@@ -1,0 +1,688 @@
+#+title: Proposed large-directory and high-churn synchronization design
+#+date: 2026-10-22
+
+* 1. Status, story, and scope
+
+This is a proposed design, not an implementation or a claim of tested
+capacity. It is grounded in repository revision =c502382=. The reported
+workload contains approximately 353,000 files, 185,000 directories, and
+1,000 symlinks, with 7 GB of file contents. Ignored entries do not
+participate. Included directories and retained tombstones do.
+
+The desired experience is that initial synchronization completes within
+available disk space and bounded working memory; subsequent synchronization
+works primarily on changed paths, not the size of the entire share. During
+sustained changes, stable paths and other shares must continue progressing.
+There is no promise to replicate every intermediate save, or to catch up
+when incoming work permanently exceeds disk or network throughput.
+
+Planning assumptions: Linux and macOS, the existing two-endpoint relationship
+model, existing ignore semantics, and unchanged conflict/recovery semantics.
+The user's available RAM, path-length distribution, typical change rate,
+and required latency remain useful tuning inputs, not blockers to this plan.
+The user requested a draft PR for this plan. Implementation, deployment, and
+external delivery of a report are not authorized by the planning request.
+
+* 2. Evidence and the actual scaling problems
+
+1. =src/sync.rs:38-39= limits a session to 1,000,000 records and 256 MiB of
+   metadata. Frames are already chunked, but receivers and later consumers
+   reconstruct whole collections. Wire chunking alone is not bounded-memory
+   synchronization. =RoundBudget::add_metadata= applies a cumulative round
+   limit that includes multiple kinds of metadata.
+2. =scan_mode= in =src/scan.rs:171= loads previous records into a map, shared
+   heads into another map, all seen paths into a set, and results into a
+   vector. Each directory's names are collected and sorted. Every regular
+   file is hashed before comparing its entry with the previous entry
+   (=src/scan.rs:245-270=). Even an unchanged tree incurs content reads.
+3. =refresh_with_root= (=src/sync.rs:1569=) loads all records;
+   =State::replace_records= (=src/state.rs:4641=) deletes and reinserts them.
+   =State::acknowledge_shared_heads= (=src/state.rs:4614=) similarly rebuilds
+   all shared heads.
+4. =reconcile= (=src/reconcile.rs:125=) constructs whole-tree maps, a path
+   set, and a =Plan= containing record, conflict, and merge vectors.
+   =apply_complete_plan_with_root_skipping_inner= (=src/sync.rs:1943=)
+   builds more maps/vectors and serializes a whole install intent.
+5. =State::validate_remote_records= (=src/state.rs:2105=) enforces duplicate
+   path and version-identity consistency across the complete input. Moving
+   this check inside individual pages would weaken security.
+6. =create_local_watcher= (=src/main.rs:7476=) discards event paths and
+   retains only a generation. Every watch round calls =refresh_with_root=.
+   =src/watch.rs:132= supplies debounce and 15-minute safety audits. The
+   bounded wake channel is already a useful pattern and should remain.
+7. =RelativePath= (=src/model.rs:70=) serializes raw bytes as JSON arrays.
+   This inflates metadata. Authentication uses its current canonical model
+   serialization (=src/state.rs:6913=), so changing global serialization
+   would also change authentication, not just compression.
+8. Object accounting scans the object directory
+   (=available_object_bytes=, =src/state.rs:6127=). Unreferenced-object
+   pruning and recovery accounting must also be audited for full-tree work.
+   Optimizing the network while retaining these per-round scans would leave
+   ongoing synchronization proportional to total share size.
+
+For approximately 539,000 included entries, 256 MiB permits only about 498
+encoded bytes per entry for a single inventory, before additional stages.
+This arithmetic explains a plausible limit encounter; it is not a measured
+inventory size or proof that these particular entries exceeded it.
+
+* 3. Architecture decision: disk-backed baseline, then durable deltas
+
+Use the existing SQLite state and authenticated record model. First make
+baseline synchronization page-oriented end to end. Then add a durable change
+journal and dirty-path capture. Do not introduce Merkle trees, distributed
+consensus, a new transport, or parallel whole-tree actors as prerequisites.
+
+The pipeline becomes:
+
+#+begin_example
+filesystem events -> bounded dirty scopes -> captured canonical records
+                                                  |
+                                        durable change journal
+                                                  |
+baseline pages or delta pages -> disk-backed reconciliation/plan
+                                                  |
+                                    guarded, durable apply batches
+                                                  |
+                                      exact-version acknowledgments
+#+end_example
+
+The journal records verified canonical-record changes, not untrusted watcher
+events. Watcher events are hints about where to inspect the real filesystem.
+Records retain existing authenticated identities, causal ancestry, merge
+bases, tombstones, and recoverable conflicts.
+
+** Atomicity decision
+
+Filesystem synchronization is not a whole-tree atomic transaction today.
+Keep atomic replacement and durable recovery per installed path. The new
+protocol makes successful bounded batches explicit. A failure may leave
+completed batches visible while the relationship is still catching up.
+Never report the whole initial sync complete because one batch completed.
+
+Within a batch, a durable intent precedes any visible mutation. Preserve
+existing temporary ownership, no-follow traversal, precondition checks,
+conflict retention before destructive mutation, file/directory fsyncs,
+and restart recovery. A SQLite transaction is not a substitute for these
+filesystem guarantees.
+
+* 4. Phase A: observable baseline and pinned regressions
+
+Before changing behavior, add counters for included/hashed entries, bytes
+read, serialized metadata bytes, SQLite rows touched, object-directory
+entries visited, time per stage, peak RSS, and state/scratch bytes. Counters
+must distinguish scanning, inventory exchange, object transfer, apply,
+recovery, and waiting for local/peer scheduler ownership. No unrelated share
+paths or content should appear in peer progress.
+
+Pin the failing shape using deliberately small test budgets: a valid
+inventory larger than an entire metadata budget, while every individual
+frame fits. The expected future outcome is completion through several
+bounded pages. Separately pin a one-file change in a large unchanged share
+and a continuously changing path beside stable siblings.
+
+Measure the existing implementation before assigning throughput promises.
+This phase is diagnostic and regression scaffolding, not a scaling fix.
+
+* 5. Phase B: bounded initial synchronization
+
+** 5.1 Paged state and immutable session tables
+
+Replace internal whole-tree collection boundaries with keyset-paged APIs.
+Illustrative contracts, not final Rust signatures:
+
+#+begin_example
+record_page(share, after_path, max_rows, max_bytes) -> Page<Record>
+capture_page(scan_epoch, traversal_cursor, limits) -> CaptureCheckpoint
+snapshot_page(session, side, after_path, limits) -> Page<Record>
+plan_page(session, apply_order_cursor, limits) -> Page<PlannedPath>
+apply_batch(session, batch_id, expected_plan_digest) -> DurableBatchResult
+ack_batch(session, batch_id, exact_installed_versions) -> DurableAck
+#+end_example
+
+Use path BLOB order, not locale-dependent string order or OFFSET pagination.
+SQLite indexes provide ordering, uniqueness, ancestry lookup, object-size
+consistency, and version-identity consistency. A page is bounded by both
+encoded bytes and row count. A single oversize record produces a precise
+record/frame-size error rather than growing memory without bound.
+
+Keep canonical current records in the existing per-path table. New normalized
+session tables hold scan candidates, frozen local/remote inventories,
+validation indexes, plan rows, object requirements, install-intent rows,
+checkpoints, and coalesced pending-path obligations. They are private state,
+not files under the shared root.
+An incomplete session is never an authoritative remote inventory.
+
+Materialize frozen inventories on disk. Do not keep a SQLite read
+transaction open for the lifetime of a large transfer: that could retain an
+unbounded WAL under concurrent writes. Short bounded transactions and
+explicitly pinned immutable session rows make the disk obligation visible.
+At most one active capture/apply owner exists per share. Other shares can
+make progress between scheduler grants.
+
+Replace the old full =records_json= install intent with an indexed parent
+intent plus per-path rows. Pending, creating, installed, and committed
+transitions remain durable. Recovery pages through these rows; it must not
+reconstruct the old whole-plan JSON in memory. Existing intents must recover
+under the old format before migration or be migrated transactionally with
+their tokens/phases preserved.
+
+** 5.2 Traversal and deletion safety
+
+Traverse using capability-relative, no-follow operations. Persist a bounded
+directory work queue and per-directory enumeration work in SQLite. Do not
+sort a directory's complete name list in RAM; use bounded enumeration plus
+disk indexing when stable ordering is needed. A very wide directory, not
+only a deeply nested tree, must satisfy the same memory bound. Do not depend
+on portable persistent directory-stream offsets across process restarts:
+restart an unfinished directory and idempotently upsert its observed names.
+Give that restarted enumeration a fresh generation. Previously staged names
+are not evidence of fresh presence: invalidate that directory's old partial
+candidate set, rebuild it, and include only its completed new generation in
+sealed coverage. Revalidate queued descendants against current ancestry too.
+Pin the case where a newly observed child disappears while the process is
+down; its pre-crash candidate must not survive as current scan evidence.
+
+Capture files into the existing content-addressed store with bounded buffers.
+Keep opened-file before/after checks and revalidation around installation.
+Do not infer equality solely from size and mtime. A stat cache can be a later
+optimization; event-driven capture plus full audits already removes most
+unnecessary hashing without changing file-identity assumptions.
+
+A scan is a sequence of per-path observations, not an atomic filesystem
+snapshot. Build its candidate inventory separately and seal it only after
+the required traversal completed successfully and the root identity remains
+valid. Only a completed coverage epoch can infer deletions of previously
+tracked paths. Revalidate absence with no-follow operations; only genuine
+absence is deletion, not permission failure, I/O error, inaccessible mount,
+or interrupted traversal. An incomplete capture cannot manufacture mass
+tombstones or clear the authoritative previous inventory.
+
+Start watching before capture. Queue later changes while the frozen inventory
+is being exchanged. A gap or callback overflow durably requests another
+coverage scan. A restart always requests a scan because events during
+downtime cannot be reconstructed. Files changed during capture or apply
+remain dirty and use the current guarded-install/unsettled behavior.
+No claim is made that a live, endlessly changing tree has a simultaneous
+snapshot. Stable captured paths can still advance.
+
+** 5.3 Paged exchange and merge-join planning
+
+Introduce explicitly versioned paged protocols for explicit sync and watch.
+Both endpoints must support them. Preserve the existing separate wire-family
+versioning and produce an actionable upgrade error; do not silently fall
+back to the known non-scaling full-in-memory path for an oversized tree.
+
+An authenticated relationship opens a session bound to the share, both peer
+identities, relationship generation, root identities, capture epochs, and a
+protocol version. Inventory frames contain session ID, side, page number,
+cursor, and a running canonical digest. Strictly increasing path order and
+page numbers reject duplicates/replay/out-of-order records. The final seal
+binds total rows and digest. End-of-stream is not a seal.
+
+Validate every record as received and retain validation state in disk indexes
+across every page: canonical path, duplicate paths, contradictory records for
+the same peer/version identity, locally owned authenticators, causal IDs,
+merge-base authenticators, and conflicting sizes for the same object hash.
+Cross-check against relevant durable local records, not just the current
+page. No visible apply occurs from an unsealed/unvalidated inventory.
+Bound field lengths, causal lists, and decoding work within the existing
+frame-size contract; preserve previously valid record semantics.
+
+Run a sorted merge join over the two sealed inventories and reuse the current
+per-path reconciliation decision logic. Stream output into indexed plan,
+conflict, and merge rows. Preserve bounded text-merge work and deterministic
+conflict identities. Required objects and declared sizes are indexed on disk,
+not reconstructed as a full set/vector.
+
+The complete initial plan is validated and disk-backed before confirmation.
+Compute its canonical digest by streaming ordered rows and length-delimited
+fields into the hasher; replace =sync_plan_fingerprint='s whole-buffer
+serialization (=src/main.rs:4366=), rather than copying the entire inventory
+and plan just to obtain a confirmation token.
+Show exact aggregate counts and bytes plus a paged/detail view, not a huge
+terminal dump. Consent is bound to the plan digest and relationship/root
+generation. An invalidated path is recaptured; newly destructive or otherwise
+materially different initial decisions require renewed consent. Never quietly
+reuse old consent for a changed destructive plan. Existing noninteractive
+confirmation options retain their explicitly authorized behavior.
+
+Compact path and symlink bytes using a canonical base64 wire DTO, decoded
+into the unchanged validated model. Keep authentication's canonical model
+encoding unchanged. This is useful bandwidth reduction, not the mechanism
+that makes the design memory-safe. Avoid compression initially so compressed
+size cannot conceal unbounded decode work.
+
+** 5.4 Dependencies, batches, transfer, and scheduler ownership
+
+Plan ordering must preserve descendants-before-parent deletion,
+parents-before-child creation, and guarded type replacement. Arbitrary
+contiguous path pages are not independent apply batches. Store dependency
+phase/depth/order indexes, and consult indexed ancestry/preconditions across
+page boundaries. A large subtree operation proceeds in bounded resumable
+steps; it must not require loading or reserving the entire subtree in RAM.
+If a changing ancestor invalidates dependent work, persist that deferred
+scope and let unrelated stable scopes proceed.
+
+A batch freezes a finite set of plan rows and both endpoints agree to its
+digest. Transfer and verify required objects before guarded apply. Each
+endpoint commits its local durable batch then exchanges exact installed
+versions. Acknowledged shared heads are upserted only for matching versions,
+never inferred from successful socket writes or receipt of content alone.
+Lost acknowledgments are replayable and idempotent. One-sided commit does
+not invent a mutually shared merge base.
+
+Retain the current deadlock-free paired reservation authority. Rejoin both
+installation FIFO schedulers at bounded mutation checkpoints, rather than
+holding global ownership for the entire tree. Never hold one installation's
+permit while waiting to obtain the other. Share session ownership survives
+these yields, so a competing process cannot interleave a second install.
+Removal, stop, and upgrade generations are revalidated at every checkpoint.
+Lock order is explicit: acquire per-share session ownership before entering
+paired reservation, then acquire the installation grant, then any short
+per-share mutation lock. Release mutation locks and installation grants
+before yielding/requeueing; retain only session ownership. Recovery,
+removal, and maintenance must never hold an installation grant while
+blocking on someone else's session ownership: cancel/mark the generation
+and retry from the scheduler instead. Prove this wait graph in tests before
+changing today's lock boundaries. Session ownership is not permission to
+skip global scheduling for a visible mutation.
+
+Large file hashing, transfer, and construction of a private install temporary
+must not monopolize the installation-wide mutation grant. Reserve disk
+quota and temporary ownership in short transactions, do bulk I/O outside
+the grant, then reacquire paired ownership and revalidate before visible
+replacement/fsync/record commit. Per-object synchronization prevents races.
+If separating this from today's locks cannot preserve recovery invariants,
+it is an implementation gate, not an excuse to promise bounded fairness
+while one 7-GB file holds the global lock.
+
+** 5.5 Durable reconnect and completion
+
+Persist received-page checkpoints only after validated rows are durable.
+Resume a matching session using the last durably accepted page and batch
+acknowledgment, not a peer-provided arbitrary cursor. Bind checkpoints to all
+session identities above. Replayed committed batches return their durable
+result. A stale/unknown/expired session requests a new baseline and never
+interprets missing history as an empty remote tree.
+
+Define three distinct states: baseline validated, initial plan running, and
+initial complete. A sealed baseline alone is not readiness. Initial complete
+requires every accepted initial-plan obligation resolved on both endpoints,
+mutual exact-version acknowledgments for completed work, and no unresolved
+startup coverage gap. Deferring an accepted initial-plan path does not count
+as resolving it; it keeps initial completion pending while siblings advance.
+If that path never stabilizes, the initial job truthfully remains unsettled.
+
+Keep a durable confirmed-initial-job owner separate from ordinary enabled
+watch intent. It retains the watcher/capture loop and retries deferred initial
+work before the final handoff. Managed daemon restart reclaims confirmed jobs;
+an unconfirmed job never starts applying automatically. Foreground jobs resume
+when the initiating command is rerun. Persist consent digest, intent generation,
+and ownership checkpoints so a crash cannot leave an undefined retry owner.
+Only after initial obligations finish does one generation-checked transaction
+mark initial complete. Managed pairing or a previously enabled managed intent
+may then enable/requeue its normal watch in that transaction. A foreground
+one-shot sync preserves its prior enabled state; completion does not enable a
+disabled relationship. Stop/remove cancels the same job generation rather
+than allowing restart to re-enable it.
+
+Changes observed after the frozen initial cut are later work, unless they
+invalidate an accepted initial decision and require recapture/reconfirmation.
+They remain durable pending work across handoff. Report initial completion
+separately from catching up with these newer changes. Never print Connected
+while accepted initial-plan work is pending, or imply an actively edited tree
+is globally quiet merely because the frozen initial plan completed.
+
+This phase alone removes tree size as a working-memory/session-total ceiling
+and permits long initial work to checkpoint. It still scans the whole tree
+on each change-driven round until Phase C lands. Do not advertise high-churn
+scalability when shipping only Phase B.
+
+* 6. Phase C: dirty capture and checkpointed delta synchronization
+
+** 6.1 Loss-aware bounded dirty scopes
+
+Keep the wake channel size one. Add a bounded path/scope accumulator with
+oldest-pending age. Repeated events for one path coalesce. Rename pairs dirty
+both endpoints and parents; ambiguous renames remain delete-plus-create.
+Directory/coalesced events require subtree enumeration. =.gitignore= changes
+dirty their affected scope and force re-evaluation of advertised membership.
+Apply-generated events are inspected, not blindly suppressed.
+
+The native callback must not block on database I/O. When its bounded queue
+fills or the OS reports a gap, atomically latch =needs_full_scan= before
+dropping detailed events. The coordinator persists that flag before advancing
+any coverage/completion marker. A crash before persistence is safe because
+startup unconditionally requires new coverage. Clearing a loss latch is
+generation-checked against events arriving during recovery.
+
+Bound the persistent dirty-scope table too. Collapse an overfull table to one
+root-dirty obligation; never silently discard work. Process it in bounded
+traversal checkpoints while preserving later event generations. An event
+generation is cleared only after the corresponding capture is durable; a
+newer event for that path must survive completion of an older capture.
+
+Keep content-verifying safety audits for missed notifications. Turn the
+15-minute audit into a background bounded sweep, not an all-at-once global
+pause. Report last completed audit and current coverage age. Fifteen minutes
+is a scheduling goal, not a guaranteed maximum detection time if a full audit
+itself takes longer. Audits and startup scans must not indefinitely postpone
+already captured stable-path deltas.
+
+** 6.2 Transactional current-record journal
+
+Add a per-share journal sequence independent of existing per-author version
+IDs. In one transaction, upsert a changed canonical record and append its
+journal row. This includes local capture and received/applied changes; an
+unchanged authenticated record is not re-journaled. Per-path shared heads and
+object references update incrementally in the same appropriate commit.
+
+Use two explicit boundaries rather than pretending a journal cursor is a
+filesystem snapshot. First select a bounded contiguous journal prefix through
+=H= on each endpoint and exchange its changed-path set. Limit examined rows
+as well as distinct paths, so a million repeated entries cannot create an
+unbounded query. The union includes unchanged counterparts on both peers;
+a one-sided delta is not permission to overwrite a concurrent remote version.
+
+Second, materialize each endpoint's current authenticated records for that
+bounded union in one short SQLite transaction. Its materialization cut =M=
+may be later than =H=. Persist immutable input rows and their digest before
+planning; this finite cut, not an as-of-H historical query, defines the batch
+values and replay identity. A version captured between H selection and M may
+be included, but it does not acknowledge journal rows beyond H. A version
+captured after M belongs to later work and guarded apply must preserve it.
+After a disconnect, replay the frozen rows, never fetch new current values
+under the same batch ID. Directory/type and ignore changes expand bounded,
+indexed dependency scopes through the same materialization protocol.
+
+Persist per-direction transport receipt separately from installed-version
+agreement. Before advancing a received/prunable prefix through H, durably
+account for every row: either it is already reconciled, or its required work
+has been transferred into an indexed, coalesced pending-path obligation.
+Those obligations pin needed versions, inputs, objects, causal state, and
+consent/recovery information independently of the transport journal. Advancing
+receipt never claims those paths are installed. Peers keep their own pending
+ownership durable; an unreceived or unowned obligation cannot be pruned.
+
+Choose that explicit pending-path table, not a contiguous applied-prefix
+alternative. It retains oldest-pending age while newer observations coalesce
+the required current work; immutable in-flight inputs remain pinned until
+their exact outcome is durable. Schedule oldest eligible obligations, defer
+repeatedly invalidated paths for a bounded retry turn, and let stable siblings
+complete. A hot oldest journal row therefore cannot pin all later history or
+force baseline restarts solely because it is not installed yet.
+
+Exact installed-version acknowledgments alone establish shared merge bases.
+Store per-path reconciled, superseded-with-causal-evidence, and deferred
+outcomes; do not claim every intermediate saved version was installed. A
+batch is complete only when its defined obligations have terminal outcomes;
+it can durably transfer deferred work to the pending table without announcing
+those paths settled. Neither a receipt/pruning cursor nor a peer's sequence
+number proves causal authorship. Retain existing record authentication and
+identity checks. Relationship or journal-epoch changes invalidate old cursors.
+
+** 6.3 Retention, gaps, and backpressure
+
+Journal retention is bounded by both bytes and age. A disconnected peer may
+fall behind the retained prefix: invalidate its resume cursor explicitly and
+perform a new paged baseline. Current canonical records remain authoritative.
+Pruning a transport journal does not prune tombstones. Retain tombstones in
+this plan; safe tombstone pruning needs a separate acknowledged-epoch/rejoin
+design so an old peer cannot resurrect deleted paths.
+
+If captures arrive faster than transmission, coalesce dirty hints and bound
+the transport backlog. If pinned session/history quota would be exceeded,
+expire/restart that transport session at a safe checkpoint and retain a
+baseline-required marker. Do not discard recovery conflicts, unacknowledged
+install obligations, or canonical deletion state to make room. If even
+canonical state/required recovery cannot fit, stop new apply safely with a
+clear quota error and explicit pending work.
+
+* 7. Resource policy and session garbage collection
+
+Proposed starting batch limits: 1,024 records and 4 MiB of canonical metadata
+accounting bytes, with at most two pages in flight and the existing 2-MiB raw
+JSON frame ceiling. The 4-MiB limit is for a complete batch across all pages
+and metadata stages, not for each frame. Define accounting bytes as the sum
+of existing-model canonical JSON encodings of its records, conflicts, merge
+instructions, and control metadata, after decoding any compact wire DTO.
+This is deterministic admission accounting, not a claim about Rust heap size;
+independently bound record fields, decoder allocations, and live buffers.
+Use a roughly two-second cooperative work quantum between checkpointable
+steps. These are initial engineering targets to validate, not shipped values
+or a hard bound on uninterruptible OS I/O/fsync latency. Limit decoder fields
+before large allocation and include bounded merge buffers and SQLite cache
+in the measured RSS budget. Long files use fixed buffers.
+
+Use explicit local disk budgets for canonical state, scratch sessions,
+journal, conflict recovery, and content objects. Proposed starting scratch
+allowance is 2 GiB per active large share, constrained by a separately
+accounted installation limit; tune it from Phase A measurements. A local
+operator may increase durable disk allowances, but an untrusted peer may not.
+Preflight estimated additional space, reserve incrementally before writes,
+and fail safely on real ENOSPC regardless of estimates. Do not claim the
+existing =FLOCAL_MAX_STATE_BYTES= is an all-state quota: current code charges
+only the objects directory. Define the new accounting explicitly.
+
+Keep at most one resumable baseline and one active delta batch per share,
+plus an unfinished durable install obligation if present. Proposed session
+expiry is 24 hours without durable progress, also bounded by disk quota.
+Expiry/GC runs in short bounded scheduled steps. It may collect abandoned
+inventories and transport checkpoints, never a live install intent or its
+required objects. Per-share quotas and a global quota prevent many shares
+from multiplying resource consumption without bound.
+
+Replace per-round object-directory enumeration with an indexed object
+catalog and quota reservations. Commit immutable object publication with
+recovery markers; crashes reconcile reserved/published entries in bounded
+maintenance. Reference accounting includes canonical records, pinned
+snapshots/plans, merge bases, conflicts, install intents, and pending objects.
+GC must never delete an object needed by replay/recovery. Periodic scrub can
+reconcile real storage and the catalog incrementally; it is not a per-delta
+full traversal.
+
+Separate per-batch bytes/time limits from a multi-batch job's lifetime. A
+large valid initial sync must checkpoint before exceeding the batch limit,
+not fail because all pages together exceed 256 MiB or five minutes. Keep
+frame deadlines and bounded no-progress/heartbeat timeouts. Progress does
+not grant unlimited scratch growth. A file larger than a batch transfer
+allowance requires chunk-progress checkpoints/one-object bounded streaming,
+not an endless retry of the same impossible batch. Resume at verified object
+boundaries initially; resumable partial-object chunks are a later bandwidth
+optimization, unless measured workloads require them.
+
+* 8. Linux/macOS platform and filesystem boundaries
+
+Native watcher bookkeeping may itself grow with directory count. The target
+is bounded synchronization working sets and measured total endpoint RSS,
+not a mathematically constant-memory daemon independent of the watcher
+backend. Measure native watch allocation separately from planner/capture
+buffers and include it in the full-scale RSS acceptance result.
+
+On Linux, recursively watching 185,000 directories can exceed inotify
+per-user watch/instance limits before any transfer occurs. Detect and report
+the actual failing limit with measured directory/watch requirements; do not
+silently increase host-wide sysctls. Expose an explicit bounded audit/polling
+mode as the slower fallback when native coverage cannot be established.
+It must report degraded latency and does not claim high-rate event-driven
+performance. Validate native watch feasibility in the large Linux fixture.
+
+macOS notifications may coalesce directory changes or omit a usable rename
+pair. Treat these as dirty scopes, not exact operation logs. Do not require
+persisted FSEvents cursors or Linux-specific fanotify privileges for the
+first implementation. After downtime, native cursor ambiguity, sleep, or
+overflow, recover through bounded coverage scans. Test native macOS behavior,
+not just a Linux Docker container running on a Mac.
+
+Continue capability-relative no-follow traversal and immutable opened-root
+identity checks on both platforms. Concurrent symlink/ancestor replacement,
+file-to-directory transitions, nested ignores, non-UTF-8 names, executable
+changes, failed fsync, mount/inode changes, and permission failures remain
+real-filesystem tests. Pagination must not authorize traversal through a
+previously validated but now replaced parent.
+
+* 9. Progress and user-visible guarantees
+
+Report phase, completed/known counts, transferred bytes, pending dirty scopes,
+oldest pending age, completed durable batches, last peer acknowledgment, last
+completed audit, and actual scheduler wait reason. Counts discovered during
+scan are not a reliable percentage before enumeration completes.
+
+Distinguish =connected/catching up=, =applying=, =waiting for peer/local
+scheduler=, =unsettled paths=, =watch degraded=, and =disk quota blocked=.
+Initial =Connected= retains its current completion boundary, not merely SSH
+establishment. Later caught-up status describes the frozen captured
+high-water marks, not a claim that no unobserved filesystem change exists.
+Under continuous churn, show backlog/age and progress, not repeated false
+quiet states. After churn stops and coverage succeeds, eventual convergence
+is the acceptance requirement.
+
+* 10. Validation and proposed acceptance targets
+
+These are proposed targets, to be calibrated against a recorded hardware and
+filesystem baseline. Do not label them achieved until measured.
+
+1. At the user's approximate scale (353k files, 185k directories, 1k symlinks,
+   7 GB; synthetic names/content), initial sync completes with long paths and
+   several old 256-MiB equivalents of metadata. Target peak RSS no more than
+   512 MiB per active endpoint with configured caches at that workload. When
+   fixture count doubles, require approximately flat synchronization pipeline
+   buffers/cache memory; measure native watcher bookkeeping separately because
+   it grows with directory count. Include it in total endpoint RSS rather than
+   hiding it from the 512-MiB workload target. Disk use is linear, not constant.
+   Benchmark on local SSD with adequate explicit state/scratch quota.
+2. After baseline, a ten-file edit touches/hashes those paths and required
+   dependency scopes, not all 539k entries. Assert counters for no whole-tree
+   =records= load/rewrite, no full shared-head rebuild, no per-round object
+   directory traversal, and no unrelated content reads outside audits.
+3. Sweep sustained synthetic 100, 1,000, and 10,000 small-file events/s,
+   recording actual distinct captured versions/s, backlog age, stable sibling
+   latency, CPU, RSS, disk/WAL growth, and network use on named reference
+   hardware. Identify the sustainable rate rather than claiming one before
+   measurement. At a supported load, target stable sibling p95 under five
+   seconds; at overload require explicit backlog/backpressure, bounded state,
+   and eventual final-state convergence after load stops. Repeated-event and
+   distinct-path workloads must be reported separately.
+4. One hot path cannot block 1,000 stable siblings. A second small share
+   acquires scheduler ownership between bounded batches; target under five
+   seconds on the benchmark host absent a blocking OS operation. Test both
+   connector directions and stop/removal/upgrade while work is pending.
+   Put the hot path at the oldest journal sequence, force guarded-apply
+   invalidations, restart both endpoints, and apply journal quota pressure:
+   later stable obligations must still complete without hot-path-induced
+   repeated baselines. Separately edit a selected path between H and M and
+   after M; assert the defined immutable input, receipt bound, later work,
+   and identical replay across reconnect.
+5. Abruptly kill either endpoint during scan page persistence, validation,
+   object staging, intent creation, file replacement/fsync, SQLite commit,
+   and either side of ACK. Repeat lost/replayed pages and ACKs. No lost local
+   edits, invented merge bases, mass deletion, duplicated conflicts, or
+   permanent queue head. Resume skips durably committed work.
+6. Force notification overflow, missing events, callback queue saturation,
+   restart without clean exit, ignored-rule changes, large directory renames,
+   and watch resource exhaustion. A durably scheduled coverage pass repairs
+   uncertainty without falsely acknowledging an unknown inventory.
+7. Adversarial tests cross page boundaries: duplicate path/identity,
+   contradictory owned metadata, invalid causal/base authentication, hash-size
+   disagreement, reused cursor from another relationship/epoch, oversized
+   fields, forged seals, stale root, and unlimited tiny pages. Resource and
+   grammar failures precede visible apply.
+8. Unit/property tests compare paged reconciliation with existing
+   =reconcile= for valid bounded histories, including cross-page ancestor
+   conflicts and deterministic recovery outputs. Existing conflict-prune
+   consent/budget and initial-confirmation contracts remain covered.
+
+Default CI uses small deterministic limits and real filesystems to force all
+multi-page, quota, retry, dependency, and crash boundaries in seconds/minutes.
+Keep =make check= with at least 90% whole-project and changed-line coverage.
+Run bounded native Linux/macOS integration tests; use Docker E2E for network
+protocol and two-ended recovery. The full 539k-entry/7-GB benchmark is opt-in
+or scheduled with explicit timeout and process/I/O backstop. Hard CI timeouts
+do not justify removing boundary coverage; scale the fixture down, not the
+invariant.
+
+* 11. Delivery slices, alternatives, and open feasibility work
+
+1. Land measurements/regressions and record observed costs. No behavior
+   claim changes.
+2. Land normalized state/session/intent paging and disk validation indexes
+   under tests. Keep the old protocol until the new bounded pipeline is
+   complete; do not hide a whole-tree materialization behind a paged API.
+3. Land versioned paged baseline, merge-join plan, explicit confirmation,
+   guarded batch replay/ACK, scheduler yields, and bounded object accounting.
+   This is the first end-user large-initial-directory deliverable.
+4. Land durable change journal, per-path incremental shared heads/object
+   references, dirty scopes, overflow coverage, and background audits. This
+   is the first high-churn scaling deliverable.
+5. Tune using measured results. Consider bounded hash/capture concurrency,
+   partial-object resumption, and cached-stat acceleration only where they
+   solve demonstrated remaining bottlenecks without weakening observation
+   correctness.
+
+Raising/configuring the existing cap is not the main solution: it preserves
+whole-tree RAM, scans, rewrites, and unsafe aggregate resource assumptions.
+Compact encoding is useful but similarly cannot make O(N) repeated work
+incremental. A Merkle tree could later reduce baseline comparisons after
+history expiry, but introduces tree maintenance, authentication, tombstone,
+and prefix/ignore semantics before the much simpler journal is exhausted.
+There is no evidence yet that this additional mechanism is needed.
+
+Feasibility gates before implementation commitments: real per-entry disk
+amplification and required local space; native watch support at 185k
+directories; safely moving bulk private object I/O outside installation-wide
+ownership; indexed dependency expansion for very large directory/type
+changes; incremental crash-safe object reference accounting; migration of
+old install intents; and demonstrated end-to-end RSS bounds including all
+hidden collectors and SQLite buffers.
+
+No blocking user choice is presently required. The recommended behavior is
+bounded partial progress with existing per-path guarantees, unchanged
+conflict preservation, explicit overload/degraded states, and resumable
+baseline fallback when transport history expires. If the user requires
+whole-tree atomic visibility or every intermediate save preserved, those
+are different products and require a revised story before implementation.
+
+* 12. Design review and validation of this proposal
+
+Two independent design-review rounds covered simplicity, platform/dependency
+fit, user guidance/intention, end-to-end UX, interfaces, filesystem
+correctness, and adversarial security. A separate documentation-alignment
+pass and final narrow UX/documentation recheck also converged.
+
+No blockers were found. Three distinct important findings were fixed: an
+unsettled oldest path pinning journal history; ambiguous journal-selection
+versus immutable-value cuts; and deferred initial work lacking a precise
+completion/retry owner. Four minor clarifications were fixed: interrupted
+directory-enumeration candidates, native watcher versus pipeline memory,
+canonical batch accounting versus raw frame/heap sizes, and preservation of
+foreground one-shot enabled state. No verified finding was rejected or left
+actionable. This is design review, not proof that the proposed code works.
+
+Validation on the unchanged application at =c502382=:
+
+- =cargo fmt --all -- --check=: passed.
+- =cargo clippy --all-targets --all-features -- -D warnings=: passed.
+- =make test-make-prefix=: passed.
+- =make elisp-test=: all 27 tests passed.
+- =make check=: blocked by the current execution sandbox. The first library
+  test suite reported 43 passes and 71 failures; full validation stopped there,
+  so neither coverage threshold is claimed passed. A focused scan test
+  reproduces =private directory component / has an unexpected owner=; this
+  sandbox presents the root directory as UID/GID 65534. Product ownership
+  checks were not weakened to accommodate it. Socket-based cases also report
+  =Operation not permitted= under the same restricted execution profile.
+
+No scaling implementation, full 539k-entry benchmark, new Docker scaling
+scenario, deployment, or Copilot review was performed. This draft PR contains
+only the proposed design. Application tests and capacity benchmarks remain
+implementation gates; the local sandbox failure is disclosed rather than
+described as a passing complete gate.
+
+* Historical supersessions
+
+None at this proposal stage: current behavior and every pre-existing dated
+document remain unchanged. When implementation ships, its new report must
+name only the directly superseded historical sections. =README.org= must
+then be updated to distinguish shipped paged baseline, shipped incremental
+watch, and still-deferred optimizations. In particular, this proposal does
+not retrospectively rewrite earlier full-scan/session-budget decisions.
