@@ -1,0 +1,315 @@
+#+title: Next scalable-sync slice: indexed install-temporary progress
+#+date: 2026-10-24
+
+* 1. Scope and production value
+
+Extend PR #26's scaling-persistence work with indexed mutable installation
+progress. Its first CI run passed 62 E2E scenarios, but the existing 5k-file
+initial sync exceeded its ten-minute command deadline. A separate real-SQLite
+regression on unchanged main measured 2,751,936 bytes of parent-intent rewrites
+for 128 progress operations over 64 records. Address that quadratic boundary
+in the same feature PR instead of increasing the timeout. The branch remains
+based on main; the separate design PR is unchanged.
+
+The accepted October 22 proposal and simplification amendment remain the
+architecture contract. This is its next concrete, independently deployable
+slice, not a claim of a bounded scanner, bounded complete initial protocol,
+or removal of the 256-MiB metadata ceiling.
+
+Current code provides an especially expensive consumed boundary:
+
+- =src/state.rs:set_install_temp_phase= calls =install_intent_with_raw=,
+  locates one temp in its vector, serializes the complete intent, and updates
+  =install_intents.records_json= for each creating/owned transition.
+- =rotate_unowned_install_temp= does the same for a token rotation.
+- =src/sync.rs:apply_complete_plan_with_root_skipping_inner= and =apply_record=
+  call those methods for each installed path. Consequently N paths repeatedly
+  rewrite an O(N) payload. Root observed approximately 65 GB of worker writes
+  during a generated 5k-file apply, not 65 GB of file contents.
+- =src/scan.rs:scan_mode= calls =is_owned_temp= for every enumerated entry;
+  that method reads and scans the complete pending intent again. The following
+  =is_internal_path= already excludes all generated =.flocal-tmp-= components.
+
+Eliminate these particular O(N)-per-path operations before adding a general
+disk-backed inventory pipeline. A new inventory interface alone would either
+be unused, require a larger scanner/ancestry/ignore rewrite, or retain this
+quadratic apply cost. Normalizing mutable intent progress has immediate
+consumers and a narrow observable red-to-green contract.
+
+* 2. Small storage representation, no new journal
+
+Keep =InstallIntent= as the current cold reconstructed value used by admission,
+recovery, invalidation, object-reference inspection, and existing apply code.
+Do not add a second synchronization backlog, receipt cursor, work journal,
+or generic state-version framework.
+
+Use the existing =install_intents= row as a SMALL tagged header. Its current
+=records_json= column holds, for the new format, only an explicit format tag,
+a unique intent identity, and one checked monotonically increasing revision.
+Existing failure fingerprint/diagnostic columns stay on this small row.
+
+Add two private SQLite child tables:
+
+#+begin_example
+install_plans(share_id PRIMARY KEY, intent_id, plan_json)
+install_temps(share_id, path BLOB, ordinal, token, phase,
+              PRIMARY KEY(share_id, path), UNIQUE(share_id, ordinal))
+#+end_example
+
+The immutable plan payload contains ordered records, conflicts, and managed
+generation. Temp rows contain ordered per-path mutable token/phase state.
+Retain the original temp order through =ordinal= because finish/invalidation
+guards currently zip temp paths. Preserve the exact Pending/Creating/Owned
+meaning and token restrictions already used by the installer.
+
+The unique intent identity prevents an old revision from identifying a later
+intent for the same share. The revision identifies progress changes within
+that intent and invalidates stale failure classification. Neither is version
+ancestry, a transport position, or another outstanding-work representation.
+Do not add a separate stored plan hash when its immutable payload can be
+hashed at the existing cold recovery/classification boundary.
+
+Separating the large payload physically matters: updating a revision beside
+that payload in one SQLite row would not establish constant write cost by
+construction. The mutable header and child temp row must contain no copied
+plan JSON. A TEMP audit trigger alone cannot prove overflow pages were not
+rewritten; test that the immutable payload row is not updated at all and
+record actual page/write amplification on the existing generated fixture.
+
+* 3. Consumed state operations
+
+** 3.1 Admission and full readers
+
+=set_plan_install_intent_inner= creates the header, immutable payload, and
+ordered temp rows in one existing writer-reserved transaction. Publish none
+of them on error. Clearing =pending_objects= remains in that same commit so
+object ownership transfers atomically into the admitted intent.
+
+Admission of an already pending plan compares typed ordered records,
+conflicts, and the existing conditional managed-generation rule. It is not
+raw JSON byte equality. A matching admission returns existing tokens/phases
+and =created=false= without resetting progress or failure classification.
+A different plan still fails rather than replacing a live mutation intent.
+
+One representation-aware reader reconstructs =InstallIntent= from legacy JSON
+or the new header, payload, and temp rows. Reuse it at all full consumers:
+=install_intent=, =install_recovery_intent=, =install_intent_failure=,
+=unclassified_install_intents=, =begin_install_intent_retry=,
+=install_intents=, =finish_install_inner=, =retire_invalidated_install=, and
+object authorization/reference collection. Preserve missing/corrupt/incomplete
+state as errors; do not treat a header lacking child payload/temps as no intent.
+
+Split rows must be reconstructed from ONE SQLite snapshot. Mutation ownership
+cannot substitute for this: =src/main.rs:remove_sync_relationship= reads
+=install_intent= during preflight before acquiring mutation ownership. A
+reader that observes the header before a progress/finish commit and children
+afterward can combine different revisions or report false missing-child
+corruption.
+
+Use a narrow private helper, =load_install_intent_in(connection, share)=,
+whose connection already owns a transaction. It reads the header,
+classification, immutable payload, and ordered temp rows from that snapshot
+and returns their consistent reconstructed value/fingerprint.
+=with_install_snapshot= reuses an existing connection transaction, including
+the one held by recovery accounting. Otherwise it begins a short DEFERRED read
+transaction, invokes the reader, materializes its result, then commits before returning.
+Listing readers reconstruct their header/child sets within the same short
+read transaction. Do not retain that transaction across filesystem recovery,
+object reads, network transfer, callbacks, or command confirmation.
+
+Mutation helpers that already hold a transaction call the private reader
+with that transaction's connection. Public cold readers invoked inside existing
+recovery accounting inherit that snapshot through the wrapper. In particular, do not
+begin nested transactions or open a second connection to evade an existing
+transaction. A single joined statement is not preferred: duplicating a large
+plan payload once per temp row would recreate the amplification being removed.
+
+This compatibility reader is intentionally still O(N) at these cold boundaries.
+It is not a new promise that all recovery memory is bounded. Do not invoke it
+from each ordinary temp phase/token update.
+
+** 3.2 Indexed mutable progress
+
+Inside a writer-reserved transaction, =set_install_temp_phase= and
+=rotate_unowned_install_temp= read the small header and one indexed path row.
+Perform the existing semantic checks, mutate only that row, advance the header
+revision with checked arithmetic, and clear any valid classified failure plus
+only its matching share diagnostic atomically.
+
+Use the writer reservation to serialize observation and update; carrying a
+complete JSON CAS value outside the transaction is unnecessary. Rotation
+still rejects Owned temps, creates a new reserved token, and resets phase to
+Pending. Missing path/intent or malformed phase/header remains an error.
+No filesystem file is created or adopted by this database operation.
+
+Preserve no-op phase-call behavior: a successful call setting the same phase
+still clears its valid classification and matching diagnostic, as today.
+Advance the revision for every accepted progress operation, even if the child
+phase value is unchanged. This makes stale failure results unambiguously stale
+without retaining the previous full JSON image.
+
+If no failure classification is present, these point operations must not read,
+deserialize, hash, or serialize the immutable plan payload. If classification
+is present, one cold validation may read it before clearing the marker; a
+corrupt or mismatched marker must not silently disappear.
+
+** 3.3 Remove the redundant ownership query
+
+Remove =scan_mode='s =is_owned_temp= call, retaining =is_internal_path= as the
+single unconditional exclusion. Root verified both token origins on main and
+the deployed alpha =5fa9c6fc05a4bca70b79461bccb8f973e363e968=: admission and
+rotation both generate reserved =.flocal-tmp-= names. Reserved-name exclusion
+does not depend on whether a temp is Pending, Creating, Owned, or legacy.
+
+Remove the now-unconsumed =State::is_owned_temp= method rather than create an
+unused token/derived-path index. Its only other repository callers are three
+state-API test assertions; replace those with cold reconstructed intent
+phase/token assertions and preserve actual scanner exclusion tests. README
+promises the CLI/product behavior, not this internal public Rust method.
+
+This also prevents legacy pending plans from being decoded once per scanned
+entry before their first progress mutation. It avoids making an observation
+helper silently migrate durable state just to optimize an unnecessary lookup.
+
+* 4. Fingerprints and failure classification
+
+Legacy failure markers must continue to validate against the exact raw JSON
+or the already supported legacy canonical fingerprint before conversion.
+Do not weaken that check or silently clear a classified intent on open.
+
+For the new representation, compute the opaque recovery fingerprint from a
+domain tag, exact small header identity/revision, and immutable plan payload.
+Hash these unambiguously with length-delimited fields. Compute it only when
+the cold recovery/classification reader already needs that payload. No new
+stored digest column or per-path hashing of the full plan is needed.
+
+The revision binds the temp-progress state: every authorized token/phase
+change advances it in the same transaction as the changed child row. The
+payload is immutable once admitted; public APIs cannot update it in place.
+Classification compares the current fingerprint while holding the writer
+reservation. A delayed classification from an earlier intent or progress
+revision returns false and cannot block a newer intent.
+
+Keep the existing paired failure-column validation, diagnostic truncation,
+unrelated-diagnostic preservation, affected-share queue cancellation, and
+removal-binding behavior. Retrying a failure clears only its matching marker;
+it does not allocate a new plan or reset owned temporary phases.
+
+* 5. Legacy state, downgrade, and cleanup
+
+Create the two child tables and one narrow parent-delete trigger during the
+existing atomic schema setup. Do not eagerly load and rewrite every legacy
+pending plan at startup. Legacy full readers retain their current format and
+fingerprint behavior until an actual phase/token mutation needs conversion.
+
+At the first such mutation, the same IMMEDIATE transaction validates the
+legacy intent and any classification, copies its exact ordered records,
+conflicts, managed generation, paths, tokens, and phases into the new layout,
+then performs the requested point operation and header revision update.
+A failure rolls back to the original legacy row with no partial child state.
+Conversion must not adopt a new token, discard a conflict, or mark Pending
+data as Owned. If conversion is ever performed without an actual progress
+operation, translate a valid failure fingerprint to the new representation
+while preserving its diagnostic, rather than clearing it as a side effect.
+
+Make the new header fail closed in the old =InstallIntent= decoder: it must
+not include a stale legacy-compatible =records=/=temps= mirror. An old binary
+must error before trying to recover/apply a new-format intent. Keep the
+existing installer/upgrade barrier and native service quiescence. Document
+that recovering a new-format pending install requires the upgraded binary;
+do not claim downgrade compatibility with its on-disk intent state.
+
+Use an AFTER DELETE trigger on =install_intents= to remove both child tables'
+rows for that share. This is narrower than enabling a new connection-wide
+foreign-key policy, and SQLite executes it for all existing parent-delete
+paths even if an older binary has foreign_keys disabled. Check finish,
+invalidated retirement, explicit clear, share removal/reinitialization, and
+all bulk share-state cleanup helpers. Do not replace a parent header in place
+with a different identity while retaining old child rows.
+
+Object authorization and GC must reconstruct/visit the immutable plan records
+and conflicts until the same successful finish/retirement transaction transfers
+ownership into canonical/recovery state and deletes the parent. Child-table
+normalization is not permission to collect the plan's objects. No new network
+protocol, global work queue, or transport journal is introduced.
+
+* 6. Red-to-green and end-to-end acceptance
+
+1. Generate a moderate real intent, snapshot its immutable payload row, and
+   audit payload/header/temp mutations. One path's Creating/Owned/token
+   operation must update only its indexed temp row and small header, never
+   the immutable payload or other temp rows. On old main each phase rewrites
+   the large =records_json= intent, so the storage-amplification boundary is
+   a concrete failing scenario, not a timing benchmark.
+2. Reconstruct the full intent after all phase combinations, reopen state,
+   and verify exact path order, tokens, phases, records, conflicts, and managed
+   generation. Matching/different admission, duplicate/invalid paths, SQL
+   failure rollback, another share, and Owned-rotation refusal remain covered.
+   Pin token-collision handling in a real-filesystem state/apply test using
+   the reconstructed token, not a new network debug endpoint.
+   Also use two real connections in WAL mode for deterministic interleavings:
+   establish the reader transaction's snapshot by reading the header, commit
+   a writer's phase/revision update, then reconstruct through the private
+   helper in the same reader transaction. The result must contain the old
+   header/fingerprint AND old temp phase; a fresh public read sees both new
+   values. Repeat with writer finish/parent deletion and cascading child
+   deletion: the old read sees a complete old intent, the fresh read sees
+   no intent, and neither read reports missing-child corruption. These tests
+   require no timing race, global ownership assumption, or production hook.
+3. Load generated legacy intents including missing optional fields, different
+   formatting, valid classified failures using both supported fingerprints,
+   and Pending/Creating/Owned temps. Mutate one path, reopen, and verify every
+   other path, classification cleanup, diagnostic, and root binding. A stale
+   old fingerprint cannot classify the progressed normalized intent.
+4. A same-phase call clears only the matching diagnostic and advances revision.
+   Clear/recreate for one share yields a new identity so an old marker cannot
+   match revision zero of a later plan. Corrupt header/payload/child state and
+   malformed classification fail before any filesystem mutation.
+5. Parent deletion exercises finish, retirement, and clear; no orphaned
+   plan/temp rows remain. Existing removal/reinitialization refusal tests
+   retain their pending-install guards: they cannot detach a live intent.
+   The same parent-delete trigger covers any eventual share-state cleanup.
+   An intent owning the only reference to
+   an object pins it across reopen/GC, and completion transfers that ownership
+   before deleting the normalized children.
+6. Existing generated 5k initial-sync E2E measures stage time and process/state
+   writes before/after with a backstop, not a flaky fixed-speed assertion.
+   Reuse the current fixture; do not add a second huge checked-in tree.
+7. Reuse real SSH abrupt-restart/apply-stop tests on both connector and
+   responder, plus an upgrade E2E starting from an old alpha pending install.
+   A small runtime-generated 32–128-path fixture exercises multiple temp rows,
+   and crashes between Creating/Owned/replacement/commit.
+   Trees, conflict inputs, exact state recovery, and clean final intent status
+   must pass. No Docker execution is part of this architecture assignment.
+8. The scanner must continue excluding reserved temps in every phase, including
+   old-alpha tokens and descendants. The removed ownership query cannot become
+   a reason to inspect or transfer reserved content.
+
+Use focused state tests for mutation counts and cold payload-read behavior;
+real E2E verifies the filesystem/recovery contract. Do not install a new SQLite
+debug endpoint or add a general tracing framework solely for these checks.
+All fixture contents/records are generated at runtime. Default CI remains
+bounded; the 539k-entry benchmark remains opt-in and is not claimed achieved.
+
+* 7. Delivery and remaining limits
+
+Independent reviewers must test this proposal's storage/cleanup, old-format,
+classification, and recovery boundaries before implementation. Then write the
+failing storage tests first, implement against them, run the affected native
+and SSH tests plus complete =make check= and local review to convergence, and
+follow the normal deploy/PR/Copilot process. This extends the existing main-based scaling branch without merging another
+feature branch.
+
+This slice removes a concrete quadratic intent-progress write/read cost. It
+does not normalize the entire immutable plan into record pages, bound cold
+recovery materialization, replace full scans, or fix the full metadata ceiling.
+The later consumed disk-backed inventory/intent readers can use this physical
+separation without having to undo an intermediate second authoritative log.
+
+* Historical supersessions
+
+- [[file:2026-10-24-scalable-sync-implementation-plan.org::*3.3 Interfaces, simplicity, and exclusions][First implementation plan, section 3.3]] limited production changes to two
+  persistence operations and excluded durable-schema changes. This extension
+  adds physically separated immutable plans and indexed temporary progress
+  to remove the measured quadratic apply cost. Existing safety guarantees
+  and the remaining full-snapshot/protocol limits still apply.

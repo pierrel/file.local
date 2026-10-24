@@ -76,6 +76,7 @@ fn abrupt_responder_restart_preserves_an_idle_managed_relationship() -> Result<(
 fn abrupt_connector_restart_recovers_an_interrupted_apply() -> Result<()> {
     let (a, b) = e2e::managed_pair()?;
     a.arm_apply_stops(1)?;
+    b.write_mixed_tree(2, 16)?;
     b.write(
         "during-connector-restart.txt",
         "durable before connector restart",
@@ -92,7 +93,9 @@ fn abrupt_connector_restart_recovers_an_interrupted_apply() -> Result<()> {
         "during-connector-restart.txt",
         "durable before connector restart",
     )?;
-    a.assert_status(|status| !status.pending_install && status.relationship_state == "connector")?;
+    a.wait_for_status(|status| {
+        !status.pending_install && status.relationship_state == "connector"
+    })?;
 
     a.arm_apply_stops(1)?;
     b.write(
@@ -142,6 +145,7 @@ fn replaced_connector_root_requires_explicit_detach_then_can_be_reinitialized() 
 fn abrupt_responder_restart_recovers_an_interrupted_apply() -> Result<()> {
     let (a, b) = e2e::managed_pair()?;
     b.arm_apply_stops(1)?;
+    a.write_mixed_tree(2, 16)?;
     a.write(
         "during-responder-restart.txt",
         "durable before responder restart",
@@ -156,7 +160,9 @@ fn abrupt_responder_restart_recovers_an_interrupted_apply() -> Result<()> {
         "during-responder-restart.txt",
         "durable before responder restart",
     )?;
-    b.assert_status(|status| !status.pending_install && status.relationship_state == "responder")?;
+    b.wait_for_status(|status| {
+        !status.pending_install && status.relationship_state == "responder"
+    })?;
     e2e::assert_trees_equal(&a, &b)
 }
 

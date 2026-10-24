@@ -18,17 +18,8 @@ fn five_thousand_initial_changes_do_not_timeout_after_scan() -> Result<()> {
     let elapsed = started.elapsed();
     eprintln!("large initial sync completed in {elapsed:?}:\n{stderr}");
 
-    for (phase, minimum) in [
-        ("remote file transfer in progress:", 3),
-        ("remote apply in progress:", 7),
-        ("local apply in progress:", 7),
-    ] {
-        let reports = stderr.matches(phase).count();
-        anyhow::ensure!(
-            reports >= minimum,
-            "expected at least {minimum} {phase} reports, got {reports} in: {stderr}"
-        );
-    }
+    // Apply progress is time-throttled, so faster execution emits fewer reports.
+    // Check completion and exact state without requiring a minimum duration.
     let connected: Vec<_> = stdout
         .lines()
         .filter(|line| line.starts_with("Connected "))

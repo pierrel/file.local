@@ -480,6 +480,42 @@ pub struct InstallIntent {
     pub managed_generation: Option<i64>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallIntentHeader {
+    format: u8,
+    id: String,
+    revision: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum InstallIntentDocument {
+    Indexed(InstallIntentHeader),
+    Legacy(InstallIntent),
+}
+
+#[derive(serde::Serialize)]
+struct InstallPlanRef<'a> {
+    records: &'a [Record],
+    conflicts: &'a [Conflict],
+    managed_generation: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct InstallPlan {
+    records: Vec<Record>,
+    conflicts: Vec<Conflict>,
+    managed_generation: Option<i64>,
+}
+
+struct LoadedInstallIntent {
+    raw: String,
+    intent: InstallIntent,
+    fingerprint: String,
+    failure: Option<InstallIntentFailure>,
+}
+
 #[derive(Clone)]
 pub struct InstallRecoveryIntent {
     pub share: ShareId,
@@ -1697,6 +1733,26 @@ impl State {
                     (failure_fingerprint IS NOT NULL AND failure_diagnostic IS NOT NULL)
                 )
             );
+            CREATE TABLE IF NOT EXISTS install_plans (
+                share_id TEXT PRIMARY KEY NOT NULL,
+                intent_id TEXT NOT NULL,
+                plan_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS install_temps (
+                share_id TEXT NOT NULL,
+                path BLOB NOT NULL,
+                ordinal INTEGER NOT NULL CHECK (ordinal>=0),
+                token TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN ('Pending','Creating','Owned')),
+                PRIMARY KEY (share_id,path),
+                UNIQUE (share_id,ordinal)
+            );
+            CREATE TRIGGER IF NOT EXISTS install_intents_delete_children
+            AFTER DELETE ON install_intents
+            BEGIN
+                DELETE FROM install_plans WHERE share_id=OLD.share_id;
+                DELETE FROM install_temps WHERE share_id=OLD.share_id;
+            END;
             CREATE TABLE IF NOT EXISTS unsettled_paths (
                 share_id TEXT NOT NULL,
                 path BLOB NOT NULL,
@@ -2168,19 +2224,14 @@ impl State {
     }
 
     fn install_intent_with_raw(&self, share: &ShareId) -> Result<Option<(String, InstallIntent)>> {
-        let json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT records_json FROM install_intents WHERE share_id=?1",
-                [&share.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        json.map(|json| {
-            let intent = serde_json::from_str(&json)?;
-            Ok((json, intent))
+        self.read_install_intent(share)
+            .map(|loaded| loaded.map(|loaded| (loaded.raw, loaded.intent)))
+    }
+
+    fn read_install_intent(&self, share: &ShareId) -> Result<Option<LoadedInstallIntent>> {
+        with_install_snapshot(&self.conn, |connection| {
+            load_install_intent_in(connection, share)
         })
-        .transpose()
     }
 
     fn install_intent_fingerprint(json: &str) -> String {
@@ -2197,77 +2248,37 @@ impl State {
         &self,
         share: &ShareId,
     ) -> Result<Option<InstallRecoveryIntent>> {
-        let row: Option<(String, Option<String>, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT records_json,failure_fingerprint,failure_diagnostic
-                 FROM install_intents WHERE share_id=?1",
-                [&share.0],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((json, failure_fingerprint, failure_diagnostic)) = row else {
-            return Ok(None);
-        };
-        let intent: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&json, &intent, failure_fingerprint, failure_diagnostic)?;
-        Ok(Some(InstallRecoveryIntent {
-            share: share.clone(),
-            fingerprint: Self::install_intent_fingerprint(&json),
-            intent,
-        }))
+        Ok(self
+            .read_install_intent(share)?
+            .map(|loaded| InstallRecoveryIntent {
+                share: share.clone(),
+                fingerprint: loaded.fingerprint,
+                intent: loaded.intent,
+            }))
     }
 
     pub fn install_intent_failure(&self, share: &ShareId) -> Result<Option<InstallIntentFailure>> {
-        let row: Option<(String, Option<String>, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT records_json,failure_fingerprint,failure_diagnostic
-                 FROM install_intents WHERE share_id=?1",
-                [&share.0],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((json, fingerprint, diagnostic)) = row else {
-            return Ok(None);
-        };
-        let intent: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&json, &intent, fingerprint, diagnostic)
+        Ok(self
+            .read_install_intent(share)?
+            .and_then(|loaded| loaded.failure))
     }
 
     pub fn unclassified_install_intents(&self) -> Result<Vec<InstallRecoveryIntent>> {
-        let mut statement = self.conn.prepare(
-            "SELECT share_id,records_json,failure_fingerprint,failure_diagnostic
-             FROM install_intents ORDER BY share_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        let mut intents = Vec::new();
-        for row in rows {
-            let (share, json, failure_fingerprint, failure_diagnostic) = row?;
-            let intent: InstallIntent = serde_json::from_str(&json)?;
-            if decode_install_intent_failure(
-                &json,
-                &intent,
-                failure_fingerprint,
-                failure_diagnostic,
-            )?
-            .is_none()
-            {
-                intents.push(InstallRecoveryIntent {
-                    share: ShareId(share),
-                    fingerprint: Self::install_intent_fingerprint(&json),
-                    intent,
-                });
+        with_install_snapshot(&self.conn, |connection| {
+            let mut intents = Vec::new();
+            for share in install_intent_shares_in(connection)? {
+                let loaded = load_install_intent_in(connection, &share)?
+                    .context("install intent is missing")?;
+                if loaded.failure.is_none() {
+                    intents.push(InstallRecoveryIntent {
+                        share,
+                        fingerprint: loaded.fingerprint,
+                        intent: loaded.intent,
+                    });
+                }
             }
-        }
-        Ok(intents)
+            Ok(intents)
+        })
     }
 
     pub fn classify_install_intent_failure(
@@ -2278,49 +2289,37 @@ impl State {
     ) -> Result<bool> {
         validate_install_intent_fingerprint(expected_fingerprint)?;
         let diagnostic = bounded_diagnostic(diagnostic);
-        let transaction = self
+        let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<String>, Option<String>)> = transaction
-            .query_row(
-                "SELECT records_json,failure_fingerprint,failure_diagnostic
-                 FROM install_intents WHERE share_id=?1",
-                [&share.0],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((json, prior_fingerprint, prior_diagnostic)) = row else {
-            transaction.commit()?;
+        let Some(loaded) = load_install_intent_in(&tx, share)? else {
+            tx.commit()?;
             return Ok(false);
         };
-        let intent: InstallIntent = serde_json::from_str(&json)?;
-        decode_install_intent_failure(&json, &intent, prior_fingerprint, prior_diagnostic)?;
-        let actual_fingerprint = Self::install_intent_fingerprint(&json);
-        if actual_fingerprint != expected_fingerprint {
-            transaction.commit()?;
+        if loaded.fingerprint != expected_fingerprint {
+            tx.commit()?;
             return Ok(false);
         }
-        let changed = transaction.execute(
-            "UPDATE install_intents
-             SET failure_fingerprint=?2,failure_diagnostic=?3
+        let changed = tx.execute(
+            "UPDATE install_intents SET failure_fingerprint=?2,failure_diagnostic=?3
              WHERE share_id=?1 AND records_json=?4",
-            params![share.0, actual_fingerprint, diagnostic, json],
+            params![share.0, loaded.fingerprint, diagnostic, loaded.raw],
         )?;
         if changed != 1 {
             bail!("install intent changed while classifying recovery failure");
         }
-        let share_changed = transaction.execute(
+        let share_changed = tx.execute(
             "UPDATE shares SET blocked_diagnostic=?2 WHERE share_id=?1",
             params![share.0, diagnostic],
         )?;
         if share_changed != 1 {
             bail!("share disappeared while classifying install recovery failure");
         }
-        transaction.execute(
+        tx.execute(
             "DELETE FROM sync_queue WHERE share_id=?1 AND active=0",
             [&share.0],
         )?;
-        transaction.commit()?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -2328,46 +2327,30 @@ impl State {
         &mut self,
         share: &ShareId,
     ) -> Result<Option<InstallRecoveryIntent>> {
-        let transaction = self
+        let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<String>, Option<String>)> = transaction
-            .query_row(
-                "SELECT records_json,failure_fingerprint,failure_diagnostic
-                 FROM install_intents WHERE share_id=?1",
-                [&share.0],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((json, failure_fingerprint, failure_diagnostic)) = row else {
-            transaction.commit()?;
+        let Some(loaded) = load_install_intent_in(&tx, share)? else {
+            tx.commit()?;
             return Ok(None);
         };
-        let intent: InstallIntent = serde_json::from_str(&json)?;
-        let failure =
-            decode_install_intent_failure(&json, &intent, failure_fingerprint, failure_diagnostic)?;
-        let fingerprint = Self::install_intent_fingerprint(&json);
-        if let Some(failure) = failure {
-            let changed = transaction.execute(
-                "UPDATE install_intents
-                 SET failure_fingerprint=NULL,failure_diagnostic=NULL
+        if let Some(failure) = loaded.failure {
+            tx.execute(
+                "UPDATE install_intents SET failure_fingerprint=NULL,failure_diagnostic=NULL
                  WHERE share_id=?1 AND records_json=?2 AND failure_fingerprint=?3",
-                params![share.0, json, failure.fingerprint],
+                params![share.0, loaded.raw, failure.fingerprint],
             )?;
-            if changed != 1 {
-                bail!("install intent changed while beginning recovery retry");
-            }
-            transaction.execute(
+            tx.execute(
                 "UPDATE shares SET blocked_diagnostic=NULL
                  WHERE share_id=?1 AND blocked_diagnostic=?2",
                 params![share.0, failure.diagnostic],
             )?;
         }
-        transaction.commit()?;
+        tx.commit()?;
         Ok(Some(InstallRecoveryIntent {
             share: share.clone(),
-            intent,
-            fingerprint,
+            intent: loaded.intent,
+            fingerprint: loaded.fingerprint,
         }))
     }
 
@@ -2409,15 +2392,8 @@ impl State {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let existing: Option<String> = transaction
-            .query_row(
-                "SELECT records_json FROM install_intents WHERE share_id=?1",
-                [&share.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(json) = existing {
-            let intent: InstallIntent = serde_json::from_str(&json)?;
+        if let Some(loaded) = load_install_intent_in(&transaction, share)? {
+            let intent = loaded.intent;
             if intent.records != records
                 || intent.conflicts != conflicts
                 || managed_generation
@@ -2441,11 +2417,12 @@ impl State {
                 .collect(),
             managed_generation,
         };
+        let header = write_install_children_in(&transaction, share, &intent)?;
         transaction.execute(
             "INSERT INTO install_intents(
                 share_id,records_json,failure_fingerprint,failure_diagnostic
              ) VALUES(?1,?2,NULL,NULL)",
-            params![share.0, serde_json::to_string(&intent)?],
+            params![share.0, serde_json::to_string(&header)?],
         )?;
         transaction.execute("DELETE FROM pending_objects WHERE share_id=?1", [&share.0])?;
         transaction.commit()?;
@@ -2776,33 +2753,15 @@ impl State {
     }
 
     pub fn install_intents(&self) -> Result<Vec<(ShareId, InstallIntent)>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT share_id, records_json FROM install_intents ORDER BY share_id")?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .map(|row| {
-                let (share, records) = row?;
-                Ok((ShareId(share), serde_json::from_str(&records)?))
-            })
-            .collect()
-    }
-
-    pub fn is_owned_temp(&self, share: &ShareId, path: &Path) -> Result<bool> {
-        let Some(intent) = self.install_intent(share)? else {
-            return Ok(false);
-        };
-        Ok(intent
-            .temps
-            .iter()
-            .filter(|temp| temp.phase != InstallTempPhase::Pending)
-            .any(|temp| {
-                let mut owned = temp.path.to_path_buf();
-                owned.set_file_name(&temp.token);
-                owned == path
-            }))
+        with_install_snapshot(&self.conn, |connection| {
+            let mut intents = Vec::new();
+            for share in install_intent_shares_in(connection)? {
+                let loaded = load_install_intent_in(connection, &share)?
+                    .context("install intent is missing")?;
+                intents.push((share, loaded.intent));
+            }
+            Ok(intents)
+        })
     }
 
     pub fn mark_install_temp_owned(&self, share: &ShareId, path: &RelativePath) -> Result<()> {
@@ -2819,19 +2778,21 @@ impl State {
         path: &RelativePath,
         phase: InstallTempPhase,
     ) -> Result<()> {
-        let (expected_json, mut intent) = self
-            .install_intent_with_raw(share)?
-            .context("install intent is missing")?;
-        let temp_index = intent
-            .temps
-            .iter()
-            .position(|temp| &temp.path == path)
-            .context("install temporary is missing")?;
-        let old_phase = intent.temps[temp_index].phase;
-        intent.temps[temp_index].phase = phase;
-        let replacement_json = serde_json::to_string(&intent)?;
-        intent.temps[temp_index].phase = old_phase;
-        self.replace_install_intent_json(share, &expected_json, &intent, &replacement_json)
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let header = prepare_install_progress_in(&tx, share)?;
+        let changed = tx.execute(
+            "UPDATE install_temps SET phase=?3 WHERE share_id=?1 AND path=?2",
+            params![share.0, path.as_bytes(), install_phase_name(phase)],
+        )?;
+        if changed != 1 {
+            bail!("install temporary is missing");
+        }
+        advance_install_progress_in(&tx, share, header)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn rotate_unowned_install_temp(
@@ -2839,74 +2800,30 @@ impl State {
         share: &ShareId,
         path: &RelativePath,
     ) -> Result<String> {
-        let (expected_json, mut intent) = self
-            .install_intent_with_raw(share)?
-            .context("install intent is missing")?;
-        let temp_index = intent
-            .temps
-            .iter()
-            .position(|temp| &temp.path == path)
-            .context("install temporary is missing")?;
-        if intent.temps[temp_index].phase == InstallTempPhase::Owned {
-            bail!("cannot rotate an owned install temporary");
-        }
-        let token = format!(".flocal-tmp-{}", ShareId::generate().0);
-        let old_token = std::mem::replace(&mut intent.temps[temp_index].token, token.clone());
-        let old_phase = intent.temps[temp_index].phase;
-        intent.temps[temp_index].phase = InstallTempPhase::Pending;
-        let replacement_json = serde_json::to_string(&intent)?;
-        intent.temps[temp_index].token = old_token;
-        intent.temps[temp_index].phase = old_phase;
-        self.replace_install_intent_json(share, &expected_json, &intent, &replacement_json)?;
-        Ok(token)
-    }
-
-    fn replace_install_intent_json(
-        &self,
-        share: &ShareId,
-        expected_json: &str,
-        expected: &InstallIntent,
-        replacement_json: &str,
-    ) -> Result<()> {
-        let transaction = rusqlite::Transaction::new_unchecked(
+        let tx = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let classification: Option<(Option<String>, Option<String>)> = transaction
+        let header = prepare_install_progress_in(&tx, share)?;
+        let phase: String = tx
             .query_row(
-                "SELECT failure_fingerprint,failure_diagnostic
-                 FROM install_intents WHERE share_id=?1 AND records_json=?2",
-                params![share.0, expected_json],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT phase FROM install_temps WHERE share_id=?1 AND path=?2",
+                params![share.0, path.as_bytes()],
+                |row| row.get(0),
             )
-            .optional()?;
-        let Some((failure_fingerprint, failure_diagnostic)) = classification else {
-            bail!("install intent changed while updating its recovery state");
-        };
-        let failure = decode_install_intent_failure(
-            expected_json,
-            expected,
-            failure_fingerprint,
-            failure_diagnostic,
-        )?;
-        let changed = transaction.execute(
-            "UPDATE install_intents
-             SET records_json=?3,failure_fingerprint=NULL,failure_diagnostic=NULL
-             WHERE share_id=?1 AND records_json=?2",
-            params![share.0, expected_json, replacement_json],
-        )?;
-        if changed != 1 {
-            bail!("install intent changed while updating its recovery state");
+            .optional()?
+            .context("install temporary is missing")?;
+        if parse_install_phase(&phase)? == InstallTempPhase::Owned {
+            bail!("cannot rotate an owned install temporary");
         }
-        if let Some(failure) = failure {
-            transaction.execute(
-                "UPDATE shares SET blocked_diagnostic=NULL
-                 WHERE share_id=?1 AND blocked_diagnostic=?2",
-                params![share.0, failure.diagnostic],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
+        let token = format!(".flocal-tmp-{}", ShareId::generate().0);
+        tx.execute(
+            "UPDATE install_temps SET token=?3,phase='Pending' WHERE share_id=?1 AND path=?2",
+            params![share.0, path.as_bytes(), token],
+        )?;
+        advance_install_progress_in(&tx, share, header)?;
+        tx.commit()?;
+        Ok(token)
     }
 
     pub fn lock_share(&self, id: &ShareId) -> Result<File> {
@@ -6438,9 +6355,261 @@ fn validate_install_intent_fingerprint(fingerprint: &str) -> Result<()> {
     Ok(())
 }
 
-fn decode_install_intent_failure(
-    records_json: &str,
+fn decode_install_intent_document(raw: &str) -> Result<InstallIntentDocument> {
+    let document = serde_json::from_str(raw)?;
+    if let InstallIntentDocument::Indexed(header) = &document
+        && header.format != 2
+    {
+        bail!("unsupported install intent format {}", header.format);
+    }
+    Ok(document)
+}
+
+fn with_install_snapshot<T>(
+    connection: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    // Recovery accounting already owns a transaction. Reuse that snapshot.
+    if !connection.is_autocommit() {
+        return read(connection);
+    }
+    let tx = connection.unchecked_transaction()?;
+    let value = read(&tx)?;
+    tx.commit()?;
+    Ok(value)
+}
+
+fn install_intent_shares_in(tx: &Connection) -> Result<Vec<ShareId>> {
+    let mut statement = tx.prepare("SELECT share_id FROM install_intents ORDER BY share_id")?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(0).map(ShareId))?
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+fn install_phase_name(phase: InstallTempPhase) -> &'static str {
+    match phase {
+        InstallTempPhase::Pending => "Pending",
+        InstallTempPhase::Creating => "Creating",
+        InstallTempPhase::Owned => "Owned",
+    }
+}
+
+fn parse_install_phase(phase: &str) -> Result<InstallTempPhase> {
+    match phase {
+        "Pending" => Ok(InstallTempPhase::Pending),
+        "Creating" => Ok(InstallTempPhase::Creating),
+        "Owned" => Ok(InstallTempPhase::Owned),
+        _ => bail!("invalid install temporary phase"),
+    }
+}
+
+fn indexed_install_fingerprint(header: &str, plan: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"flocal-install-intent-v2\0");
+    for value in [header, plan] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+// All pieces, including failure classification, belong to this one snapshot.
+fn load_install_intent_in(tx: &Connection, share: &ShareId) -> Result<Option<LoadedInstallIntent>> {
+    debug_assert!(!tx.is_autocommit());
+    let row: Option<(String, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT records_json,failure_fingerprint,failure_diagnostic
+             FROM install_intents WHERE share_id=?1",
+            [&share.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((raw, failure_fingerprint, diagnostic)) = row else {
+        return Ok(None);
+    };
+    let (intent, fingerprint, failure) = match decode_install_intent_document(&raw)? {
+        InstallIntentDocument::Legacy(intent) => {
+            let failure =
+                decode_install_intent_failure(&raw, &intent, failure_fingerprint, diagnostic)?;
+            let fingerprint = State::install_intent_fingerprint(&raw);
+            (intent, fingerprint, failure)
+        }
+        InstallIntentDocument::Indexed(header) => {
+            let payload: String = tx
+                .query_row(
+                    "SELECT plan_json FROM install_plans WHERE share_id=?1 AND intent_id=?2",
+                    params![share.0, header.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .context("install intent immutable plan is missing or changed")?;
+            let plan: InstallPlan = serde_json::from_str(&payload)?;
+            let mut statement = tx.prepare(
+                "SELECT path,ordinal,token,phase FROM install_temps
+                 WHERE share_id=?1 ORDER BY ordinal",
+            )?;
+            let rows = statement.query_map([&share.0], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut temps = Vec::new();
+            for row in rows {
+                let (path, ordinal, token, phase) = row?;
+                if ordinal != temps.len() as i64 {
+                    bail!("install temporary order is incomplete");
+                }
+                temps.push(InstallTemp {
+                    path: RelativePath::from_bytes(path)?,
+                    token,
+                    phase: parse_install_phase(&phase)?,
+                });
+            }
+            if temps.len() != plan.records.len()
+                || temps
+                    .iter()
+                    .zip(&plan.records)
+                    .any(|(temp, record)| temp.path != record.path)
+            {
+                bail!("install temporary membership does not match its plan");
+            }
+            let fingerprint = indexed_install_fingerprint(&raw, &payload);
+            let failure = validate_install_failure_marker(failure_fingerprint, diagnostic)?;
+            if failure
+                .as_ref()
+                .is_some_and(|failure| failure.fingerprint != fingerprint)
+            {
+                bail!("stored install recovery classification does not match its intent");
+            }
+            (
+                InstallIntent {
+                    records: plan.records,
+                    conflicts: plan.conflicts,
+                    temps,
+                    managed_generation: plan.managed_generation,
+                },
+                fingerprint,
+                failure,
+            )
+        }
+    };
+    Ok(Some(LoadedInstallIntent {
+        raw,
+        intent,
+        fingerprint,
+        failure,
+    }))
+}
+
+fn write_install_children_in(
+    tx: &rusqlite::Transaction<'_>,
+    share: &ShareId,
     intent: &InstallIntent,
+) -> Result<InstallIntentHeader> {
+    if intent.temps.len() != intent.records.len()
+        || intent
+            .temps
+            .iter()
+            .zip(&intent.records)
+            .any(|(temp, record)| temp.path != record.path)
+    {
+        bail!("install temporary membership does not match its plan");
+    }
+    let header = InstallIntentHeader {
+        format: 2,
+        id: ShareId::generate().0,
+        revision: 0,
+    };
+    let payload = serde_json::to_string(&InstallPlanRef {
+        records: &intent.records,
+        conflicts: &intent.conflicts,
+        managed_generation: intent.managed_generation,
+    })?;
+    tx.execute(
+        "INSERT INTO install_plans(share_id,intent_id,plan_json) VALUES(?1,?2,?3)",
+        params![share.0, header.id, payload],
+    )?;
+    let mut insert = tx.prepare(
+        "INSERT INTO install_temps(share_id,path,ordinal,token,phase) VALUES(?1,?2,?3,?4,?5)",
+    )?;
+    for (ordinal, temp) in intent.temps.iter().enumerate() {
+        insert.execute(params![
+            share.0,
+            temp.path.as_bytes(),
+            ordinal as i64,
+            temp.token,
+            install_phase_name(temp.phase)
+        ])?;
+    }
+    Ok(header)
+}
+
+// Called only while reserving the writer; conversion and the point mutation
+// commit together, so an error leaves the original legacy state untouched.
+fn prepare_install_progress_in(
+    tx: &rusqlite::Transaction<'_>,
+    share: &ShareId,
+) -> Result<InstallIntentHeader> {
+    let (raw, fingerprint, diagnostic): (String, Option<String>, Option<String>) = tx
+        .query_row(
+            "SELECT records_json,failure_fingerprint,failure_diagnostic
+             FROM install_intents WHERE share_id=?1",
+            [&share.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .context("install intent is missing")?;
+    match decode_install_intent_document(&raw)? {
+        InstallIntentDocument::Legacy(_) => {
+            let loaded = load_install_intent_in(tx, share)?.context("install intent is missing")?;
+            clear_install_failure_diagnostic(tx, share)?;
+            let header = write_install_children_in(tx, share, &loaded.intent)?;
+            tx.execute(
+                "UPDATE install_intents SET records_json=?2,
+                 failure_fingerprint=NULL,failure_diagnostic=NULL WHERE share_id=?1",
+                params![share.0, serde_json::to_string(&header)?],
+            )?;
+            Ok(header)
+        }
+        InstallIntentDocument::Indexed(header) => {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM install_plans WHERE share_id=?1 AND intent_id=?2)",
+                params![share.0, header.id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                bail!("install intent immutable plan is missing or changed");
+            }
+            if fingerprint.is_some() || diagnostic.is_some() {
+                load_install_intent_in(tx, share)?;
+                clear_install_failure_diagnostic(tx, share)?;
+            }
+            Ok(header)
+        }
+    }
+}
+
+fn advance_install_progress_in(
+    tx: &rusqlite::Transaction<'_>,
+    share: &ShareId,
+    mut header: InstallIntentHeader,
+) -> Result<()> {
+    header.revision = header
+        .revision
+        .checked_add(1)
+        .context("install progress revision overflow")?;
+    tx.execute(
+        "UPDATE install_intents SET records_json=?2,
+         failure_fingerprint=NULL,failure_diagnostic=NULL WHERE share_id=?1",
+        params![share.0, serde_json::to_string(&header)?],
+    )?;
+    Ok(())
+}
+
+fn validate_install_failure_marker(
     fingerprint: Option<String>,
     diagnostic: Option<String>,
 ) -> Result<Option<InstallIntentFailure>> {
@@ -6451,11 +6620,6 @@ fn decode_install_intent_failure(
             if diagnostic.len() > 4096 {
                 bail!("stored install recovery diagnostic exceeds its limit");
             }
-            if State::install_intent_fingerprint(records_json) != fingerprint
-                && State::legacy_install_intent_fingerprint(intent)? != fingerprint
-            {
-                bail!("stored install recovery classification does not match its intent");
-            }
             Ok(Some(InstallIntentFailure {
                 fingerprint,
                 diagnostic,
@@ -6463,6 +6627,22 @@ fn decode_install_intent_failure(
         }
         _ => bail!("stored install recovery classification is incomplete"),
     }
+}
+
+fn decode_install_intent_failure(
+    records_json: &str,
+    intent: &InstallIntent,
+    fingerprint: Option<String>,
+    diagnostic: Option<String>,
+) -> Result<Option<InstallIntentFailure>> {
+    let failure = validate_install_failure_marker(fingerprint, diagnostic)?;
+    if let Some(failure) = &failure
+        && State::install_intent_fingerprint(records_json) != failure.fingerprint
+        && State::legacy_install_intent_fingerprint(intent)? != failure.fingerprint
+    {
+        bail!("stored install recovery classification does not match its intent");
+    }
+    Ok(failure)
 }
 
 fn clear_install_failure_diagnostic(
@@ -8311,10 +8491,8 @@ mod tests {
         let recovery = state
             .install_recovery_intent(&share)?
             .context("install recovery intent is missing")?;
-        assert_eq!(
-            recovery.fingerprint,
-            State::install_intent_fingerprint(&records_json)
-        );
+        assert!(records_json.len() < 1024);
+        assert!(serde_json::from_str::<InstallIntent>(&records_json).is_err());
         assert_eq!(state.unclassified_install_intents()?.len(), 1);
         let wrong_fingerprint = "0".repeat(64);
         assert_ne!(recovery.fingerprint, wrong_fingerprint);
@@ -8352,6 +8530,401 @@ mod tests {
             .try_activate()?
             .context("unrelated share did not remain eligible")?
             .finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn install_temp_progress_does_not_rewrite_the_whole_plan() -> Result<()> {
+        let (_temp, state, share, records) = install_fixture(64)?;
+        state.set_install_intent(&share, &records)?;
+        state.conn.execute_batch(
+            "CREATE TEMP TABLE intent_write_audit(bytes INTEGER NOT NULL);
+             CREATE TEMP TRIGGER audit_intent_payload_updates
+             AFTER UPDATE OF records_json ON main.install_intents
+             BEGIN
+                 INSERT INTO intent_write_audit VALUES(LENGTH(CAST(NEW.records_json AS BLOB)));
+             END;
+             CREATE TEMP TRIGGER immutable_install_plan_update
+             BEFORE UPDATE ON main.install_plans
+             BEGIN SELECT RAISE(ABORT,'immutable plan was updated'); END;
+             CREATE TEMP TRIGGER immutable_install_plan_delete
+             BEFORE DELETE ON main.install_plans
+             BEGIN SELECT RAISE(ABORT,'immutable plan was deleted'); END;",
+        )?;
+        for record in &records {
+            state.mark_install_temp_creating(&share, &record.path)?;
+            state.mark_install_temp_owned(&share, &record.path)?;
+        }
+        let bytes: i64 = state.conn.query_row(
+            "SELECT COALESCE(SUM(bytes),0) FROM intent_write_audit",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            bytes <= records.len() as i64 * 2 * 1024,
+            "per-path progress rewrote {bytes} bytes of parent intent payload"
+        );
+        let recovered = state.install_intent(&share)?.context("intent is missing")?;
+        assert_eq!(recovered.records, records);
+        assert!(
+            recovered
+                .temps
+                .iter()
+                .all(|temp| temp.phase == InstallTempPhase::Owned)
+        );
+        Ok(())
+    }
+
+    fn install_fixture(count: u64) -> Result<(tempfile::TempDir, State, ShareId, Vec<Record>)> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let records = (0..count)
+            .map(|index| {
+                Ok(file_record(
+                    RelativePath::from_bytes(format!("entry-{index}").into_bytes())?,
+                    PeerId("owner".into()),
+                    index + 1,
+                    1,
+                    Vec::new(),
+                    Entry::Directory,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((temp, state, share, records))
+    }
+
+    #[test]
+    fn indexed_install_reads_keep_one_snapshot_across_progress_and_finish() -> Result<()> {
+        let (_temp, state, share, records) = install_fixture(4)?;
+        let (original, _) = state.set_install_intent(&share, &records)?;
+        let mut writer = State::open(&state.dir)?;
+        let tx = state.conn.unchecked_transaction()?;
+        let before = load_install_intent_in(&tx, &share)?.unwrap();
+        writer.mark_install_temp_creating(&share, &records[0].path)?;
+        let fresh = writer.install_recovery_intent(&share)?.unwrap();
+        assert_ne!(fresh.fingerprint, before.fingerprint);
+        assert!(fresh.intent.temps[0].phase == InstallTempPhase::Creating);
+        let during = load_install_intent_in(&tx, &share)?.unwrap();
+        assert_eq!(during.fingerprint, before.fingerprint);
+        assert!(during.intent.temps[0].phase == InstallTempPhase::Pending);
+        writer.finish_install(&share, &original, &records)?;
+        assert!(writer.install_intent(&share)?.is_none());
+        let after_finish = load_install_intent_in(&tx, &share)?.unwrap();
+        assert_eq!(after_finish.intent.records, records);
+        assert_eq!(after_finish.fingerprint, before.fingerprint);
+        tx.commit()?;
+        assert!(state.install_intent(&share)?.is_none());
+        for table in ["install_plans", "install_temps"] {
+            let count: i64 =
+                state
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            assert_eq!(count, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_install_progress_is_atomic_ordered_and_rejects_stale_classification() -> Result<()> {
+        let (temp, mut state, share, records) = install_fixture(4)?;
+        let conflict = recovery_conflict()?;
+        let (original, _) = state.set_managed_plan_install_intent(
+            &share,
+            &records,
+            std::slice::from_ref(&conflict),
+            7,
+        )?;
+        let (same, created) = state.set_managed_plan_install_intent(
+            &share,
+            &records,
+            std::slice::from_ref(&conflict),
+            7,
+        )?;
+        assert!(!created);
+        assert_eq!(same.temps[0].token, original.temps[0].token);
+        assert!(
+            state
+                .set_managed_plan_install_intent(&share, &records, &[conflict], 8)
+                .is_err()
+        );
+        assert!(state.set_install_intent(&share, &[]).is_err());
+        state.mark_install_temp_creating(&share, &records[2].path)?;
+        let before = state.install_recovery_intent(&share)?.unwrap();
+        assert!(state.classify_install_intent_failure(&share, &before.fingerprint, "blocked")?);
+        state.set_blocked(&share, "unrelated")?;
+        state.mark_install_temp_creating(&share, &records[2].path)?;
+        assert!(state.install_intent_failure(&share)?.is_none());
+        assert_eq!(
+            state.managed_share(&share)?.blocked_diagnostic.as_deref(),
+            Some("unrelated")
+        );
+        assert!(!state.classify_install_intent_failure(&share, &before.fingerprint, "stale")?);
+        let progressed = state.install_recovery_intent(&share)?.unwrap();
+        assert_ne!(progressed.fingerprint, before.fingerprint);
+        let missing = RelativePath::from_bytes(b"missing".to_vec())?;
+        assert!(state.mark_install_temp_creating(&share, &missing).is_err());
+        assert!(state.rotate_unowned_install_temp(&share, &missing).is_err());
+        assert_eq!(
+            state.install_recovery_intent(&share)?.unwrap().fingerprint,
+            progressed.fingerprint
+        );
+        state.conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_temp_update BEFORE UPDATE ON main.install_temps
+             BEGIN SELECT RAISE(ABORT,'induced temporary failure'); END;",
+        )?;
+        assert!(
+            state
+                .mark_install_temp_owned(&share, &records[2].path)
+                .is_err()
+        );
+        assert_eq!(
+            state.install_recovery_intent(&share)?.unwrap().fingerprint,
+            progressed.fingerprint
+        );
+        state
+            .conn
+            .execute_batch("DROP TRIGGER temp.fail_temp_update;")?;
+        state.mark_install_temp_owned(&share, &records[2].path)?;
+        assert!(
+            state
+                .rotate_unowned_install_temp(&share, &records[2].path)
+                .is_err()
+        );
+        drop(state);
+        let mut state = State::open(temp.path().join("state"))?;
+        let recovered = state.install_intent(&share)?.unwrap();
+        assert_eq!(recovered.records, original.records);
+        assert_eq!(recovered.conflicts, original.conflicts);
+        assert_eq!(recovered.managed_generation, Some(7));
+        for (index, entry) in recovered.temps.iter().enumerate() {
+            assert_eq!(entry.path, records[index].path);
+            assert_eq!(entry.token, original.temps[index].token);
+            assert!(
+                entry.phase
+                    == if index == 2 {
+                        InstallTempPhase::Owned
+                    } else {
+                        InstallTempPhase::Pending
+                    }
+            );
+        }
+        let old = state.install_recovery_intent(&share)?.unwrap();
+        state.clear_install_intent(&share)?;
+        state.set_install_intent(&share, &records)?;
+        assert!(!state.classify_install_intent_failure(
+            &share,
+            &old.fingerprint,
+            "previous intent"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_install_pins_objects_across_reopen_and_transfers_ownership_on_retirement()
+    -> Result<()> {
+        for retire in [false, true] {
+            let (temp, state, share, mut records) = install_fixture(1)?;
+            let bytes = b"held only by the pending plan";
+            let hash = ObjectHash::from_blake3(blake3::hash(bytes));
+            state.import_object(&hash, bytes)?;
+            records[0].version.entry = Entry::File {
+                hash: hash.clone(),
+                size: bytes.len() as u64,
+                executable: false,
+            };
+            state.set_install_intent(&share, &records)?;
+            assert!(state.records(&share)?.is_empty());
+            state.prune_unreferenced_objects()?;
+            assert_eq!(state.read_object(&hash)?, bytes);
+            drop(state);
+            let mut state = State::open(temp.path().join("state"))?;
+            state.prune_unreferenced_objects()?;
+            assert_eq!(state.read_object(&hash)?, bytes);
+            let candidates = HashSet::from([hash.clone()]);
+            assert_eq!(
+                state.share_authorized_objects(&share, &candidates)?,
+                candidates
+            );
+            let intent = state.install_intent(&share)?.unwrap();
+            if retire {
+                state.retire_invalidated_install(
+                    &share,
+                    &intent,
+                    &records,
+                    &[],
+                    &records[0].path,
+                )?;
+            } else {
+                state.finish_install(&share, &intent, &records)?;
+            }
+            assert!(state.install_intent(&share)?.is_none());
+            for table in ["install_plans", "install_temps"] {
+                let count: i64 = state.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE share_id=?1"),
+                    [&share.0],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(count, 0);
+            }
+            state.prune_unreferenced_objects()?;
+            assert_eq!(state.read_object(&hash)?, bytes);
+            assert_eq!(state.records(&share)?, records);
+            state.replace_records(&share, &[])?;
+            state.prune_unreferenced_objects()?;
+            assert!(!state.object_path(&hash).exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_install_conversion_preserves_all_rows_and_rolls_back_on_error() -> Result<()> {
+        for canonical_marker in [false, true] {
+            let (temp, mut state, share, records) = install_fixture(4)?;
+            let (mut intent, _) = state.set_managed_plan_install_intent(
+                &share,
+                &records,
+                &[recovery_conflict()?],
+                3,
+            )?;
+            intent.temps[0].phase = InstallTempPhase::Owned;
+            intent.temps[1].phase = InstallTempPhase::Creating;
+            state.clear_install_intent(&share)?;
+            let raw = serde_json::to_string_pretty(&intent)?;
+            let fingerprint = if canonical_marker {
+                State::legacy_install_intent_fingerprint(&intent)?
+            } else {
+                State::install_intent_fingerprint(&raw)
+            };
+            state.conn.execute(
+                "INSERT INTO install_intents(share_id,records_json,failure_fingerprint,failure_diagnostic)
+                 VALUES(?1,?2,?3,'legacy failure')",
+                params![share.0, raw, fingerprint],
+            )?;
+            state.set_blocked(&share, "legacy failure")?;
+            state.conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_legacy_progress BEFORE UPDATE ON main.install_temps
+                 BEGIN SELECT RAISE(ABORT,'induced conversion failure'); END;",
+            )?;
+            assert!(
+                state
+                    .mark_install_temp_creating(&share, &records[2].path)
+                    .is_err()
+            );
+            let unchanged = state.read_install_intent(&share)?.unwrap();
+            assert_eq!(unchanged.raw, raw);
+            assert_eq!(unchanged.failure.unwrap().fingerprint, fingerprint);
+            assert_eq!(
+                state.managed_share(&share)?.blocked_diagnostic.as_deref(),
+                Some("legacy failure")
+            );
+            let count: i64 =
+                state
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM install_plans", [], |row| row.get(0))?;
+            assert_eq!(count, 0);
+            state
+                .conn
+                .execute_batch("DROP TRIGGER temp.fail_legacy_progress;")?;
+            state.mark_install_temp_creating(&share, &records[2].path)?;
+            assert!(state.install_intent_failure(&share)?.is_none());
+            assert!(state.managed_share(&share)?.blocked_diagnostic.is_none());
+            assert!(!state.classify_install_intent_failure(
+                &share,
+                &State::install_intent_fingerprint(&raw),
+                "old"
+            )?);
+            drop(state);
+            let state = State::open(temp.path().join("state"))?;
+            let actual = state.install_intent(&share)?.unwrap();
+            assert_eq!(actual.records, intent.records);
+            assert_eq!(actual.conflicts, intent.conflicts);
+            assert_eq!(actual.managed_generation, intent.managed_generation);
+            for (index, actual) in actual.temps.iter().enumerate() {
+                assert_eq!(actual.path, intent.temps[index].path);
+                assert_eq!(actual.token, intent.temps[index].token);
+                assert!(
+                    actual.phase
+                        == if index == 2 {
+                            InstallTempPhase::Creating
+                        } else {
+                            intent.temps[index].phase
+                        }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_install_rejects_incomplete_state_and_preserves_other_shares() -> Result<()> {
+        let (temp, mut state, share, records) = install_fixture(2)?;
+        let other_root = temp.path().join("other-root");
+        fs::create_dir(&other_root)?;
+        let other = state.init_share(&other_root)?;
+        state.set_install_intent(&other, &records)?;
+        assert!(
+            state
+                .set_install_intent(&share, &[records[0].clone(), records[0].clone()])
+                .is_err()
+        );
+        assert!(state.install_intent(&share)?.is_none());
+        state.set_install_intent(&share, &records)?;
+        let raw = state.read_install_intent(&share)?.unwrap().raw;
+        let mut header: InstallIntentHeader = serde_json::from_str(&raw)?;
+        header.revision = u64::MAX;
+        state.conn.execute(
+            "UPDATE install_intents SET records_json=?2 WHERE share_id=?1",
+            params![share.0, serde_json::to_string(&header)?],
+        )?;
+        assert!(
+            state
+                .mark_install_temp_creating(&share, &records[0].path)
+                .is_err()
+        );
+        assert!(state.install_intent(&share)?.unwrap().temps[0].phase == InstallTempPhase::Pending);
+        header.format = 99;
+        state.conn.execute(
+            "UPDATE install_intents SET records_json=?2 WHERE share_id=?1",
+            params![share.0, serde_json::to_string(&header)?],
+        )?;
+        assert!(state.install_intent(&share).is_err());
+        state.conn.execute(
+            "UPDATE install_intents SET records_json=?2 WHERE share_id=?1",
+            params![share.0, raw],
+        )?;
+        state.conn.execute(
+            "DELETE FROM install_temps WHERE share_id=?1 AND ordinal=0",
+            [&share.0],
+        )?;
+        assert!(state.install_intent(&share).is_err());
+        assert!(
+            state
+                .mark_install_temp_owned(&share, &records[0].path)
+                .is_err()
+        );
+        state.clear_install_intent(&share)?;
+        let other_intent = state.install_intent(&other)?.unwrap();
+        assert_eq!(other_intent.records, records);
+        let remaining: i64 = state.conn.query_row(
+            "SELECT COUNT(*) FROM install_plans WHERE share_id=?1",
+            [&share.0],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0);
+        state
+            .conn
+            .execute("DELETE FROM install_plans WHERE share_id=?1", [&other.0])?;
+        assert!(state.install_intent(&other).is_err());
+        assert!(
+            state
+                .mark_install_temp_creating(&other, &records[0].path)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -8496,7 +9069,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_install_intent_json_uses_raw_cas_and_rejects_replacement() -> Result<()> {
+    fn legacy_install_intent_preserves_fingerprints_and_migrates_progress() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("root");
         fs::create_dir(&root)?;
@@ -8511,14 +9084,8 @@ mod tests {
             Vec::new(),
             Entry::Directory,
         );
-        state.set_install_intent(&share, &[record])?;
-
-        let current_json: String = state.conn.query_row(
-            "SELECT records_json FROM install_intents WHERE share_id=?1",
-            [&share.0],
-            |row| row.get(0),
-        )?;
-        let mut legacy_json: serde_json::Value = serde_json::from_str(&current_json)?;
+        let (intent, _) = state.set_install_intent(&share, &[record])?;
+        let mut legacy_json = serde_json::to_value(&intent)?;
         legacy_json
             .as_object_mut()
             .context("install intent is not a JSON object")?
@@ -8531,10 +9098,10 @@ mod tests {
         let legacy_intent: InstallIntent = serde_json::from_str(&legacy_json)?;
         let legacy_fingerprint = State::legacy_install_intent_fingerprint(&legacy_intent)?;
         assert_ne!(raw_fingerprint, legacy_fingerprint);
+        state.clear_install_intent(&share)?;
         state.conn.execute(
-            "UPDATE install_intents
-             SET records_json=?2,failure_fingerprint=?3,failure_diagnostic=?4
-             WHERE share_id=?1",
+            "INSERT INTO install_intents(share_id,records_json,failure_fingerprint,failure_diagnostic)
+             VALUES(?1,?2,?3,?4)",
             params![
                 share.0,
                 legacy_json,
@@ -8556,36 +9123,16 @@ mod tests {
         assert_ne!(old_token, new_token);
         assert!(state.install_intent(&share)?.unwrap().temps[0].phase == InstallTempPhase::Pending);
 
-        let expected_json: String = state.conn.query_row(
-            "SELECT records_json FROM install_intents WHERE share_id=?1",
-            [&share.0],
-            |row| row.get(0),
-        )?;
-        let expected: InstallIntent = serde_json::from_str(&expected_json)?;
-        let mut replacement = expected.clone();
-        replacement.temps[0].phase = InstallTempPhase::Owned;
-        let replacement_json = serde_json::to_string(&replacement)?;
-        let mut competing: InstallIntent = serde_json::from_str(&expected_json)?;
-        competing.temps[0].token = ".flocal-tmp-replaced".into();
-        let competing_json = serde_json::to_string(&competing)?;
-        state.conn.execute(
-            "UPDATE install_intents SET records_json=?2 WHERE share_id=?1",
-            params![share.0, competing_json],
-        )?;
-        let error = state
-            .replace_install_intent_json(&share, &expected_json, &expected, &replacement_json)
-            .expect_err("a genuinely replaced intent must not satisfy the CAS");
-        assert!(
-            error
-                .to_string()
-                .contains("install intent changed while updating its recovery state")
-        );
-        let after: String = state.conn.query_row(
-            "SELECT records_json FROM install_intents WHERE share_id=?1",
-            [&share.0],
-            |row| row.get(0),
-        )?;
-        assert_eq!(after, competing_json);
+        let before = state.install_recovery_intent(&share)?.unwrap();
+        state.mark_install_temp_owned(&share, &path)?;
+        assert!(!state.classify_install_intent_failure(
+            &share,
+            &before.fingerprint,
+            "stale failure"
+        )?);
+        let after = state.install_intent(&share)?.unwrap();
+        assert_eq!(after.temps[0].token, new_token);
+        assert!(after.temps[0].phase == InstallTempPhase::Owned);
         Ok(())
     }
 
