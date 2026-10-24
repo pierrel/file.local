@@ -4611,46 +4611,93 @@ impl State {
     /// current record. Calling this after the peer's commit acknowledgement
     /// makes one-sided failures conservative without inventing a shared base.
     pub fn acknowledge_shared_heads(&mut self, share: &ShareId, plan: &[Record]) -> Result<()> {
-        let current: std::collections::HashMap<_, _> = self
-            .records(share)?
-            .into_iter()
-            .map(|record| (record.path.as_bytes().to_vec(), record))
-            .collect();
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM shared_heads WHERE share_id=?1", [&share.0])?;
-        for record in plan {
-            if current.get(record.path.as_bytes()) != Some(record) {
-                continue;
-            }
-            let Some(base) = record.version.as_base() else {
-                continue;
-            };
-            tx.execute(
-                "INSERT INTO shared_heads(share_id,path,base_json) VALUES(?1,?2,?3)",
-                params![
-                    share.0,
+        // Reserve the writer before reading: scheduler writes can otherwise
+        // invalidate a deferred transaction's WAL snapshot before publication.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE acknowledged_heads(
+                 path BLOB PRIMARY KEY NOT NULL, base_json TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
+        {
+            let mut current =
+                tx.prepare("SELECT version_json FROM records WHERE share_id=?1 AND path=?2")?;
+            let mut stage =
+                tx.prepare("INSERT INTO temp.acknowledged_heads(path,base_json) VALUES(?1,?2)")?;
+            for record in plan {
+                let Some(json) = current
+                    .query_row(params![share.0, record.path.as_bytes()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()?
+                else {
+                    continue;
+                };
+                // Stored legacy JSON may omit defaults or use different whitespace.
+                if serde_json::from_str::<Version>(&json)? != record.version {
+                    continue;
+                }
+                let Some(base) = record.version.as_base() else {
+                    continue;
+                };
+                stage.execute(params![
                     record.path.as_bytes(),
                     serde_json::to_string(&base)?
-                ],
-            )?;
+                ])?;
+            }
         }
+        tx.execute(
+            "DELETE FROM shared_heads WHERE share_id=?1 AND NOT EXISTS(
+                 SELECT 1 FROM temp.acknowledged_heads WHERE path=shared_heads.path
+             )",
+            [&share.0],
+        )?;
+        tx.execute(
+            "INSERT INTO shared_heads(share_id,path,base_json)
+             SELECT ?1,path,base_json FROM temp.acknowledged_heads WHERE true
+             ON CONFLICT(share_id,path) DO UPDATE SET base_json=excluded.base_json
+             WHERE shared_heads.base_json<>excluded.base_json",
+            [&share.0],
+        )?;
+        tx.execute_batch("DROP TABLE temp.acknowledged_heads;")?;
         tx.commit()?;
         Ok(())
     }
 
+    /// Replaces full-snapshot membership atomically without rewriting identical rows.
     pub fn replace_records(&mut self, id: &ShareId, records: &[Record]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM records WHERE share_id=?1", [&id.0])?;
-        for record in records {
-            tx.execute(
-                "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
-                params![
+        tx.execute_batch(
+            "CREATE TEMP TABLE replacement_paths(path BLOB PRIMARY KEY NOT NULL) WITHOUT ROWID;",
+        )?;
+        {
+            let mut membership =
+                tx.prepare("INSERT INTO temp.replacement_paths(path) VALUES(?1)")?;
+            let mut upsert = tx.prepare(
+                "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)
+                 ON CONFLICT(share_id,path) DO UPDATE SET version_json=excluded.version_json
+                 WHERE records.version_json<>excluded.version_json",
+            )?;
+            // The unique TEMP index retains duplicate rejection and omitted-path
+            // detection without another whole-snapshot Rust collection.
+            for record in records {
+                membership.execute([record.path.as_bytes()])?;
+                upsert.execute(params![
                     id.0,
                     record.path.as_bytes(),
                     serde_json::to_string(&record.version)?
-                ],
-            )?;
+                ])?;
+            }
         }
+        tx.execute(
+            "DELETE FROM records WHERE share_id=?1 AND NOT EXISTS(
+                 SELECT 1 FROM temp.replacement_paths WHERE path=records.path
+             )",
+            [&id.0],
+        )?;
+        tx.execute_batch("DROP TABLE temp.replacement_paths;")?;
         tx.commit()?;
         Ok(())
     }
@@ -7722,6 +7769,293 @@ mod tests {
             ),
             crate::merge::FallbackReason::AbsentBase,
         ))
+    }
+
+    fn persistence_fixture(state: &State) -> Result<Vec<Record>> {
+        let peer = state.peer_id()?;
+        (0..64)
+            .map(|index| {
+                Ok(file_record(
+                    RelativePath::from_bytes(format!("file-{index:03}").into_bytes())?,
+                    peer.clone(),
+                    index + 1,
+                    index as i64,
+                    Vec::new(),
+                    Entry::File {
+                        hash: ObjectHash::from_blake3(blake3::hash(&index.to_le_bytes())),
+                        size: 8,
+                        executable: false,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn audit_persistence(state: &State) -> Result<()> {
+        state.conn.execute_batch(
+            "CREATE TEMP TABLE persistence_writes (table_name TEXT, operation TEXT, path BLOB);",
+        )?;
+        for table in ["records", "shared_heads"] {
+            for (operation, row) in [("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")] {
+                state.conn.execute_batch(&format!(
+                    "CREATE TEMP TRIGGER audit_{table}_{operation} AFTER {operation} ON main.{table}
+                     BEGIN INSERT INTO persistence_writes VALUES ('{table}', '{operation}', {row}.path); END;"
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persistence_writes(state: &State) -> Result<Vec<(String, String, Vec<u8>)>> {
+        let mut statement = state
+            .conn
+            .prepare("SELECT table_name,operation,path FROM persistence_writes ORDER BY rowid")?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn record_replacement_mutates_only_changed_paths_and_rolls_back_duplicates() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let records = persistence_fixture(&state)?;
+        state.replace_records(&share, &records)?;
+        audit_persistence(&state)?;
+
+        state.replace_records(&share, &records)?;
+        assert!(
+            persistence_writes(&state)?.is_empty(),
+            "no-op replacement rewrote records"
+        );
+
+        let mut changed = records.clone();
+        changed[0].version.timestamp_ns += 1;
+        changed.remove(1);
+        let mut added = changed[0].clone();
+        added.path = RelativePath::from_bytes(b"new-file".to_vec())?;
+        added.version.sequence = 100;
+        changed.push(added);
+        state.replace_records(&share, &changed)?;
+        let mut writes = persistence_writes(&state)?;
+        writes.sort();
+        assert_eq!(
+            writes,
+            vec![
+                ("records".into(), "DELETE".into(), b"file-001".to_vec()),
+                ("records".into(), "INSERT".into(), b"new-file".to_vec()),
+                ("records".into(), "UPDATE".into(), b"file-000".to_vec()),
+            ]
+        );
+        let before = state.records(&share)?;
+        let mut duplicate = changed.clone();
+        duplicate[0].version.timestamp_ns += 1;
+        duplicate.push(duplicate[0].clone());
+        assert!(state.replace_records(&share, &duplicate).is_err());
+        assert_eq!(state.records(&share)?, before);
+        assert_eq!(persistence_writes(&state)?.len(), 3);
+        state.replace_records(&share, &changed)?;
+        assert_eq!(persistence_writes(&state)?.len(), 3);
+
+        let other_root = temp.path().join("other");
+        fs::create_dir(&other_root)?;
+        let other = state.init_share(&other_root)?;
+        state.replace_records(&other, &records)?;
+        state.replace_records(&share, &[])?;
+        assert!(state.records(&share)?.is_empty());
+        assert_eq!(state.records(&other)?, records);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_head_acknowledgment_preserves_unchanged_bases_and_exact_current_checks() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let records = persistence_fixture(&state)?;
+        state.replace_records(&share, &records)?;
+        state.acknowledge_shared_heads(&share, &records)?;
+        let other_root = temp.path().join("other");
+        fs::create_dir(&other_root)?;
+        let other = state.init_share(&other_root)?;
+        state.replace_records(&other, &records)?;
+        state.acknowledge_shared_heads(&other, &records)?;
+        let other_heads = state.shared_heads(&other)?;
+        audit_persistence(&state)?;
+
+        state.acknowledge_shared_heads(&share, &records)?;
+        assert!(
+            persistence_writes(&state)?.is_empty(),
+            "no-op ACK rewrote shared heads"
+        );
+
+        let mut changed = records.clone();
+        changed[0].version.timestamp_ns += 1;
+        state.replace_records(&share, &changed)?;
+        state.conn.execute("DELETE FROM persistence_writes", [])?;
+        state.acknowledge_shared_heads(&share, &records)?;
+        assert_eq!(
+            persistence_writes(&state)?,
+            vec![("shared_heads".into(), "DELETE".into(), b"file-000".to_vec())]
+        );
+        assert!(
+            !state
+                .shared_heads(&share)?
+                .contains_key(b"file-000".as_slice())
+        );
+        state.conn.execute("DELETE FROM persistence_writes", [])?;
+        state.acknowledge_shared_heads(&share, &changed)?;
+        assert_eq!(
+            persistence_writes(&state)?,
+            vec![("shared_heads".into(), "INSERT".into(), b"file-000".to_vec())]
+        );
+        let before = state.shared_heads(&share)?;
+        let mut duplicate = changed.clone();
+        duplicate.push(changed[0].clone());
+        assert!(state.acknowledge_shared_heads(&share, &duplicate).is_err());
+        assert_eq!(state.shared_heads(&share)?, before);
+        state.acknowledge_shared_heads(&share, &changed)?;
+        assert_eq!(persistence_writes(&state)?.len(), 1);
+
+        changed[0].version.sequence += 1000;
+        state.replace_records(&share, &changed)?;
+        state.conn.execute("DELETE FROM persistence_writes", [])?;
+        state.acknowledge_shared_heads(&share, &changed)?;
+        assert_eq!(
+            persistence_writes(&state)?,
+            vec![("shared_heads".into(), "UPDATE".into(), b"file-000".to_vec())]
+        );
+        state.acknowledge_shared_heads(&share, &[])?;
+        assert!(state.shared_heads(&share)?.is_empty());
+        assert_eq!(state.shared_heads(&other)?, other_heads);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_head_acknowledgment_compares_legacy_values_and_skips_ineligible_duplicates()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let mut records = persistence_fixture(&state)?;
+        records.truncate(4);
+        records[1].version.entry = Entry::Directory;
+        records[2].version.entry = Entry::Symlink {
+            target: b"file-000".to_vec(),
+        };
+        records[3].version.entry = Entry::Tombstone;
+        state.replace_records(&share, &records)?;
+        let mut legacy = serde_json::to_value(&records[0].version)?;
+        legacy.as_object_mut().unwrap().remove("seen");
+        state.conn.execute(
+            "UPDATE records SET version_json=?2 WHERE share_id=?1 AND path=?3",
+            params![
+                share.0,
+                serde_json::to_string_pretty(&legacy)?,
+                records[0].path.as_bytes()
+            ],
+        )?;
+        state.acknowledge_shared_heads(&share, &records)?;
+        assert_eq!(state.shared_heads(&share)?.len(), 1);
+        assert_eq!(
+            state.shared_heads(&share)?.get(records[0].path.as_bytes()),
+            records[0].version.as_base().as_ref()
+        );
+        let mut ineligible = records.clone();
+        ineligible[0].version.timestamp_ns += 1;
+        let mut missing = records[0].clone();
+        missing.path = RelativePath::from_bytes(b"missing".to_vec())?;
+        ineligible.push(missing);
+        ineligible.extend(ineligible.clone());
+        state.acknowledge_shared_heads(&share, &ineligible)?;
+        assert!(state.shared_heads(&share)?.is_empty());
+        state.acknowledge_shared_heads(&share, &[])?;
+        Ok(())
+    }
+
+    #[test]
+    fn shared_head_sql_failure_rolls_back_deletion_and_updates() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let mut records = persistence_fixture(&state)?;
+        state.replace_records(&share, &records)?;
+        state.acknowledge_shared_heads(&share, &records)?;
+        let before = state.shared_heads(&share)?;
+        records[0].version.sequence += 1000;
+        records[1].version.sequence += 1000;
+        state.replace_records(&share, &records)?;
+        state.conn.execute_batch(
+            "CREATE TEMP TRIGGER reject_head BEFORE UPDATE ON main.shared_heads
+             WHEN NEW.path=X'66696C652D303031'
+             BEGIN SELECT RAISE(ABORT, 'injected persistent write failure'); END;",
+        )?;
+        assert!(
+            state
+                .acknowledge_shared_heads(&share, &records[..2])
+                .is_err()
+        );
+        assert_eq!(state.shared_heads(&share)?, before);
+        state.conn.execute_batch("DROP TRIGGER temp.reject_head;")?;
+        state.acknowledge_shared_heads(&share, &records[..2])?;
+        assert_eq!(state.shared_heads(&share)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_head_ack_reserves_writer_before_reading_current_versions() -> Result<()> {
+        thread_local! {
+            static COMPETING_WRITER: std::cell::RefCell<Option<Connection>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        fn release_writer(_: i32) -> bool {
+            COMPETING_WRITER.with(|writer| {
+                writer
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|connection| connection.execute_batch("COMMIT").is_ok())
+            })
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let mut state = State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let records = persistence_fixture(&state)?;
+        state.replace_records(&share, &records)?;
+        let writer = Connection::open(state_dir.join("state.sqlite3"))?;
+        writer.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE installation SET scheduler_completion_sequence=scheduler_completion_sequence+1;",
+        )?;
+        COMPETING_WRITER.with(|slot| *slot.borrow_mut() = Some(writer));
+        state.conn.busy_handler(Some(release_writer))?;
+
+        // A deferred reader-to-writer upgrade cannot wait here. Reserving the
+        // writer first instead invokes the handler before acquiring a snapshot.
+        let outcome = state.acknowledge_shared_heads(&share, &records);
+        let unreleased = COMPETING_WRITER.with(|slot| slot.borrow_mut().take());
+        let waited = unreleased.is_none();
+        drop(unreleased);
+        state.conn.busy_handler(None)?;
+        outcome?;
+        assert!(waited, "ACK did not reserve the writer before reading");
+        assert_eq!(state.shared_heads(&share)?.len(), records.len());
+        Ok(())
     }
 
     #[test]

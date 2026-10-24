@@ -2185,6 +2185,37 @@ done"#,
         Ok(())
     }
 
+    /// Generates small mixed-entry trees in one container command instead of
+    /// storing a fixture corpus or making one Docker call per generated file.
+    pub fn write_mixed_tree(&self, groups: u32, files_per_group: u32) -> Result<()> {
+        self.exec_ok(&[
+            "sh",
+            "-c",
+            r#"set -eu
+root=$1
+groups=$2
+files=$3
+group=0
+while [ "$group" -lt "$groups" ]; do
+    directory="$root/generated/group-$group"
+    mkdir -p "$directory/empty"
+    file=0
+    while [ "$file" -lt "$files" ]; do
+        printf 'group=%s file=%s\n' "$group" "$file" >"$directory/file-$file.txt"
+        file=$((file + 1))
+    done
+    ln -s file-0.txt "$directory/current"
+    chmod 700 "$directory/file-0.txt"
+    group=$((group + 1))
+done"#,
+            "write-mixed-tree",
+            SHARE,
+            &groups.to_string(),
+            &files_per_group.to_string(),
+        ])?;
+        Ok(())
+    }
+
     pub fn write_bytes(&self, path: &str, content: &[u8]) -> Result<()> {
         let full = self.share_path(path)?;
         if let Some((parent, _)) = full.rsplit_once('/') {

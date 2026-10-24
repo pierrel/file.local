@@ -1,0 +1,218 @@
+#+title: First scalable-sync delivery: stop rewriting unchanged state
+#+date: 2026-10-24
+
+* Outcome and intended experience
+
+This feature branch implements the first production slice of the accepted
+large-directory design: unchanged canonical record and shared-head rows are
+no longer deleted and reinserted during every synchronization round. Shared-head
+acknowledgment also stops loading a second whole-share record vector/map.
+
+The visible synchronization rules do not change. Both endpoints can edit
+independently, exact current versions still gate shared merge bases, and
+conflicts, deletion knowledge, ignores, guarded filesystem replacement, and
+crash recovery retain their existing behavior. There is no wire-version or
+durable-schema change and no new background service or progress journal.
+
+This is not yet the large-inventory deliverable. The 256-MiB metadata limit,
+full scans/hashing, full-vector planning, and full-snapshot interfaces remain.
+In particular, this change does not claim that the reported 539k-entry share
+now fits. It removes one measured source of unnecessary persistence work
+before the remaining pipeline is replaced in bounded slices.
+
+The concrete contract and later delivery gates are in
+[[file:2026-10-24-scalable-sync-implementation-plan.org][the implementation plan]], grounded in the accepted proposal and amendment
+in [[https://github.com/pierrel/file.local/pull/25][design PR #25]].
+
+* Final design and data flow
+
+The existing complete-snapshot methods keep their signatures and membership
+semantics. Each uses one connection-local SQLite TEMP index within the same
+transaction as the persistent changes:
+
+1. Stage the incoming membership with a non-null BLOB path primary key.
+2. Reconcile membership with conditional UPSERTs and deletion of omitted
+   target-share rows, leaving byte-identical persistent rows alone. Record
+   persistence UPSERTs while staging, then deletes; acknowledgment validates
+   all eligible heads first, then deletes omitted heads before its UPSERT.
+3. Keep both operations inside the same transaction, regardless of order.
+4. Drop staging and commit once. An error rolls the transaction back.
+
+These TEMP rows are ephemeral membership indexes, not a new authoritative
+queue, version history, or checkpoint system. They avoid adding a whole-tree
+Rust set. Existing SQLite TEMP configuration and private-state handling are
+unchanged; this is not a claim that every TEMP byte is physically written to
+disk or that the complete sync pipeline now has bounded memory.
+
+Full-snapshot iteration, staging, and membership checks still scale with the
+number of entries. The improvement is fewer mutations to the durable tables
+and less acknowledgment materialization, not changed-path-only execution.
+
+* Component-by-component changes
+
+** Canonical record persistence
+
+=State::replace_records= in =src/state.rs= replaces unconditional
+delete-and-insert with conditional UPSERT:
+
+#+begin_src sql
+INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)
+ON CONFLICT(share_id,path) DO UPDATE SET version_json=excluded.version_json
+WHERE records.version_json<>excluded.version_json
+#+end_src
+
+The =WHERE= clause suppresses a persistent update for identical JSON.
+=INSERT OR REPLACE= would not be equivalent: it can delete the old row and
+would retain the write amplification. The TEMP primary key separately rejects
+duplicate input paths, preserving the old transaction-failure behavior.
+
+After staging, =NOT EXISTS= removes only omitted paths for the selected
+share. Empty input therefore still clears that share, without touching
+another share. Tombstones are ordinary supplied canonical records and are
+not pruned by this optimization.
+
+** Exact shared-head acknowledgment
+
+=State::acknowledge_shared_heads= performs an indexed lookup for each plan
+path inside its transaction instead of constructing a full local-record map:
+
+#+begin_src rust
+let Some(json) = current
+    .query_row(params![share.0, record.path.as_bytes()], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()?
+else {
+    continue;
+};
+if serde_json::from_str::<Version>(&json)? != record.version {
+    continue;
+}
+#+end_src
+
+=optional()= converts SQLite's no-row result into an =Option= rather than
+treating absence as an I/O failure. Rust's =let Some(...) else= handles that
+absence explicitly. The =?= operator returns a real query/decoding error to
+the caller; it does not mistake an unavailable record for a missing one.
+
+Comparison is typed, not raw-JSON equality. A stored legacy version can omit
+serde defaults or contain whitespace while still representing the same
+version. Only an exact eligible regular file contributes its =BaseVersion=.
+Directories, symbolic links, tombstones, and stale or absent records do not
+become file merge bases.
+
+The eligible bases are staged and applied with the same differential
+membership pattern as records. This is still a complete-plan operation:
+omitted or ineligible old heads are removed, as before. It must not be used
+as an incremental partial-plan API without a separate accepted contract.
+
+** Transactions, rollback, and statement ownership
+
+Both methods keep staging, validation, deletions, and UPSERTs inside one
+=rusqlite::Transaction=. If =?= returns early, Rust drops that transaction
+and SQLite rolls back its work, including its TEMP-table creation. A failed
+call can then be retried on the same connection without a leftover staging
+table or partial authoritative membership.
+
+Inner Rust scopes release prepared =Statement= values before their TEMP
+tables are dropped and the transaction is committed. This is resource
+ownership expressed in ordinary block scope, not a second cleanup manager.
+The current-record comparison and shared-head publication now occur in the
+same database transaction rather than first materializing current records
+outside that transaction. Acknowledgment uses =TransactionBehavior::Immediate=
+to reserve the main-database writer before reading current versions. Otherwise
+a legitimate scheduler write can prevent a deferred reader from upgrading
+its WAL snapshot to a writer, failing finalization after files were applied.
+The old delete-first operation already reserved the writer before its loop;
+this preserves that exclusion without adding a retry protocol.
+
+* Tests without a fixture corpus
+
+** Mutation boundaries on real SQLite
+
+Unit tests generate 64 typed records in memory and install connection-local
+audit triggers on =main.records= and =main.shared_heads=. They count actual
+persistent-table inserts, updates, and deletes, not =total_changes=, which
+would also count ephemeral staging writes.
+
+The two no-op assertions failed against unchanged main before production
+editing: record replacement rewrote records, and repeated acknowledgment
+rewrote shared heads. They pass with this change. The tests also pin:
+
+- Exactly one insertion, update, and deletion for those three changed paths.
+- No unrelated shared-head mutation when one eligible base changes.
+- Exact-current eligibility for stale same-path acknowledgments.
+- Legacy/default-omitting JSON equivalence and non-file exclusion.
+- Duplicate eligible-input rollback, with duplicate ineligible ACK entries
+  still skipped as before.
+- Empty-input behavior, another share's state remaining intact, and reuse
+  of the connection after failure.
+- An injected persistent shared-head update failure rolling back earlier
+  membership deletion and updates, rather than publishing a partial base set.
+- A competing scheduler writer released by a connection-local busy handler,
+  proving that acknowledgment reserves its writer before reading. This
+  deterministic regression failed on the first differential candidate and
+  passes with the immediate transaction; it uses no timing sleep or new
+  production test hook.
+
+** Generated real-SSH scenarios
+
+=tests/e2e/scenarios/scaling.rs= contains two bounded stories. A small
+=Peer::write_mixed_tree= primitive in the existing harness creates deterministic
+content, empty directories, relative symlinks, and executable files in one
+container command. The largest new tree has 192 generated files. Only the
+generator and assertions are checked in; no fixture payload is tracked.
+
+The first story covers initial union, repeated no-op rounds, independent
+non-overlapping edits that merge, overlapping edits with both inputs
+recoverable, deletion in both directions, recreation, and stable conflict IDs.
+The second covers managed watch catch-up across a daemon restart, edits on
+both sides, deletion/recreation, and unchanged symlink/executable/sentinel
+content. These are semantic regression checks, not proofs of reduced writes
+or of 539k-entry performance; the SQLite tests provide the write boundary.
+
+The generated scenarios passed unchanged main as contract baselines in
+43.96 seconds, then passed the candidate in 44.43 seconds. These small-run
+durations are not a performance comparison; timing is not their assertion.
+
+* Validation and review status
+
+The initial candidate passes the complete =make check=: Rust tests, Make-prefix
+checks, all 27 Emacs tests, formatting, and Clippy. Initial whole-project
+line coverage is 92.20%; changed executable lines are 260/264, or 98.48%.
+These numbers describe this candidate run, not a final capacity benchmark.
+
+Local code-review lenses and the broader Docker suite are in progress at this
+report's first draft. There is no merge, deployment, or Copilot-convergence
+claim at this point. The final reviewed head must retain the required 90%
+whole-project and changed-line gates.
+
+* What was difficult and what remains
+
+The tempting small rewrite would have changed correctness: raw JSON equality
+can reject valid legacy versions; staging all ACK paths can reject duplicate
+ineligible inputs that were previously skipped; and treating complete plans
+as patches can preserve stale merge bases. The implementation keeps these
+boundaries explicit instead of adding probability-based safeguards.
+
+No user data migration or re-pairing is required. Install the reviewed binary
+through the normal =make install= path when this slice is ready; the existing
+service upgrade process handles ownership. Current protocol versions and
+limits remain unchanged. Users with a metadata-limit failure should not
+retry expecting this persistence slice alone to remove that failure.
+
+Subsequent slices still need consumed paged interfaces, disk-backed scans and
+plans, normalized recovery intents, a versioned bounded baseline protocol,
+the coalesced pending-work table, native dirty capture, and paced verification.
+The full-size topology and churn benchmark is opt-in and generated on demand,
+not checked-in data and not a routine-CI requirement.
+
+* Historical supersessions
+
+This implementation directly replaces the whole-table rewrite observation
+in [[https://github.com/pierrel/file.local/blob/2e3647a1d442bc393118cf7e2e03aab6d92b950e/docs/2026-10-22-large-directory-scaling-design.org][the original scaling proposal]], section 2 item 3: record and shared-head
+persistence now update only changed persistent values/delete omitted rows,
+and acknowledgment no longer loads the complete local-record map. The
+proposal's full-scan, full-vector planning, and metadata-limit observations
+remain valid. No dated document is edited and no transitive supersession
+chain is restated.

@@ -1,0 +1,326 @@
+#+title: Scalable synchronization implementation, first delivery slice and acceptance gates
+#+date: 2026-10-24
+
+* 1. Accepted outcome and delivery boundary
+
+The user authorized implementation of the large-directory design and its
+simplification amendment, with strong end-to-end coverage and no checked-in
+fixture corpus. The accepted workload remains approximately 539k included
+entries and 7 GB, followed by rapid independent edits on both peers. Preserve
+causal ancestry, conflict/recovery inputs, tombstones, exact-version shared
+bases, no-follow containment, and durable guarded installation.
+
+The authoritative design records are in [[https://github.com/pierrel/file.local/pull/25][draft PR #25]], specifically the
+[[https://github.com/pierrel/file.local/blob/2e3647a1d442bc393118cf7e2e03aab6d92b950e/docs/2026-10-22-large-directory-scaling-design.org][original proposal]] as amended by the [[https://github.com/pierrel/file.local/blob/2e3647a1d442bc393118cf7e2e03aab6d92b950e/docs/2026-10-22-large-directory-scaling-simplification.org][simplification amendment]]. These
+documents are not yet on main. Do not merge the design PR, branch from its
+feature branch, or cherry-pick its historical records merely to make relative
+links work. Implementation branches start from current main.
+
+The complete redesign is deliberately incremental. The first production
+slice removes unnecessary persistent-table writes and the full local-record
+materialization inside shared-head acknowledgment. It provides actual
+database-I/O and acknowledgment-memory improvement without changing protocol
+or file semantics. It is not the large-initial-directory deliverable yet:
+the aggregate metadata limit, full scans, and other full-vector consumers
+remain until later slices replace the pipeline end to end.
+
+Do not present a persistence optimization or passing small fixture as proof
+that the reported 539k-entry directory now synchronizes successfully.
+
+* 2. Concrete first-slice evidence and failing scenarios
+
+Current main at =c502382= has two relevant costs in =src/state.rs=:
+
+1. =replace_records= deletes every record for a share, then inserts the full
+   supplied snapshot, even when none or only one record changed.
+2. =acknowledge_shared_heads= loads all current records into a vector/map,
+   deletes every shared head for the share, then rebuilds heads eligible
+   under exact typed current-record equality.
+
+These operations run through ordinary initial/steady synchronization paths
+in =src/sync.rs= and =src/main.rs=. Record and head tables have composite
+share/path primary keys and non-null serialized values. Current full-snapshot
+semantics are the contract for this slice, not an accidental API to change
+into partial-patch semantics.
+
+Before changing either method, pin real SQLite mutation behavior with a
+small generated record set and audit triggers on the persistent tables:
+
+- Repeating the same canonical snapshot must mutate zero persistent record
+  rows. The old implementation fails this criterion.
+- Repeating the same eligible exact acknowledgments must mutate zero
+  persistent shared-head rows. The old implementation fails this criterion.
+- One changed record/head must produce only the relevant row mutation,
+  rather than deletion and reinsertion of every unrelated row.
+
+These are implementation-boundary regressions, not wall-clock assertions.
+Whole end-to-end semantics must still be tested independently through SSH.
+The initial reproduction may be a failing unit/integration test: the normal
+CLI intentionally does not expose database write counts, and adding a
+production diagnostic protocol solely for that assertion is unnecessary.
+
+* 3. First-slice implementation contract
+
+** 3.1 Differential full-snapshot record persistence
+
+Keep =State::replace_records(share, records) -> Result<()>= and its callers.
+Within one SQLite transaction:
+
+1. Create or clear one connection-local TEMP membership table whose path
+   column is a non-null BLOB primary key, preferably =WITHOUT ROWID=.
+2. For each supplied record, stage membership and serialize its version once.
+   UPSERT the main record row, updating only when stored JSON differs from
+   the supplied canonical JSON. Do not use =INSERT OR REPLACE=, which deletes
+   the existing row and would preserve the churn.
+3. Delete only target-share records whose paths are absent from membership.
+4. Commit atomically and ensure temporary staging is reusable or discarded.
+
+Duplicate input paths must still fail and roll back the whole replacement,
+as the old primary-key inserts do. Empty input removes only this share's
+records. Failed serialization, membership insertion, or persistent write
+must not publish a partial replacement. There is no schema migration or new
+durable session/backlog table in this slice.
+
+The TEMP membership index avoids constructing a new whole-tree Rust set.
+It is ephemeral SQL staging, not an authoritative work queue, receipt log,
+or version history. Reuse the repository's existing SQLite temporary-table
+pattern. Do not weaken private-state handling or introduce an unreviewed
+temporary-path/configuration mechanism. If forcing file-backed TEMP storage
+changes connection-wide behavior, examine existing collector consumers and
+native Linux/macOS behavior before doing so; it is not an automatic scope
+expansion for this slice.
+
+Canonical byte-identical JSON is sufficient to skip an unnecessary write.
+Legacy JSON with different formatting/default omission may normalize on its
+next replacement; that is not a change to record identity or authentication.
+
+** 3.2 Exact shared-head eligibility without whole-tree materialization
+
+Keep =State::acknowledge_shared_heads(share, complete_plan) -> Result<()>=.
+Do not turn this existing complete-plan operation into a per-batch patch
+API: omitted, stale, and non-file heads must have the same final membership
+as before. A later paged protocol can introduce an explicitly narrower
+settlement interface when it has a real consumer.
+
+Inside one transaction, inspect each supplied path with an indexed lookup
+of the target share's current record. Decode =Version= and compare typed
+values with the acknowledged record's version. Do not compare raw JSON to
+decide eligibility: whitespace and omitted serde defaults can represent the
+same typed record. Only an exactly matching regular-file record contributes
+its authenticated =BaseVersion= to staged membership.
+
+UPSERT only changed eligible base JSON, and delete only target-share heads
+absent from eligible membership. Other shares are untouched. Preserve the
+existing rule that a stale acknowledgment cannot invent a shared base.
+Duplicate eligible plan paths still fail and roll back; duplicate ineligible
+plan entries were skipped by the old method and must not start failing just
+because every input path was indiscriminately staged.
+
+This removes the full =records()= vector/map from acknowledgment. It does not
+remove causal metadata, prior merge inputs, recovery objects, or the exact
+peer-commit boundary at the callers.
+
+** 3.3 Interfaces, simplicity, and exclusions
+
+Limit production changes to these two state operations and a shared staging
+primitive only if it genuinely reduces duplicated validation/SQL lifecycle.
+Do not add a generic database-table framework, a configurable metadata-cap
+escape hatch, an append-only journal, or unused paging APIs.
+
+There is no wire version bump, service lifecycle change, watcher policy
+change, new externally writable endpoint, or changed authorization boundary.
+The existing global/share mutation ownership and SQLite transaction handling
+remain in force. A method cannot publish its final membership until all
+required eligibility checks and row changes succeed.
+
+* 4. First-slice validation and compact end-to-end fixtures
+
+** 4.1 Deterministic real-SQLite tests
+
+Place focused tests alongside the state implementation, where the actual
+connection is available without a new public debug API. Generate typed
+records at runtime. Use TEMP audit triggers to count changes to =main.records=
+and =main.shared_heads=; =Connection::total_changes= is not a substitute,
+because it also counts TEMP staging inserts.
+
+Cover:
+
+1. Canonical no-op replacement/head acknowledgment writes zero main rows.
+2. One inserted, updated, and removed path affects only its own main row;
+   unrelated row identities and payloads remain unchanged.
+3. Empty replacement/head set has the old complete-snapshot result.
+4. Duplicate eligible inputs and an induced SQL constraint failure roll back
+   membership and data, followed by successful reuse of the same connection.
+5. A second share's rows and bases remain untouched in every case.
+6. Exact typed equality accepts legacy/default-omitting or differently
+   formatted source JSON. Stale same-path versions and non-file entries do
+   not create shared file bases; omitted old heads are removed as before.
+7. Existing authenticated versions, causal ancestry, tombstones, conflict
+   storage, and pending-install recovery tests continue to pass.
+
+Keep the tests small enough that every invariant runs under =make check=
+with the required 90% whole-project and changed-line coverage. No timing or
+peak-RSS expectation belongs in this first slice's correctness tests.
+
+** 4.2 Generated real-SSH scenario
+
+Reuse the existing two-container harness and its bounded commands, runtime
+file generation, tree comparison, status, conflict inspection, and daemon
+guards. A fixture of roughly 256 generated files plus a modest number of
+nested/empty directories and symlinks is enough to exercise this change.
+Only generator code and concise expected outcomes are checked in.
+
+One coherent scenario can:
+
+1. Generate mixed entry kinds and initial nonempty data on both peers.
+2. Perform the confirmed initial union and verify both trees/status.
+3. Repeat an unchanged sync, then make disjoint and concurrent same-file
+   edits, delete a path, and recreate an earlier deleted path across rounds.
+4. Verify bidirectional convergence and expected retained conflict inputs,
+   not merely the winning file text.
+5. Exercise a managed/foreground watch round after convergence with edits
+   on both sides, then verify final state and clean install-intent status.
+
+An end-to-end semantic scenario can already pass main: it guards real
+consumers against regressions, while the SQLite audit tests provide the
+specific fail-to-pass performance boundary. Do not claim that ordinary tree
+equality proves reduced writes or bounded memory.
+
+Keep generated counts in the scenario, below existing harness deadlines.
+Use one container-side generator invocation rather than one Docker call per
+file. Validate arguments and use positional parameters, not interpolated
+untrusted filenames in shell. The existing =write_numbered_files= already
+provides this pattern. Do not install SQLite/Python in the Docker image just
+to inspect internal counters.
+
+The existing 5k initial-transfer regression remains; do not multiply it into
+many similar slow fixtures. This slice adds no real 256-MiB/539k-entry CI
+fixture, lowered session-limit production hook, or native watcher simulator.
+
+* 5. Remaining implementation slices and their exit criteria
+
+** 5.1 Measured disk-backed state, scanner, and install-intent pipeline
+
+Replace full-vector boundaries only with consumed keyset-page interfaces,
+bounded by rows and canonical encoded bytes. Use short transactions and
+immutable disk rows, not transfer-lifetime SQLite readers. Persist traversal
+and directory-enumeration generations; complete coverage alone authorizes
+revalidated absence/tombstones. Normalize install intents into indexed
+per-path rows while preserving existing recovery tokens and phases.
+
+Exit tests: tiny page budgets crossing many pages, wide directories, a child
+deleted during interrupted enumeration, permission failures versus genuine
+absence, exact typed legacy records, and old-format intent recovery. Global
+cross-page identity/object-size validation must have a concrete indexed
+owner before the old whole-input maps are removed.
+
+** 5.2 Versioned bounded initial-sync protocol
+
+Implement one paged baseline end to end: source capture, sealed local/remote
+inventories, cross-page validation, sorted per-path reconciliation, streamed
+confirmation digest, indexed objects/plan, guarded apply batches, exact
+mutual outcomes, resumable confirmed-job ownership, and final readiness.
+Retain paired FIFO reservation and revalidate intent/root generations at
+each mutation checkpoint. Source/receiver bulk private I/O must not pretend
+to provide fairness while holding the whole installation grant.
+
+Exit tests use generated real files and small working-window budgets so
+several valid pages exceed the former aggregate budget without allocating
+hundreds of MiB or thousands of checked-in fixtures. The new protocol's
+resource bound is per admitted window plus durable local quotas, not a
+silent increase of the old total cap. Old protocol grammar/limits remain
+fail-closed, and upgrade errors identify both endpoints' requirements.
+Cross-page forged/duplicate identities and contradictory sizes must fail
+before visible mutation. Kill either side at page, object, intent, fsync,
+commit, and ACK boundaries; preserve local edits and exact bases.
+
+This is the first user-visible deliverable that can claim the old initial
+metadata ceiling is removed. It is not shipped by the first persistence PR.
+
+** 5.3 Coalesced pending work and incremental synchronization
+
+Add the amendment's one authoritative work table, atomically coupled to
+canonical record changes, with non-reused generation tokens and one bounded
+frozen batch. Both peers exchange selected path unions and inspect both
+current counterparts. Exact installed outcomes settle only the corresponding
+work generation. Late ACKs, own-apply generation changes, deferred hot paths,
+and lost/recreated batches must follow the amended contract, without a
+journal or receipt-prefix log.
+
+Replace per-round shared-head rebuilding and object/reference traversal with
+consumed incremental operations. The first slice's full-plan wrappers are
+not automatically safe partial-batch APIs. Bound admission/quota accounting
+and pin every object needed by canonical state, a base, conflict, batch, or
+live intent before allowing collection.
+
+Exit tests: offline independent text/binary/type/deletion edits; V1 frozen
+then V2 captured; lost ACK plus newer work; pending-row ABA; long offline
+tombstone; hot earliest path plus stable siblings; both connector directions;
+quota exhaustion that retains obligations instead of dropping work. Prove
+that the amount of retained work follows distinct paths, not save count.
+
+** 5.4 Native dirty capture and unified uncertainty/verification
+
+Keep bounded callback state and enqueue scoped capture rather than losing
+the paths. Reuse the same scanner for normal changes, startup/downtime,
+watcher reestablishment, native loss, and callback saturation. Check every
+pinned native backend indication/error against the library behavior already
+identified in the amendment. Never convert a coverage gap into empty state.
+
+Replace unconditional whole-sync audits only after fair rotating verification
+uses the same work/checkpoint machinery. Retain finite paced service for
+the demonstrated Linux silent-write cases and provisional macOS coverage;
+ordinary events must not rewind all scan progress or starve old scopes.
+
+Exit tests: bounded native Linux/macOS cases for new-directory races, loss,
+coalescing, restart, unchanged mtime/size, outside-hardlink or live-mapping
+blind spots, ignored-rule changes, callback saturation, stop/removal, and
+coverage under constant events. Linux Docker cannot prove FSEvents behavior.
+No unrelated full scan/hash should occur for a small healthy update outside
+the explicitly accounted verification budget.
+
+** 5.5 Full-scale measurements, not normal-CI fixture payload
+
+Provide an opt-in generator/benchmark with the reported topology and a
+deterministic seed. Generate real contents at runtime, report hardware,
+filesystem, cold/warm cache, native-watch memory, total RSS, state/WAL/object
+bytes, stage times, network bytes, throughput, and oldest pending/coverage
+age. Run 100/1k/10k event-rate sweeps without claiming unsupported throughput.
+Verify exact final state after churn stops, not every intermediate save.
+
+Default CI uses small typed records and real filesystems to force the same
+page/window, crash, quota, and scheduling boundaries. Full-scale generation
+is explicitly opted into with bounded counts/bytes, a hard process deadline,
+progress diagnostics, and a time/I/O backstop. Do not leave an enormous tree
+or leaked containers behind when the benchmark fails.
+
+* 6. Review, release, and truthful reporting
+
+The primary reviews this implementation contract, then independent design
+reviewers cover the required lenses. Implement the first slice against its
+failing SQLite tests, run the generated SSH scenario and affected existing
+conflict/recovery cases, then run complete =make check= and local code review
+to convergence. Keep dated plan/report records immutable once published;
+record changed discoveries in the new implementation report.
+
+The first report must name what actually changed, representative SQL/Rust,
+the typed-equality/atomicity traps, deterministic mutation counts, end-to-end
+outcomes, full checker/coverage status, and the remaining full-scan/metadata
+limits. Deploy the reviewed runtime slice before opening its implementation
+PR, then follow the existing draft/local/Copilot gates. Deployment does not
+merge a feature branch. The user merges; do not merge PR #25 as a side effect.
+
+At each subsequent slice, add its own focused end-to-end scenarios and update
+current README contracts only when that behavior ships. No stage may claim
+539k-entry or high-churn support until the corresponding end-to-end and
+full-scale gates have actually passed.
+
+* Historical supersessions
+
+None at this contract stage. This document sequences implementation of the
+accepted proposal and amendment; it does not rewrite their point-in-time
+status or invalidate their remaining safety requirements. The first shipped
+implementation report should directly identify the original proposal's
+section 2.3 whole-table rewrite observation as superseded by differential
+persistence, without claiming that the still-existing full scans, vectors,
+or metadata ceiling have been superseded.
