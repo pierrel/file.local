@@ -403,6 +403,12 @@ temporary ownership/progress. Each progress transition commits atomically
 without rewriting the complete plan. Existing older install intents are read
 and recovered without resetting their tokens, conflicts, or owned temporaries.
 
+Snapshot refreshes preserve unchanged canonical rows, and shared-base
+acknowledgments preserve unchanged eligible bases. Install completion and
+invalidation recovery still replace the complete canonical snapshot;
+an unchanged sync round is not guaranteed to perform zero database writes.
+See [[file:docs/2026-10-24-persistence-report-clarification.org][the persistence report clarification]] for this remaining limit.
+
 Explicit =flocal sync= uses protocol version 8; persistent watch remains on
 version 7 in its separate wire family. Install or upgrade =flocal= on both
 peers before adding or synchronizing a managed sync. A persistent protocol
