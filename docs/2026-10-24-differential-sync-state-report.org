@@ -177,15 +177,27 @@ durations are not a performance comparison; timing is not their assertion.
 
 * Validation and review status
 
-The initial candidate passes the complete =make check=: Rust tests, Make-prefix
-checks, all 27 Emacs tests, formatting, and Clippy. Initial whole-project
-line coverage is 92.20%; changed executable lines are 260/264, or 98.48%.
-These numbers describe this candidate run, not a final capacity benchmark.
+The reviewed candidate passes the complete =make check=: Rust tests,
+Make-prefix checks, all 27 Emacs tests, formatting, and Clippy. Whole-project
+line coverage is 92.03%; changed executable lines are 296/301, or 98.34%.
+These numbers describe this implementation run, not a capacity benchmark.
 
-Local code-review lenses and the broader Docker suite are in progress at this
-report's first draft. There is no merge, deployment, or Copilot-convergence
-claim at this point. The final reviewed head must retain the required 90%
-whole-project and changed-line gates.
+The first code-review round found one important issue: deferred SQLite ACK
+transactions could fail when a concurrent scheduler writer prevented their
+read-to-write upgrade. The deterministic real-connection regression reproduced
+the failure; reserving the writer before reading fixes it by construction.
+One minor report-ordering mismatch was corrected. Affected concurrency,
+interface, error-handling, filesystem, security, and documentation reviews
+then converged. No verified finding was rejected and no new abstraction was
+added merely to satisfy a preference. The full required code-review lenses,
+plus focused concurrency and error passes, are clear.
+
+The broader Docker suite is still in progress at this report's current
+revision. The reviewed runtime was installed locally through =make install=;
+the release, installed executable, and running daemon checksums matched, the
+daemon was active, and all six configured relationships remained disabled as
+before. No remote endpoint was changed. There is no merge or Copilot-convergence
+claim yet; later external validation is recorded in the implementation PR.
 
 * What was difficult and what remains
 
