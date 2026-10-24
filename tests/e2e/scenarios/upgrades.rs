@@ -101,10 +101,21 @@ fn in_progress_managed_sync_survives_a_real_candidate_install() -> Result<()> {
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
 fn foreground_watch_recovers_an_old_interrupted_install_after_upgrade() -> Result<()> {
+    recover_interrupted_foreground_install()
+}
+
+#[test]
+#[ignore = "requires Docker and the deployed-alpha CI upgrade run"]
+fn legacy_foreground_watch_recovers_a_generated_pending_install() -> Result<()> {
+    recover_interrupted_foreground_install()
+}
+
+fn recover_interrupted_foreground_install() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
     let before_a = a.predecessor_status()?;
     let before_b = b.predecessor_status()?;
     a.sync_stop()?;
+    b.write_mixed_tree(2, 16)?;
     let watch = a.watch_start_with_apply_stop()?;
     b.write(
         "interrupted-watch.txt",

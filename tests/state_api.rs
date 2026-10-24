@@ -163,7 +163,6 @@ fn state_metadata_and_install_intent_lifecycle() -> Result<()> {
     let (intent, created) = state.set_install_intent(&share, &records)?;
     assert!(created);
     assert!(matches!(intent.temps[0].phase, InstallTempPhase::Pending));
-    assert!(!state.is_owned_temp(&share, Path::new("file"))?);
     state.mark_install_temp_creating(&share, &path)?;
     assert!(matches!(
         state.install_intent(&share)?.unwrap().temps[0].phase,
@@ -175,8 +174,9 @@ fn state_metadata_and_install_intent_lifecycle() -> Result<()> {
     let new_token = state.rotate_unowned_install_temp(&share, &path)?;
     assert_ne!(old_token, new_token);
     state.mark_install_temp_owned(&share, &path)?;
-    assert!(!state.is_owned_temp(&share, Path::new("file"))?);
-    assert!(state.is_owned_temp(&share, Path::new(&new_token))?);
+    let current = state.install_intent(&share)?.unwrap();
+    assert_eq!(current.temps[0].token, new_token);
+    assert!(matches!(current.temps[0].phase, InstallTempPhase::Owned));
     assert!(state.rotate_unowned_install_temp(&share, &path).is_err());
     assert_eq!(state.install_intents()?.len(), 1);
     state.clear_install_intent(&share)?;

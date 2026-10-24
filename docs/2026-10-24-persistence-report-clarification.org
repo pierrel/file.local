@@ -1,0 +1,73 @@
+#+title: Persistence savings apply to refreshes, not complete install publication
+#+date: 2026-10-24
+
+* Corrected outcome and remaining limit
+
+The current delivery reduces canonical-record writes in
+=State::replace_records=, the complete-snapshot refresh operation. It also
+preserves unchanged eligible shared bases in =acknowledge_shared_heads=.
+These are narrower guarantees than a zero-write unchanged sync round.
+
+=State::finish_install_inner= still deletes and reinserts the complete
+accepted canonical snapshot when publishing an install, including unchanged
+records. =retire_invalidated_install= also replaces the full canonical
+snapshot during invalidation recovery. Both operations retain their existing
+transactions and semantics in this PR.
+
+The optimization removes a refresh-time rewrite, not every whole-snapshot
+canonical write. No-op refresh mutation tests describe that specific State
+API, not the total write count of a network round. Full install publication
+remains O(N) in the number of accepted records.
+
+* The actual publication boundary
+
+The existing install completion code still includes:
+
+#+begin_src rust
+tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
+for record in records {
+    tx.execute(
+        "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
+        params![
+            share.0,
+            record.path.as_bytes(),
+            serde_json::to_string(&record.version)?
+        ],
+    )?;
+}
+#+end_src
+
+That transaction also publishes conflicts, transfers object ownership,
+clears the intent, and, for initial managed completion, publishes enablement
+and its queue request. A future differential publication change must preserve
+that atomic boundary. This clarification does not introduce one merely to
+satisfy a review comment.
+
+Indexed temporary progress is a separate improvement. It still avoids
+repeatedly parsing and rewriting the immutable plan for every phase change.
+The expanded report's small header, transactional legacy conversion,
+consistent snapshots, object pins, and parent cleanup remain applicable.
+
+* Review disposition and validation
+
+Copilot round 1 identified the overbroad canonical-row preservation claim.
+This is meaningful documentation feedback. The README and PR description now
+state the narrower refresh guarantee and remaining publication rewrites.
+
+This correction changes no production code or test behavior. Its preceding
+source head passed local gates and GitHub Linux, macOS, coverage, 63 general
+SSH cases, and three deployed-alpha cases. Full scans, whole-tree planning,
+cold recovery materialization, and the 256-MiB metadata ceiling remain.
+
+* Historical supersessions
+
+- [[file:2026-10-24-scalable-persistence-report.org::*What this delivery changes][Expanded persistence report, What this delivery changes]], opening paragraph:
+  unchanged canonical rows are preserved by refreshes through
+  =replace_records=, not throughout every unchanged round. Completion and
+  invalidation retirement still rewrite their full canonical snapshots.
+- [[file:2026-10-24-differential-sync-state-report.org::*Outcome and intended experience][First persistence report, Outcome and intended experience]], opening paragraph:
+  its canonical-row preservation claim also applies only to
+  =replace_records=. Shared-base acknowledgment savings remain valid.
+
+Both reports remain unchanged. These are the directly invalidated claims;
+this addendum does not repeat earlier supersession chains.

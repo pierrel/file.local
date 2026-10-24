@@ -8,6 +8,7 @@ mod multi_share;
 mod offline;
 mod pairing;
 mod relationships;
+mod scaling;
 mod syncing;
 mod transitions;
 mod upgrades;

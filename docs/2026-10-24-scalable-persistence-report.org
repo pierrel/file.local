@@ -1,0 +1,248 @@
+#+title: Scalable persistence: unchanged records and indexed installation progress
+#+date: 2026-10-24
+
+* What this delivery changes
+
+Synchronizing an unchanged directory no longer deletes and reinserts every
+canonical record and shared file base. Applying a changed directory no longer
+reads and rewrites the entire installation plan for each file's temporary
+ownership transition. These changes reduce database work while retaining the
+existing synchronization, conflict, and interruption-recovery behavior.
+
+This is a persistence delivery toward the accepted large-directory design,
+not completion of that design. Full scans and hashing, whole-tree planning,
+cold recovery materialization, and the 256-MiB session metadata ceiling remain.
+The reported 539k-entry directory has not been validated or claimed supported.
+Bounded inventories, initial exchange, and coalesced incremental work remain
+the next stages in the [[file:2026-10-24-scalable-sync-implementation-plan.org][implementation plan]].
+
+The [[file:2026-10-24-differential-sync-state-report.org][first persistence report]] describes the first reviewed candidate. CI then
+exposed the existing 5k-file case exceeding its ten-minute command deadline.
+The [[file:2026-10-24-indexed-install-progress-design.org][indexed-progress design]] extends the same feature PR to remove the
+observed quadratic installation cost rather than increasing the timeout.
+No pre-existing dated design or report was rewritten.
+
+* The user experience and safety contract
+
+Both endpoints may edit independently. Causal version identities, ancestry,
+tombstones, exact-version shared-base acknowledgments, three-way merging,
+retained conflict inputs, ignores, and capability-based no-follow apply keep
+their existing meaning. A faster persistence path is not permission to replace
+concurrent local edits or discard recovery objects.
+
+Normal CLI commands and protocol versions are unchanged. The user still sees
+Connected only after initial application completes. Progress remains time
+throttled, so faster work may produce fewer progress lines.
+
+An interrupted install still has one durable mutation intent. It now stores
+an immutable plan separately from indexed per-path temporary ownership. It
+does not introduce a second synchronization backlog, transport receipt cursor,
+append-only journal, or session checkpoint lifecycle.
+
+* Final design and data flow
+
+1. Scanning and reconciliation still produce the existing complete plan.
+2. Canonical snapshots use conditional UPSERTs and membership deletion,
+   preserving unchanged rows. Shared-head acknowledgment checks each current
+   record by index and compares typed versions before admitting a file base.
+3. Admission stores a small intent header, an immutable plan payload, and
+   ordered per-path temporary rows in one writer-reserved transaction.
+4. Applying a path updates that temporary row and the small header revision.
+   The plan payload is not rewritten. Existing filesystem ownership, content,
+   fsync, replacement, and interruption boundaries remain in the apply code.
+5. Cold readers reconstruct header, plan, ordered temporaries, and failure
+   classification from one SQLite snapshot. Completion or invalidation
+   transfers object ownership to canonical/conflict state before deleting
+   the parent intent in the same transaction.
+
+The physical tables have separate responsibilities:
+
+| Table | Contents | Mutation boundary |
+|-------+----------+-------------------|
+| install_intents | Small format/id/revision header and failure marker | Admission and progress |
+| install_plans | Ordered records, conflicts, managed generation | Admission or legacy conversion only |
+| install_temps | Share/path key, ordinal, token, phase | One selected path |
+
+The existing InstallIntent Rust value remains a reconstructed view for real
+full-plan consumers. This delivery intentionally does not pretend that those
+cold reads are bounded by a fixed page window.
+
+* Component changes and representative code
+
+** Differential canonical records and exact file bases
+
+The complete-snapshot interfaces retain their membership semantics. A TEMP
+index rejects duplicate paths and identifies omissions without another Rust
+whole-tree set. The record UPSERT changes only different stored values:
+
+#+begin_src sql
+ON CONFLICT(share_id,path) DO UPDATE SET version_json=excluded.version_json
+WHERE records.version_json<>excluded.version_json
+#+end_src
+
+Shared-base eligibility still decodes Version and compares typed values. Raw
+JSON equality would reject equivalent legacy JSON with omitted defaults or
+different whitespace. Its transaction reserves the writer before current
+version reads, preventing a reproduced WAL snapshot-upgrade failure caused
+by an intervening scheduler write. This optimization changes neither the
+peer-commit acknowledgment boundary nor complete-plan omission behavior.
+
+** A small mutable header and immutable payload
+
+The new header is deliberately incompatible with the old whole-intent decoder:
+
+#+begin_src rust
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallIntentHeader {
+    format: u8,
+    id: String,
+    revision: u64,
+}
+#+end_src
+
+The derive attributes generate JSON serialization/deserialization. The
+deny_unknown_fields attribute rejects unexpected fields in this header.
+InstallIntentDocument uses serde's untagged enum decoding to recognize either
+the indexed header or the legacy InstallIntent. Unsupported header formats
+are explicitly rejected.
+
+The ID distinguishes different installs of the same plan. The checked
+revision distinguishes progress within one install, including successful
+same-phase calls that must invalidate stale failure results. An ordinal
+preserves temporary ordering for existing finish/invalidation guards.
+These values are local mutation identity, not causal version history or
+transport progress.
+
+The serializer borrows records/conflicts through InstallPlanRef<'a>. Rust's
+lifetime parameter 'a ties that view to the input slices; it does not clone
+the whole plan to serialize it. Separate physical plan storage matters:
+updating a small field beside a large SQLite payload would not establish
+that the payload's overflow pages were untouched.
+
+** Indexed progress, rollback, and failure identity
+
+The path update is bounded by the selected row and small header:
+
+#+begin_src rust
+let header = prepare_install_progress_in(&tx, share)?;
+let changed = tx.execute(
+    "UPDATE install_temps SET phase=?3 WHERE share_id=?1 AND path=?2",
+    params![share.0, path.as_bytes(), install_phase_name(phase)],
+)?;
+if changed != 1 {
+    bail!("install temporary is missing");
+}
+advance_install_progress_in(&tx, share, header)?;
+tx.commit()?;
+#+end_src
+
+This runs after an Immediate transaction reserves the writer. SQL parameters
+bind path bytes rather than interpolating them. Rust's ? propagates an error;
+an uncommitted transaction rolls back when its owned value is dropped.
+Missing paths, refused Owned-token rotation, SQL errors, and revision
+overflow therefore cannot publish half a transition.
+
+Once indexed, progress without a classified failure does not read, decode,
+serialize, or hash the immutable payload. First legacy progress performs the
+one-time conversion described below. A classified failure is validated before clearing
+it, and only its matching blocked diagnostic is cleared. A new fingerprint
+hashes a domain tag, length-delimited exact header bytes, and immutable plan
+bytes. Every authorized temporary mutation advances the revision atomically,
+so an old recovery failure cannot classify newer progress or a later intent.
+
+** Consistent cold readers and cleanup
+
+with_install_snapshot reuses an existing transaction, including the one held
+by recovery accounting. Otherwise it owns a short deferred read transaction.
+Its generic T is the returned value; FnOnce accepts a reader closure invoked
+once. Reconstruction completes before that owned read transaction ends.
+
+This preserves the old single-blob observation guarantee: another connection
+may progress or finish while a reader runs, but the reader sees complete old
+state or complete new state. It cannot combine an old header with newer phases
+or mistake a concurrent valid completion for missing/corrupt children.
+
+One AFTER DELETE trigger removes both child tables for the deleted parent
+share. It covers existing finish, retirement, and clear operations without
+introducing a new connection-wide foreign-key policy. Live pending intents
+continue to prevent removal/reinitialization. Object authorization and GC
+continue visiting the plan's records and conflicts until ownership transfers.
+
+** Scanning and compact end-to-end fixtures
+
+scan_mode no longer queries is_owned_temp for each enumerated entry. Both the
+current and deployed-alpha token generators use the reserved .flocal-tmp-
+prefix, and is_internal_path already excludes every such path component.
+The redundant method and its implementation-specific API assertions were
+removed; phase/token behavior and real scanner exclusion remain tested.
+
+The SSH harness generates mixed trees in one container command. The new
+ordinary stories use at most 192 generated files plus small directory,
+symlink, and executable fixtures. Interrupted connector/responder and old
+foreground-upgrade stories add 32 generated files. The old-alpha and normal
+upgrade wrappers share one recovery story. No fixture corpus, dependency,
+new diagnostic endpoint, or production-only hook was added.
+
+* Evidence, validation, and review
+
+On unchanged main, 128 progress transitions over 64 records rewrote 2,751,936
+bytes of parent-intent payload. The same test now passes a 128-KiB upper bound
+while SQL triggers forbid any update/deletion of the immutable payload. The
+existing 5k-file initial sync completed in 74.49 seconds locally. That is a
+single local observation, not a cross-host speedup factor or capacity benchmark.
+
+The full make check passes: 92.11% whole-project line coverage and 951/995
+changed executable lines (95.58%), Rust tests with all features, formatting,
+Clippy, Make-prefix checks, and all 27 Emacs tests.
+
+Real-SQLite tests cover write counts, exact legacy equality, writer contention,
+read snapshots spanning concurrent progress/completion, lazy conversion with
+both legacy fingerprint forms, ordering, no-op and stale classification,
+SQL rollback, revision overflow, missing/corrupt state, share isolation,
+child cleanup, and sole-plan object pins across reopen/GC and ownership transfer.
+
+The full SSH run passed 62 of 63 cases before an expanded restart assertion
+exposed its invalid assumption that the first visible file means the complete
+plan has committed. Both restart tests now use the same bounded exact status
+predicate. All four abrupt-restart scenarios passed after that correction.
+All three deployed-alpha upgrade scenarios also passed, including the new
+generated pending-install story. The final pushed-head CI run remains a
+release gate; the earlier failed run belongs to the pre-indexed candidate.
+
+Independent required code-review lenses are clear on production code. The
+verified acceptance gaps produced targeted old-alpha multi-file and GC/reopen
+tests. Redundant removal permutations were declined because live intents are
+already refused and all deletion paths use one shared cleanup trigger. Reviews
+are evaluated against the design, intended use, simplicity, and correctness;
+preferences alone do not justify new machinery. Final documentation review,
+redeployment, CI, and Copilot review remain release gates.
+
+* Difficult boundaries, remaining limits, and upgrade note
+
+The difficult parts were preserving exact legacy fingerprints while changing
+physical representation, keeping split reads coherent, and retaining object
+ownership through completion. Each uses an existing narrow mechanism:
+transactional lazy conversion, one read snapshot, and atomic ownership transfer
+plus parent cleanup. The new storage is not a second pending-work queue.
+
+Full inventories, reconciliation vectors, directory sorting, content hashing,
+and cold recovery remain proportional to the entire share. The 15-minute
+audit policy and old protocol metadata cap remain unchanged in this delivery.
+The accepted event-driven coverage and bounded baseline work are still required
+before claiming large-directory/high-churn support.
+
+Use make install on both endpoints. No state reset, re-pairing, or manual
+migration is required. Legacy intents remain readable until actual progress
+converts them atomically, preserving tokens, phases, conflicts, and managed
+generation. Recover a new-format pending install with this or a newer
+compatible binary: older binaries fail decoding it. Downgrades are unsupported;
+do not delete the intent or copy an older executable over the installation.
+
+* Historical supersessions
+
+- [[file:2026-10-24-differential-sync-state-report.org::*Outcome and intended experience][First persistence report, Outcome and intended experience]] stated that its
+  reviewed first slice had no durable-schema change. The expanded delivery
+  adds two child tables and the small tagged intent representation described
+  above. Its causal/conflict guarantees and remaining metadata/full-scan limits
+  remain applicable. This names the directly changed claim only.

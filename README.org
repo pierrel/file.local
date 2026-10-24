@@ -398,14 +398,26 @@ so stable sibling paths can finish. A later full round reports =SETTLED=.
 =flocal status= and =sync list= expose durable unsettled state across daemon
 restarts.
 
+An interrupted install retains an immutable plan and separate per-path
+temporary ownership/progress. Each progress transition commits atomically
+without rewriting the complete plan. Existing older install intents are read
+and recovered without resetting their tokens, conflicts, or owned temporaries.
+
+Snapshot refreshes preserve unchanged canonical rows, and shared-base
+acknowledgments preserve unchanged eligible bases. Install completion and
+invalidation recovery still replace the complete canonical snapshot;
+an unchanged sync round is not guaranteed to perform zero database writes.
+See [[file:docs/2026-10-24-persistence-report-clarification.org][the persistence report clarification]] for this remaining limit.
+
 Explicit =flocal sync= uses protocol version 8; persistent watch remains on
 version 7 in its separate wire family. Install or upgrade =flocal= on both
 peers before adding or synchronizing a managed sync. A persistent protocol
 mismatch keeps the worker reconnecting with bounded upgrade reports until both
-peers support version 7; it never silently falls back to polling. Downgrading
-does not change synchronized state, though explicit synchronization requires
-version 8 on both peers and persistent watch remains unavailable until both
-peers support version 7.
+peers support version 7; it never silently falls back to polling. Explicit
+synchronization requires version 8 on both peers and persistent watch remains
+unavailable until both peers support version 7. Downgrades are unsupported: a pending install written
+in the current storage format requires this version or a newer compatible
+binary for recovery; an older binary refuses that intent.
 
 Relationship registration and removal capabilities each start at
 version 1 on the separate fixed =flocal protocol relationship= entrypoint.

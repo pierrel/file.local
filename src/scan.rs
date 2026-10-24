@@ -231,7 +231,7 @@ fn scan_mode(
         names.sort();
         for name in names {
             let relative = directory_path.join(name);
-            if state.is_owned_temp(share, &relative)? || is_internal_path(&relative) {
+            if is_internal_path(&relative) {
                 continue;
             }
             let path = RelativePath::from_path(&relative)?;
