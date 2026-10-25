@@ -1,0 +1,137 @@
+#+title: Differential persistence for complete synchronization snapshots
+#+date: 2026-10-25
+
+* 1. Authorized milestone and source
+
+Implement from =github/main= at =c502382b60dfd54e25126399b59ac4946c8088e0=,
+on a fresh main-based branch. The old scalable worktree is reference only.
+Hard stop: 2026-10-26 02:21:08 UTC. This milestone changes row persistence
+through every existing full-snapshot caller; it does not implement bounded
+scanning or remove any existing synchronization limit.
+
+Observed main bottleneck: =src/state.rs::replace_records= (4641),
+=finish_install_inner= (2567), and =retire_invalidated_install= (2728)
+DELETE every canonical row then INSERT the whole supplied snapshot.
+=acknowledge_shared_heads= (4613) similarly rebuilds all bases. A no-op
+CLI round therefore rewrites unchanged metadata through scan, apply and ACK.
+The source demonstrates these writes; do not attribute all large-sync delay
+or previous large write-byte observations solely to this mechanism.
+
+* 2. One canonical helper, existing transaction owners
+
+Add one private =replace_records_in(tx, share, records)= and call it from
+ALL THREE canonical snapshot publication sites. Public replace_records opens
+its publication transaction; finish/retire pass their own transactions.
+Keep their guard checks, conflict publication, unsettled-path update,
+managed-enable generation, diagnostics and intent retirement in their
+existing order and atomic commit. No nested/new partial commits.
+
+Reserve the main SQLite writer with IMMEDIATE before point reads in replace,
+retire and ACK. The old leading DELETE implicitly reserved it first; retaining
+DEFERRED after adding reads permits a concurrent scheduler writer to invalidate
+the read snapshot before its upgrade. Install completion already uses IMMEDIATE.
+
+Use a connection-private TEMP membership table with path BLOB PRIMARY KEY.
+Populate it with plain INSERT for every input path before updating main rows:
+duplicate paths still fail and the enclosing transaction rolls back. Scope
+every canonical query/mutation to this share. Delete only paths absent from
+the complete staged membership, including the empty-snapshot case.
+Configure =temp_store=FILE once before transactions if needed to guarantee
+disk-backed staging; add no persistent table/index/schema migration.
+
+For each supplied Record, point-read the existing Version and compare typed
+values. Equal versions leave the exact existing JSON and row untouched.
+Different/missing versions use UPDATE/INSERT (or one conditional UPSERT after
+that typed decision). Never use INSERT OR REPLACE. Serialize only rows being
+written. Do not retain the old all-row DELETE in finish/retire.
+
+Raw JSON inequality is NOT semantic inequality: legacy whitespace, field
+order and omitted serde-default fields must not cause a false change. Parse
+the existing Version/BaseVersion with existing model serde and compare using
+their current equality. Preserve unknown/default field behavior rather than
+inventing a new canonical encoding, hash, version or authentication rule.
+Malformed stored JSON cannot prove equality: replace that row with the
+supplied typed value as the old DELETE/INSERT did. Serialization/SQL errors
+still roll back the complete enclosing transaction.
+
+TEMP contents are cleared/recreated at helper entry; successful completion
+cleans staging and failed outer transactions cannot leak partial main-table
+changes. Separate stable internal TEMP names for canonical and head staging;
+no SQL identifier/path comes from a peer or filesystem filename.
+
+* 3. Exact shared-head behavior, differential writes
+
+Retain the existing typed current-record map and eligibility rule for this
+milestone: only a plan Record exactly equal to durable current Record whose
+version has a file base is eligible. Keep ACK's existing transaction boundary
+and caller requirement that peer commit acknowledgment has already arrived.
+Changing full-record reads/transport is unnecessary here.
+
+Stage eligible paths in a second TEMP table using plain INSERT.
+Duplicate ELIGIBLE paths retain the existing uniqueness failure/rollback;
+duplicates skipped as nonfile/ineligible remain skipped as main does today.
+Delete heads absent from this eligible set, including stale heads for paths
+whose canonical version advanced or vanished; retain no stale base by union.
+For each remaining base, typed BaseVersion equality skips unchanged rows;
+update only changed bases and insert new ones. Never acknowledge successful
+transport alone or relax exact version/ancestry/conflict safeguards.
+
+* 4. Required validation with small generated data
+
+1. Reproduce main's churn with deterministic SQLite audit triggers on main
+   records/shared_heads. Count actual INSERT/UPDATE/DELETE, not total_changes
+   (TEMP staging would inflate it). On no-op expect zero main-row writes;
+   on one changed path expect only that path; unchanged rowids/JSON survive.
+2. Exercise the canonical helper THROUGH public replace_records, finish_install
+   and retire_invalidated_install, including empty/omitted members, duplicate
+   rollback, share isolation and failure after staging/publication. Pin that
+   conflicts, unsettled rows, managed flags and intent retirement remain in
+   the original all-or-nothing transaction.
+3. ACK tests cover exact current checks, changed/omitted heads removal, typed
+   legacy JSON equality, eligible duplicate rollback and skipped duplicate
+   behavior. Causal/authentication/base fields remain unchanged on no-op.
+4. Real two-peer CLI E2E: generate 256 ordinary files at runtime through
+   the existing harness, initial sync, install test-only SQLite row audit
+   triggers on BOTH databases, then no-op sync. Assert zero canonical/head
+   churn end to end. One ordinary file edit then sync must mutate only that
+   path's canonical row and base on both peers, through scan+apply+ACK.
+   Add only a narrow harness SQL/audit helper; SQLite CLI in the test image
+   is sufficient, no production hook/dependency/instrumentation framework.
+5. Reuse existing compact filesystem, offline, conflict, deletion/recreation
+   and interruption regressions to verify safety. Do not build another scenario
+   framework or combine those stories into the row-write audit. The new audit
+   covers no-op/single-edit phases; existing tests cover their real contents,
+   history and recovery outcomes. No checked-in fixture tree is required.
+6. Run the complete required test/lint/coverage gate and independent local
+   reviews; report actual results and remaining limits by the hard stop.
+
+* 5. Classification of old work and risks
+
+NEEDED: the differential membership/equality idea and compact generated E2E
+approach, reimplemented against fresh main and covering finish/retire too.
+OPTIONAL reference: old pure test generators and typed equality cases only
+when they fit this milestone and carry no broader source dependency.
+UNSUPPORTED for this milestone: indexed intents, new object/candidate/work
+schemas, watcher/native changes, paging/protocol revisions, object lifetime
+changes or a claim that the full scaling design shipped. Do not cherry-pick
+old broad commits or modify published dated documentation.
+
+Risks: typed point reads add bounded per-record SQLite/decode work while
+removing writes; this remains an O(snapshot-size) operation with existing
+full scans/vectors. TEMP writes are deliberate disk work, not zero total I/O.
+Full-plan JSON progress rewriting and object hashing may still dominate large
+syncs. Tests must audit both endpoints and apply/recovery callers so refresh
+savings cannot hide later table churn. Existing guard/transaction semantics
+take precedence over speculative micro-optimizations.
+
+* Design review
+
+Seven independent design lenses found no required correction: simplicity,
+platform/dependency fit, guidance/intention, end-to-end experience, interfaces,
+filesystem correctness and adversarial security. The primary agent narrowed the
+new audit to no-op and single-edit sync, reusing existing safety regressions.
+
+* Historical supersessions
+
+None. This main-based milestone implements only differential persistence from
+the earlier scaling proposal; it does not replace its remaining requirements.
