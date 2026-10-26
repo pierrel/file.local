@@ -9,6 +9,48 @@ use crate::harness as e2e;
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
+fn unchanged_and_single_file_sync_preserve_unrelated_persistent_rows() -> Result<()> {
+    let (a, b) = e2e::containers()?;
+    a.write_numbered_files(256)?;
+    a.init()?;
+    let (a, b) = a.peer_add(b)?;
+    a.sync()?;
+    a.start_persistence_audit()?;
+    b.start_persistence_audit()?;
+
+    a.sync()?;
+    for peer in [&*a, &b] {
+        let changes = peer.take_persistence_audit()?;
+        eprintln!("no-op persistent row changes: {}", changes.len());
+        anyhow::ensure!(
+            changes.is_empty(),
+            "no-op sync touched {} row groups; first: {:?}",
+            changes.len(),
+            changes.first()
+        );
+    }
+
+    a.write("file-0.txt", "one edited file\n")?;
+    a.sync()?;
+    for peer in [&*a, &b] {
+        let changes = peer.take_persistence_audit()?;
+        eprintln!("one-file persistent row changes: {changes:?}");
+        anyhow::ensure!(
+            changes.len() == 2
+                && changes
+                    .iter()
+                    .all(|(_, path, count)| path == "66696C652D302E747874" && *count <= 3),
+            "one-file sync touched unrelated rows or repeatedly rewrote them: {changes:?}"
+        );
+    }
+    b.assert_file("file-0.txt", "one edited file\n")?;
+    a.conflicts()?.expect_none()?;
+    b.conflicts()?.expect_none()?;
+    e2e::assert_trees_equal(&a, &b)
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
 fn five_thousand_initial_changes_do_not_timeout_after_scan() -> Result<()> {
     let (a, b) = e2e::managed_containers()?;
     a.write_numbered_files(5_000)?;

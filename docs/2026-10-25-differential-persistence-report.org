@@ -1,0 +1,162 @@
+#+title: Keeping unchanged synchronization rows unchanged
+#+date: 2026-10-25
+
+* What this changes for a user
+
+A synchronization round still scans and reconciles the complete share, but
+publishing its result now preserves unchanged canonical records and shared
+file bases in SQLite. A one-file edit changes that path's metadata rather
+than deleting and recreating every row during refresh, apply and acknowledgment.
+There is no CLI, wire-protocol or persistent-schema change.
+
+This is one independently testable scaling milestone, implemented afresh from
+main =c502382=. It does not deliver the full large-directory design: full scans,
+in-memory inventories/plans, session limits, object accounting and whole-intent
+JSON remain. The old broad implementation was used as a reference, not imported.
+
+* Evidence for choosing this milestone
+
+The existing code rebuilt canonical rows in three places: scan refresh,
+successful install completion and invalidated-install recovery. Shared-head
+acknowledgment rebuilt its own table. Optimizing refresh alone would leave
+the same churn later in the actual synchronization command.
+
+The new generated two-peer CLI regression first ran on unchanged main inside
+the strict expected-failure wrapper. With 256 unchanged files, the initiating
+endpoint recorded 1,024 canonical-row mutations and 512 shared-head mutations
+during a no-op round. Three direct SQLite regressions also failed on the
+original implementation. These are row-mutation measurements, not total disk
+bytes, elapsed-time speedups or a measurement of the full reported workload.
+
+After the fix, the same real SSH/two-container scenario reports, on EACH peer:
+
+| Round | Canonical row mutations | Shared-head row mutations |
+|-------+-------------------------+---------------------------|
+| No changes | 0 | 0 |
+| One edited file | 1 | 1 |
+
+The changed-row audit uses SQLite triggers on the actual tables across the CLI
+processes. It does not count writes to TEMP staging as canonical improvements.
+All 256 files are generated at test runtime; no fixture tree is checked in.
+
+* How complete snapshots are published
+
+One private helper, =replace_records_in=, serves all three canonical callers.
+It borrows their existing transaction, so record changes, conflicts, managed
+enablement, unsettled paths and install-intent retirement retain their original
+all-or-nothing publication boundary.
+
+The helper stages all input paths in a connection-private, disk-backed TEMP
+table with a BLOB primary key. A duplicate path fails instead of silently
+choosing one input. Point lookups compare existing typed Versions; equal values
+leave their row and exact stored JSON untouched. Changed/new values use UPSERT.
+Only paths omitted from the complete snapshot are deleted:
+
+#+begin_src sql
+DELETE FROM records WHERE share_id=?1 AND NOT EXISTS(
+    SELECT 1 FROM temp.replacement_paths WHERE path=records.path)
+#+end_src
+
+An empty snapshot therefore still removes that share's full membership.
+Every lookup and mutation includes the share ID. Bound SQL parameters keep
+raw path bytes out of SQL syntax. Successful staging is dropped before commit;
+an error rolls it back together with persistent changes.
+
+The helper's Rust signature keeps transaction ownership visible:
+
+#+begin_src rust
+fn replace_records_in(
+    tx: &rusqlite::Transaction<'_>,
+    share: &ShareId,
+    records: &[Record],
+) -> Result<()>
+#+end_src
+
+=&= borrows the caller's transaction and input slice. =Transaction<'_>= asks
+Rust to infer the transaction's connection lifetime. The helper does not
+acquire a second transaction or decide when the outer operation commits.
+The =?= operator propagates SQL/serialization errors, allowing transaction Drop
+to roll back the operation.
+
+* Equality and exact acknowledgment
+
+Typed comparison matters because legacy JSON may have different whitespace,
+field order or omitted default fields. The implementation compares decoded
+Versions and BaseVersions, including their causal/authentication fields:
+
+#+begin_src rust
+if stored
+    .as_deref()
+    .and_then(|json| serde_json::from_str::<Version>(json).ok())
+    .as_ref()
+    == Some(&record.version)
+{
+    continue;
+}
+#+end_src
+
+=Option= represents a missing existing row. =as_deref= borrows a string,
+=and_then= attempts decoding when one exists, and =as_ref= compares borrowed
+typed values. Here =ok()= deliberately means malformed old JSON cannot establish
+equality: it is replaced by the supplied typed value, matching the former
+delete-and-insert behavior. SQL errors themselves still propagate.
+
+ACK eligibility is unchanged: a plan Record must exactly equal the durable
+current Record and represent a file base. Only eligible paths enter the TEMP
+membership set. Missing, stale and nonfile bases are removed; unchanged eligible
+bases remain. Duplicate eligible paths still fail atomically. Receipt or a
+transport position does not establish a shared version.
+
+* The difficult part: preserving writer ordering
+
+The new comparisons introduced reads before the first main-table write. Review
+found that leaving those transactions DEFERRED allowed a concurrent scheduler
+write to invalidate the read snapshot before its upgrade to a writer. The old
+leading DELETE had implicitly reserved the writer first.
+
+Replace, recovery retirement and ACK now use IMMEDIATE transactions, as install
+completion already did. This reserves the writer before reading, with the
+existing busy handler/timeout behavior. No retry layer was added. A deterministic
+test holds a scheduler write on a second real SQLite connection, releases it
+through the waiting connection's busy handler, and exercises all four actual
+publication entry points. It failed before the correction and passes afterward.
+
+* Validation and review
+
+The complete =make check= gate passed: 22,141/24,027 executable lines covered
+(92.15%), and 147/154 changed executable lines covered (95.45%). Tests,
+27 Emacs tests, formatting and strict all-target/all-feature Clippy passed.
+Six direct persistence tests cover changed/omitted membership, empty snapshots,
+duplicate rollback, share isolation, intent-retirement failure/retry, exact and
+stale ACKs, nonfile duplicate handling, and legacy/malformed JSON.
+
+Six real two-peer Docker E2E tests passed: the new row audit, nonoverlapping
+concurrent edits, recoverable conflicting edits, concurrent deletion/edit,
+recreation after a tombstone, and file/directory transitions. Existing core and
+lifecycle tests also exercise guarded application and restart behavior.
+Execution here was on Linux; macOS execution is not claimed.
+
+Seven independent design lenses cleared the narrow plan. The code review
+covered the project lenses plus correctness, concurrency and error handling.
+Its one required finding was writer reservation, fixed and re-reviewed by the
+affected correctness, concurrency and security lenses. The documentation pass
+also corrected the description of TEMP staging to paths, not path/base pairs.
+There was no review-driven expansion into the old object/runtime architecture.
+
+* Remaining costs and operational notes
+
+The operation still visits each snapshot record, decodes existing values and
+writes TEMP membership. Existing full-record maps/vectors remain. This reduces
+persistent row churn; it neither bounds whole-sync memory nor avoids hashing
+unchanged files. Whole install-intent progress rewriting can still dominate a
+large initial apply. Future milestones must measure and address those concrete
+boundaries separately without treating this result as full scaling delivery.
+
+The normal installation/upgrade path applies. There is no persistent migration
+for this change. Before deployment, inspect the actual installed state so the
+fresh-main branch does not overwrite an incompatible experimental build.
+
+* Historical supersessions
+
+None. Existing dated documents remain unchanged; the implementation contract
+for this milestone is [[file:2026-10-25-differential-persistence-design.org][Differential persistence for complete synchronization snapshots]].

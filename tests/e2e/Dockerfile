@@ -20,7 +20,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked --features e2
 # debian:bookworm-slim
 FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-server openssh-client bash emacs-nox \
+    && apt-get install -y --no-install-recommends openssh-server openssh-client bash emacs-nox sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd \
     && ssh-keygen -A \
