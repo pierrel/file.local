@@ -200,9 +200,14 @@ fn failed_candidate_migration_is_retryable_without_state_repair() -> Result<()> 
 #[ignore = "requires Docker and the deployed-alpha CI upgrade run"]
 fn legacy_responder_first_upgrade_refuses_until_connector_is_upgraded() -> Result<()> {
     let (a, b) = e2e::upgrade_managed_pair()?;
+    // Keep the legacy responder and its locks alive throughout the refusal
+    // check; a completed file alone does not prove the old session stays open.
+    b.arm_apply_stops(1)?;
     a.write("before-responder-first.txt", "base session is established")?;
-    b.wait_for_file("before-responder-first.txt", "base session is established")?;
+    let stopped = b.wait_for_stopped_apply_process()?;
     b.install_candidate_expect_err("upgrade the connector first")?;
+    stopped.resume()?;
+    b.wait_for_file("before-responder-first.txt", "base session is established")?;
 
     a.install_candidate()?;
     b.install_candidate()?;
