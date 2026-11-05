@@ -1,0 +1,502 @@
+#+title: Large-directory scaling amendment: one work queue, causal records, event-driven coverage
+#+date: 2026-10-22
+
+* 1. Status and decision
+
+This is a design-only amendment to the proposal in draft PR #25. Nothing
+here describes shipped behavior. The original dated proposal remains
+unchanged. This amendment replaces the synchronization-progress and watcher
+coverage decisions identified under Historical supersessions below; the
+original bounded-memory baseline, filesystem safety, resource-accounting,
+measurement, and delivery requirements otherwise remain applicable.
+
+Both endpoints may edit the same path independently, including while they
+are disconnected. Synchronization is causal reconciliation, not replication
+from an authoritative primary. Preserve the existing authenticated version
+identities, =seen= ancestry, exact shared merge bases, tombstones, guarded
+installation, and retained recovery conflicts. Do not silently overwrite an
+independent edit because one endpoint sent its record first.
+
+The revised proposal has three durable responsibilities:
+
+1. Canonical records and existing causal/recovery state describe what is
+   known, including deletions and version relationships.
+2. One coalesced work table describes what still needs observation or
+   reconciliation. A path remains outstanding until its exact obligation is
+   settled, not until its message arrives.
+3. A bounded frozen batch and existing install intents describe work already
+   admitted to a specific guarded operation. They are replay inputs and
+   filesystem recovery evidence, not a second general-purpose backlog.
+
+Do not add the proposed append-only change journal, journal receipt cursor,
+or a separate durable transport-acknowledgment log. Section 3 accounts for
+each responsibility before removing them. Exact-version acknowledgment is
+retained: it is a correctness fact, not a disposable transport optimization.
+
+Use native notifications during normal operation. Explicit uncertainty
+becomes work in the same table and runs through the same capture pipeline.
+The platform coverage decision is specified in section 7 after validating
+native backend guarantees, rather than assuming that no overflow means no
+missed changes.
+
+* 2. Existing correctness state is not a transport journal
+
+Repository references below describe the current implementation, not newly
+implemented APIs. =Version= in =src/model.rs= contains an authenticated
+author/sequence identity, =seen= identities, an optional authenticated
+=merge_base=, timestamp, and entry. =scan_mode= in =src/scan.rs= inherits the
+previous record's ancestry and remembers its identity when creating a new
+local version. =reconcile= in =src/reconcile.rs= tests causal ancestry before
+using deterministic conflict/merge behavior for concurrent inputs.
+
+This is causal history, not a retained Git commit DAG or a promise to keep
+every save. Coalescing untransmitted observations must not remove the causal
+information already required by these rules. A version that has been
+captured and made part of an in-flight input stays pinned until that input's
+outcome is durable. Unobserved intermediate saves are not new promises.
+
+=State::acknowledge_shared_heads= in =src/state.rs= advances a file's shared
+base only after peer commit acknowledgment and exact equality with the local
+durable current record. Non-file tombstones and directory identities remain
+canonical records even though this existing file-base table does not
+represent them. Preserve this distinction; a transport position must never
+become an ancestry fact or a reason to discard a deletion.
+
+The existing install intent precedes visible filesystem changes and retains
+the records, conflicts, temporary ownership, and durable apply phases needed
+after interruption. Paging its representation does not eliminate its job.
+No new SQLite transaction can make a filesystem replacement atomic with a
+database commit.
+
+* 3. Guarantee-by-guarantee journal audit
+
+The original proposal's journal stored verified current-record changes in a
+new per-share sequence. Its sequence was not a version identity. Its receipt
+cursor meant that rows had been received or transferred into durable pending
+obligations, not installed. The following substitutions are required before
+the new journal can be omitted:
+
+| Responsibility | Revised authoritative mechanism |
+|----------------+---------------------------------|
+| Find local changes since the last successful round | Atomically upsert a coalesced path obligation whenever a canonical record changes |
+| Retain work while the other endpoint is offline | Keep that obligation locally until durable exact settlement |
+| Avoid sending every intermediate version | Repeated changes update the same obligation; frozen batch inputs remain immutable |
+| Prevent a hot oldest item from pinning later work | Schedule oldest eligible paths with bounded retry turns, not a contiguous applied prefix |
+| Recover after process interruption | Durable work survives; startup coverage repairs uncaptured filesystem changes |
+| Replay a disconnected operation consistently | The one bounded frozen batch retains exact input versions, plan, and durable results |
+| Preserve version ancestry and merge bases | Existing authenticated records, causal identities, exact shared heads, and pinned base objects |
+| Keep deletion knowledge | Retained canonical tombstones, independent of whether the peer has acknowledged them |
+| Prevent a late message clearing newer work | Work-generation and exact-version compare-and-swap checks |
+| Bound offline history growth | One obligation per distinct outstanding path, not one journal row per captured edit |
+
+The journal's replay interval and transport receipt cursor are unnecessary
+once the sender never relinquishes its obligation merely because a message
+arrived. There is no received-prefix pruning decision to coordinate. No
+reconstructible transport state is allowed to be the sole owner of unsent
+work. A socket write, receipt of an object, or session-page checkpoint cannot
+clear a work row or advance a shared base.
+
+This trades ordered transport-history replay for coalesced current-state
+reconciliation, which matches the accepted story. It does not replace version
+history with timestamps. If implementation discovers a causal/recovery fact
+that exists only in a proposed journal row and cannot be retained by the
+state above, the omission fails its acceptance gate; identify that fact and
+revise this design before removing its only owner.
+
+* 4. One authoritative work representation
+
+Use one indexed durable work table, scoped to the authenticated relationship
+and its current generation. Illustrative fields, not a final schema:
+
+#+begin_example
+work(relationship, scope_kind, path,
+     generation, oldest_pending, retry_after,
+     needs_capture, needs_peer, coverage_checkpoint, initial_job)
+#+end_example
+
+=scope_kind= distinguishes an exact path from a subtree/root coverage scope.
+Flags identify the remaining tasks within that obligation, not independent
+queues or progress protocols. =initial_job= associates accepted initial-plan
+work with its existing consent and completion boundary. The frozen batch
+references the specific work generations it selected.
+
+Use a share-monotonic work revision or fresh update nonce, not a per-row
+counter that resets on reinsertion. An old ACK cannot match a deleted and
+recreated row by accident. Do not introduce an all-entry settled-version
+ledger: successful generation-checked retirement of peer work is its durable
+completion fact. Existing file-only shared heads retain their narrower
+merge-base responsibility.
+
+An event upserts capture work. A successful content-verifying capture commits
+the changed authenticated canonical record and peer-reconciliation work in
+one transaction. An unchanged capture can clear only its matching capture
+generation; previously outstanding peer work survives. Apply results use the
+same transaction boundary: either they settle their selected generation or
+leave/update the path obligation. No applied version silently falls outside
+the pending-work bookkeeping.
+
+Only event/capture hints may collapse into a covering ancestor when their
+bounded accumulator fills. That ancestor requires real enumeration through
+the same pipeline. Do not discard exact outstanding peer obligations on the
+assumption that a root-dirty row already proves their delivery. If storage
+cannot retain required obligations and pinned recovery state, stop admitting
+new captures/apply safely and report quota blockage; retain root uncertainty.
+One per-path peer obligation grows with distinct outstanding paths, including
+tombstones, not with the number of edits. This disk cost is necessary state,
+not an unbounded append-only history.
+
+Preserve oldest-pending age across coalescing. A hot path's newer generation
+must not continually reset its age. Use a bounded retry turn for repeatedly
+invalidated work so stable siblings continue progressing. Give an eligible
+old coverage scope a bounded service share too; a stream of cheap exact-path
+events must not starve its traversal forever. Reuse the existing installation
+FIFO and paired reservation authority at checkpointable mutation boundaries.
+This is queue selection policy, not another scheduler or worker lifecycle.
+
+An initial concrete policy is at least one bounded coverage turn per eight
+ordinary batches while coverage is pending, with tuning from measured latency.
+When ordinary work is idle, eligible coverage work still runs; its service
+does not depend on receiving eight more filesystem events.
+Ordinary new events do not rewind an entire root traversal: retain completed
+stable pieces and later exact-path work, and record later gap generations as
+still outstanding. Directory-enumeration generations still prevent an
+interrupted partial listing from proving absence. Test wide/hot directories
+so one restart cannot repeatedly discard all useful traversal progress.
+
+* 5. Bounded two-way reconciliation and straightforward resume
+
+Both endpoints select bounded eligible work, exchange the union of selected
+paths and required dependency scopes, and materialize BOTH current records
+for each selected path into one frozen batch. Always inspect the counterpart
+even if that endpoint had no locally pending row for this path. A missing
+counterpart must have explicit authenticated-inventory context; it is not an
+implicit deletion. Existing tombstones represent known deletions.
+
+Newly inspected scopes enqueue paths incrementally. Directory/type changes
+must expand dependencies through bounded disk-backed enumeration, preserving
+parent creation, descendant deletion, ignore semantics, and guarded ancestor
+checks. Do not put an entire large subtree into a single memory page or
+declare it independently applicable because paths are contiguous in order.
+
+The frozen batch binds relationship/generation, roots, protocol, unique batch
+identity, selected work generations, exact canonical inputs, plan digest,
+and consent where required. Its inputs are immutable after admission. The
+endpoint-local input rows are copied in a short SQLite transaction together
+with their work tokens; the two endpoints do not share an atomic filesystem
+snapshot. Selection is not a historical cut: a newer current record may be
+included at materialization, but later changes cannot alter the frozen rows.
+Replay uses those rows, not a fresh lookup under the same batch identity. The
+existing per-path reconciliation logic and cross-page validation indexes
+produce the plan. Preserve global version-identity, path, authenticator,
+object-size, and causal/base validation, not merely per-frame validation.
+
+Transfer verified objects, persist the indexed install intent, then apply
+with existing no-follow ancestry, opened-file/precondition, durable conflict,
+temporary ownership, replacement, and fsync safeguards. Bulk private I/O
+does not monopolize the installation mutation grant. Before visible changes,
+reacquire paired scheduler ownership and revalidate generation/preconditions.
+
+Each endpoint's durable batch result identifies the exact installed outcome.
+Advance shared file bases only on the existing exact-version conditions.
+Retire an old pending generation only when that generation's defined result
+is durably settled on both endpoints and no newer local obligation replaced
+it. The acknowledged result may intentionally differ from the captured input
+because reconciliation chose/merged another version; that result and its
+conflict disposition must match the agreed frozen plan.
+If this batch's own apply creates a new canonical record/work generation,
+record that resulting token in its durable outcome. Settlement compares that
+token and exact current outcome, not an obsolete pre-apply token; an external
+capture or event updating the token afterwards still prevents retirement.
+
+If the path changed after batch selection, install guards preserve it and
+generation checks keep the new obligation. An ACK for version V never means
+that later version V2 is settled. Supersession is allowed only where existing
+causal/reconciliation rules justify it, never because a later transport
+message or larger scheduling generation arrived.
+
+A safely deferred path remains in the work table, not in an immortal active
+batch. After recovering any live intent, finish that batch with explicit
+deferred outcomes and leave its work generations pending. Select stable
+siblings next. Do not keep a whole frozen batch active solely because one
+path keeps invalidating its preconditions; do not discard an unfinished
+filesystem mutation merely to achieve that scheduling result.
+
+After disconnect, first recover any live install intent, then replay the
+matching bounded batch's durable result or continue its verified unfinished
+work. A partial, unsealed input page can simply be retransmitted. Page offsets
+inside a retained baseline are local reconstruction checkpoints, not a
+per-direction durable receipt history and not installation acknowledgment.
+The transport never rewrites new current values under an old batch identity.
+
+A stale or safely discarded pre-apply batch is replanned from still-pending
+work. Keep install intents and any unacknowledged guarded outcome that owns
+required recovery evidence; scratch expiry cannot remove them. If one peer
+no longer recognizes a batch after safe retirement, do not replay visible
+mutations blindly or invent an ACK. Reconcile the still-pending paths anew
+against both current records. Deterministic conflict identities and exact
+version guards prevent duplicate recovery outputs. This may conservatively
+retain an older shared base; it cannot invent a newer one.
+
+No transport-history expiry can force repeated full baselines while a peer
+is offline: pending paths remain authoritative. A baseline is required for
+initial pairing, actual loss/migration of authoritative state, explicit
+membership/root changes, or coverage of unknown filesystem changes, not
+because an old journal cursor ran out of retention.
+
+* 6. Initial synchronization still uses the bounded pipeline
+
+Initial work is larger, not a different correctness model. Retain the original
+paged, disk-backed inventories and merge-join planning, full initial-plan
+validation/confirmation, dependency-aware bounded apply, and incremental
+object accounting. Do not replace a 256-MiB aggregate failure with a larger
+unbounded accumulator or an indefinitely held SQLite read transaction.
+
+Install the watcher before traversal and mark root coverage pending. A scan
+is a set of verified per-path observations, not an atomic filesystem snapshot.
+Stage observations on disk, seal coverage only after complete successful
+enumeration and valid root identity, and infer tombstones only from genuine
+revalidated absence. Incomplete traversal, permission/I/O errors, inaccessible
+mounts, and interrupted partial directories cannot prove deletion.
+
+Changes captured during paged manifest construction leave newer work
+generations pending. A path inserted behind a keyset cursor cannot disappear
+from all work merely because that page was already copied. Use transactionally
+recorded selected generations and the persistent pending table to retain it.
+Frozen inventory rows remain replayable without a long-lived WAL snapshot.
+
+The confirmed initial job keeps its durable consent, generation, retry owner,
+and per-path obligations in the common work/batch machinery. Deferred accepted
+initial work remains pending while siblings advance. Initial completion still
+requires every accepted initial-plan obligation resolved on both endpoints,
+mutual exact outcomes, and the startup coverage gap discharged. Do not print
+=Connected= sooner. Later changes remain pending without pretending the live
+tree is globally quiet. Stop/remove cannot resurrect an old generation or
+silently enable a disabled foreground relationship after restart.
+
+* 7. Event-driven coverage and audit decision
+
+** 7.1 Native signals are useful but not a complete coverage proof
+
+The Linux [[https://man7.org/linux/man-pages/man7/inotify.7.html][inotify manual]] documents =IN_Q_OVERFLOW=, watch-installation
+limits, and recursive-directory races. It also identifies changes without
+ordinary notifications: =mmap=/=msync= modifications, operations through an
+outside hard link to a watched directory's file, remote network-filesystem
+activity, and mounting over a watched directory. None requires an overflow.
+Consequently, overflow-driven recovery alone cannot preserve detection of
+stable final file contents for the broad regular-filesystem workload already
+supported. Installing a new directory watch must be followed by enumeration;
+events from before installation are not retroactively generated.
+
+A Linux diagnostic confirmed two local-filesystem cases: writing through a
+long-lived mapping after closing its descriptor produced changed bytes but
+no event or overflow while the mapping remained live; writing through an
+outside hard link also changed the watched file without an event. A direct
+write positive control did produce notifications. Later unmapping produced a
+close-write event, so the claim is not that such a file can never produce any
+event; updates through a still-live mapping can remain invisible indefinitely.
+
+Apple's [[https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html][FSEvents guide]] specifies =MustScanSubDirs= for scope rescans and
+=KernelDropped=/=UserDropped= for rescanning all watched roots. It recommends
+starting the stream before enumeration. Its advisory-history and offline
+volume caveats do not by themselves establish that a healthy live APFS stream
+needs a 15-minute content scan. Startup, stream restart, root change, and
+unusable/wrapped history nevertheless require explicit coverage handling.
+This design does not persist FSEvents event cursors as synchronization state.
+
+The selected =notify= 8.2 backend also needs an adapter audit, not merely an
+API selection: its [[https://docs.rs/notify/8.2.0/src/notify/inotify.rs.html#382-395][Linux dynamic-watch code]] reports some resource-limit
+errors but can omit other watch-add/enumeration errors; the macOS backend's
+[[https://github.com/notify-rs/notify/blob/a1d7c2d8f80786679d58ec6d5986a1d4278bc8cf/notify/src/fsevent.rs#L295-L303][default flags]] do not request =WatchRoot= and not all uncertainty flags become
+a rescan indication. Validate/preserve every required native indication and
+surface failed descendant coverage. Backend patching or a small adapter may
+be required; do not assume an opaque library error covers every gap.
+
+** 7.2 One reusable uncertainty path
+
+Native uncertainty, startup/downtime,
+watch reestablishment, callback saturation, and failed watch installation
+upsert affected-scope/root capture work. Persist it before claiming coverage.
+The callback remains nonblocking with a bounded wake channel and accumulator;
+an atomic overflow latch prevents detail loss being mistaken for idle state.
+A crash before the latch is durable is repaired by unconditional startup
+coverage. Clearing it is generation-checked against newer events.
+
+Start watching before enumeration. After installing coverage for a newly
+created/moved directory, enumerate it to cover changes predating installation.
+Do not blindly suppress apply-generated events. Rename ambiguity dirties both
+parents/scopes. =.gitignore= changes require affected membership reevaluation
+without converting ignored-but-present paths into deletions. Watch failure
+never starts an independent recovery actor: it enqueues the same capture work
+and exposes the affected coverage state.
+
+Use the smallest trustworthy scope; unknown loss marks the root. Retain the
+row's oldest age and checkpoint it through the same bounded scanner used for
+initial and ordinary scope capture. A completed scan clears only its selected
+uncertainty generation. Later loss keeps coverage pending. Known resource or
+filesystem coverage failures remain visibly degraded, not falsely healthy
+because retries produced no overflow event. Do not silently raise sysctls;
+185k Linux directories may require operator changes to watch limits.
+
+** 7.3 Replace the unconditional 15-minute audit, not its safety guarantee
+
+Normal events drive low-latency synchronization. Remove the unconditional
+15-minute full-scan synchronization round. For demonstrated Linux blind spots,
+retain fair rotating content verification as a coverage-work obligation, using
+the same root/scope scanner and disk checkpoint, not a new audit subsystem,
+separate session, or alternate reconciliation algorithm. Content verification,
+rather than size/mtime equality, is necessary for notification-blind writes.
+Its budget yields to ordinary work but must receive finite service under
+sustained load. One complete finite pass can then start the next low-priority
+coverage obligation; measure coverage age and I/O before choosing its default
+pacing. Fifteen minutes is neither a proven necessity nor a coverage-latency
+guarantee at this scale.
+Reuse the work item's =retry_after= to pace verification slices and later
+passes, including when the machine is otherwise idle; never restart them in
+an unpaced full-speed loop. A finite, nonzero verification I/O/service budget
+and its measured coverage age are delivery gates, not another timer actor or
+a promise that background verification is free. Do not silently disable that
+service while claiming the unchanged broad correctness guarantee.
+
+Do not claim macOS notification-only correctness before native tests and
+documented guarantees cover the permitted mutation/filesystem classes and
+root/backend failure modes. Until that gate passes, use the same verification
+fallback there. A backend/workload with established complete change-or-gap
+coverage may omit recurring verification; mere absence of observed loss in
+a stress test is not that proof. Explicit polling/degraded coverage uses
+this same scanner when native watching cannot cover a filesystem. It cannot
+be advertised as the high-churn fast path.
+
+This verification is a cost of unchanged broad correctness, not infrastructure
+to make a failure merely less likely. Event-driven scope capture prevents
+each save from rehashing 539k entries; eventual content reads across the tree
+remain necessary to detect changes the notification API cannot observe.
+Budget and report this work separately. Completion of an initial coverage
+epoch is not blocked forever by the next verification epoch; newly introduced
+uncertainty during that initial epoch must still be discharged.
+
+* 8. Necessary complexity and explicit removals
+
+| Mechanism | Why it remains or disappears |
+|-----------+-----------------------------|
+| Authenticated version IDs, seen ancestry, merge bases | Remain: distinguish causal updates from independent edits |
+| Retained tombstones and recovery conflicts | Remain: prevent resurrection and retain overwritten/conflicting inputs |
+| One coalesced work table with generation checks | Remains: offline ownership, fairness, and no lost newer changes |
+| Exact installed-version ACK | Remains: receipt is not durable installation or a mutual merge base |
+| One frozen bounded batch plus install intent | Remains: deterministic replay and filesystem/database crash recovery |
+| Paged baseline manifest/coverage cursor | Remains: enumerate large unknown state in bounded memory and resume traversal |
+| New append-only change journal | Removed: outstanding current-path work replaces its transport-history role |
+| Journal H/M cuts, received-prefix cursor, receipt pruning protocol | Removed with the journal; immutable selected batch inputs supply the only replay cut |
+| Separate general-purpose pending/session/ACK obligation logs | Not introduced; batch/intent rows reference the authoritative work generation |
+| Second watcher-recovery subsystem | Not introduced; loss/uncertainty are ordinary capture scopes |
+
+Work generations are local compare-and-swap tokens, not version ancestry or
+wire receipt cursors. Checkpoints bound restart cost; they do not assert peer
+installation. These distinctions are the remaining necessary complexity.
+
+* 9. Counterexamples that implementation must survive
+
+1. A and B independently edit the same shared-base file while offline.
+   Exchanging pending paths fetches both versions; existing causal/merge and
+   recovery behavior applies. Coalescing cannot erase the other input.
+2. A captures V1 then V2 before transmission. One pending path is enough;
+   V2 retains required causal information. If V1 is already frozen, its exact
+   input/recovery ownership remains pinned while V2 stays pending.
+3. B commits V1, its ACK is lost, and A captures V2. Retrying V1 cannot clear
+   V2's generation or grant V2 a shared base. Recovery/reconciliation remains
+   conservative even if an obsolete transport batch was discarded safely.
+4. A deletes a path while B remains offline for months. The pending tombstone
+   and canonical deletion survive; neither transport expiry nor queue quota
+   may resurrect B's old file.
+5. One path changes continuously beside stable siblings. It keeps one row and
+   bounded pinned input, not one row per save; deferred retries do not block
+   stable paths or an old root-coverage obligation.
+6. Watch coverage is lost during a root scan or while the process is down.
+   An older scan checkpoint cannot clear the newer uncertainty generation.
+   Normal bounded traversal repairs it without authorizing mass deletion.
+7. A permission error occurs in a directory and then a remote delete arrives.
+   Unknown local contents are not absence. Preserve the guarded conflict and
+   recovery boundaries rather than treating the scan as an empty inventory.
+
+* 10. Interfaces, validation, and delivery plan
+
+Proposed narrow operations replace journal APIs:
+
+#+begin_example
+mark_capture(scope, cause) -> WorkGeneration
+capture_page(scope, generation, checkpoint, limits) -> CaptureCheckpoint
+commit_capture(path, expected_generation, observed_record) -> PendingWork
+select_work(limits) -> SelectedGenerations
+freeze_batch(local_selection, remote_selection, current_counterparts) -> Batch
+apply_batch(batch, existing_install_intent) -> ExactDurableResult
+settle_work(batch, exact_peer_result, expected_generations) -> RemainingWork
+#+end_example
+
+The original measurement baseline remains required: 539k entries/7 GB,
+bounded end-to-end RSS including native watch bookkeeping, no whole-tree
+record/shared-head rewrite or content/object-directory scan per small change,
+bounded bytes/rows/fields per frame and batch, measured disk amplification,
+backpressure, and explicit quota failure. No throughput result is claimed.
+
+Extend the original validation matrix with every counterexample above,
+path-generation ABA/late-ACK cases, both connector directions, prolonged
+offline changes with no journal retention fallback, and crash points around
+the atomic canonical-record/work commit. Prove queue size follows distinct
+outstanding paths rather than captures and that coalescing never discards
+frozen causal inputs. Compare paged results with current reconciliation for
+valid bounded histories, including text/binary/type/deletion conflicts.
+
+Test notification loss at native-backend, callback, queue, traversal, and
+restart boundaries on native Linux and macOS. Verify continuous event load
+cannot indefinitely starve uncertainty work, and that normal healthy edits
+do not trigger unconditional full scans. Backend-specific silent-loss tests
+must match the final coverage policy in section 7.
+
+Delivery remains incremental: measure/pin regressions; build disk-backed
+paging and indexed intents; ship bounded initial sync; add the common work
+table and event-driven capture/reconciliation; tune from measured results.
+Do not begin implementation under this design-feedback request. Keep PR #25
+draft. Its description must identify this amendment as the current proposal
+and the original as historical context, not leave readers to choose between
+contradictory designs.
+
+* 11. Review and validation of this amendment
+
+Independent design reviewers covered simplicity, platform/dependency fit,
+user guidance/intention, end-to-end UX, interfaces, filesystem correctness,
+and adversarial security. A separate documentation-alignment pass checked
+the source facts and direct historical supersessions. No blocker or important
+finding remained. A primary-review clarification made idle-time coverage
+service and paced verification explicit; affected reviews were repeated.
+
+The complete =make check= passed outside the restricted execution sandbox,
+including formatting, Clippy, Make-prefix tests, all 27 Emacs tests, and the
+whole-project/changed-line coverage gates. The application is unchanged;
+these results are not validation of an implemented scaling protocol.
+
+The throwaway native Linux probe used a directory watch and an ordinary-write
+positive control. It verified both silent changed-content cases in section
+7.1 without overflow, and distinguished the later unmap close event. This
+was a diagnostic outside the repository, not new production or test-harness
+implementation. No native macOS probe, full-scale capacity benchmark,
+deployment, or Copilot review was performed for this amendment.
+
+* Historical supersessions
+
+This amendment directly replaces the following sections of
+[[file:2026-10-22-large-directory-scaling-design.org][the original large-directory scaling proposal]]:
+
+- Section 3, journal-containing pipeline: the common coalesced work table,
+  causal current state, and bounded frozen batch replace that proposed
+  transport-history pipeline; existing causal/conflict guarantees remain.
+- Sections 5.5 and 6.2-6.3, journal/cursor/pending resumption: pending work
+  retains sender ownership until exact settlement, with no journal receipt
+  prefix or retention-triggered baseline. Initial job/consent and durable
+  install recovery remain required within the common work/batch machinery.
+- Sections 6.1 and 8, watcher coverage/audits: section 7 of this amendment
+  supplies the validated event-driven coverage and audit policy.
+- Sections 7, 9, 10, and 11 where they refer to journal quotas, journal
+  H/M cuts, receipt cursors, automatic audit status, or journal delivery:
+  use the work-generation, frozen-batch, coverage, and validation rules here.
+
+These links are one level deep. No older report or implementation claim is
+rewritten. Application behavior is unchanged by this design-only amendment.
