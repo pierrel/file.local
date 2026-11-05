@@ -2185,6 +2185,49 @@ done"#,
         Ok(())
     }
 
+    /// Audit actual persistent row mutations across the separate CLI processes.
+    pub fn start_persistence_audit(&self) -> Result<()> {
+        self.exec_ok(&[
+            "sqlite3",
+            "/home/peer/.local/state/file.local/state.sqlite3",
+            "CREATE TABLE persistence_audit(kind TEXT NOT NULL,path BLOB NOT NULL);
+             CREATE TRIGGER audit_record_insert AFTER INSERT ON records BEGIN
+                 INSERT INTO persistence_audit VALUES('record',new.path); END;
+             CREATE TRIGGER audit_record_update AFTER UPDATE ON records BEGIN
+                 INSERT INTO persistence_audit VALUES('record',new.path); END;
+             CREATE TRIGGER audit_record_delete AFTER DELETE ON records BEGIN
+                 INSERT INTO persistence_audit VALUES('record',old.path); END;
+             CREATE TRIGGER audit_head_insert AFTER INSERT ON shared_heads BEGIN
+                 INSERT INTO persistence_audit VALUES('head',new.path); END;
+             CREATE TRIGGER audit_head_update AFTER UPDATE ON shared_heads BEGIN
+                 INSERT INTO persistence_audit VALUES('head',new.path); END;
+             CREATE TRIGGER audit_head_delete AFTER DELETE ON shared_heads BEGIN
+                 INSERT INTO persistence_audit VALUES('head',old.path); END;",
+        ])?;
+        Ok(())
+    }
+
+    pub fn take_persistence_audit(&self) -> Result<Vec<(String, String, u64)>> {
+        let output = self.exec_ok(&[
+            "sqlite3",
+            "/home/peer/.local/state/file.local/state.sqlite3",
+            "SELECT kind,hex(path),count(*) FROM persistence_audit
+             GROUP BY kind,path ORDER BY kind,path; DELETE FROM persistence_audit;",
+        ])?;
+        String::from_utf8(output.stdout)?
+            .lines()
+            .map(|line| {
+                let fields: Vec<_> = line.split('|').collect();
+                anyhow::ensure!(fields.len() == 3, "invalid persistence audit: {line}");
+                Ok((
+                    fields[0].to_owned(),
+                    fields[1].to_owned(),
+                    fields[2].parse()?,
+                ))
+            })
+            .collect()
+    }
+
     pub fn write_bytes(&self, path: &str, content: &[u8]) -> Result<()> {
         let full = self.share_path(path)?;
         if let Some((parent, _)) = full.rsplit_once('/') {

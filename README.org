@@ -367,7 +367,15 @@ A local or
 remote filesystem event schedules synchronization after a 250-millisecond
 debounce, capped at two seconds during a continuous burst. Change-driven rounds
 still perform a complete reconciliation scan in this alpha; incremental
-dirty-path scanning and operation deltas remain deferred. While healthy and
+dirty-path scanning and operation deltas remain deferred.
+
+Complete snapshots preserve unchanged canonical-record and acknowledged-base
+rows in SQLite, including install completion and interrupted-install recovery.
+Only changed or omitted rows are written. Scans, inventory exchange and plan
+construction still process complete snapshots; this reduces metadata writes
+without removing the session metadata limit or making scans incremental.
+
+While healthy and
 idle, peers exchange a small heartbeat every 30 seconds. A full safety audit
 runs every 15 minutes on the same session to bound silently missed filesystem
 notifications without returning to frequent SSH and scan polling.

@@ -1638,6 +1638,7 @@ impl State {
         set_private_file(&database)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "temp_store", "FILE")?;
         #[cfg(target_os = "macos")]
         conn.pragma_update(None, "fullfsync", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -2610,17 +2611,7 @@ impl State {
             let tx = self
                 .conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
-            for record in records {
-                tx.execute(
-                    "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
-                    params![
-                        share.0,
-                        record.path.as_bytes(),
-                        serde_json::to_string(&record.version)?
-                    ],
-                )?;
-            }
+            replace_records_in(&tx, share, records)?;
             for conflict in &current.conflicts {
                 insert_conflict(&tx, share, conflict)?;
             }
@@ -2749,18 +2740,10 @@ impl State {
             bail!("install intent changed before invalidation recovery");
         }
         self.ensure_recovery_limits(share, conflicts)?;
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM records WHERE share_id=?1", [&share.0])?;
-        for record in records {
-            tx.execute(
-                "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
-                params![
-                    share.0,
-                    record.path.as_bytes(),
-                    serde_json::to_string(&record.version)?
-                ],
-            )?;
-        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        replace_records_in(&tx, share, records)?;
         for conflict in conflicts {
             insert_conflict(&tx, share, conflict)?;
         }
@@ -4616,8 +4599,19 @@ impl State {
             .into_iter()
             .map(|record| (record.path.as_bytes().to_vec(), record))
             .collect();
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM shared_heads WHERE share_id=?1", [&share.0])?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE acknowledged_paths(path BLOB PRIMARY KEY NOT NULL) WITHOUT ROWID;",
+        )?;
+        let mut membership = tx.prepare("INSERT INTO temp.acknowledged_paths(path) VALUES(?1)")?;
+        let mut previous =
+            tx.prepare("SELECT base_json FROM shared_heads WHERE share_id=?1 AND path=?2")?;
+        let mut publish = tx.prepare(
+            "INSERT INTO shared_heads(share_id,path,base_json) VALUES(?1,?2,?3)
+             ON CONFLICT(share_id,path) DO UPDATE SET base_json=excluded.base_json",
+        )?;
         for record in plan {
             if current.get(record.path.as_bytes()) != Some(record) {
                 continue;
@@ -4625,32 +4619,40 @@ impl State {
             let Some(base) = record.version.as_base() else {
                 continue;
             };
-            tx.execute(
-                "INSERT INTO shared_heads(share_id,path,base_json) VALUES(?1,?2,?3)",
-                params![
-                    share.0,
-                    record.path.as_bytes(),
-                    serde_json::to_string(&base)?
-                ],
-            )?;
+            membership.execute([record.path.as_bytes()])?;
+            let stored: Option<String> = previous
+                .query_row(params![share.0, record.path.as_bytes()], |row| row.get(0))
+                .optional()?;
+            if stored
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<crate::model::BaseVersion>(json).ok())
+                .as_ref()
+                == Some(&base)
+            {
+                continue;
+            }
+            publish.execute(params![
+                share.0,
+                record.path.as_bytes(),
+                serde_json::to_string(&base)?
+            ])?;
         }
+        drop((membership, previous, publish));
+        tx.execute(
+            "DELETE FROM shared_heads WHERE share_id=?1 AND NOT EXISTS(
+                SELECT 1 FROM temp.acknowledged_paths WHERE path=shared_heads.path)",
+            [&share.0],
+        )?;
+        tx.execute_batch("DROP TABLE temp.acknowledged_paths;")?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn replace_records(&mut self, id: &ShareId, records: &[Record]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM records WHERE share_id=?1", [&id.0])?;
-        for record in records {
-            tx.execute(
-                "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)",
-                params![
-                    id.0,
-                    record.path.as_bytes(),
-                    serde_json::to_string(&record.version)?
-                ],
-            )?;
-        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        replace_records_in(&tx, id, records)?;
         tx.commit()?;
         Ok(())
     }
@@ -6418,6 +6420,57 @@ fn decode_install_intent_failure(
     }
 }
 
+/// Replace complete membership inside the caller's publication transaction.
+/// TEMP keys reject duplicate inputs; unchanged typed versions keep their rows.
+fn replace_records_in(
+    tx: &rusqlite::Transaction<'_>,
+    share: &ShareId,
+    records: &[Record],
+) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TEMP TABLE replacement_paths(path BLOB PRIMARY KEY NOT NULL) WITHOUT ROWID;",
+    )?;
+    {
+        let mut membership = tx.prepare("INSERT INTO temp.replacement_paths(path) VALUES(?1)")?;
+        for record in records {
+            membership.execute([record.path.as_bytes()])?;
+        }
+        let mut previous =
+            tx.prepare("SELECT version_json FROM records WHERE share_id=?1 AND path=?2")?;
+        let mut publish = tx.prepare(
+            "INSERT INTO records(share_id,path,version_json) VALUES(?1,?2,?3)
+             ON CONFLICT(share_id,path) DO UPDATE SET version_json=excluded.version_json",
+        )?;
+        for record in records {
+            let stored: Option<String> = previous
+                .query_row(params![share.0, record.path.as_bytes()], |row| row.get(0))
+                .optional()?;
+            // Legacy JSON formatting/defaults are not a version change. An
+            // undecodable old value is replaced, as in the former full rebuild.
+            if stored
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Version>(json).ok())
+                .as_ref()
+                == Some(&record.version)
+            {
+                continue;
+            }
+            publish.execute(params![
+                share.0,
+                record.path.as_bytes(),
+                serde_json::to_string(&record.version)?
+            ])?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM records WHERE share_id=?1 AND NOT EXISTS(
+             SELECT 1 FROM temp.replacement_paths WHERE path=records.path)",
+        [&share.0],
+    )?;
+    tx.execute_batch("DROP TABLE temp.replacement_paths;")?;
+    Ok(())
+}
+
 fn clear_install_failure_diagnostic(
     transaction: &rusqlite::Transaction<'_>,
     share: &ShareId,
@@ -7685,6 +7738,99 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    #[test]
+    fn snapshot_publication_reserves_writer_before_reading_under_scheduler_contention() -> Result<()>
+    {
+        use std::cell::RefCell;
+        use std::sync::mpsc::{self, Receiver, Sender};
+        use std::time::Duration;
+
+        thread_local! {
+            static WRITER: RefCell<Option<(Sender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+        }
+        fn release_writer(_: i32) -> bool {
+            WRITER.with(|slot| {
+                let Some((release, committed)) = slot.borrow_mut().take() else {
+                    return false;
+                };
+                release.send(()).is_ok() && committed.recv_timeout(Duration::from_secs(5)).is_ok()
+            })
+        }
+
+        for operation in ["replace", "ack", "retire", "finish"] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("root");
+            fs::create_dir(&root)?;
+            let mut state = State::open(temp.path().join("state"))?;
+            let share = state.init_share(&root)?;
+            let records = vec![file_record(
+                RelativePath::from_bytes(b"file".to_vec())?,
+                PeerId("test-peer".into()),
+                1,
+                1,
+                Vec::new(),
+                Entry::File {
+                    hash: ObjectHash::from_blake3(blake3::hash(b"file")),
+                    size: 4,
+                    executable: false,
+                },
+            )];
+            state.replace_records(&share, &records)?;
+            state.acknowledge_shared_heads(&share, &records)?;
+            let (intent, _) = state.set_install_intent(&share, &records)?;
+            let database = state.dir.join("state.sqlite3");
+            let (locked, ready) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let (commit, committed) = mpsc::channel();
+            let writer = std::thread::spawn(move || -> Result<()> {
+                let mut connection = Connection::open(database)?;
+                let tx = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute("UPDATE installation SET scheduler_completion_sequence=scheduler_completion_sequence+1", [])?;
+                locked.send(())?;
+                released.recv_timeout(Duration::from_secs(5))?;
+                tx.commit()?;
+                commit.send(())?;
+                Ok(())
+            });
+            ready.recv_timeout(Duration::from_secs(5))?;
+            WRITER.with(|slot| *slot.borrow_mut() = Some((release, committed)));
+            state.conn.busy_handler(Some(release_writer))?;
+            let result = match operation {
+                "replace" => state.replace_records(&share, &records),
+                "ack" => state.acknowledge_shared_heads(&share, &records),
+                "retire" => state.retire_invalidated_install(
+                    &share,
+                    &intent,
+                    &records,
+                    &[],
+                    &records[0].path,
+                ),
+                "finish" => state.finish_install(&share, &intent, &records),
+                _ => unreachable!(),
+            };
+            // Release the other thread even when the old deferred upgrade
+            // fails immediately instead of invoking the reservation wait.
+            let waited = WRITER.with(|slot| {
+                if let Some((release, committed)) = slot.borrow_mut().take() {
+                    release.send(())?;
+                    committed.recv_timeout(Duration::from_secs(5))?;
+                    Ok::<_, anyhow::Error>(false)
+                } else {
+                    Ok(true)
+                }
+            })?;
+            writer.join().expect("scheduler writer panicked")?;
+            result.with_context(|| format!("{operation} failed during scheduler contention"))?;
+            assert!(
+                waited,
+                "{operation} did not reserve the main writer before its reads"
+            );
+            assert_eq!(state.records(&share)?, records);
+        }
+        Ok(())
+    }
 
     const PERMISSIVE_UMASK_STATE_DIR: &str = "FLOCAL_TEST_PERMISSIVE_UMASK_STATE_DIR";
 
