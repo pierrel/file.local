@@ -127,3 +127,45 @@ fn decode_volume_uuid(buffer: &[u8; 40]) -> Result<Option<String>> {
     }
     Ok(identifier("macos-volume-v1", &buffer[24..40]))
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn packed_volume_uuid_requires_complete_returned_evidence() {
+        let mut valid = [0x42_u8; 40];
+        valid[..24].fill(0);
+        valid[..4].copy_from_slice(&40_u32.to_ne_bytes());
+        valid[4..8].copy_from_slice(&libc::ATTR_CMN_RETURNED_ATTRS.to_ne_bytes());
+        valid[8..12].copy_from_slice(&libc::ATTR_VOL_UUID.to_ne_bytes());
+        let mut missing_masks = valid;
+        missing_masks[4..8].fill(0);
+        let mut omitted_uuid = valid;
+        omitted_uuid[8..12].fill(0);
+        omitted_uuid[..4].copy_from_slice(&24_u32.to_ne_bytes());
+        let mut zero_uuid = valid;
+        zero_uuid[24..].fill(0);
+        let mut truncated = valid;
+        truncated[..4].copy_from_slice(&24_u32.to_ne_bytes());
+        let mut too_short = valid;
+        too_short[..4].copy_from_slice(&23_u32.to_ne_bytes());
+        let mut too_long = valid;
+        too_long[..4].copy_from_slice(&41_u32.to_ne_bytes());
+        for (name, response, expected) in [
+            ("valid", valid, "identity"),
+            ("missing returned masks", missing_masks, "error"),
+            ("omitted UUID", omitted_uuid, "unsupported"),
+            ("zero UUID", zero_uuid, "unsupported"),
+            ("truncated UUID", truncated, "error"),
+            ("short length", too_short, "error"),
+            ("oversized length", too_long, "error"),
+            ("empty response", [0; 40], "error"),
+        ] {
+            let outcome = match super::decode_volume_uuid(&response) {
+                Ok(Some(_)) => "identity",
+                Ok(None) => "unsupported",
+                Err(_) => "error",
+            };
+            assert_eq!(outcome, expected, "{name}");
+        }
+    }
+}

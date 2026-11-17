@@ -1975,36 +1975,6 @@ impl State {
                 ],
             )?;
         }
-        // Legacy enrollment needs the complete old numeric identity. A missing
-        // or already-renumbered root cannot supply historical volume evidence.
-        let unenrolled: Vec<(String, Vec<u8>, String, String)> = {
-            let mut query = transaction.prepare(
-                "SELECT share_id,root,root_device,root_inode FROM shares
-                 WHERE root_filesystem_identity IS NULL",
-            )?;
-            query
-                .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for (share, root, device, inode) in unenrolled {
-            let root = bytes_path(root);
-            let Ok((_directory, actual, filesystem)) = root_observation(&root) else {
-                continue;
-            };
-            if actual.device.to_string() != device || actual.inode.to_string() != inode {
-                continue;
-            }
-            if filesystem.is_none() || !root_identity(&root).is_ok_and(|current| current == actual)
-            {
-                continue;
-            }
-            transaction.execute(
-                "UPDATE shares SET root_filesystem_identity=?2 WHERE share_id=?1",
-                params![share, filesystem],
-            )?;
-        }
         transaction.commit()?;
         Ok(Self {
             dir,
@@ -6778,6 +6748,21 @@ fn validate_stored_root_identity(
                 "configured root numeric identity changed without enrolled filesystem evidence"
             ));
         }
+        // Enroll only this selected root. Optional UUID enrollment must not
+        // probe unrelated mounts at startup: even an open can stall there.
+        if let Some(filesystem) = observed_filesystem {
+            let changed = connection.execute(
+                "UPDATE shares SET root_filesystem_identity=?2 WHERE share_id=?1 AND root=?3
+                 AND root_device=?4 AND root_inode=?5
+                 AND (root_filesystem_identity IS NULL OR root_filesystem_identity=?2)",
+                params![share.0, filesystem, stored_root, device, inode],
+            )?;
+            if changed != 1 {
+                bail!(RootIdentityChanged::new(
+                    "configured root binding changed during filesystem enrollment"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -7829,6 +7814,20 @@ pub fn file_record(
 
 #[cfg(all(test, unix))]
 mod tests {
+    fn stored_root_filesystem(
+        state: &super::State,
+        share: &crate::model::ShareId,
+    ) -> Option<String> {
+        state
+            .conn
+            .query_row(
+                "SELECT root_filesystem_identity FROM shares WHERE share_id=?1",
+                [&share.0],
+                |row| row.get(0),
+            )
+            .expect("reading stored root filesystem identity")
+    }
+
     #[test]
     fn volume_identity_refresh_preserves_state_and_rejects_unproved_changes() -> anyhow::Result<()>
     {
@@ -7839,11 +7838,7 @@ mod tests {
         let state = super::State::open(&state_dir)?;
         let share = state.init_share(&root)?;
         let original = state.expected_root_identity(&share)?;
-        let filesystem: Option<String> = state.conn.query_row(
-            "SELECT root_filesystem_identity FROM shares WHERE share_id=?1",
-            [&share.0],
-            |r| r.get(0),
-        )?;
+        let filesystem = stored_root_filesystem(&state, &share);
         let Some(filesystem) = filesystem else {
             return Ok(());
         };
@@ -7881,30 +7876,43 @@ mod tests {
             "UPDATE shares SET root_filesystem_identity=NULL WHERE share_id=?1",
             [&share.0],
         )?;
-        assert_eq!(
-            state.validate_root_identity(&share)?,
-            original,
-            "unenrolled matching legacy roots retain strict numeric validation"
-        );
+        let unrelated_root = temp.path().join("unrelated-root");
+        std::fs::create_dir(&unrelated_root)?;
+        let unrelated = state.init_share(&unrelated_root)?;
+        state.conn.execute(
+            "UPDATE shares SET root_filesystem_identity=NULL WHERE share_id=?1",
+            [&unrelated.0],
+        )?;
         drop(state);
         let state = super::State::open(&state_dir)?;
-        let enrolled: Option<String> = state.conn.query_row(
-            "SELECT root_filesystem_identity FROM shares WHERE share_id=?1",
-            [&share.0],
-            |r| r.get(0),
-        )?;
+        let enrolled = stored_root_filesystem(&state, &share);
+        assert_eq!(enrolled, None, "startup must not probe or enroll any root");
+        state.conn.execute_batch("CREATE TEMP TRIGGER reject_uuid_enrollment BEFORE UPDATE OF root_filesystem_identity ON shares BEGIN SELECT RAISE(ABORT, 'injected enrollment failure'); END;")?;
+        let error = state
+            .validate_root_identity(&share)
+            .expect_err("enrollment SQL failure must propagate");
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        assert!(error.downcast_ref::<super::RootIdentityChanged>().is_none());
+        let unchanged = stored_root_filesystem(&state, &share);
+        assert_eq!(unchanged, None);
+        state
+            .conn
+            .execute_batch("DROP TRIGGER reject_uuid_enrollment")?;
+        assert_eq!(state.validate_root_identity(&share)?, original);
+        let enrolled = stored_root_filesystem(&state, &share);
         assert_eq!(enrolled.as_ref(), Some(&filesystem));
+        let untouched = stored_root_filesystem(&state, &unrelated);
+        assert_eq!(
+            untouched, None,
+            "selected-share validation must not probe unrelated roots"
+        );
         state.conn.execute(
             "UPDATE shares SET root_filesystem_identity=NULL,root_device=?2 WHERE share_id=?1",
             rusqlite::params![share.0, old_device],
         )?;
         drop(state);
         let state = super::State::open(&state_dir)?;
-        let enrolled: Option<String> = state.conn.query_row(
-            "SELECT root_filesystem_identity FROM shares WHERE share_id=?1",
-            [&share.0],
-            |r| r.get(0),
-        )?;
+        let enrolled = stored_root_filesystem(&state, &share);
         assert_eq!(
             enrolled, None,
             "changed legacy device must not be silently enrolled"
@@ -7960,7 +7968,7 @@ mod tests {
     use std::process::Command;
 
     #[test]
-    fn snapshot_publication_reserves_writer_before_reading_under_scheduler_contention() -> Result<()>
+    fn publication_and_enrollment_wait_for_scheduler_writer_without_stale_snapshots() -> Result<()>
     {
         use std::cell::RefCell;
         use std::sync::mpsc::{self, Receiver, Sender};
@@ -7978,7 +7986,7 @@ mod tests {
             })
         }
 
-        for operation in ["replace", "ack", "retire", "finish"] {
+        for operation in ["replace", "ack", "retire", "finish", "enroll"] {
             let temp = tempfile::tempdir()?;
             let root = temp.path().join("root");
             fs::create_dir(&root)?;
@@ -7999,6 +8007,16 @@ mod tests {
             state.replace_records(&share, &records)?;
             state.acknowledge_shared_heads(&share, &records)?;
             let (intent, _) = state.set_install_intent(&share, &records)?;
+            if operation == "enroll" {
+                let filesystem = stored_root_filesystem(&state, &share);
+                if filesystem.is_none() {
+                    continue;
+                }
+                state.conn.execute(
+                    "UPDATE shares SET root_filesystem_identity=NULL WHERE share_id=?1",
+                    [&share.0],
+                )?;
+            }
             let database = state.dir.join("state.sqlite3");
             let (locked, ready) = mpsc::channel();
             let (release, released) = mpsc::channel();
@@ -8028,6 +8046,7 @@ mod tests {
                     &records[0].path,
                 ),
                 "finish" => state.finish_install(&share, &intent, &records),
+                "enroll" => state.validate_root_identity(&share).map(|_| ()),
                 _ => unreachable!(),
             };
             // Release the other thread even when the old deferred upgrade
@@ -8045,9 +8064,16 @@ mod tests {
             result.with_context(|| format!("{operation} failed during scheduler contention"))?;
             assert!(
                 waited,
-                "{operation} did not reserve the main writer before its reads"
+                "{operation} did not wait for the competing main writer"
             );
             assert_eq!(state.records(&share)?, records);
+            if operation == "enroll" {
+                let filesystem = stored_root_filesystem(&state, &share);
+                assert!(
+                    filesystem.is_some(),
+                    "enrollment must survive another writer's commit"
+                );
+            }
         }
         Ok(())
     }

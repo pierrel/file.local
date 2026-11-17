@@ -123,9 +123,14 @@ Capture supplementary filesystem identity for new registrations and deliberate
 unpaired-root reinitialization. For existing rows, enroll it only while the
 opened root's complete old device/inode pair matches the stored pair. Recheck
 the opened root against the current path before publishing enrollment. Add the
-column transactionally with existing schema changes. Missing, mismatched, or
-unsupported existing roots stay unenrolled; they must not make unrelated
-healthy shares unavailable merely because optional evidence cannot be added.
+column transactionally with existing schema changes. Enroll a previously
+numerically bound legacy root only when that share is selected for validation,
+using conditional publication after its descriptor observations. Do not probe
+every UUID-unenrolled root during State::open: unsupported mounts remain
+unenrolled, and a stalled mount must not block healthy-share commands or
+detachment by share ID. The pre-existing one-time migration for much older
+rows missing their numeric root binding remains unchanged. Missing, mismatched,
+or unsupported existing roots stay unenrolled.
 
 Centralize stored-root validation so ordinary sync, managed restart, exact
 PATH removal, registration retry, and recovery use the same rule:

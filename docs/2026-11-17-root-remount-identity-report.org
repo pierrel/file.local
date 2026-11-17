@@ -58,8 +58,12 @@ before publication or filesystem mutation.
 ** One persisted fact, existing runtime guards
 
 =src/state.rs= adds nullable =shares.root_filesystem_identity=. New roots store
-it at registration. Legacy enrollment requires the entire old device/inode
-pair to match first, and an unavailable unrelated root is left unenrolled.
+it at registration. Legacy enrollment occurs only during validation of the
+selected share and requires the entire old device/inode pair to match first.
+The schema upgrade adds the column without optional UUID probes of unrelated
+roots. This keeps a stalled unsupported mount from blocking startup or detach
+by share ID. Enrollment uses a conditional write after the descriptor checks;
+the much older initial numeric-binding migration retains its existing rules.
 The original root descriptor remains open through the path recheck and
 identity UPDATE, preventing device-number reuse between those checks.
 
@@ -152,6 +156,23 @@ disabled. Native macOS, Ubuntu, and CI coverage checks passed on source commit
 =4ad2dbe=. The default SSH catalog and external Copilot review remain pending at
 this report's final local review; they are tracked on the pull request.
 
+** Copilot round 1 corrections
+
+Copilot found that optional UUID enrollment originally probed all unenrolled
+roots inside the startup schema transaction. A stalled NFS or FUSE mount
+could block unrelated commands even though failures were otherwise skipped.
+That loop was deleted. A legacy UUID is now enrolled only when its selected
+root is validated, after numeric identity and pathname proof, with a
+conditional write. Tests require startup to leave UUIDs unenrolled, then
+verify that validating one share enrolls only that share.
+
+Copilot also identified missing packed-response validation tests. A small
+native macOS table now exercises a valid UUID, absent returned masks, omitted
+and all-zero UUIDs, truncated UUID data, invalid short/long lengths, and an
+empty response. These byte fixtures do not mount disks or add fixture trees.
+Both findings were accepted; no generic filesystem timeouts or background
+enrollment lifecycle was added.
+
 ** Keeping CI within its established command budget
 
 The first full SSH run passed 63 scenarios and timed out only in the existing
@@ -171,7 +192,9 @@ into a root-identity fix and makes the CI coverage limit explicit.
 
 Upgrade both endpoints using the normal guarded =make install= path. Legacy
 shares should be upgraded while their original recorded numeric identity
-still matches, so the new filesystem evidence can be enrolled safely.
+still matches, then synchronized or started once before rebooting so selected-
+share validation can enroll the evidence safely. Installation alone no longer
+performs optional root probes; read-only status also does not enroll roots.
 Older Linux kernels, unsupported native UUID facilities, overlays, and other
 Linux backends retain strict checks. Filesystem identifiers are identity evidence,
 not protection against a privileged attacker cloning a volume UUID.

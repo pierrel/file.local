@@ -10,8 +10,11 @@ installation to this version, verify that every registered share path is the
 intended mounted directory on that machine. Registration records the directory
 inode and, where supported, a persistent filesystem UUID. A verified remount
 can refresh its numeric device number without re-pairing or losing history.
-Legacy roots enroll that UUID only while their previously recorded device
-and inode still match. Already changed legacy roots remain blocked until
+Legacy roots enroll that UUID when selected for validation, while their
+previously recorded device and inode still match. After upgrading, synchronize
+or start a healthy legacy share once before rebooting. Installation does not
+perform optional UUID enrollment, and read-only status does not enroll roots.
+Already changed legacy roots remain blocked until
 deliberately recovered; an inode alone cannot prove the original volume.
 For an already affected share, record its ID with =flocal sync list=, detach
 with =flocal sync remove --share SHARE_ID --yes=, and add it again after
