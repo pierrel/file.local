@@ -1,6 +1,6 @@
 #+title: Preserve root identity across device renumbering
 #+date: 2026-11-17
-#+status: reviewed implementation design; native acceptance pending
+#+status: reviewed implementation design; native acceptance passed
 
 * 1. User story, boundary, and acceptance milestone
 

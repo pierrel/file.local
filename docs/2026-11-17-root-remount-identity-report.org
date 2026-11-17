@@ -1,6 +1,6 @@
 #+title: Recognizing the same synchronized directory after a remount
 #+date: 2026-11-17
-#+status: implementation validation in progress
+#+status: implemented; local and native acceptance passed; external review pending
 
 * The user experience and the defect
 
@@ -120,13 +120,15 @@ test now expecting the earlier refusal produced by the shared validator.
 
 The macOS helper passed an isolated cross-target type check and strict Clippy.
 The full project cannot cross-build on this Linux host without an Apple SDK.
-A generated APFS disk-image test will detach and reattach the same directory
-on native macOS CI, occupy the previous device slot, validate the remounted
-root, reject a held old capability before any separate device refresh,
-recover a Creating-phase install temporary, capture a later edit, and verify
-that a replacement is still rejected. That native run remains pending; Linux
-Docker results do not establish it. This is a real-filesystem installation
-integration test, not a complete two-machine macOS watch test.
+A generated APFS disk-image test detached and reattached the same directory
+on native macOS CI, occupied the previous device slot, validated the remounted
+root, rejected a held old capability before any separate device refresh,
+recovered a Creating-phase install temporary, captured a later edit, and verified
+that a replacement is still rejected. The actual test passed in 15.32 seconds
+in [[https://github.com/pierrel/file.local/actions/runs/44120936860/job/134171766803][the native macOS CI job]], which also passed the full project build,
+Clippy, Rust suite, and Emacs tests. This is a real-filesystem installation
+integration test, not a complete two-machine macOS watch test. Linux Docker
+results alone do not establish this native result.
 
 Complete =make check= passed: the full Rust suite, 27 Emacs tests, Make-prefix
 checks, formatting, and strict all-target/all-feature Clippy. Whole-project
@@ -146,8 +148,9 @@ excluded because strict overlay refusal preserves safety with a smaller scope.
 
 The reviewed release was deployed locally through the guarded installer; the
 binary hash matched and the daemon was healthy. All six relationships remained
-disabled. Native macOS CI and external Copilot review remain pending; local
-Linux checks are not presented as native macOS acceptance.
+disabled. Native macOS, Ubuntu, and CI coverage checks passed on source commit
+=4ad2dbe=. The full SSH catalog and external Copilot review remain pending at
+this report's final local review; they are tracked on the pull request.
 
 * Operational limits and upgrade
 
