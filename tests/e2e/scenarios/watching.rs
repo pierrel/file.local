@@ -347,7 +347,9 @@ fn changing_path_does_not_block_a_stable_sibling() -> Result<()> {
     a.write("changing.txt", "local two")?;
     watch.resume()?;
 
-    watch.wait_for_log("UNSETTLED changing.txt is still changing; stable paths will continue")?;
+    // Either path can invalidate the first plan, which selects the deferral wording.
+    watch.wait_for_log("UNSETTLED changing.txt ")?;
+    watch.wait_for_log("stable paths will continue")?;
     a.wait_for_file("stable.txt", "stable remote")?;
     watch.wait_for_log("stable.txt")?;
     watch.wait_for_log("SETTLED changing.txt no longer blocks synchronization")?;

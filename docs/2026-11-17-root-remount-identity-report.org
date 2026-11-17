@@ -159,6 +159,14 @@ disabled, including after redeploying the first Copilot fixes. All four CI jobs,
 including native macOS and the default SSH catalog, passed on =ae3ee06=.
 Revalidation of the first Copilot fixes is tracked on the pull request.
 
+That revalidation passed 62 SSH scenarios and exposed an existing watch-test
+ordering assumption: the first invalidation may be the stable sibling, which
+makes the changing path report “changed during recalculation” rather than
+“is still changing.” Both transitions have deterministic unit coverage. The
+E2E assertion now requires the changing-path warning and stable-path progress,
+retaining settlement, exact final contents, and same-SSH-session assertions.
+The runtime synchronization behavior is unchanged.
+
 ** Copilot round 1 corrections
 
 Copilot found that optional UUID enrollment originally probed all unenrolled
