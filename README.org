@@ -481,3 +481,12 @@ service-management UX, and recovery retention suitable for non-technical users.
 
 The stable milestone will be defined from experience running the earlier
 versions across real directories and peers.
+
+* Development checks
+
+Run =make check= for the complete local gate and =make e2e= for the default
+Docker SSH scenarios. The deployed-alpha upgrade scenarios have their separate
+CI selection. The 5,000-file initial-sync scenario is available explicitly as
+=make e2e-large-initial=; its ten-minute command deadline has been exceeded on
+unchanged main in CI, so it is excluded from the default CI selection. This
+does not claim that large-directory scaling is fixed or abandon that test.

@@ -149,8 +149,23 @@ excluded because strict overlay refusal preserves safety with a smaller scope.
 The reviewed release was deployed locally through the guarded installer; the
 binary hash matched and the daemon was healthy. All six relationships remained
 disabled. Native macOS, Ubuntu, and CI coverage checks passed on source commit
-=4ad2dbe=. The full SSH catalog and external Copilot review remain pending at
+=4ad2dbe=. The default SSH catalog and external Copilot review remain pending at
 this report's final local review; they are tracked on the pull request.
+
+** Keeping CI within its established command budget
+
+The first full SSH run passed 63 scenarios and timed out only in the existing
+5,000-file initial-sync case at its ten-minute command deadline. The same case
+failed with the same deadline on unchanged main =c502382= in
+[[https://github.com/pierrel/file.local/actions/runs/36595513583/job/109499261990][the baseline CI run]]. This is evidence of the existing large-sync limit,
+not evidence that this root-identity fix resolves scaling.
+
+Following the user's instruction permitting abandonment of oversized CI E2E
+runs, =make e2e= now excludes that one case. =make e2e-large-initial= retains
+the exact scenario and deadline for explicit execution. Native APFS acceptance,
+both overlay-substitution refusals, other SSH scenarios, and separate deployed-
+alpha upgrade tests remain required. This avoids folding a scaling rewrite
+into a root-identity fix and makes the CI coverage limit explicit.
 
 * Operational limits and upgrade
 
@@ -185,3 +200,7 @@ roots enroll their persistent identity immediately.
 - [[file:2026-09-03-root-identity-removal-recovery-design.org::*3. Chosen flow and interfaces][Root identity recovery design, section 3]] treated the stored numeric
   device/inode pair as the durable binding. Enrolled roots now also require
   filesystem evidence and can retain their relationship across renumbering.
+- [[file:2026-09-08-initial-transfer-receipts-design.org::*5. Acceptance and fail-to-pass validation][Initial transfer receipts design, section 5]] included the promoted 5,000-file
+  scenario in normal =make e2e= validation. It now requires the explicit
+  =make e2e-large-initial= selection because of reproduced CI budget failures;
+  its assertions and deadline are retained.

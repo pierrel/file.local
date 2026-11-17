@@ -50,7 +50,7 @@ fn unchanged_and_single_file_sync_preserve_unrelated_persistent_rows() -> Result
 }
 
 #[test]
-#[ignore = "requires docker; run via `make e2e`"]
+#[ignore = "requires docker and a large-sync budget; run via `make e2e-large-initial`"]
 fn five_thousand_initial_changes_do_not_timeout_after_scan() -> Result<()> {
     let (a, b) = e2e::managed_containers()?;
     a.write_numbered_files(5_000)?;
