@@ -136,12 +136,15 @@ results alone do not establish this native result.
 
 Complete =make check= passed: the full Rust suite, 27 Emacs tests, Make-prefix
 checks, formatting, and strict all-target/all-feature Clippy. Whole-project
-coverage is 22,338/24,255 lines (92.10%); changed executable-line coverage is
-262/289 (90.66%). Both generated Docker view-refusal scenarios passed.
+coverage after the first Copilot fixes is 22,364/24,281 lines (92.10%);
+changed executable-line coverage is 286/317 (90.22%). Both generated Docker
+view-refusal scenarios passed again after those fixes. The persistent-UUID
+fixture mounts sequentially and uses bounded spacers if the kernel reuses the
+old device number; it verifies the changed-device precondition explicitly.
 
 Seven independent design lenses and twelve code lenses were used, with two
-code rounds and affected design rechecks. No blocker or important finding
-remains locally. Important findings corrected inherited overlay-ID aliasing,
+initial code rounds, affected design rechecks, and focused Copilot-fix rechecks.
+No blocker or important finding remains locally. Important findings corrected inherited overlay-ID aliasing,
 the distinct own-UUID/lower-view alias, final opened-capability validation,
 registration writer reservation, operational-error classification, and the
 missing held-capability test. The obsolete positive Docker restart fixture
@@ -152,9 +155,9 @@ excluded because strict overlay refusal preserves safety with a smaller scope.
 
 The reviewed release was deployed locally through the guarded installer; the
 binary hash matched and the daemon was healthy. All six relationships remained
-disabled. Native macOS, Ubuntu, and CI coverage checks passed on source commit
-=4ad2dbe=. The default SSH catalog and external Copilot review remain pending at
-this report's final local review; they are tracked on the pull request.
+disabled, including after redeploying the first Copilot fixes. All four CI jobs,
+including native macOS and the default SSH catalog, passed on =ae3ee06=.
+Revalidation of the first Copilot fixes is tracked on the pull request.
 
 ** Copilot round 1 corrections
 

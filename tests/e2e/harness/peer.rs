@@ -2658,7 +2658,7 @@ done"#,
     pub fn use_persistent_overlay_root(&self) -> Result<()> {
         self.context.docker_ok(&[
             "exec", "-u", "root", &self.container.name, "sh", "-eu", "-c",
-            "mkdir -p /data /lower-a /lower-b /one /two /spacer; \
+            "mkdir -p /data /lower-a /lower-b /one /two; \
              mount -t tmpfs tmpfs /data; mount -t tmpfs tmpfs /lower-a; mount -t tmpfs tmpfs /lower-b; \
              mkdir -p /lower-a/share /lower-b/share /data/upper /data/work; \
              printf original >/lower-a/share/marker; printf altered >/lower-b/share/marker; \
@@ -2670,12 +2670,18 @@ done"#,
     }
 
     pub fn replace_overlay_lower_view(&self) -> Result<()> {
+        // Mount sequentially: sharing an active overlay's upper/work is undefined.
+        // Keep bounded spacers if the kernel reuses the old device number.
         self.context.docker_ok(&[
             "exec", "-u", "root", &self.container.name, "sh", "-eu", "-c",
             "stat -c %i /home/peer/share >/data/inode; stat -c %d /home/peer/share >/data/device; \
              stat -f -c %i /home/peer/share >/data/fsid; \
-             umount /home/peer/share; umount /one; mount -t tmpfs tmpfs /spacer; \
-             mount -t overlay overlay -o lowerdir=/lower-b,upperdir=/data/upper,workdir=/data/work,uuid=on,index=off,xino=off /two; \
+             umount /home/peer/share; umount /one; \
+             for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do \
+               mount -t overlay overlay -o lowerdir=/lower-b,upperdir=/data/upper,workdir=/data/work,uuid=on,index=off,xino=off /two; \
+               if test \"$(cat /data/device)\" != \"$(stat -c %d /two/share)\"; then break; fi; \
+               umount /two; mkdir /spacer-$attempt; mount -t tmpfs tmpfs /spacer-$attempt; \
+             done; \
              mount --bind /two/share /home/peer/share; \
              test \"$(cat /data/inode)\" = \"$(stat -c %i /home/peer/share)\"; \
              test \"$(cat /data/device)\" != \"$(stat -c %d /home/peer/share)\"; \
