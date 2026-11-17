@@ -434,14 +434,14 @@ impl ShareRoot {
                 inode: metadata.ino(),
             }
         };
-        if identity != state.expected_root_identity(share)? {
+        let directory = cap_std::fs::Dir::from_std_file(file);
+        let current = state.validate_root_identity(share)?;
+        if identity != current {
             return Err(RootIdentityChanged::new(
-                "configured root identity changed while opening its directory capability",
+                "configured root identity changed after opening its directory capability",
             )
             .into());
         }
-        let directory = cap_std::fs::Dir::from_std_file(file);
-        state.validate_root_identity(share)?;
         Ok(Self {
             path,
             directory,
@@ -450,13 +450,13 @@ impl ShareRoot {
     }
 
     pub fn validate(&self, state: &State, share: &ShareId) -> Result<()> {
-        if self.identity != state.expected_root_identity(share)? {
+        let current = state.validate_root_identity(share)?;
+        if self.identity != current {
             return Err(RootIdentityChanged::new(
                 "held root capability: configured root identity changed",
             )
             .into());
         }
-        state.validate_root_identity(share)?;
         Ok(())
     }
 }

@@ -1,0 +1,184 @@
+#+title: Recognizing the same synchronized directory after a remount
+#+date: 2026-11-17
+#+status: implementation validation in progress
+
+* The user experience and the defect
+
+A reboot can assign a new device number to the same mounted directory.
+Previously file.local persisted the device/inode pair and treated that change
+as replacement. Restarting an otherwise healthy relationship then failed with
+“configured root identity changed.” Apple's filesystem-events documentation
+explicitly warns that numeric device IDs can change across reboots.
+
+An enrolled directory now retains its relationship and synchronization history
+when its filesystem UUID and inode still match. The device number is refreshed
+only after that proof. Missing roots, replacement directories, final symlinks,
+different volumes, and obsolete open capabilities remain refused. The protocol,
+conflict rules, installation journal, and scheduling model do not change.
+
+This report accompanies the [[file:2026-11-17-root-remount-identity-design.org][design and its safety boundaries]]. Already-renumbered
+legacy state uses deliberate detach-and-add recovery: it did not record a UUID, so
+matching an inode alone cannot establish that today's volume is the original.
+This implementation does not silently invent that missing evidence.
+
+* How the implementation works
+
+** Native evidence from the open directory
+
+=src/root_identity.rs= contains the platform boundary. macOS asks
+=fgetattrlist= for the opened directory's volume UUID, then checks the packed
+response length, returned attribute masks, and UUID. Linux uses
+=FS_IOC_GETFSUUID=, available since Linux 6.9, for native ext-family, XFS, and
+Btrfs filesystems, and includes the filesystem type.
+Btrfs additionally includes its subvolume-specific fsid because inode numbers
+alone are not unique across its subvolumes.
+
+The Linux request uses the kernel's fixed =fsuuid2= layout:
+
+#+begin_src rust
+let mut value = [0_u8; 17];
+const GET_FS_UUID: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::read::<[u8; 17]>(0x15, 0);
+#+end_src
+
+The first byte is a length and the next sixteen bytes hold the UUID. The
+buffer is initialized and bounded. The two small native calls are the sole
+unsafe-code allowance in a private module; the remainder of the library
+denies unsafe code. Their safety comments bind the argument layout, writable
+buffer length, and lifetime of the borrowed file descriptor. Rust's borrowed
+=&File= keeps ownership with the caller; a platform query does not close it.
+=#[cfg(target_os = ...)]= means each platform compiles its own actual API.
+
+Unsupported facilities return =Option::None= and preserve strict device/inode
+checking. Actual I/O failures and malformed responses return =Result::Err=.
+An already enrolled UUID can never fall back to a numeric-only match when the
+native query becomes unsupported. The =?= operator propagates failed checks
+before publication or filesystem mutation.
+
+** One persisted fact, existing runtime guards
+
+=src/state.rs= adds nullable =shares.root_filesystem_identity=. New roots store
+it at registration. Legacy enrollment requires the entire old device/inode
+pair to match first, and an unavailable unrelated root is left unenrolled.
+The original root descriptor remains open through the path recheck and
+identity UPDATE, preventing device-number reuse between those checks.
+
+The shared stored-root validator requires UUID and inode equality for enrolled
+roots, including when their numeric device still matches. A successful
+renumbering updates only =root_device=, conditionally against the selected
+share, exact path, inode, filesystem identity, and previously observed device:
+
+#+begin_src sql
+UPDATE shares SET root_device=?2 WHERE share_id=?1 AND root=?3
+AND root_inode=?4 AND root_filesystem_identity=?5
+AND root_device IN (?6,?2)
+#+end_src
+
+The second accepted device value permits another process to have completed
+the identical verified refresh. A changed binding fails closed. Registration
+reserves SQLite's writer before its transactional reads, avoiding a deferred
+read-to-write snapshot upgrade under scheduler contention. Refresh preserves
+causal records, shared heads, conflicts, pending installation, and unrelated
+diagnostics.
+
+=src/sync.rs= retains the live device/inode guard. Both the final check in
+=ShareRoot::open= and later =validate= calls compare the actual current path's
+validated tuple with the held capability. Persistent identity permits opening
+the remounted directory; it does not authorize continued use of an obsolete
+mount descriptor. Read-only status does no migration or repair and exposes
+the last verified numeric identity through its existing schema.
+
+** Why layered filesystems remain strict
+
+Independent adversarial review demonstrated two overlay mounts with the same
+lower tree, different writable upper trees, equal statfs IDs, and equal root
+inode numbers, while their file contents differed. An inherited overlay fsid
+would therefore accept a different directory view. A second real reproduction
+kept an overlay's own UUID and writable upper tree while replacing its lower
+filesystem; equal directory inodes then exposed different contents. An overlay
+UUID identifies the upper instance, not the full layered view. All overlays
+therefore retain strict numeric checks. Supporting them automatically would
+require additional layer identity machinery outside this reported native
+macOS reboot problem. The native Linux backend list is deliberately bounded.
+
+* Tests and review evidence
+
+The runtime-generated Docker scenario first failed on unchanged main with the
+exact reported diagnostic. Intermediate code passed both endpoint remounts
+and interrupted installations, but independent review disproved the safety of
+that backend's identity. Those positive Docker scenarios were removed with
+automatic overlay support. The final two generated SSH scenarios instead
+verify refusal of both inherited-ID and persistent-UUID overlay collisions,
+and the rejected sync preserves the altered local marker and original remote
+marker. No fixture tree is checked in.
+
+State tests exercise verified refresh, transactional failure and retry,
+unrelated-diagnostic retention, UUID mismatch despite matching numeric fields,
+matching legacy enrollment, changed legacy refusal, and an unavailable root.
+Existing symlink/path-retargeting coverage remains, with the internal selection
+test now expecting the earlier refusal produced by the shared validator.
+
+The macOS helper passed an isolated cross-target type check and strict Clippy.
+The full project cannot cross-build on this Linux host without an Apple SDK.
+A generated APFS disk-image test will detach and reattach the same directory
+on native macOS CI, occupy the previous device slot, validate the remounted
+root, reject a held old capability before any separate device refresh,
+recover a Creating-phase install temporary, capture a later edit, and verify
+that a replacement is still rejected. That native run remains pending; Linux
+Docker results do not establish it. This is a real-filesystem installation
+integration test, not a complete two-machine macOS watch test.
+
+Complete =make check= passed: the full Rust suite, 27 Emacs tests, Make-prefix
+checks, formatting, and strict all-target/all-feature Clippy. Whole-project
+coverage is 22,338/24,255 lines (92.10%); changed executable-line coverage is
+262/289 (90.66%). Both generated Docker view-refusal scenarios passed.
+
+Seven independent design lenses and twelve code lenses were used, with two
+code rounds and affected design rechecks. No blocker or important finding
+remains locally. Important findings corrected inherited overlay-ID aliasing,
+the distinct own-UUID/lower-view alias, final opened-capability validation,
+registration writer reservation, operational-error classification, and the
+missing held-capability test. The obsolete positive Docker restart fixture
+and its reconnect-before-remount race were removed with unsupported overlay
+acceptance. Small documentation and duplicate-query findings were fixed;
+no verified important finding was declined. Layer-inspection machinery was
+excluded because strict overlay refusal preserves safety with a smaller scope.
+
+The reviewed release was deployed locally through the guarded installer; the
+binary hash matched and the daemon was healthy. All six relationships remained
+disabled. Native macOS CI and external Copilot review remain pending; local
+Linux checks are not presented as native macOS acceptance.
+
+* Operational limits and upgrade
+
+Upgrade both endpoints using the normal guarded =make install= path. Legacy
+shares should be upgraded while their original recorded numeric identity
+still matches, so the new filesystem evidence can be enrolled safely.
+Older Linux kernels, unsupported native UUID facilities, overlays, and other
+Linux backends retain strict checks. Filesystem identifiers are identity evidence,
+not protection against a privileged attacker cloning a volume UUID.
+
+Already affected legacy roots cannot be automatically proved original. The
+user chose the existing detach-and-add procedure, without a special command:
+
+#+begin_src sh
+flocal sync list
+flocal sync remove --share SHARE_ID --yes
+flocal sync add PATH --host HOST --remote-path REMOTE_PATH
+#+end_src
+
+Record the share ID before detaching. This creates a fresh relationship and
+uses the current directory as its explicitly selected root. Existing detach
+is restricted by live installation recovery; this change does not bypass
+that safeguard. Upgrade both endpoints before re-adding, so supported native
+roots enroll their persistent identity immediately.
+
+* Historical supersessions
+
+- [[file:2026-09-03-root-identity-removal-recovery-report.org::*What users experience][Root identity recovery report, What users experience]] assumed that the
+  tested abrupt restarts did not change root identity. Those named-volume
+  scenarios did not exercise device renumbering; a verified UUID/inode now
+  permits updating the numeric device.
+- [[file:2026-09-03-root-identity-removal-recovery-design.org::*3. Chosen flow and interfaces][Root identity recovery design, section 3]] treated the stored numeric
+  device/inode pair as the durable binding. Enrolled roots now also require
+  filesystem evidence and can retain their relationship across renumbering.

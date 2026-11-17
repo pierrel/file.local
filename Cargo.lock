@@ -326,6 +326,7 @@ dependencies = [
  "directories",
  "fs2",
  "ignore",
+ "libc",
  "notify",
  "rand",
  "rusqlite",

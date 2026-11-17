@@ -309,17 +309,22 @@ struct Condition {
 pub fn containers() -> Result<(PeerBox, PeerBox)> {
     // Everything up to the first scenario primitive is harness
     // infrastructure: its failures must not satisfy a known_failure pin.
-    infra(setup_containers())
+    infra(setup_containers(false))
+}
+
+/// Peers with mount capability confined to disposable overlay safety scenarios.
+pub fn remountable_containers() -> Result<(PeerBox, PeerBox)> {
+    infra(setup_containers(true))
 }
 
 pub fn upgrade_containers() -> Result<(PeerBox, PeerBox)> {
     infra(setup_upgrade_containers())
 }
 
-fn setup_containers() -> Result<(PeerBox, PeerBox)> {
+fn setup_containers(remountable: bool) -> Result<(PeerBox, PeerBox)> {
     let context = RunContext::new()?;
-    let a = start_peer(&context, "peer-a", 0)?;
-    let b = start_peer(&context, "peer-b", 1)?;
+    let a = start_peer_inner(&context, "peer-a", 0, None, remountable)?;
+    let b = start_peer_inner(&context, "peer-b", 1, None, remountable)?;
     for peer in [&a, &b] {
         peer.wait_sshd_ready()?;
         peer.install_ssh_material()?;
@@ -475,17 +480,19 @@ pub fn assert_trees_equal(a: &Peer, b: &Peer) -> Result<()> {
     Ok(())
 }
 
-fn start_peer(context: &Arc<RunContext>, alias: &str, volume: usize) -> Result<Peer> {
-    start_peer_inner(context, alias, volume, None)
-}
-
 fn start_peer_with_installed(
     context: &Arc<RunContext>,
     alias: &str,
     volume: usize,
     executable: &std::path::Path,
 ) -> Result<Peer> {
-    let peer = start_peer_inner(context, alias, volume, Some("/home/peer/.local/bin/flocal"))?;
+    let peer = start_peer_inner(
+        context,
+        alias,
+        volume,
+        Some("/home/peer/.local/bin/flocal"),
+        false,
+    )?;
     let staged = format!("{}:/tmp/flocal-upgrade-base", peer.container.name);
     let source = executable
         .to_str()
@@ -508,6 +515,7 @@ fn start_peer_inner(
     alias: &str,
     volume: usize,
     installed: Option<&str>,
+    remountable: bool,
 ) -> Result<Peer> {
     let name = format!("flocal-e2e-{}-{alias}", context.run_id);
     let volume_arg = format!("{}:/home/peer", context.volumes[volume]);
@@ -533,6 +541,14 @@ fn start_peer_inner(
         "FLOCAL_E2E_CONTAINER_LIFETIME_SECONDS",
     ];
     let installed_environment = installed.map(|path| format!("FLOCAL_E2E_EXECUTABLE={path}"));
+    if remountable {
+        arguments.extend_from_slice(&[
+            "--cap-add",
+            "SYS_ADMIN",
+            "--security-opt",
+            "apparmor=unconfined",
+        ]);
+    }
     if let Some(installed) = &installed_environment {
         arguments.extend_from_slice(&["-e", installed]);
     }
@@ -2605,6 +2621,67 @@ done"#,
             Ok((!output.status.success()).then_some(()))
         })?;
         self.start_daemon()
+    }
+
+    /// Two different directory views deliberately inherit the same statfs ID.
+    pub fn use_inherited_overlay_root(&self) -> Result<()> {
+        self.context.docker_ok(&[
+            "exec", "-u", "root", &self.container.name, "sh", "-eu", "-c",
+            "mkdir -p /data /one /two; mount -t tmpfs tmpfs /data; \
+             mkdir -p /data/lower/share /data/upper1 /data/work1 /data/upper2 /data/work2; \
+             printf original >/data/lower/share/marker; chown -R peer:peer /data/lower; \
+             mount -t overlay overlay -o lowerdir=/data/lower,upperdir=/data/upper1,workdir=/data/work1,uuid=off,index=off /one; \
+             mount -t overlay overlay -o lowerdir=/data/lower,upperdir=/data/upper2,workdir=/data/work2,uuid=off,index=off /two; \
+             mount --bind /one/share /home/peer/share",
+        ])?;
+        Ok(())
+    }
+
+    pub fn switch_to_distinct_overlay_view(&self) -> Result<()> {
+        self.context.docker_ok(&[
+            "exec",
+            "-u",
+            "root",
+            &self.container.name,
+            "sh",
+            "-eu",
+            "-c",
+            "printf altered >/two/share/marker; \
+             test \"$(stat -c %i /one/share)\" = \"$(stat -c %i /two/share)\"; \
+             test \"$(stat -f -c %i /one/share)\" = \"$(stat -f -c %i /two/share)\"; \
+             test \"$(stat -c %d /one/share)\" != \"$(stat -c %d /two/share)\"; \
+             umount /home/peer/share; mount --bind /two/share /home/peer/share",
+        ])?;
+        Ok(())
+    }
+
+    pub fn use_persistent_overlay_root(&self) -> Result<()> {
+        self.context.docker_ok(&[
+            "exec", "-u", "root", &self.container.name, "sh", "-eu", "-c",
+            "mkdir -p /data /lower-a /lower-b /one /two /spacer; \
+             mount -t tmpfs tmpfs /data; mount -t tmpfs tmpfs /lower-a; mount -t tmpfs tmpfs /lower-b; \
+             mkdir -p /lower-a/share /lower-b/share /data/upper /data/work; \
+             printf original >/lower-a/share/marker; printf altered >/lower-b/share/marker; \
+             chown -R peer:peer /lower-a/share /lower-b/share; \
+             mount -t overlay overlay -o lowerdir=/lower-a,upperdir=/data/upper,workdir=/data/work,uuid=on,index=off,xino=off /one; \
+             mount --bind /one/share /home/peer/share",
+        ])?;
+        Ok(())
+    }
+
+    pub fn replace_overlay_lower_view(&self) -> Result<()> {
+        self.context.docker_ok(&[
+            "exec", "-u", "root", &self.container.name, "sh", "-eu", "-c",
+            "stat -c %i /home/peer/share >/data/inode; stat -c %d /home/peer/share >/data/device; \
+             stat -f -c %i /home/peer/share >/data/fsid; \
+             umount /home/peer/share; umount /one; mount -t tmpfs tmpfs /spacer; \
+             mount -t overlay overlay -o lowerdir=/lower-b,upperdir=/data/upper,workdir=/data/work,uuid=on,index=off,xino=off /two; \
+             mount --bind /two/share /home/peer/share; \
+             test \"$(cat /data/inode)\" = \"$(stat -c %i /home/peer/share)\"; \
+             test \"$(cat /data/device)\" != \"$(stat -c %d /home/peer/share)\"; \
+             test \"$(cat /data/fsid)\" = \"$(stat -f -c %i /home/peer/share)\"",
+        ])?;
+        Ok(())
     }
 
     fn crash_and_restart_daemon(&self) -> Result<()> {

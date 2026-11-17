@@ -1,12 +1,40 @@
 //! Catalog #13 (watch notices an editor-style atomic-rename save), #14
 //! (watch catches up unattended after the peer goes offline and returns),
 //! plus committed-action reporting and process-suspension recovery.
-//! The scenarios exercise the persistent two-sided watcher through real SSH;
+//! The scenarios exercise synchronization and watcher recovery through real SSH;
 //! their `wait_*` primitives are assertions with a deadline.
 
 use anyhow::Result;
 
 use crate::harness as e2e;
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn inherited_overlay_id_cannot_adopt_a_different_directory_view() -> Result<()> {
+    let (a, b) = e2e::remountable_containers()?;
+    a.use_inherited_overlay_root()?;
+    a.init()?;
+    let (a, b) = a.peer_add(b)?;
+    a.sync()?;
+    a.switch_to_distinct_overlay_view()?;
+    a.sync_expect_err("configured root identity changed")?;
+    a.assert_file("marker", "altered")?;
+    b.assert_file("marker", "original")
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
+fn persistent_overlay_uuid_cannot_adopt_a_replacement_lower_view() -> Result<()> {
+    let (a, b) = e2e::remountable_containers()?;
+    a.use_persistent_overlay_root()?;
+    a.init()?;
+    let (a, b) = a.peer_add(b)?;
+    a.sync()?;
+    a.replace_overlay_lower_view()?;
+    a.sync_expect_err("configured root identity changed")?;
+    a.assert_file("marker", "altered")?;
+    b.assert_file("marker", "original")
+}
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
