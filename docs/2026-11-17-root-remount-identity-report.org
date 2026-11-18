@@ -1,0 +1,240 @@
+#+title: Recognizing the same synchronized directory after a remount
+#+date: 2026-11-17
+#+status: implemented; local and native acceptance passed; external review pending
+
+* The user experience and the defect
+
+A reboot can assign a new device number to the same mounted directory.
+Previously file.local persisted the device/inode pair and treated that change
+as replacement. Restarting an otherwise healthy relationship then failed with
+“configured root identity changed.” Apple's filesystem-events documentation
+explicitly warns that numeric device IDs can change across reboots.
+
+An enrolled directory now retains its relationship and synchronization history
+when its filesystem UUID and inode still match. The device number is refreshed
+only after that proof. Missing roots, replacement directories, final symlinks,
+different volumes, and obsolete open capabilities remain refused. The protocol,
+conflict rules, installation journal, and scheduling model do not change.
+
+This report accompanies the [[file:2026-11-17-root-remount-identity-design.org][design and its safety boundaries]]. Already-renumbered
+legacy state uses deliberate detach-and-add recovery: it did not record a UUID, so
+matching an inode alone cannot establish that today's volume is the original.
+This implementation does not silently invent that missing evidence.
+
+* How the implementation works
+
+** Native evidence from the open directory
+
+=src/root_identity.rs= contains the platform boundary. macOS asks
+=fgetattrlist= for the opened directory's volume UUID, then checks the packed
+response length, returned attribute masks, and UUID. Linux uses
+=FS_IOC_GETFSUUID=, available since Linux 6.9, for native ext-family, XFS, and
+Btrfs filesystems, and includes the filesystem type.
+Btrfs additionally includes its subvolume-specific fsid because inode numbers
+alone are not unique across its subvolumes.
+
+The Linux request uses the kernel's fixed =fsuuid2= layout:
+
+#+begin_src rust
+let mut value = [0_u8; 17];
+const GET_FS_UUID: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::read::<[u8; 17]>(0x15, 0);
+#+end_src
+
+The first byte is a length and the next sixteen bytes hold the UUID. The
+buffer is initialized and bounded. The two small native calls are the sole
+unsafe-code allowance in a private module; the remainder of the library
+denies unsafe code. Their safety comments bind the argument layout, writable
+buffer length, and lifetime of the borrowed file descriptor. Rust's borrowed
+=&File= keeps ownership with the caller; a platform query does not close it.
+=#[cfg(target_os = ...)]= means each platform compiles its own actual API.
+
+Unsupported facilities return =Option::None= and preserve strict device/inode
+checking. Actual I/O failures and malformed responses return =Result::Err=.
+An already enrolled UUID can never fall back to a numeric-only match when the
+native query becomes unsupported. The =?= operator propagates failed checks
+before publication or filesystem mutation.
+
+** One persisted fact, existing runtime guards
+
+=src/state.rs= adds nullable =shares.root_filesystem_identity=. New roots store
+it at registration. Legacy enrollment occurs only during validation of the
+selected share and requires the entire old device/inode pair to match first.
+The schema upgrade adds the column without optional UUID probes of unrelated
+roots. This keeps a stalled unsupported mount from blocking startup or detach
+by share ID. Enrollment uses a conditional write after the descriptor checks;
+the much older initial numeric-binding migration retains its existing rules.
+The original root descriptor remains open through the path recheck and
+identity UPDATE, preventing device-number reuse between those checks.
+
+The shared stored-root validator requires UUID and inode equality for enrolled
+roots, including when their numeric device still matches. A successful
+renumbering updates only =root_device=, conditionally against the selected
+share, exact path, inode, filesystem identity, and previously observed device:
+
+#+begin_src sql
+UPDATE shares SET root_device=?2 WHERE share_id=?1 AND root=?3
+AND root_inode=?4 AND root_filesystem_identity=?5
+AND root_device IN (?6,?2)
+#+end_src
+
+The second accepted device value permits another process to have completed
+the identical verified refresh. A changed binding fails closed. Registration
+reserves SQLite's writer before its transactional reads, avoiding a deferred
+read-to-write snapshot upgrade under scheduler contention. Refresh preserves
+causal records, shared heads, conflicts, pending installation, and unrelated
+diagnostics.
+
+=src/sync.rs= retains the live device/inode guard. Both the final check in
+=ShareRoot::open= and later =validate= calls compare the actual current path's
+validated tuple with the held capability. Persistent identity permits opening
+the remounted directory; it does not authorize continued use of an obsolete
+mount descriptor. Read-only status does no migration or repair and exposes
+the last verified numeric identity through its existing schema.
+
+** Why layered filesystems remain strict
+
+Independent adversarial review demonstrated two overlay mounts with the same
+lower tree, different writable upper trees, equal statfs IDs, and equal root
+inode numbers, while their file contents differed. An inherited overlay fsid
+would therefore accept a different directory view. A second real reproduction
+kept an overlay's own UUID and writable upper tree while replacing its lower
+filesystem; equal directory inodes then exposed different contents. An overlay
+UUID identifies the upper instance, not the full layered view. All overlays
+therefore retain strict numeric checks. Supporting them automatically would
+require additional layer identity machinery outside this reported native
+macOS reboot problem. The native Linux backend list is deliberately bounded.
+
+* Tests and review evidence
+
+The runtime-generated Docker scenario first failed on unchanged main with the
+exact reported diagnostic. Intermediate code passed both endpoint remounts
+and interrupted installations, but independent review disproved the safety of
+that backend's identity. Those positive Docker scenarios were removed with
+automatic overlay support. The final two generated SSH scenarios instead
+verify refusal of both inherited-ID and persistent-UUID overlay collisions,
+and the rejected sync preserves the altered local marker and original remote
+marker. No fixture tree is checked in.
+
+State tests exercise verified refresh, transactional failure and retry,
+unrelated-diagnostic retention, UUID mismatch despite matching numeric fields,
+matching legacy enrollment, changed legacy refusal, and an unavailable root.
+Existing symlink/path-retargeting coverage remains, with the internal selection
+test now expecting the earlier refusal produced by the shared validator.
+
+The macOS helper passed an isolated cross-target type check and strict Clippy.
+The full project cannot cross-build on this Linux host without an Apple SDK.
+A generated APFS disk-image test detached and reattached the same directory
+on native macOS CI, occupied the previous device slot, validated the remounted
+root, rejected a held old capability before any separate device refresh,
+recovered a Creating-phase install temporary, captured a later edit, and verified
+that a replacement is still rejected. The actual test passed in 15.32 seconds
+in [[https://github.com/pierrel/file.local/actions/runs/44120936860/job/134171766803][the native macOS CI job]], which also passed the full project build,
+Clippy, Rust suite, and Emacs tests. This is a real-filesystem installation
+integration test, not a complete two-machine macOS watch test. Linux Docker
+results alone do not establish this native result.
+
+Complete =make check= passed: the full Rust suite, 27 Emacs tests, Make-prefix
+checks, formatting, and strict all-target/all-feature Clippy. Whole-project
+coverage after the first Copilot fixes is 22,364/24,281 lines (92.10%);
+changed executable-line coverage is 286/317 (90.22%). Both generated Docker
+view-refusal scenarios passed again after those fixes. The persistent-UUID
+fixture mounts sequentially and uses bounded spacers if the kernel reuses the
+old device number; it verifies the changed-device precondition explicitly.
+
+Seven independent design lenses and twelve code lenses were used, with two
+initial code rounds, affected design rechecks, and focused Copilot-fix rechecks.
+No blocker or important finding remains locally. Important findings corrected inherited overlay-ID aliasing,
+the distinct own-UUID/lower-view alias, final opened-capability validation,
+registration writer reservation, operational-error classification, and the
+missing held-capability test. The obsolete positive Docker restart fixture
+and its reconnect-before-remount race were removed with unsupported overlay
+acceptance. Small documentation and duplicate-query findings were fixed;
+no verified important finding was declined. Layer-inspection machinery was
+excluded because strict overlay refusal preserves safety with a smaller scope.
+
+The reviewed release was deployed locally through the guarded installer; the
+binary hash matched and the daemon was healthy. All six relationships remained
+disabled, including after redeploying the first Copilot fixes. All four CI jobs,
+including native macOS and the default SSH catalog, passed on =ae3ee06=.
+Revalidation of the first Copilot fixes is tracked on the pull request.
+
+That revalidation passed 62 SSH scenarios and exposed an existing watch-test
+ordering assumption: the first invalidation may be the stable sibling, which
+makes the changing path report “changed during recalculation” rather than
+“is still changing.” Both transitions have deterministic unit coverage. The
+E2E assertion now requires the changing-path warning and stable-path progress,
+retaining settlement, exact final contents, and same-SSH-session assertions.
+The runtime synchronization behavior is unchanged.
+
+** Copilot round 1 corrections
+
+Copilot found that optional UUID enrollment originally probed all unenrolled
+roots inside the startup schema transaction. A stalled NFS or FUSE mount
+could block unrelated commands even though failures were otherwise skipped.
+That loop was deleted. A legacy UUID is now enrolled only when its selected
+root is validated, after numeric identity and pathname proof, with a
+conditional write. Tests require startup to leave UUIDs unenrolled, then
+verify that validating one share enrolls only that share.
+
+Copilot also identified missing packed-response validation tests. A small
+native macOS table now exercises a valid UUID, absent returned masks, omitted
+and all-zero UUIDs, truncated UUID data, invalid short/long lengths, and an
+empty response. These byte fixtures do not mount disks or add fixture trees.
+Both findings were accepted; no generic filesystem timeouts or background
+enrollment lifecycle was added.
+
+** Keeping CI within its established command budget
+
+The first full SSH run passed 63 scenarios and timed out only in the existing
+5,000-file initial-sync case at its ten-minute command deadline. The same case
+failed with the same deadline on unchanged main =c502382= in
+[[https://github.com/pierrel/file.local/actions/runs/36595513583/job/109499261990][the baseline CI run]]. This is evidence of the existing large-sync limit,
+not evidence that this root-identity fix resolves scaling.
+
+Following the user's instruction permitting abandonment of oversized CI E2E
+runs, =make e2e= now excludes that one case. =make e2e-large-initial= retains
+the exact scenario and deadline for explicit execution. Native APFS acceptance,
+both overlay-substitution refusals, other SSH scenarios, and separate deployed-
+alpha upgrade tests remain required. This avoids folding a scaling rewrite
+into a root-identity fix and makes the CI coverage limit explicit.
+
+* Operational limits and upgrade
+
+Upgrade both endpoints using the normal guarded =make install= path. Legacy
+shares should be upgraded while their original recorded numeric identity
+still matches, then synchronized or started once before rebooting so selected-
+share validation can enroll the evidence safely. Installation alone no longer
+performs optional root probes; read-only status also does not enroll roots.
+Older Linux kernels, unsupported native UUID facilities, overlays, and other
+Linux backends retain strict checks. Filesystem identifiers are identity evidence,
+not protection against a privileged attacker cloning a volume UUID.
+
+Already affected legacy roots cannot be automatically proved original. The
+user chose the existing detach-and-add procedure, without a special command:
+
+#+begin_src sh
+flocal sync list
+flocal sync remove --share SHARE_ID --yes
+flocal sync add PATH --host HOST --remote-path REMOTE_PATH
+#+end_src
+
+Record the share ID before detaching. This creates a fresh relationship and
+uses the current directory as its explicitly selected root. Existing detach
+is restricted by live installation recovery; this change does not bypass
+that safeguard. Upgrade both endpoints before re-adding, so supported native
+roots enroll their persistent identity immediately.
+
+* Historical supersessions
+
+- [[file:2026-09-03-root-identity-removal-recovery-report.org::*What users experience][Root identity recovery report, What users experience]] assumed that the
+  tested abrupt restarts did not change root identity. Those named-volume
+  scenarios did not exercise device renumbering; a verified UUID/inode now
+  permits updating the numeric device.
+- [[file:2026-09-03-root-identity-removal-recovery-design.org::*3. Chosen flow and interfaces][Root identity recovery design, section 3]] treated the stored numeric
+  device/inode pair as the durable binding. Enrolled roots now also require
+  filesystem evidence and can retain their relationship across renumbering.
+- [[file:2026-09-08-initial-transfer-receipts-design.org::*5. Acceptance and fail-to-pass validation][Initial transfer receipts design, section 5]] included the promoted 5,000-file
+  scenario in normal =make e2e= validation. It now requires the explicit
+  =make e2e-large-initial= selection because of reproduced CI budget failures;
+  its assertions and deadline are retained.

@@ -89,6 +89,71 @@ fn wait_until(mut condition: impl FnMut() -> Result<bool>, description: &str) ->
 }
 
 #[test]
+fn unpaired_root_recovery_requires_local_confirmation() -> Result<()> {
+    use std::io::Write;
+
+    let temporary = tempdir()?;
+    let root = temporary.path().join("root");
+    let state_dir = temporary.path().join("state");
+    std::fs::create_dir(&root)?;
+    let state = State::open(&state_dir)?;
+    let share = state.init_share(&root)?;
+    let original = state.expected_root_identity(&share)?;
+    drop(state);
+    std::fs::rename(&root, temporary.path().join("old-root"))?;
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("kept"), "current destination contents")?;
+    let binary = env!("CARGO_BIN_EXE_flocal");
+
+    for input in [b"n\n".as_slice(), b"".as_slice()] {
+        let mut child = Command::new(binary)
+            .args(["sync", "remove", "--share", &share.0])
+            .env("FLOCAL_STATE_DIR", &state_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .context("confirmation stdin")?
+            .write_all(input)?;
+        let output = child.wait_with_output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Registration unchanged."));
+        let state = State::open(&state_dir)?;
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        assert_eq!(
+            state.endpoint_binding(&share)?,
+            flocal::state::EndpointBinding::Unpaired
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("kept"))?,
+            "current destination contents"
+        );
+    }
+
+    let output = Command::new(binary)
+        .args(["sync", "remove", "--share", &share.0, "--yes"])
+        .env("FLOCAL_STATE_DIR", &state_dir)
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("the root remains unpaired"));
+    let state = State::open(&state_dir)?;
+    assert_ne!(state.expected_root_identity(&share)?, original);
+    state.validate_root_identity(&share)?;
+    assert_eq!(
+        state.endpoint_binding(&share)?,
+        flocal::state::EndpointBinding::Unpaired
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("kept"))?,
+        "current destination contents"
+    );
+    Ok(())
+}
+
+#[test]
 fn daemon_serves_the_managed_sync_list_over_its_private_socket() -> Result<()> {
     let temporary = tempdir()?;
     let state = temporary.path().join("state");

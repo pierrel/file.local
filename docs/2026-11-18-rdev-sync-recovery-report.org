@@ -1,0 +1,174 @@
+#+title: Explicitly recover an already-unpaired synchronization root
+#+date: 2026-11-18
+#+status: one-time recovery locally reviewed, validated, and deployed; broader platform work unresolved
+
+* What this change does
+
+An old destination registration can already be unpaired while still remembering
+a directory identity that no longer matches. Incoming pairing correctly refuses
+that stale binding. Previously =sync remove --share SHARE_ID= then returned
+“nothing to remove,” so the documented detach-and-add recipe could never
+advance. This change makes that existing removal command provide deliberate
+local acknowledgment of the current directory. It adds no recovery command.
+
+The destination keeps its files and retained recovery data. The registration
+remains unpaired until the user retries the connector's ordinary =sync add=.
+Initial synchronization still uses its normal preview, confirmation, union,
+and conflict rules. A healthy unpaired root remains a no-op.
+
+This is the first, one-time recovery milestone from the
+[[file:2026-11-18-rdev-sync-recovery-design.org][November 18 design]]. It does not solve automatic device-renumbering recovery
+on Linux 5.15 ext4, or installation under a login supervisor without systemd.
+Those are separate remaining requirements, not consequences of this successful
+pairing test.
+
+* The local authorization boundary
+
+=src/main.rs= changes only the already-unpaired removal branch. It first asks
+the normal validator whether recovery is needed. Only the existing typed
+root-identity error enters the recovery preview:
+
+#+begin_src rust
+match state.validate_root_identity(&share) {
+    Ok(_) => println!("No relationship is configured; nothing to remove."),
+    Err(error) if error.downcast_ref::<sync::RootIdentityChanged>().is_some() => {
+        let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+#+end_src
+
+Rust's =match= selects the error category; the guard uses =downcast_ref= to
+recognize the concrete error inside =anyhow::Error=. Ordinary state or SQLite
+failures propagate instead of authorizing a new binding. The =?= operator
+returns immediately when opening the preview directory fails.
+
+The preview names the root and share and explains that today's directory is
+being acknowledged, not that its historical volume identity was proved. The
+normal confirmation prompt or existing =--yes= is required. Declining leaves
+the registration unchanged. Incoming SSH registration cannot invoke this
+local acknowledgment path and continues to reject stale retained roots.
+
+* The directory remains pinned through publication
+
+=src/state.rs= adds two narrow operations. Opening the preview returns an owned
+=File= for the exact existing directory, using the existing no-follow/path
+validation. After confirmation, =reinitialize_unpaired_root= uses the existing
+interprocess removal reservation, registration lock, and an immediate SQLite
+transaction. It rechecks the binding and pending-removal state, opens the exact
+configured root again, and verifies the preview still identifies that directory:
+
+#+begin_src rust
+if file_root_identity(preview, &root)? != identity {
+    bail!("configured root changed since the recovery preview");
+}
+let _observation = Self::publish_reinitialized_root(&transaction, id, &root, identity)?;
+transaction.commit()?;
+#+end_src
+
+=&File= borrows the caller's still-open preview descriptor. The returned
+=_observation= is another owned =File= retained until after commit; its leading
+underscore suppresses an unused-variable warning without dropping it early.
+Rust closes these descriptors when their owners leave scope, including errors.
+No cached pathname observation substitutes for the held descriptor.
+
+The shared =publish_reinitialized_root= helper also serves the pre-existing
+connector reinitialization path. It checks the existing unpaired-state guards,
+obtains inode/device and supported filesystem evidence from the same opened
+directory, conditionally updates the selected root, and rechecks its pathname:
+
+#+begin_src sql
+UPDATE shares SET root_device=?2,root_inode=?3,root_filesystem_identity=?4
+WHERE share_id=?1 AND root=?5
+#+end_src
+
+An unexpected affected-row count is an error. The transaction rolls back on
+failure. Only these root fields change: sequence, recovery budget, conflicts,
+objects, and unrelated roots remain intact. Pending installation, records,
+shared heads, pending objects, unsettled paths, enabled watch, completed initial
+sync, active bindings, or a root changed after preview make this narrow recovery ineligible.
+
+The hard part was distinguishing deliberate local trust from historical
+identity proof without weakening incoming pairing or duplicating its safety
+checks. Reusing the existing scheduler and root-publication logic keeps that
+distinction in a small local operation. There is no new daemon request,
+supervisor, identity-provider framework, or synchronization protocol change.
+
+* Evidence and review status
+
+The generated SSH scenario
+=unpaired_responder_root_can_be_deliberately_recovered_before_pairing= reproduced
+the defect on unchanged main =5a2a7cb= under =e2e::known_failure=. After removal's
+no-op, incoming add failed with the reported configured-root-identity diagnostic.
+The fixed version is a plain passing test using the existing managed peers.
+Its final local run passed in 7.27 seconds, preserved independent source/destination
+files through initial sync, transferred later edits in both directions, and
+required equal final trees, and verified both final endpoint roles. The matched
+main-baseline fixture reproduced the expected failure in 3.89 seconds. No
+fixture tree is checked in.
+
+Two non-skipped state tests passed: one uses an obsolete numeric device and
+absent UUID evidence, proves incoming registration is refused before local
+acknowledgment, and checks preserved sequence/budget/conflicts afterward. The
+other rejects a changed preview directory, pending install, enabled watch,
+and an active connector without altering the stored root identity. The existing
+explicit connector-reinitialization regression also passed.
+
+The real CLI consent test rejects both an explicit =n= and EOF without changing
+the stored root identity, files, or unpaired binding; =--yes= then succeeds in
+the same fixture. It passed in 0.02 seconds.
+
+The SSH test replaces a real directory; the state test models the stale numeric
+device explicitly. Neither is a positive old-kernel ext4 remount acceptance
+test. Complete =make check= passed, including Rust tests, 27 Emacs tests,
+Make checks, formatting, and strict Clippy. Whole-project coverage was
+22,498/24,450 lines (92.02%); changed executable lines were 475/510 (93.14%).
+Seven scoped design lenses and twelve code lenses converged locally. The first
+code round identified the missing consent regression and README drift; both
+were fixed and the affected reviews cleared. No important finding was declined.
+
+The reviewed release was installed locally through the guarded installer. Its
+hash matched the installed binary, the daemon was healthy, and all six existing
+relationships remained disabled. This was not deployment to the reported
+development container. CI and external review of this amendment remain pending;
+the PR stays draft while the remaining platform requirements are unresolved.
+
+* Operational use and remaining machine requirements
+
+After the reviewed fix is safely installed, run on the destination:
+
+#+begin_src sh
+flocal status /home/peer/share --json
+flocal sync remove --share SHARE_ID --yes
+#+end_src
+
+Use the =share= field from the first command. Both list forms omit unpaired
+registrations; =status PATH --json= can inspect this retained root without a
+match to its old numeric identity. Removal by PATH remains strict, so use the
+share ID for this recovery. Then rerun the original connector-side =sync add=
+with its actual source and remote target. These are synthetic example paths.
+
+The current session has no access to the reported machine. It has not upgraded
+that machine, acknowledged its live registration, restarted its container, or
+performed the user's real initial transfer. Its old-kernel UUID facility is
+still unavailable, so another future device renumbering can require deliberate
+recovery again. A safe durable identity source remains unresolved; generic
+fsid or inode equality is not substituted for missing UUID evidence.
+
+The no-systemd guarded installation route also remains unresolved. The existing
+login supervisor must be preserved, and its restart loop must not race state
+migration. The next useful machine information is the supervisor script and
+login-hook block, the exact installed/running/noninteractive-SSH executable
+hashes and build provenance, and read-only kernel/mount information plus any
+trusted platform volume-identity interface. An unattended binary copy is not
+an approved substitute for guarded installation. Do not retry real pairing
+until the relevant installed executable and local recovery are verified.
+
+* Historical supersessions
+
+- [[file:2026-11-17-root-remount-identity-design.org::*5. Already affected legacy roots: explicit decision][November 17 design, section 5]] treated detach-and-add as sufficient deliberate
+  recovery. An already-unpaired retained responder needs the explicit local
+  acknowledgment now provided by the existing removal command.
+- [[file:2026-11-17-root-remount-identity-report.org::*Operational limits and upgrade][November 17 report, Operational limits and upgrade]] gave an incomplete recovery
+  recipe for that state. Discover its ID with =status PATH --json=, acknowledge
+  the exact current directory locally, then retry connector-side pairing.
+
+The earlier documents correctly stated the older-Linux limitation. This
+one-time recovery change does not invalidate or remove that limitation.

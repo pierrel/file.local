@@ -1,4 +1,4 @@
-.PHONY: build install check test elisp-test test-make-prefix test-make-prefix-value coverage coverage-tools e2e
+.PHONY: build install check test elisp-test test-make-prefix test-make-prefix-value coverage coverage-tools e2e e2e-large-initial
 
 PREFIX ?=
 override PREFIX := $(value PREFIX)
@@ -33,7 +33,11 @@ coverage: coverage-tools
 	python3 tools/check_changed_coverage.py target/coverage.xml $(COVERAGE_BASE) 90
 
 e2e:
-	cargo test --test e2e -- --ignored --test-threads=1 --skip scenarios::upgrades::legacy_
+	cargo test --test e2e -- --ignored --test-threads=1 --skip scenarios::upgrades::legacy_ \
+		--skip scenarios::syncing::five_thousand_initial_changes_do_not_timeout_after_scan
+
+e2e-large-initial:
+	cargo test --test e2e scenarios::syncing::five_thousand_initial_changes_do_not_timeout_after_scan -- --ignored --exact --test-threads=1
 
 check: coverage test-make-prefix elisp-test
 	cargo fmt --all -- --check

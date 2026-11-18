@@ -7,10 +7,29 @@ is named =flocal=.
 
 Rust stable is required on both peers. Before upgrading an existing
 installation to this version, verify that every registered share path is the
-intended mounted directory on that machine. The installer records each legacy
-root's filesystem device and inode as its durable identity. A missing,
-symlinked, or later replaced root is rejected rather than being mistaken for
-an empty tree and propagating mass deletions.
+intended mounted directory on that machine. Registration records the directory
+inode and, where supported, a persistent filesystem UUID. A verified remount
+can refresh its numeric device number without re-pairing or losing history.
+Legacy roots enroll that UUID when selected for validation, while their
+previously recorded device and inode still match. After upgrading, synchronize
+or start a healthy legacy share once before rebooting. Installation does not
+perform optional UUID enrollment, and read-only status does not enroll roots.
+Already changed legacy roots remain blocked until
+deliberately recovered; an inode alone cannot prove the original volume.
+For an already affected share, obtain its ID with =flocal status PATH --json=.
+Detach an existing relationship from its connector with =flocal sync remove
+--share SHARE_ID --yes=. If a destination is already unpaired but its root
+identity changed, run that removal command locally on the destination to
+acknowledge the current directory before adding it again from the connector.
+Upgrade both endpoints first. Existing pending-install recovery restrictions apply.
+A missing, symlinked, or replaced root is rejected rather than being mistaken
+for an empty tree and propagating mass deletions.
+
+macOS uses the volume UUID. Native ext-family, XFS, and Btrfs filesystems on
+Linux use the filesystem UUID ioctl available since Linux 6.9. Other Linux
+filesystems and older kernels retain strict device/inode checks. OverlayFS
+remains strict even with its own UUID: changing its lower layer can change
+the directory view without changing that UUID or inode.
 
 Run installation with the account's normal =HOME=, not an overridden home
 directory. The installer verifies it against the systemd user manager on Linux
@@ -141,8 +160,8 @@ original directory and run =sync start --share SHARE= to retry it; =sync stop
 --share SHARE= works even while its old path is gone. To deliberately use a
 replacement directory, first record its target with =sync list=, detach the
 old relationship with =sync remove --share SHARE --yes=, then run =sync add
-PATH --host HOST --remote-path REMOTE_PATH=. Only that explicit fresh pairing
-records the replacement's identity. =sync list= also shows the durable enabled
+PATH --host HOST --remote-path REMOTE_PATH=. Deliberate local recovery or fresh
+local pairing records the replacement's identity. =sync list= also shows the durable enabled
 setting separately from connection and scheduling state.
 
 ** Relationship lifecycle
@@ -162,11 +181,22 @@ use =--share= to deliberately detach it, then a new =sync add= to adopt the
 replacement as a fresh relationship. A local-only detach does not make it safe
 to re-add the same responder until the other endpoint has also detached.
 
-The command previews the root, share, known peer, and scope. Confirmation
+Ordinary relationship removal previews the root, share, known peer, and scope. Confirmation
 defaults to no. Declining, entering an empty answer, or reaching end of input
 prints =Relationship unchanged=, exits successfully, and changes nothing.
-=--yes= skips the prompt but never the preview or a local-only warning. An
-already-unpaired root is a successful no-op without a prompt.
+=--yes= skips the prompt but never the preview or a local-only warning. A
+healthy already-unpaired root is a successful no-op without a prompt.
+
+For an already-unpaired root with changed identity, removal by =--share= instead
+previews a local acknowledgment of the current directory and requires confirmation.
+Discover that share ID with =flocal status PATH --json=; unpaired roots are omitted
+from both relationship lists. The directory must exist, must not be a final
+symlink, and must have no active synchronization or pending installation state.
+The opened preview directory must still match when confirmation is applied.
+Declining prints =Registration unchanged=. Confirmation refreshes only the local
+root identity and leaves it unpaired, retaining files, sequence, conflicts, and
+recovery budget. It acknowledges today's directory without proving its historical
+volume identity. Incoming pairing cannot perform this acknowledgment itself.
 
 A failed normal removal remains disabled and visible as =removing=; retry the
 same =sync remove= command after correcting the reported error. Removal never
@@ -175,8 +205,9 @@ endpoint when the other endpoint is permanently unavailable. It warns that the
 other endpoint may still retain the relationship.
 
 Removal itself does not modify synchronized files. It retains the root and
-share registration, root identity, recovery budget, conflicts, and recovery
-objects. Any already-committed install recovery finishes before detach, so the
+share registration, recovery budget, conflicts, and recovery objects. Ordinary
+detach retains root identity; only the explicit unpaired acknowledgment above
+refreshes it. Any already-committed install recovery finishes before detach, so the
 preview warns that visible paths may still be repaired first. Path-based
 recovery commands still require an unavailable root to be restored.
 
@@ -213,8 +244,8 @@ private daemon transport is usable it reports =source: live=; a connection,
 write, deadline, or read failure before any reply byte instead reads only durable
 state and reports enabled shares as =unknown=. A malformed, truncated, oversized,
 or stalled partial reply is an error, not a stored fallback. Roots remain
-base64-encoded native path bytes and carry the registered filesystem device and
-inode as decimal strings, so clients can reject a path replaced by a different
+base64-encoded native path bytes and carry the last verified filesystem device
+and inode as decimal strings, so clients can reject a path replaced by a different
 directory. The initial schema is 1 and deliberately contains only the share
 identity/root, enabled state, connection and scheduling state, role,
 initial-completion state, bounded diagnostic, and unsettled count.
@@ -232,7 +263,7 @@ tested with Eldev. Enable its global mode after installing =flocal=:
 It discovers enabled, non-stopped shares through the read-only status
 interface. Its modeline and =M-x flocal-status= distinguish live from stored
 status; the status buffer shows every configured share and =g= refreshes it
-asynchronously. A root whose registered device/inode no longer matches is
+asynchronously. A root whose last verified device/inode no longer matches is
 visible for diagnosis but never guarded. A modified guarded buffer never saves
 on a cold or expired status cache. When disk bytes differ from the visiting
 buffer's recorded serialized-content baseline, it opens Ediff with the user
@@ -468,3 +499,12 @@ service-management UX, and recovery retention suitable for non-technical users.
 
 The stable milestone will be defined from experience running the earlier
 versions across real directories and peers.
+
+* Development checks
+
+Run =make check= for the complete local gate and =make e2e= for the default
+Docker SSH scenarios. The deployed-alpha upgrade scenarios have their separate
+CI selection. The 5,000-file initial-sync scenario is available explicitly as
+=make e2e-large-initial=; its ten-minute command deadline has been exceeded on
+unchanged main in CI, so it is excluded from the default CI selection. This
+does not claim that large-directory scaling is fixed or abandon that test.

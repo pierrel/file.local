@@ -1663,6 +1663,7 @@ impl State {
                 removing_relationship TEXT,
                 root_device TEXT,
                 root_inode TEXT,
+                root_filesystem_identity TEXT,
                 watch_enabled INTEGER NOT NULL DEFAULT 0,
                 blocked_diagnostic TEXT,
                 intent_generation INTEGER NOT NULL DEFAULT 0,
@@ -1898,6 +1899,15 @@ impl State {
         }
         if !columns.iter().any(|name| name == "root_inode") {
             transaction.execute("ALTER TABLE shares ADD COLUMN root_inode TEXT", [])?;
+        }
+        if !columns
+            .iter()
+            .any(|name| name == "root_filesystem_identity")
+        {
+            transaction.execute(
+                "ALTER TABLE shares ADD COLUMN root_filesystem_identity TEXT",
+                [],
+            )?;
         }
         if !columns.iter().any(|name| name == "watch_enabled") {
             transaction.execute(
@@ -4114,7 +4124,7 @@ impl State {
             .canonicalize()
             .with_context(|| format!("cannot open {}", root.display()))?;
         let root_bytes = path_bytes(&root);
-        let identity = root_identity(&root)?;
+        let (_directory, identity, filesystem) = root_observation(&root)?;
         if self
             .conn
             .query_row("SELECT 1 FROM shares WHERE root=?1", [&root_bytes], |_| {
@@ -4128,12 +4138,13 @@ impl State {
         self.reject_overlapping_root(&root)?;
         let id = ShareId::generate();
         self.conn.execute(
-            "INSERT INTO shares(share_id, root, root_device, root_inode) VALUES(?1, ?2, ?3, ?4)",
+            "INSERT INTO shares(share_id, root, root_device, root_inode, root_filesystem_identity) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![
                 id.0,
                 root_bytes,
                 identity.device.to_string(),
-                identity.inode.to_string()
+                identity.inode.to_string(),
+                filesystem
             ],
         )?;
         Ok(id)
@@ -4144,30 +4155,29 @@ impl State {
         fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
         let root_bytes = path_bytes(&root);
-        let identity = root_identity(&root)?;
-        let existing: Option<(Vec<u8>, String, String)> = self
+        let (_directory, identity, filesystem) = root_observation(&root)?;
+        let existing: Option<Vec<u8>> = self
             .conn
-            .query_row(
-                "SELECT root, root_device, root_inode FROM shares WHERE share_id=?1",
-                [&id.0],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            .query_row("SELECT root FROM shares WHERE share_id=?1", [&id.0], |r| {
+                r.get(0)
+            })
             .optional()?;
-        if let Some((path, device, inode)) = existing {
+        if let Some(path) = existing {
             if path != root_bytes {
                 bail!("share ID is already registered to a different directory");
             }
-            validate_identity_values(&root, identity, &device, &inode)?;
+            validate_stored_root_identity(&self.conn, id, &root, identity)?;
             return Ok(());
         }
         self.reject_overlapping_root(&root)?;
         self.conn.execute(
-            "INSERT INTO shares(share_id, root, root_device, root_inode) VALUES(?1, ?2, ?3, ?4)",
+            "INSERT INTO shares(share_id, root, root_device, root_inode, root_filesystem_identity) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![
                 id.0,
                 root_bytes,
                 identity.device.to_string(),
-                identity.inode.to_string()
+                identity.inode.to_string(),
+                filesystem
             ],
         )?;
         Ok(())
@@ -4264,7 +4274,9 @@ impl State {
         self.reject_overlapping_root_except(&root, exact_root_share.as_ref())?;
         ensure_relationship_available(&self.conn, id, relationship)?;
 
-        let transaction = self.conn.transaction()?;
+        let transaction = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let outcome = match exact_root_share {
             Some(existing_id) if existing_id == *id => {
                 let (binding, marker) = binding_and_marker(&transaction, id)?
@@ -4316,15 +4328,16 @@ impl State {
             None => {
                 transaction.execute(
                     "INSERT INTO shares(
-                         share_id,root,bound_peer,bound_relationship,root_device,root_inode
-                     ) VALUES(?1,?2,?3,?4,?5,?6)",
+                         share_id,root,bound_peer,bound_relationship,root_device,root_inode,root_filesystem_identity
+                     ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     params![
                         id.0,
                         root_bytes,
                         peer.0,
                         relationship.0,
                         identity.device.to_string(),
-                        identity.inode.to_string()
+                        identity.inode.to_string(),
+                        crate::root_identity::filesystem_identity(&root_file)?
                     ],
                 )?;
                 RegistrationOutcome { prior_share: None }
@@ -4475,18 +4488,18 @@ impl State {
         root: &Path,
         identity: RootIdentity,
     ) -> Result<(ShareId, PathBuf)> {
-        let row: Option<(String, String, String)> = self
+        let row: Option<String> = self
             .conn
             .query_row(
-                "SELECT share_id,root_device,root_inode FROM shares WHERE root=?1",
+                "SELECT share_id FROM shares WHERE root=?1",
                 [path_bytes(root)],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .optional()?;
-        let (share, device, inode) = row.context(
+        let share = row.context(
             "removal PATH must name the configured sync root; use --share when it is unavailable",
         )?;
-        validate_identity_values(root, identity, &device, &inode).with_context(|| {
+        validate_stored_root_identity(&self.conn, &ShareId(share.clone()), root, identity).with_context(|| {
             format!(
                 "use `flocal sync remove --share {share} --yes` to deliberately detach this changed root"
             )
@@ -4521,7 +4534,6 @@ impl State {
 
     pub fn validate_root_identity(&self, id: &ShareId) -> Result<RootIdentity> {
         let root = self.root_for(id)?;
-        let expected = self.expected_root_identity(id)?;
         let actual = root_identity(&root).map_err(|error| {
             RootIdentityChanged::new(format!(
                 "configured root {} is unavailable: {error}; restore the original directory before retrying, or record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {} --yes`",
@@ -4529,9 +4541,12 @@ impl State {
                 id.0
             ))
         })?;
-        if actual != expected {
+        if let Err(error) = validate_stored_root_identity(&self.conn, id, &root, actual) {
+            if error.downcast_ref::<RootIdentityChanged>().is_none() {
+                return Err(error);
+            }
             return Err(RootIdentityChanged::new(format!(
-                "configured root identity changed at {}; restore the original directory, or record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {} --yes` before adding the replacement as a new relationship",
+                "configured root identity changed at {}: {error}; restore the original directory, or record the target with `flocal sync list` then deliberately detach with `flocal sync remove --share {} --yes` before adding the replacement as a new relationship",
                 root.display(),
                 id.0
             ))
@@ -4754,18 +4769,12 @@ impl State {
                 )?)
             }
         };
-        if let Some((root, identity)) = &reinitialization {
-            ensure_unpaired_registration_state(&transaction, id)?;
-            transaction.execute(
-                "UPDATE shares SET root_device=?2,root_inode=?3 WHERE share_id=?1",
-                params![
-                    id.0,
-                    identity.device.to_string(),
-                    identity.inode.to_string()
-                ],
-            )?;
-            ensure_reinitialization_identity(root, *identity)?;
-        }
+        let _observation = reinitialization
+            .as_ref()
+            .map(|(root, _directory, identity)| {
+                Self::publish_reinitialized_root(&transaction, id, root, *identity)
+            })
+            .transpose()?;
         let config = PeerConfig {
             peer_id: None,
             host: host.to_owned(),
@@ -4779,7 +4788,7 @@ impl State {
              intent_generation=intent_generation+1 WHERE share_id=?1",
             params![id.0, serde_json::to_string(&config)?],
         )?;
-        if let Some((root, identity)) = &reinitialization {
+        if let Some((root, _directory, identity)) = &reinitialization {
             ensure_reinitialization_identity_after_connector(root, *identity)?;
         }
         transaction.commit()?;
@@ -4789,7 +4798,7 @@ impl State {
     fn open_reinitialization_root(
         stored_root: &Path,
         requested_root: &Path,
-    ) -> Result<(PathBuf, RootIdentity)> {
+    ) -> Result<(PathBuf, File, RootIdentity)> {
         let requested_root = std::path::absolute(requested_root)?;
         let resolved = resolve_registration_path(&requested_root)?;
         if !resolved.missing.is_empty() {
@@ -4807,7 +4816,79 @@ impl State {
         if root != stored_root {
             bail!("replacement root must be selected by its exact configured path");
         }
-        Ok((root, identity))
+        Ok((root, resolved.ancestor, identity))
+    }
+
+    /// Pins the current exact directory while a local user confirms recovery.
+    pub fn open_unpaired_root_for_reinitialization(&self, id: &ShareId) -> Result<File> {
+        let (binding, marker) = binding_and_marker(&self.conn, id)?.context("share not found")?;
+        if binding != EndpointBinding::Unpaired || marker.is_some() {
+            bail!("root reinitialization requires an unpaired registration");
+        }
+        let root = self.root_for(id)?;
+        Ok(Self::open_reinitialization_root(&root, &root)?.1)
+    }
+
+    /// Acknowledges a confirmed local directory without creating a relationship.
+    pub fn reinitialize_unpaired_root(
+        &mut self,
+        id: &ShareId,
+        requested_root: &Path,
+        preview: &File,
+    ) -> Result<()> {
+        self.scheduled_mutation(Some(id), SyncOperation::Removal, |state| {
+            let _registration_lock = state.lock_registration()?;
+            let transaction = state
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let (binding, marker) =
+                binding_and_marker(&transaction, id)?.context("share not found")?;
+            if binding != EndpointBinding::Unpaired || marker.is_some() {
+                bail!("root reinitialization requires an unpaired registration");
+            }
+            let stored_root: Vec<u8> = transaction.query_row(
+                "SELECT root FROM shares WHERE share_id=?1",
+                [&id.0],
+                |row| row.get(0),
+            )?;
+            let (root, _directory, identity) =
+                Self::open_reinitialization_root(&bytes_path(stored_root), requested_root)?;
+            if file_root_identity(preview, &root)? != identity {
+                bail!("configured root changed since the recovery preview");
+            }
+            let _observation = Self::publish_reinitialized_root(&transaction, id, &root, identity)?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    fn publish_reinitialized_root(
+        connection: &Connection,
+        id: &ShareId,
+        root: &Path,
+        identity: RootIdentity,
+    ) -> Result<File> {
+        ensure_unpaired_registration_state(connection, id)?;
+        let (directory, observed, filesystem) = root_observation(root)?;
+        if observed != identity {
+            bail!("relationship root identity changed while reinitializing registration");
+        }
+        let changed = connection.execute(
+            "UPDATE shares SET root_device=?2,root_inode=?3,root_filesystem_identity=?4
+             WHERE share_id=?1 AND root=?5",
+            params![
+                id.0,
+                identity.device.to_string(),
+                identity.inode.to_string(),
+                filesystem,
+                path_bytes(root)
+            ],
+        )?;
+        if changed != 1 {
+            bail!("configured root binding changed during reinitialization");
+        }
+        ensure_reinitialization_identity(root, identity)?;
+        Ok(directory)
     }
 
     pub fn complete_connector_registration(
@@ -6673,12 +6754,78 @@ fn validate_stored_root_identity(
     root: &Path,
     actual: RootIdentity,
 ) -> Result<()> {
-    let (device, inode): (String, String) = connection.query_row(
-        "SELECT root_device,root_inode FROM shares WHERE share_id=?1",
+    let (device, inode, filesystem, stored_root): (String, String, Option<String>, Vec<u8>) = connection.query_row(
+        "SELECT root_device,root_inode,root_filesystem_identity,root FROM shares WHERE share_id=?1",
         [&share.0],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    validate_identity_values(root, actual, &device, &inode)
+    let expected = RootIdentity {
+        device: device.parse().map_err(|error| {
+            RootIdentityChanged::new(format!("stored root device is invalid: {error}"))
+        })?,
+        inode: inode.parse().map_err(|error| {
+            RootIdentityChanged::new(format!("stored root inode is invalid: {error}"))
+        })?,
+    };
+    if stored_root != path_bytes(root) {
+        bail!(RootIdentityChanged::new("configured root path changed"));
+    }
+    let (_directory, observed, observed_filesystem) = root_observation(root)?;
+    if observed != actual || root_identity(root)? != actual {
+        bail!(RootIdentityChanged::new(
+            "configured root changed while verifying its filesystem"
+        ));
+    }
+    if let Some(filesystem) = &filesystem {
+        if observed_filesystem.as_ref() != Some(filesystem) || expected.inode != actual.inode {
+            bail!(RootIdentityChanged::new(
+                "configured root filesystem or inode changed"
+            ));
+        }
+        if expected.device != actual.device {
+            let changed = connection.execute(
+                "UPDATE shares SET root_device=?2 WHERE share_id=?1 AND root=?3
+                 AND root_inode=?4 AND root_filesystem_identity=?5
+                 AND root_device IN (?6,?2)",
+                params![
+                    share.0,
+                    actual.device.to_string(),
+                    stored_root,
+                    inode,
+                    filesystem,
+                    device
+                ],
+            )?;
+            if changed != 1 {
+                bail!(RootIdentityChanged::new(
+                    "configured root binding changed during device refresh"
+                ));
+            }
+        }
+        Ok(())
+    } else {
+        if actual != expected {
+            bail!(RootIdentityChanged::new(
+                "configured root numeric identity changed without enrolled filesystem evidence"
+            ));
+        }
+        // Enroll only this selected root. Optional UUID enrollment must not
+        // probe unrelated mounts at startup: even an open can stall there.
+        if let Some(filesystem) = observed_filesystem {
+            let changed = connection.execute(
+                "UPDATE shares SET root_filesystem_identity=?2 WHERE share_id=?1 AND root=?3
+                 AND root_device=?4 AND root_inode=?5
+                 AND (root_filesystem_identity IS NULL OR root_filesystem_identity=?2)",
+                params![share.0, filesystem, stored_root, device, inode],
+            )?;
+            if changed != 1 {
+                bail!(RootIdentityChanged::new(
+                    "configured root binding changed during filesystem enrollment"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn managed_share_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedShare> {
@@ -7056,6 +7203,19 @@ fn same_file_snapshot(before: &fs::Metadata, after: &fs::Metadata) -> Result<boo
 
 #[cfg(unix)]
 fn root_identity(path: &Path) -> Result<RootIdentity> {
+    file_root_identity(&open_root_directory(path)?, path)
+}
+
+/// Keep the returned File alive through path rechecking and identity publication.
+/// Its open mount reference prevents numeric device reuse between those steps.
+fn root_observation(path: &Path) -> Result<(File, RootIdentity, Option<String>)> {
+    let file = open_root_directory(path)?;
+    let identity = file_root_identity(&file, path)?;
+    let filesystem = crate::root_identity::filesystem_identity(&file)?;
+    Ok((file, identity, filesystem))
+}
+
+fn open_root_directory(path: &Path) -> Result<File> {
     use rustix::fs::{Mode, OFlags};
 
     let descriptor = rustix::fs::open(
@@ -7069,8 +7229,7 @@ fn root_identity(path: &Path) -> Result<RootIdentity> {
             path.display()
         )
     })?;
-    let file = File::from(descriptor);
-    file_root_identity(&file, path)
+    Ok(File::from(descriptor))
 }
 
 fn ensure_reinitialization_identity(root: &Path, identity: RootIdentity) -> Result<()> {
@@ -7254,25 +7413,6 @@ fn create_registration_tail(mut current: File, missing: &[std::ffi::OsString]) -
         )?);
     }
     Ok(current)
-}
-
-fn validate_identity_values(
-    root: &Path,
-    actual: RootIdentity,
-    device: &str,
-    inode: &str,
-) -> Result<()> {
-    let expected = RootIdentity {
-        device: device.parse().context("stored root device is invalid")?,
-        inode: inode.parse().context("stored root inode is invalid")?,
-    };
-    if actual != expected {
-        bail!(
-            "configured root identity changed at {}; restore the original directory or deliberately remove and reinitialize the share",
-            root.display()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -7735,12 +7875,161 @@ pub fn file_record(
 
 #[cfg(all(test, unix))]
 mod tests {
+    fn stored_root_filesystem(
+        state: &super::State,
+        share: &crate::model::ShareId,
+    ) -> Option<String> {
+        state
+            .conn
+            .query_row(
+                "SELECT root_filesystem_identity FROM shares WHERE share_id=?1",
+                [&share.0],
+                |row| row.get(0),
+            )
+            .expect("reading stored root filesystem identity")
+    }
+
+    #[test]
+    fn volume_identity_refresh_preserves_state_and_rejects_unproved_changes() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state_dir = temp.path().join("state");
+        let state = super::State::open(&state_dir)?;
+        let share = state.init_share(&root)?;
+        let original = state.expected_root_identity(&share)?;
+        let filesystem = stored_root_filesystem(&state, &share);
+        let Some(filesystem) = filesystem else {
+            return Ok(());
+        };
+        state.set_blocked(&share, "retain this unrelated diagnostic")?;
+        let old_device = original.device.wrapping_add(1).to_string();
+        state.conn.execute(
+            "UPDATE shares SET root_device=?2 WHERE share_id=?1",
+            rusqlite::params![share.0, old_device],
+        )?;
+        state.conn.execute_batch("CREATE TEMP TRIGGER reject_device_refresh BEFORE UPDATE OF root_device ON shares BEGIN SELECT RAISE(ABORT, 'injected refresh failure'); END;")?;
+        let error = state
+            .validate_root_identity(&share)
+            .expect_err("refresh SQL failure must propagate");
+        assert!(error.downcast_ref::<super::RootIdentityChanged>().is_none());
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        assert_ne!(state.expected_root_identity(&share)?, original);
+        state
+            .conn
+            .execute_batch("DROP TRIGGER reject_device_refresh")?;
+        assert_eq!(state.validate_root_identity(&share)?, original);
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        assert_eq!(
+            state.managed_share(&share)?.blocked_diagnostic.as_deref(),
+            Some("retain this unrelated diagnostic")
+        );
+        state.conn.execute(
+            "UPDATE shares SET root_filesystem_identity='different-volume' WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(
+            state.validate_root_identity(&share).is_err(),
+            "matching dev/inode cannot override volume mismatch"
+        );
+        state.conn.execute(
+            "UPDATE shares SET root_filesystem_identity=NULL WHERE share_id=?1",
+            [&share.0],
+        )?;
+        let unrelated_root = temp.path().join("unrelated-root");
+        std::fs::create_dir(&unrelated_root)?;
+        let unrelated = state.init_share(&unrelated_root)?;
+        state.conn.execute(
+            "UPDATE shares SET root_filesystem_identity=NULL WHERE share_id=?1",
+            [&unrelated.0],
+        )?;
+        drop(state);
+        let state = super::State::open(&state_dir)?;
+        let enrolled = stored_root_filesystem(&state, &share);
+        assert_eq!(enrolled, None, "startup must not probe or enroll any root");
+        state.conn.execute_batch("CREATE TEMP TRIGGER reject_uuid_enrollment BEFORE UPDATE OF root_filesystem_identity ON shares BEGIN SELECT RAISE(ABORT, 'injected enrollment failure'); END;")?;
+        let error = state
+            .validate_root_identity(&share)
+            .expect_err("enrollment SQL failure must propagate");
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        assert!(error.downcast_ref::<super::RootIdentityChanged>().is_none());
+        let unchanged = stored_root_filesystem(&state, &share);
+        assert_eq!(unchanged, None);
+        state
+            .conn
+            .execute_batch("DROP TRIGGER reject_uuid_enrollment")?;
+        assert_eq!(state.validate_root_identity(&share)?, original);
+        let enrolled = stored_root_filesystem(&state, &share);
+        assert_eq!(enrolled.as_ref(), Some(&filesystem));
+        let untouched = stored_root_filesystem(&state, &unrelated);
+        assert_eq!(
+            untouched, None,
+            "selected-share validation must not probe unrelated roots"
+        );
+        state.conn.execute(
+            "UPDATE shares SET root_filesystem_identity=NULL,root_device=?2 WHERE share_id=?1",
+            rusqlite::params![share.0, old_device],
+        )?;
+        drop(state);
+        let state = super::State::open(&state_dir)?;
+        let enrolled = stored_root_filesystem(&state, &share);
+        assert_eq!(
+            enrolled, None,
+            "changed legacy device must not be silently enrolled"
+        );
+        assert!(state.validate_root_identity(&share).is_err());
+        std::fs::rename(&root, temp.path().join("unavailable"))?;
+        drop(state);
+        super::State::open(&state_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn root_validation_classifies_corrupt_identity_fields_and_changed_paths() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root)?;
+        let state = super::State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let identity = state.expected_root_identity(&share)?;
+        for column in ["root_device", "root_inode"] {
+            let saved: String = state.conn.query_row(
+                &format!("SELECT {column} FROM shares WHERE share_id=?1"),
+                [&share.0],
+                |row| row.get(0),
+            )?;
+            state.conn.execute(
+                &format!("UPDATE shares SET {column}='invalid' WHERE share_id=?1"),
+                [&share.0],
+            )?;
+            let error = state
+                .validate_root_identity(&share)
+                .expect_err("corrupt identity must fail closed");
+            assert!(error.downcast_ref::<super::RootIdentityChanged>().is_some());
+            state.conn.execute(
+                &format!("UPDATE shares SET {column}=?2 WHERE share_id=?1"),
+                rusqlite::params![share.0, saved],
+            )?;
+        }
+        let error = super::validate_stored_root_identity(
+            &state.conn,
+            &share,
+            &temp.path().join("different"),
+            identity,
+        )
+        .expect_err("share selection cannot retarget the registered root");
+        assert!(error.downcast_ref::<super::RootIdentityChanged>().is_some());
+        state.validate_root_identity(&share)?;
+        Ok(())
+    }
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     #[test]
-    fn snapshot_publication_reserves_writer_before_reading_under_scheduler_contention() -> Result<()>
+    fn publication_and_enrollment_wait_for_scheduler_writer_without_stale_snapshots() -> Result<()>
     {
         use std::cell::RefCell;
         use std::sync::mpsc::{self, Receiver, Sender};
@@ -7758,7 +8047,7 @@ mod tests {
             })
         }
 
-        for operation in ["replace", "ack", "retire", "finish"] {
+        for operation in ["replace", "ack", "retire", "finish", "enroll"] {
             let temp = tempfile::tempdir()?;
             let root = temp.path().join("root");
             fs::create_dir(&root)?;
@@ -7779,6 +8068,16 @@ mod tests {
             state.replace_records(&share, &records)?;
             state.acknowledge_shared_heads(&share, &records)?;
             let (intent, _) = state.set_install_intent(&share, &records)?;
+            if operation == "enroll" {
+                let filesystem = stored_root_filesystem(&state, &share);
+                if filesystem.is_none() {
+                    continue;
+                }
+                state.conn.execute(
+                    "UPDATE shares SET root_filesystem_identity=NULL WHERE share_id=?1",
+                    [&share.0],
+                )?;
+            }
             let database = state.dir.join("state.sqlite3");
             let (locked, ready) = mpsc::channel();
             let (release, released) = mpsc::channel();
@@ -7808,6 +8107,7 @@ mod tests {
                     &records[0].path,
                 ),
                 "finish" => state.finish_install(&share, &intent, &records),
+                "enroll" => state.validate_root_identity(&share).map(|_| ()),
                 _ => unreachable!(),
             };
             // Release the other thread even when the old deferred upgrade
@@ -7825,9 +8125,16 @@ mod tests {
             result.with_context(|| format!("{operation} failed during scheduler contention"))?;
             assert!(
                 waited,
-                "{operation} did not reserve the main writer before its reads"
+                "{operation} did not wait for the competing main writer"
             );
             assert_eq!(state.records(&share)?, records);
+            if operation == "enroll" {
+                let filesystem = stored_root_filesystem(&state, &share);
+                assert!(
+                    filesystem.is_some(),
+                    "enrollment must survive another writer's commit"
+                );
+            }
         }
         Ok(())
     }
@@ -8570,6 +8877,125 @@ mod tests {
     }
 
     #[test]
+    fn explicit_unpaired_recovery_preserves_state_without_prior_filesystem_evidence() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("kept"), "destination contents")?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let original = state.expected_root_identity(&share)?;
+        state.add_conflicts(&share, &[recovery_conflict()?])?;
+        state.conn.execute(
+            "UPDATE shares SET root_device=?2,root_filesystem_identity=NULL,
+             sequence=17,recovery_budget_bytes=98765 WHERE share_id=?1",
+            params![share.0, original.device.wrapping_add(1).to_string()],
+        )?;
+        assert!(state.validate_root_identity(&share).is_err());
+        let incoming = ShareId::generate();
+        let peer = PeerId("connector".into());
+        let relationship = relationship("relationship-recovered");
+        assert!(
+            state
+                .register_relationship(&incoming, &root, &peer, &relationship)
+                .is_err()
+        );
+
+        let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+        state.reinitialize_unpaired_root(&share, &root, &preview)?;
+        assert_eq!(state.validate_root_identity(&share)?, original);
+        assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        assert_eq!(
+            fs::read_to_string(root.join("kept"))?,
+            "destination contents"
+        );
+        assert_eq!(state.conflicts(&share)?.len(), 1);
+        let retained: (i64, i64) = state.conn.query_row(
+            "SELECT sequence,recovery_budget_bytes FROM shares WHERE share_id=?1",
+            [&share.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(retained, (17, 98765));
+        state.register_relationship(&incoming, &root, &peer, &relationship)?;
+        assert_eq!(state.conflicts(&incoming)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_unpaired_recovery_rejects_preview_replacement_and_live_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let original = state.expected_root_identity(&share)?;
+        let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+        fs::rename(&root, temp.path().join("preview-root"))?;
+        fs::create_dir(&root)?;
+        let error = state
+            .reinitialize_unpaired_root(&share, &root, &preview)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed since the recovery preview")
+        );
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+
+        state.set_install_intent(&share, &[])?;
+        assert!(
+            state
+                .reinitialize_unpaired_root(&share, &root, &preview)
+                .is_err()
+        );
+        assert!(state.install_intent(&share)?.is_some());
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        state.clear_install_intent(&share)?;
+
+        state.conn.execute(
+            "UPDATE shares SET watch_enabled=1 WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(
+            state
+                .reinitialize_unpaired_root(&share, &root, &preview)
+                .is_err()
+        );
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        state.conn.execute(
+            "UPDATE shares SET watch_enabled=0 WHERE share_id=?1",
+            [&share.0],
+        )?;
+
+        let config = PeerConfig {
+            peer_id: None,
+            host: "peer-b".into(),
+            remote_path: b"/remote".to_vec(),
+            executable: "/flocal".into(),
+            relationship: Some(relationship("relationship-active")),
+        };
+        state.set_peer(&share, &config)?;
+        assert!(
+            state
+                .open_unpaired_root_for_reinitialization(&share)
+                .is_err()
+        );
+        assert!(
+            state
+                .reinitialize_unpaired_root(&share, &root, &preview)
+                .is_err()
+        );
+        assert_eq!(
+            state.endpoint_binding(&share)?,
+            EndpointBinding::Connector(config)
+        );
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        Ok(())
+    }
+
+    #[test]
     fn explicit_registration_reinitializes_only_an_unpaired_exact_root() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("root");
@@ -9156,13 +9582,13 @@ mod tests {
         std::os::unix::fs::symlink(&second_root, &first_root)?;
 
         assert!(state.find_share_by_exact_root(&first_root).is_err());
-        assert_eq!(
+        assert!(
             state
-                .find_share_by_exact_root_identity(&first_stored_root, opened_identity)?
-                .0,
-            first_share
+                .find_share_by_exact_root_identity(&first_stored_root, opened_identity)
+                .is_err()
         );
         assert_ne!(first_share, second_share);
+        state.validate_root_identity(&second_share)?;
         assert!(canonical_registration_root(&first_root, opened_identity).is_err());
         Ok(())
     }

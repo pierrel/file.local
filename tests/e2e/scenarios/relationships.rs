@@ -6,6 +6,31 @@ use crate::harness as e2e;
 
 #[test]
 #[ignore = "requires docker; run via `make e2e`"]
+fn unpaired_responder_root_can_be_deliberately_recovered_before_pairing() -> Result<()> {
+    let (a, b) = e2e::managed_containers()?;
+    b.init()?;
+    b.replace_share_root()?;
+    b.write("destination.txt", "existing destination contents")?;
+    a.write("source.txt", "existing source contents")?;
+    let share = b.status()?.share;
+
+    b.sync_remove_by_share(&share)?;
+    anyhow::ensure!(b.status()?.relationship_state == "unpaired");
+    a.sync_add_to(&b)?;
+    anyhow::ensure!(a.status()?.relationship_state == "connector");
+    anyhow::ensure!(b.status()?.relationship_state == "responder");
+    a.assert_file("destination.txt", "existing destination contents")?;
+    b.assert_file("source.txt", "existing source contents")?;
+    a.write("from-source.txt", "after fresh pairing")?;
+    b.wait_for_file("from-source.txt", "after fresh pairing")?;
+    b.write("from-destination.txt", "back to the source")?;
+    a.wait_for_file("from-destination.txt", "back to the source")?;
+    e2e::assert_trees_equal(&a, &b)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires docker; run via `make e2e`"]
 fn upgraded_legacy_relationship_continues_without_repair() -> Result<()> {
     const REGRESSION: &str = "connector relationship registration is incomplete";
     let (a, b) = e2e::managed_pair()?;
