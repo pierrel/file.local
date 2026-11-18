@@ -4769,23 +4769,12 @@ impl State {
                 )?)
             }
         };
-        if let Some((root, identity)) = &reinitialization {
-            ensure_unpaired_registration_state(&transaction, id)?;
-            let (_directory, observed, filesystem) = root_observation(root)?;
-            if observed != *identity {
-                bail!("relationship root identity changed while reinitializing registration");
-            }
-            transaction.execute(
-                "UPDATE shares SET root_device=?2,root_inode=?3,root_filesystem_identity=?4 WHERE share_id=?1",
-                params![
-                    id.0,
-                    identity.device.to_string(),
-                    identity.inode.to_string(),
-                    filesystem
-                ],
-            )?;
-            ensure_reinitialization_identity(root, *identity)?;
-        }
+        let _observation = reinitialization
+            .as_ref()
+            .map(|(root, _directory, identity)| {
+                Self::publish_reinitialized_root(&transaction, id, root, *identity)
+            })
+            .transpose()?;
         let config = PeerConfig {
             peer_id: None,
             host: host.to_owned(),
@@ -4799,7 +4788,7 @@ impl State {
              intent_generation=intent_generation+1 WHERE share_id=?1",
             params![id.0, serde_json::to_string(&config)?],
         )?;
-        if let Some((root, identity)) = &reinitialization {
+        if let Some((root, _directory, identity)) = &reinitialization {
             ensure_reinitialization_identity_after_connector(root, *identity)?;
         }
         transaction.commit()?;
@@ -4809,7 +4798,7 @@ impl State {
     fn open_reinitialization_root(
         stored_root: &Path,
         requested_root: &Path,
-    ) -> Result<(PathBuf, RootIdentity)> {
+    ) -> Result<(PathBuf, File, RootIdentity)> {
         let requested_root = std::path::absolute(requested_root)?;
         let resolved = resolve_registration_path(&requested_root)?;
         if !resolved.missing.is_empty() {
@@ -4827,7 +4816,79 @@ impl State {
         if root != stored_root {
             bail!("replacement root must be selected by its exact configured path");
         }
-        Ok((root, identity))
+        Ok((root, resolved.ancestor, identity))
+    }
+
+    /// Pins the current exact directory while a local user confirms recovery.
+    pub fn open_unpaired_root_for_reinitialization(&self, id: &ShareId) -> Result<File> {
+        let (binding, marker) = binding_and_marker(&self.conn, id)?.context("share not found")?;
+        if binding != EndpointBinding::Unpaired || marker.is_some() {
+            bail!("root reinitialization requires an unpaired registration");
+        }
+        let root = self.root_for(id)?;
+        Ok(Self::open_reinitialization_root(&root, &root)?.1)
+    }
+
+    /// Acknowledges a confirmed local directory without creating a relationship.
+    pub fn reinitialize_unpaired_root(
+        &mut self,
+        id: &ShareId,
+        requested_root: &Path,
+        preview: &File,
+    ) -> Result<()> {
+        self.scheduled_mutation(Some(id), SyncOperation::Removal, |state| {
+            let _registration_lock = state.lock_registration()?;
+            let transaction = state
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let (binding, marker) =
+                binding_and_marker(&transaction, id)?.context("share not found")?;
+            if binding != EndpointBinding::Unpaired || marker.is_some() {
+                bail!("root reinitialization requires an unpaired registration");
+            }
+            let stored_root: Vec<u8> = transaction.query_row(
+                "SELECT root FROM shares WHERE share_id=?1",
+                [&id.0],
+                |row| row.get(0),
+            )?;
+            let (root, _directory, identity) =
+                Self::open_reinitialization_root(&bytes_path(stored_root), requested_root)?;
+            if file_root_identity(preview, &root)? != identity {
+                bail!("configured root changed since the recovery preview");
+            }
+            let _observation = Self::publish_reinitialized_root(&transaction, id, &root, identity)?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    fn publish_reinitialized_root(
+        connection: &Connection,
+        id: &ShareId,
+        root: &Path,
+        identity: RootIdentity,
+    ) -> Result<File> {
+        ensure_unpaired_registration_state(connection, id)?;
+        let (directory, observed, filesystem) = root_observation(root)?;
+        if observed != identity {
+            bail!("relationship root identity changed while reinitializing registration");
+        }
+        let changed = connection.execute(
+            "UPDATE shares SET root_device=?2,root_inode=?3,root_filesystem_identity=?4
+             WHERE share_id=?1 AND root=?5",
+            params![
+                id.0,
+                identity.device.to_string(),
+                identity.inode.to_string(),
+                filesystem,
+                path_bytes(root)
+            ],
+        )?;
+        if changed != 1 {
+            bail!("configured root binding changed during reinitialization");
+        }
+        ensure_reinitialization_identity(root, identity)?;
+        Ok(directory)
     }
 
     pub fn complete_connector_registration(
@@ -8812,6 +8873,125 @@ mod tests {
         assert!(state.finalize_connector_removal(&prepared).is_err());
         state.finalize_local_removal(&prepared)?;
         assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_unpaired_recovery_preserves_state_without_prior_filesystem_evidence() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        fs::write(root.join("kept"), "destination contents")?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let original = state.expected_root_identity(&share)?;
+        state.add_conflicts(&share, &[recovery_conflict()?])?;
+        state.conn.execute(
+            "UPDATE shares SET root_device=?2,root_filesystem_identity=NULL,
+             sequence=17,recovery_budget_bytes=98765 WHERE share_id=?1",
+            params![share.0, original.device.wrapping_add(1).to_string()],
+        )?;
+        assert!(state.validate_root_identity(&share).is_err());
+        let incoming = ShareId::generate();
+        let peer = PeerId("connector".into());
+        let relationship = relationship("relationship-recovered");
+        assert!(
+            state
+                .register_relationship(&incoming, &root, &peer, &relationship)
+                .is_err()
+        );
+
+        let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+        state.reinitialize_unpaired_root(&share, &root, &preview)?;
+        assert_eq!(state.validate_root_identity(&share)?, original);
+        assert_eq!(state.endpoint_binding(&share)?, EndpointBinding::Unpaired);
+        assert_eq!(
+            fs::read_to_string(root.join("kept"))?,
+            "destination contents"
+        );
+        assert_eq!(state.conflicts(&share)?.len(), 1);
+        let retained: (i64, i64) = state.conn.query_row(
+            "SELECT sequence,recovery_budget_bytes FROM shares WHERE share_id=?1",
+            [&share.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(retained, (17, 98765));
+        state.register_relationship(&incoming, &root, &peer, &relationship)?;
+        assert_eq!(state.conflicts(&incoming)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_unpaired_recovery_rejects_preview_replacement_and_live_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let mut state = State::open(temp.path().join("state"))?;
+        let share = state.init_share(&root)?;
+        let original = state.expected_root_identity(&share)?;
+        let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+        fs::rename(&root, temp.path().join("preview-root"))?;
+        fs::create_dir(&root)?;
+        let error = state
+            .reinitialize_unpaired_root(&share, &root, &preview)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed since the recovery preview")
+        );
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+
+        state.set_install_intent(&share, &[])?;
+        assert!(
+            state
+                .reinitialize_unpaired_root(&share, &root, &preview)
+                .is_err()
+        );
+        assert!(state.install_intent(&share)?.is_some());
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        state.clear_install_intent(&share)?;
+
+        state.conn.execute(
+            "UPDATE shares SET watch_enabled=1 WHERE share_id=?1",
+            [&share.0],
+        )?;
+        assert!(
+            state
+                .reinitialize_unpaired_root(&share, &root, &preview)
+                .is_err()
+        );
+        assert_eq!(state.expected_root_identity(&share)?, original);
+        state.conn.execute(
+            "UPDATE shares SET watch_enabled=0 WHERE share_id=?1",
+            [&share.0],
+        )?;
+
+        let config = PeerConfig {
+            peer_id: None,
+            host: "peer-b".into(),
+            remote_path: b"/remote".to_vec(),
+            executable: "/flocal".into(),
+            relationship: Some(relationship("relationship-active")),
+        };
+        state.set_peer(&share, &config)?;
+        assert!(
+            state
+                .open_unpaired_root_for_reinitialization(&share)
+                .is_err()
+        );
+        assert!(
+            state
+                .reinitialize_unpaired_root(&share, &root, &preview)
+                .is_err()
+        );
+        assert_eq!(
+            state.endpoint_binding(&share)?,
+            EndpointBinding::Connector(config)
+        );
+        assert_eq!(state.expected_root_identity(&share)?, original);
         Ok(())
     }
 

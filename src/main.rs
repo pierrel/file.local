@@ -956,7 +956,30 @@ fn remove_sync_relationship(
     let root = state.root_for(&share)?;
     let binding = state.endpoint_binding(&share)?;
     if matches!(&binding, EndpointBinding::Unpaired) {
-        println!("No relationship is configured; nothing to remove.");
+        match state.validate_root_identity(&share) {
+            Ok(_) => println!("No relationship is configured; nothing to remove."),
+            Err(error) if error.downcast_ref::<sync::RootIdentityChanged>().is_some() => {
+                let preview = state.open_unpaired_root_for_reinitialization(&share)?;
+                println!("Recover the already-unpaired registration for:");
+                println!("  Root:  {}", escaped(&root.to_string_lossy()));
+                println!("  Share: {}", escaped(&share.0));
+                println!(
+                    "This acknowledges the current directory; its historical volume identity cannot be proved."
+                );
+                println!(
+                    "Files and retained recovery data stay in place. No relationship will be created."
+                );
+                if !yes && !confirm("Acknowledge this directory for fresh pairing?")? {
+                    println!("Registration unchanged.");
+                    return Ok(());
+                }
+                state.reinitialize_unpaired_root(&share, &root, &preview)?;
+                println!(
+                    "Current directory acknowledged; the root remains unpaired. Retry sync add from the connector."
+                );
+            }
+            Err(error) => return Err(error),
+        }
         return Ok(());
     }
     let pending = state.removing_relationship(&share)?.is_some();

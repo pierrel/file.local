@@ -1,0 +1,300 @@
+#+title: Recover retained roots and run guarded upgrades without systemd
+#+date: 2026-11-18
+#+status: one-time recovery locally reviewed and validated; older-kernel identity and external-service installation unresolved
+
+* 1. Failing scenarios and the acceptance milestone
+
+The reported user flow starts on a laptop, with an existing destination
+directory on an SSH-accessible Linux development container. The directory
+contains user files. Its retained registration is already unpaired, has no
+pending installation or causal records, and remembers a different device
+number. Its inode is unchanged. These observations explain the failure but do
+not prove the historical volume identity.
+
+Three distinct scenarios must be pinned before changing behavior:
+
+1. An unpaired responder root retains an obsolete numeric identity. A new
+   incoming pairing is rejected. Running the existing local =sync remove
+   --share SHARE_ID --yes= reports that nothing is configured and changes
+   nothing. The next incoming add therefore fails identically. Expected:
+   explicit local removal can acknowledge today's exact root safely, leaving
+   it unpaired; the subsequent laptop-originated add preserves destination
+   files and completes the ordinary initial reconciliation.
+2. An enrolled root lives on native ext4 under Linux 5.15. The descriptor-based
+   =FS_IOC_GETFSUUID= query returns =ENOTTY=. A genuine remount that changes the
+   numeric device must not require another manual database repair. Expected:
+   a separately justified, available identity source preserves the same
+   directory and relationship across that lifecycle boundary. An edited SQL
+   device field or a skipped native-identity test is not positive acceptance.
+3. The container starts an existing singleton daemon supervisor at login and
+   has no systemd user manager. The daemon survives logout and is restarted by
+   that supervisor after exit. =make install= fails during systemd preflight.
+   Expected: guarded installation and migration work without replacing the
+   container init system or racing the restart loop and concurrent logins.
+
+The first bounded milestone is a generated two-peer SSH scenario for item 1:
+reject the stale retained responder, perform deliberate local recovery using
+the existing removal command, and successfully pair/synchronize in the intended
+direction. It should take approximately 20–30 minutes to establish the
+fail-to-pass path. The integrated scenario now passes locally; section 8 records
+its evidence and limits. That milestone does not imply that items 2 and 3 are solved.
+
+The current session cannot reach the reported development container. The user
+accepted reproduction as closely as possible locally and requests for specific
+additional machine facts when needed. Use disposable filesystems and processes;
+record separately what local tests establish and what still requires deployment
+or a lifecycle check on the actual machine. Do not restart that shared machine
+or disturb its SSH sessions without separate authorization.
+
+* 2. Scope and intended user flow
+
+Preserve the user's existing decision: detach and add, with no special identity
+recovery command. The change extends the already-existing removal operation
+for an exact, retained, unpaired local root. It does not let an incoming peer
+authorize a different local root.
+
+The intended sequence is:
+
+1. Install the reviewed executable on both endpoints through the appropriate
+   guarded upgrade route. Verify executable hashes, including the binary used
+   by noninteractive SSH, rather than relying on the unchanged version string.
+2. On the destination endpoint, deliberately select the retained root for local
+   removal. Preview that it is already unpaired and that the operation would
+   acknowledge the currently opened directory, then require confirmation.
+3. Preserve files and retained recovery information. Refresh only the exact
+   root binding and supported identity evidence; leave it unpaired.
+4. Run the original laptop-side =sync add= against that destination. Retain the
+   existing initial union/preview/confirmation and conflict handling.
+5. Demonstrate edits in both directions, then separately demonstrate supported
+   remount recovery and login-supervised installation/startup.
+
+The retained unpaired registration is omitted by both =sync list= and =status
+--list --json= today. Use the existing =flocal status PATH --json= to discover
+its =share= field and =relationship_state=. This status path uses
+=State::find_share= without requiring a match to the old numeric identity.
+Do not broaden removal's PATH selector or change list membership for recovery.
+
+Out of scope: a generic identity-provider framework, accepting inode equality
+alone, automatic OverlayFS recovery, privileged host-device access, a new init
+system, a second supervisor, scaling changes, and a synchronization protocol or
+causal-history redesign.
+
+* 3. Invariants reused from the existing implementation
+
+- =root_observation= obtains the device/inode and native identity from the same
+  opened no-follow directory =File=. Keep that descriptor alive through the
+  pathname recheck and conditional identity publication.
+- =ShareRoot::validate= first validates the current pathname and then compares
+  its actual numeric tuple with the held capability's captured tuple. Persistent
+  continuity permits a fresh open; it never upgrades a stale capability.
+- The existing installation barrier, scheduler reservation, registration lock,
+  state transaction, and exact binding comparisons remain the mutation
+  boundaries. Reuse their established order rather than adding another queue.
+- Never clear or bypass a pending installation to make registration work.
+  Missing roots, final symlinks, a concurrently changed root, active bindings,
+  pending removal, or a changed registration invalidate local recovery.
+- Existing records, shared heads, pending objects, or unsettled paths make the
+  narrow unpaired recovery case ineligible. Retained conflicts, recovery
+  objects, budget, sequence, installation identity, and unrelated roots remain
+  intact. A zero records count does not mean that the directory is empty.
+- Incoming registration continues to validate stored identity before adopting
+  a retained root. Its successful reply is not local root-rebinding authority.
+- Both existing adversarial overlay refusal scenarios remain required.
+
+* 4. Extend deliberate removal of an unpaired root
+
+The defect is the early unpaired return in =remove_sync_relationship= in
+=src/main.rs=. Incoming =State::register_relationship_locked= correctly
+refuses the stale binding. Do not fix incoming registration by relaxing it.
+
+For an unpaired row selected by =sync remove --share SHARE_ID=, first call the
+existing =validate_root_identity=. A valid root remains the existing no-op.
+Only a typed =RootIdentityChanged= error enters the explicit local recovery
+preview. Propagate operational/SQLite errors without treating them as
+authorization to rebind. Preview the stored root, share, and current opened
+directory, explain the local acknowledgment, and require confirmation or the
+existing =--yes=. No peer contact or relationship removal is needed for this
+already-unpaired case.
+
+The implementation reuses the existing local connector reinitialization:
+=prepare_connector_registration_locked= already calls
+=open_reinitialization_root=, checks =ensure_unpaired_registration_state=,
+observes a no-follow descriptor, updates identity, and rechecks the exact path.
+The shared =publish_reinitialized_root= helper now owns those guards, the
+descriptor observation, conditional root-field update, and final path recheck.
+Both connector reinitialization and local recovery retain the returned =File=
+through transaction commit. No reverse connector relationship is manufactured.
+
+The local removal path calls =open_unpaired_root_for_reinitialization= to pin
+the preview directory and =reinitialize_unpaired_root= after confirmation.
+The latter runs through
+=State::scheduled_mutation(Some(share), SyncOperation::Removal)=. Existing
+interprocess scheduling already provides this exclusion; do not add a daemon
+request or network operation for recovery. Inside it, take the existing
+registration lock and an immediate SQLite transaction. Its contract is:
+
+1. Accept the deliberately selected share and the directory identity shown in
+   the confirmation preview. Selection by share ID is not permission to follow
+   a missing or symlinked configured root.
+2. Reopen/verify the exact stored root using the existing descriptor/path
+   machinery. Compare the current opened tuple with metadata from the retained
+   preview =File=, so a root replacement during confirmation is rejected.
+3. Recheck that binding is still unpaired, removal is absent, watch is disabled,
+   initial sync is incomplete, and no live installation or synchronization
+   payload exists. Use the existing unpaired-state check for these conditions.
+4. Conditionally publish only device, inode, and the chosen supported identity
+   evidence. Recheck the pathname before committing. Preserve sequence and
+   recovery data and do not create a peer or relationship ID.
+5. Report that the user acknowledged today's directory; this does not recover
+   the missing historical UUID. Leave it unpaired and keep the healthy
+   unpaired no-op unchanged.
+
+Confirmation cancellation, an ineligible row, a state error, or a path/binding
+race must leave the registration unchanged. Remote protocol handlers must not
+reach this explicit local authorization path.
+
+The local responder-side recipe, once the fix is installed, is:
+
+#+begin_src sh
+flocal status /home/peer/share --json
+flocal sync remove --share SHARE_ID --yes
+#+end_src
+
+Then rerun the original connector-side =sync add LOCAL_PATH --host peer-b
+--remote-path /home/peer/share=. Do not tell the user to retry before the local
+recovery operation and the installed SSH executable have been verified.
+
+* 5. Native identity on older Linux: evidence required before selection
+
+The existing full-UUID ioctl is unavailable on the reported native ext4 mount.
+The November 17 implementation's unsupported result is correct; installing it
+alone does not establish persistent identity there.
+
+Research has ruled out treating generic =statfs.f_fsid= as a full UUID. Native
+ext4 on Linux 5.15 derives its 64-bit fsid from a projection of its 128-bit UUID;
+that projection has constructible collisions. Exported file handles include
+inode/generation information and a transient mount ID, not the missing volume
+UUID. No exposed block-device node or usable sysfs UUID has been established.
+
+The older-kernel mechanism is an unresolved design decision at this draft.
+The platform investigation must specify the exact descriptor-bound API,
+enrollment authorization, persistence, copying/tampering and inode-reuse
+boundaries, and availability without privileged host access. A local root
+xattr is a candidate to examine, not an accepted implementation: copying or
+transplanting its value, deletion, remote influence, unsupported xattrs, and
+kernel upgrades all require a concrete contract. A plain synchronized UUID
+file is not sufficient evidence.
+
+Retain the existing bounded =filesystem_identity(&File)= boundary and tagged
+stored representation if the chosen mechanism fits them. Do not add a generic
+abstraction before a specific available mechanism and its real-filesystem
+acceptance are established. Do not silently change an enrolled identity method
+merely because a newer kernel exposes an additional query.
+
+* 6. Guarded installation with the existing login supervisor
+
+Linux =prepare_daemon_service= currently requires a working systemd user
+manager. The alternative must still use =StagedExecutable=, the service
+installer lock, installer lock, upgrade marker, legacy operation locks,
+exclusive installation barrier, state migration, and verification. The macOS
+binary-only service outcome is not a substitute: it intentionally skips managed
+migration and cannot satisfy this installation requirement.
+
+Do not kill a child while an unaware restart loop can launch a state-opening
+replacement during migration. Reuse the existing upgrade marker and barrier:
+for compatible binaries, creating the pending marker before daemon shutdown
+makes subsequent =State::open= attempts fail before or after their shared
+barrier acquisition. The exclusive installer barrier supplies actual migration
+exclusion. After publication/migration, clear the marker and let the same
+supervisor start the installed executable. Keep its singleton lock and login
+hook; do not create a second owner.
+
+The concrete service-control interface is unresolved at this draft. The exact
+existing helper bytes and installed binary's marker behavior were not provided.
+The design must distinguish first bootstrap from later upgrades. Options under
+examination are an explicit external-service install route with a verified
+owner-quiescence procedure, or narrow local daemon shutdown control coordinated
+with the marker. Do not add arbitrary shell-command hooks or use unverified
+pidfiles. A new shutdown request would need handling before the daemon control
+thread's ordinary =State::open= while a pending marker exists.
+
+The daemon-not-running fallback must describe the selected supported startup
+route instead of promising that systemd can be repaired by rerunning installation
+in a container without that manager. Starting at login, surviving logout,
+singleton ownership, and child restart are required; boot before login is not.
+
+* 7. Acceptance and delivery plan
+
+1. Pin the unpaired-responder failure with generated SSH peers and
+   =e2e::known_failure= before the runtime fix. Promote that same scenario to a
+   passing test. Preserve independent existing destination and source files;
+   verify actual content agreement and both relationship roles after pairing.
+2. Test local recovery confirmation, exact-root selection, retained budget and
+   sequence/conflicts, binding/path races, final symlinks, missing roots,
+   active operations, and pending installation refusal at existing boundaries.
+   Reuse nearby tests and fixtures; do not add checked-in directory trees.
+3. Prove the chosen older-kernel identity mechanism on disposable native ext4
+   through a genuine remount/device-number change. Assert actual changed device
+   and same enrolled directory; preserve history and reject a held old
+   capability before any separate refresh. An ENOTTY injection can pin fallback
+   selection but is not itself proof of mount persistence or Linux 5.15 support.
+4. Preserve the native APFS acceptance and both overlay collision refusals.
+   Exercise replacement, differing volume, missing root, and final symlink
+   negatives for any additional identity source.
+5. Exercise installation under a disposable no-systemd SSH/login environment
+   with real supervisor/child processes: concurrent logins, logout survival,
+   child crash/restart, upgrade while restart is armed, and interrupted upgrade.
+   Require safe migration exclusion and exact installed/running/SSH executable
+   hashes. Fake service output alone does not prove lifecycle behavior.
+6. Update =README.org= and write a separate new dated reader-first report for
+   the actual implementation and evidence. Keep all earlier dated documents
+   immutable. Do not claim machine deployment or a shared-container restart
+   was performed when access or authorization was unavailable.
+7. Run independent design reviews, implement the accepted bounded design, run
+   affected code lenses and complete =make check= at both 90% thresholds, then
+   follow the existing draft PR and bounded Copilot process. Existing review
+   rounds on this PR do not reset because this amendment adds tests or commits.
+
+* 8. First milestone evidence and remaining work
+
+=unpaired_responder_root_can_be_deliberately_recovered_before_pairing= was
+pinned against unchanged main =5a2a7cb= with =e2e::known_failure=. Incoming add
+failed with the reported root-identity diagnostic after unpaired removal did
+nothing. The fixed scenario is a plain passing test using existing managed
+Docker/SSH peers. Its final run passed locally in 7.27 seconds: independent source and
+destination files survived initial pairing, subsequent edits synchronized in
+both directions, and the final trees matched. Its real root replacement pins
+the recovery-flow defect; it is not a positive ext4 remount test.
+
+Two state tests passed without a native-identity early return. They exercise
+an obsolete numeric device with UUID evidence absent, refused incoming pairing
+before acknowledgment, preservation of sequence/budget/conflicts, and safe
+incoming pairing afterward. They also reject preview replacement, pending
+installation, enabled watch, and a newly paired row without changing its root
+binding. The existing connector reinitialization regression still passes.
+
+The real CLI consent test also preserves the registration after explicit
+decline and EOF, then performs confirmed recovery. Seven scoped design lenses
+and twelve code lenses cleared after focused rechecks. Complete =make check=
+passed with 92.02% whole-project and 93.14% changed-line coverage. The reviewed
+release was deployed locally; the daemon remained healthy and all six shares
+remained disabled. External CI/review remain pending for the amendment.
+Sections 5 and 6 remain unresolved: no older-kernel
+automatic-remount proof or no-systemd installer was added by the first
+milestone. Do not advertise the full reported machine requirement as solved.
+
+* Historical supersessions
+
+- [[file:2026-11-17-root-remount-identity-design.org::*5. Already affected legacy roots: explicit decision][November 17 design, section 5]] describes detach-and-add as sufficient deliberate
+  recovery. For an already-unpaired retained responder, existing removal is a
+  no-op and incoming pairing remains blocked. Replace that incomplete recipe
+  with deliberate local acknowledgment through the existing removal operation,
+  subject to the exact-root and empty synchronization-state guards above.
+- [[file:2026-11-17-root-remount-identity-report.org::*Operational limits and upgrade][November 17 report, Operational limits and upgrade]] gives the same incomplete
+  three-command recovery recipe. The destination may require explicit local
+  recovery even though no relationship currently exists; installing the branch
+  does not establish the missing historical identity.
+
+The older-Linux limitation was already stated correctly. Supporting an
+additional older-kernel mechanism is a new contract requiring its own evidence,
+not a retrospective correction of that limitation.
